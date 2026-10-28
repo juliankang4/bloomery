@@ -161,7 +161,7 @@ Measured at main `cb8d92eb` on DGX Sparks (GB10, driver 595.84, CUDA 13.3 build,
 MHz just after each server's requests. Drafting off ran on one Spark with `BLOOMERY_HOST_ROOM=100G`, which sets the
 host room the plan reads instead of `MemAvailable` (at that commit the drafting-off load at `--ctx-size 33024` was
 refused at its part read-ahead by 0.6 GB without it; since [#870](https://github.com/midagedev/bloomery/pull/870) the
-load reads in smaller runs instead). MTP on ran on a second Spark of the same model with the room read from
+load reads fewer parts at once instead). MTP on ran on a second Spark of the same model with the room read from
 `MemAvailable`. The same drafting-off servers measured on two Sparks agreed within 1.5 % in every cell. tok/s
 unless named:
 

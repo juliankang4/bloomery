@@ -1,17 +1,16 @@
 //! The one load of a part source onto a card (`model::part::Source`: a GGUF file or a
 //! checkpoint folder). The caller's rule says which tensors the card holds, whole, the part of
 //! a rank, or a stack's listed experts, as the source plans them; every planned part's card
-//! format is checked before any is read; then parts are read a run at a time and staged in
-//! order as they arrive through one staging ring, which one synchronize ends ([`load`]). A rank of a tensor-parallel load of N
+//! format is checked before any is read; then parts are read while the parts before them still
+//! hold their read bytes, up to the planned read-ahead, and staged in order as they arrive through
+//! one staging ring, which one synchronize ends ([`load`]). A rank of a tensor-parallel load of N
 //! ranks passes its family's cut; a one-card load passes its placement plan's card
 //! ([`OnCard`]), and a folder whose host reads tensors where its located header holds them
 //! passes those ([`InPlace`]): the card takes its share of a stack the plan splits between it
 //! and that host, the host reads the rest where the folder stores it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Condvar, Mutex, PoisonError, mpsc};
 
 use cuda_core::CudaStream;
 use gguf::{GgmlType, Place, Split, TensorInfo};
@@ -20,18 +19,18 @@ use model::placement::workstation::{HostRead, host_available_read};
 use model::placement::{CardFormat, Device, ExpertList, Format, ModelTensor, Plan, Segment};
 
 use crate::GpuError;
-use crate::upload::{UploadRing, pool_map};
+use crate::upload::UploadRing;
 use crate::weights::{TensorPart, Weights, part_format, stage_parts};
 
 /// What the errors name.
 const WHAT: &str = "parts::load";
 
-/// The parts selected by `rule`, read in runs bounded by owned read and packing bytes and staged
-/// in plan order while the run still reads ([`read_staged`]). Oversized parts run alone. The
-/// placed caller reserves `LoadPlan::host_bytes` in its host need. Each run is checked against
-/// the live host reading and, when it does not fit, read in smaller runs down to one part at a
-/// time; a part alone over the reading is refused. A refusal drains pending copies before freeing
-/// device buffers. Under `release`, each run's source pages are dropped after staging.
+/// The parts selected by `rule`, each read once the parts before it that are not yet staged
+/// leave it room under the planned read-ahead and the live host reading, and staged in plan order
+/// while later parts still read ([`read_staged`]); a part over the read-ahead reads with none
+/// held. The placed caller reserves `LoadPlan::host_bytes` in its host need; a part alone over the live
+/// reading is refused. A refusal drains pending copies before freeing device buffers. Under
+/// `release`, each part's source pages are dropped after it is staged.
 pub fn load<S: Source + Sync, E: std::fmt::Display>(
     stream: &CudaStream,
     source: &S,
@@ -62,91 +61,187 @@ fn load_plan<S: Source + Sync>(
     let mut staged = BTreeMap::new();
     // Dropped before the staged device buffers: draining the ring protects refused loads.
     let mut ring = UploadRing::new(stream, plan.upload_bytes)?;
-    for run in plan.checked_runs(|| host_available_read().map_err(refused)) {
-        let run = run?;
-        let mut done = Vec::with_capacity(run.len());
-        read_staged(source, run, |p, part| {
-            let one = TensorPart {
-                info: part.info.clone(),
-                spans: part.spans(),
-                scale: part.scale.clone(),
-            };
-            let held = |name: &str| staged.contains_key(name);
-            let added = stage_parts(stream, &mut ring, &[one], held, &card)?;
-            staged.extend(added);
-            done.push((p, part));
-            Ok(())
-        })?;
-        let released = pool_map(done, |(p, part)| {
-            drop(part);
-            match release {
-                true => source.release(p).map_err(|e| e.to_string()),
-                false => Ok(()),
-            }
-        });
-        released
-            .into_iter()
-            .collect::<Result<(), _>>()
-            .map_err(refused)?;
-    }
+    let live = || host_available_read().map_err(refused);
+    read_staged(source, plan, live, release, |_, part| {
+        let one = TensorPart {
+            info: part.info.clone(),
+            spans: part.spans(),
+            scale: part.scale.clone(),
+        };
+        let held = |name: &str| staged.contains_key(name);
+        let added = stage_parts(stream, &mut ring, &[one], held, &card)?;
+        staged.extend(added);
+        Ok(())
+    })?;
     ring.finish(stream)?;
     Ok(Weights::of_staged(staged))
 }
 
-/// `run`'s parts read on threads of their own while `stage` takes each, in run order, as soon as
-/// it and every part before it are read, so the staging of a run overlaps its reads. Staging
-/// packs and copies over the pool, which is not reentrant, so the readers are not the pool's;
-/// each first sets its mask to the pool's cpus, since a spawned thread inherits the caller's pin.
-/// The first refusal, a reader's, a read's or the stage's, stops the readers taking more parts.
-fn read_staged<'s, 'r, S: Source + Sync>(
+/// Whether a part may start its read ([`LoadPlan::admits`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    Read,
+    /// Over the planned read-ahead: it waits for the parts before it to be staged.
+    Wait,
+    /// Within the planned read-ahead, over the live host reading: it waits as `Wait` does.
+    Short,
+}
+
+/// What the readers and the stage of [`read_staged`] share.
+#[derive(Default)]
+struct Window {
+    /// The next part a reader takes.
+    next: usize,
+    /// The parts staged: every part before it has dropped its read bytes.
+    staged: usize,
+    /// Staged parts whose source pages a reader drops next; the readers end once every part is
+    /// staged and this is empty.
+    releases: Vec<usize>,
+    /// The first refusal: every reader ends, and the stage ends at its next wait.
+    failed: Option<GpuError>,
+    /// The stage refused; the readers end.
+    stop: bool,
+    /// The live reading has held a read back once (named once on stderr).
+    short: bool,
+}
+
+/// `plan`'s parts read on threads of their own while `stage` takes each, in plan order, as soon
+/// as it and every part before it are read, so reads, normalizing and staging overlap across the
+/// whole load. A reader takes the next part once [`LoadPlan::admits`] lets it beside the read
+/// parts not yet staged, reading `available` as it admits; a part's read bytes are freed when
+/// its stage returns, and under `release` a reader then drops its source pages. Staging packs
+/// and copies over the pool, which is not reentrant, so the readers are not the pool's; each
+/// first sets its mask to the pool's cpus, since a spawned thread inherits the caller's pin. The
+/// first refusal, a reader's, an admission's, a read's, a release's or the stage's, stops the
+/// readers taking more parts; a reader's or the stage's panic stops them the same way and then
+/// unwinds.
+fn read_staged<'s, 'p, S: Source + Sync>(
     source: &'s S,
-    run: &'r [Planned],
-    mut stage: impl FnMut(&'r Planned, Part<'s>) -> Result<(), GpuError>,
+    plan: &'p LoadPlan,
+    available: impl Fn() -> Result<(u64, HostRead), GpuError> + Sync,
+    release: bool,
+    mut stage: impl FnMut(&'p Planned, Part<'s>) -> Result<(), GpuError>,
 ) -> Result<(), GpuError> {
+    let parts = &plan.parts;
     let pool = threads::pool();
     let cpus: Vec<u32> = pool.topology().concat();
-    let next = AtomicUsize::new(0);
-    let stop = AtomicBool::new(false);
+    let shared = Mutex::new(Window::default());
+    let changed = Condvar::new();
+    let lock = || shared.lock().unwrap_or_else(PoisonError::into_inner);
+    let fail = |e: GpuError| {
+        lock().failed.get_or_insert(e);
+        changed.notify_all();
+    };
+    /// Runs its call when dropped by a panic's unwinding.
+    struct OnUnwind<F: Fn()>(F);
+    impl<F: Fn()> Drop for OnUnwind<F> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                (self.0)();
+            }
+        }
+    }
     let (tx, rx) = mpsc::channel();
     std::thread::scope(|scope| {
-        for _ in 0..pool.threads().clamp(1, run.len().max(1)) {
+        let _stage_unwind = OnUnwind(|| fail(refused("the parts' stage panicked".into())));
+        for _ in 0..pool.threads().clamp(1, parts.len().max(1)) {
             let tx = tx.clone();
-            let (next, stop, cpus) = (&next, &stop, &cpus);
-            scope.spawn(move || {
-                let placed = os::set_mask(cpus).map_err(|e| format!("a part reader's cpus: {e}"));
-                while !stop.load(Ordering::Relaxed) {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(p) = run.get(i) else { break };
-                    let read = placed
-                        .clone()
-                        .map(|()| (i, source.read(p).map_err(|e| e.to_string())));
-                    if tx.send(read).is_err() || placed.is_err() {
-                        break;
+            let (cpus, changed, available, lock, fail) =
+                (&cpus, &changed, &available, &lock, &fail);
+            let reader = std::thread::Builder::new().spawn_scoped(scope, move || {
+                let _reader_unwind = OnUnwind(|| fail(refused("a part reader panicked".into())));
+                if let Err(e) = os::set_mask(cpus) {
+                    return fail(refused(format!("a part reader's cpus: {e}")));
+                }
+                let mut w = lock();
+                while !w.stop && w.failed.is_none() {
+                    if let Some(j) = w.releases.pop() {
+                        drop(w);
+                        if let Err(e) = source.release(&parts[j]) {
+                            return fail(refused(e.to_string()));
+                        }
+                        w = lock();
+                        continue;
+                    }
+                    if w.next == parts.len() {
+                        if w.staged == parts.len() {
+                            break;
+                        }
+                        w = changed.wait(w).unwrap_or_else(PoisonError::into_inner);
+                        continue;
+                    }
+                    let i = w.next;
+                    match plan.admits(w.staged..i, available) {
+                        Ok(Admit::Read) => {
+                            w.next += 1;
+                            drop(w);
+                            let read = source.read(&parts[i]).map_err(|e| e.to_string());
+                            if tx.send((i, read)).is_err() {
+                                return;
+                            }
+                            w = lock();
+                        }
+                        Ok(admit) => {
+                            if admit == Admit::Short && !std::mem::replace(&mut w.short, true) {
+                                eprintln!(
+                                    "{WHAT}: the parts' read-ahead of up to {} B is over the live \
+                                     host room; fewer parts read at once",
+                                    plan.window
+                                );
+                            }
+                            w = changed.wait(w).unwrap_or_else(PoisonError::into_inner);
+                        }
+                        Err(e) => {
+                            drop(w);
+                            return fail(e);
+                        }
                     }
                 }
             });
+            if let Err(e) = reader {
+                fail(refused(format!("a part reader could not start: {e}")));
+                break;
+            }
         }
         drop(tx);
-        let mut read: Vec<Option<Result<Part<'s>, String>>> = run.iter().map(|_| None).collect();
+        let mut read: Vec<Option<Result<Part<'s>, String>>> = parts.iter().map(|_| None).collect();
         let mut at = 0;
         let staged = (|| {
-            while at < run.len() {
-                let (i, part) = rx
-                    .recv()
-                    .map_err(|_| refused("a part reader stopped".into()))?
-                    .map_err(refused)?;
+            while at < parts.len() {
+                let Ok((i, part)) = rx.recv() else {
+                    return Err(lock()
+                        .failed
+                        .take()
+                        .unwrap_or_else(|| refused("a part reader stopped".into())));
+                };
                 read[i] = Some(part);
                 while let Some(part) = read.get_mut(at).and_then(Option::take) {
-                    stage(&run[at], part.map_err(refused)?)?;
+                    stage(&parts[at], part.map_err(refused)?)?;
+                    let mut w = lock();
+                    w.staged = at + 1;
+                    if release {
+                        w.releases.push(at);
+                    }
+                    drop(w);
+                    changed.notify_all();
                     at += 1;
                 }
             }
             Ok(())
         })();
-        stop.store(true, Ordering::Relaxed);
+        lock().stop = staged.is_err();
+        changed.notify_all();
         drop(rx);
         staged
-    })
+    })?;
+    match shared
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+        .failed
+    {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// A placed source shares one admission and upload implementation across model components.
@@ -199,57 +294,64 @@ impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
     }
 }
 
-/// Parts, their read costs, their bounded parallel reads, the peak owned host bytes reserved
-/// before loading and the least peak, one part at a time.
+/// Parts, their read costs, the owned read bytes they may hold at once, the peak owned host bytes
+/// reserved before loading and the least peak, one part at a time.
 struct LoadPlan {
     parts: Vec<Planned>,
     costs: Vec<(u64, u64)>,
-    runs: Vec<(std::ops::Range<usize>, u64)>,
+    /// The read-ahead: the most owned read and packing bytes the parts read and not yet staged
+    /// hold at once ([`Self::admits`]), the largest a leading run of parts takes under the
+    /// planned room.
+    window: u64,
     host_bytes: u64,
     serial_bytes: u64,
     upload_bytes: usize,
 }
 
 impl LoadPlan {
-    fn checked_runs<'a>(
-        &'a self,
-        mut available: impl FnMut() -> Result<(u64, HostRead), GpuError> + 'a,
-    ) -> impl Iterator<Item = Result<&'a [Planned], GpuError>> + 'a {
-        let mut runs = self.runs.iter();
-        let mut left = 0..0;
-        std::iter::from_fn(move || {
-            let mut planned = None;
-            if left.is_empty() {
-                let (range, bytes) = runs.next()?;
-                (left, planned) = (range.clone(), Some(*bytes));
+    /// Whether part `held.end` may start its read while the parts `held` are read and not yet
+    /// staged: with none held it reads alone, refused when its peak is over the live reading
+    /// `available` gives; with some held, the held parts and it within the read-ahead
+    /// ([`read_ahead`] under [`Self::window`]) and within the live reading, or it waits. The live
+    /// reading already lacks what the held parts hold, so it is read only once the read-ahead
+    /// admits the part.
+    fn admits(
+        &self,
+        held: std::ops::Range<usize>,
+        available: impl Fn() -> Result<(u64, HostRead), GpuError>,
+    ) -> Result<Admit, GpuError> {
+        let (at, i) = (held.start, held.end);
+        let parts = &self.parts[at..=i];
+        let costs = &self.costs[at..=i];
+        let fits = |room: u64| {
+            read_ahead(parts, costs, room)
+                .map(|(n, bytes)| n == parts.len() && bytes <= room)
+                .map_err(|e| refused(e.to_string()))
+        };
+        if at < i && !fits(self.window)? {
+            return Ok(Admit::Wait);
+        }
+        let (live, read) = available()?;
+        if at == i {
+            let bytes = read_ahead(parts, costs, 0)
+                .map_err(|e| refused(e.to_string()))?
+                .1;
+            if bytes > live {
+                return Err(refused(format!(
+                    "part read-ahead needs {bytes} B, the host room is {live} B ({read})"
+                )));
             }
-            // The ring is already paid for in the live reading.
-            let run = available().and_then(|(live, read)| {
-                let (n, bytes) =
-                    read_ahead(&self.parts[left.clone()], &self.costs[left.clone()], live)
-                        .map_err(|e| refused(e.to_string()))?;
-                if bytes > live {
-                    return Err(refused(format!(
-                        "part read-ahead needs {bytes} B, the host room is {live} B ({read})"
-                    )));
-                }
-                if let Some(planned) = planned.filter(|_| n < left.len()) {
-                    eprintln!(
-                        "{WHAT}: a read-ahead run of {} parts needs {planned} B, the host room \
-                         is {live} B ({read}); it reads in smaller runs",
-                        left.len()
-                    );
-                }
-                let at = left.start;
-                left.start += n;
-                Ok(&self.parts[at..left.start])
-            });
-            Some(run)
+            return Ok(Admit::Read);
+        }
+        Ok(if fits(live)? {
+            Admit::Read
+        } else {
+            Admit::Short
         })
     }
 
     /// Refused unless one part at a time fits the host room `room`, named by the reading that
-    /// gave it; [`Self::checked_runs`] shrinks the planned runs to the live reading.
+    /// gave it; [`Self::admits`] holds reads back to the live reading.
     fn check(&self, (available, read): &(u64, HostRead)) -> Result<(), GpuError> {
         if self.serial_bytes > *available {
             return Err(refused(format!(
@@ -273,15 +375,14 @@ impl LoadPlan {
             upload_bytes = upload_bytes
                 .checked_add(staged)
                 .ok_or_else(|| refused("the parts' staging bytes pass usize".into()))?;
-            // Packing capacity and scale copies coexist with the entire run's read results.
+            // Packing capacity and scale copies coexist with every held part's read results.
             let read = source.read_bytes(p).map_err(|e| refused(e.to_string()))?;
             let packing = (staged as u64)
                 .checked_mul(2)
                 .ok_or_else(|| refused(format!("{}: packing bytes pass u64", p.info.name)))?;
             costs.push((read, packing));
         }
-        let mut runs = Vec::new();
-        let (mut host_bytes, mut serial_bytes) = (0, 0);
+        let (mut window, mut serial_bytes) = (0, 0);
         for at in 0..parts.len() {
             // A part runs alone under no room.
             let one = read_ahead(&parts[at..=at], &costs[at..=at], 0)
@@ -297,8 +398,7 @@ impl LoadPlan {
                 room.saturating_sub(UploadRing::HOST_MAX),
             )
             .map_err(|e| refused(e.to_string()))?;
-            runs.push((at..at + n, bytes));
-            host_bytes = host_bytes.max(bytes);
+            window = window.max(bytes);
             at += n;
         }
         let with_ring = |bytes: u64| match bytes {
@@ -310,8 +410,8 @@ impl LoadPlan {
         Ok(Self {
             parts,
             costs,
-            runs,
-            host_bytes: with_ring(host_bytes)?,
+            window,
+            host_bytes: with_ring(window)?,
             serial_bytes: with_ring(serial_bytes)?,
             upload_bytes,
         })
@@ -674,14 +774,27 @@ mod tests {
     use super::*;
     use model::placement::Role;
 
-    /// A run's parts are staged in run order while later parts still read, and a read's refusal
-    /// stops the stage at that part. The last part's read waits, at most 10 s, for the first
-    /// part's stage. Mutants: staging in arrival order stages the later, faster reads first;
-    /// staging once every read is in leaves the last read waiting until it is refused.
+    /// Parts are staged in plan order while later parts still read, a staged part's pages are
+    /// released once, and a read's refusal stops the stage at that part. The last part's read
+    /// waits, at most 10 s, for the first part's stage. A read-ahead of two parts reads four once
+    /// each stage frees its part, and the last part's failed release is the load's error.
+    /// Mutants: staging in arrival order stages the later, faster reads first; staging once every
+    /// read is in leaves the last read waiting until it is refused; a release queued twice or
+    /// never changes the released list; a stage that never frees its read-ahead stalls a load,
+    /// and the test aborts after 10 s; a release error dropped after the last stage returns `Ok`;
+    /// a reader's or the stage's panic that leaves the other readers waiting stalls its load.
     #[test]
-    fn a_run_stages_in_order_as_its_reads_arrive() {
+    fn parts_stage_in_order_as_their_reads_arrive() {
+        let (finished, watch) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let wait = watch.recv_timeout(std::time::Duration::from_secs(10));
+            if wait == Err(mpsc::RecvTimeoutError::Timeout) {
+                eprintln!("parts_stage_in_order_as_their_reads_arrive stalled a load");
+                std::process::abort();
+            }
+        });
         /// Signals the first part's stage, for the last part's read.
-        struct Slow(std::sync::Mutex<mpsc::Receiver<()>>);
+        struct Slow(Mutex<mpsc::Receiver<()>>);
         impl Source for Slow {
             type Error = std::io::Error;
             fn plan<E: std::fmt::Display>(
@@ -694,6 +807,7 @@ mod tests {
                 unreachable!()
             }
             fn read(&self, p: &Planned) -> Result<model::part::Part<'_>, Self::Error> {
+                assert_ne!(p.info.name, "r0", "a read panicked");
                 let i = p.info.offset;
                 std::thread::sleep(std::time::Duration::from_millis(2 * (12 - i)));
                 if i == 8 {
@@ -707,21 +821,37 @@ mod tests {
                     _ => Ok(model::part::Part::made(p.info.clone(), vec![i as u8], None)),
                 }
             }
+            fn release(&self, p: &Planned) -> Result<(), Self::Error> {
+                if p.info.name == "q3" {
+                    return Err(std::io::Error::other("q3 release refused"));
+                }
+                RELEASED.lock().unwrap().push(p.info.offset);
+                Ok(())
+            }
         }
-        let run: Vec<Planned> = (0..12)
-            .map(|i| Planned {
-                at: None,
-                info: TensorInfo {
-                    name: format!("p{i}"),
-                    ty: GgmlType::F32,
-                    dims: vec![1],
-                    offset: i,
-                    nbytes: 4,
-                },
-            })
-            .collect();
+        static RELEASED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let plan = |n: u64, window: u64, name: &str| LoadPlan {
+            parts: (0..n)
+                .map(|i| Planned {
+                    at: None,
+                    info: TensorInfo {
+                        name: format!("{name}{i}"),
+                        ty: GgmlType::F32,
+                        dims: vec![1],
+                        offset: i,
+                        nbytes: 4,
+                    },
+                })
+                .collect(),
+            costs: vec![(4, 0); n as usize],
+            window,
+            host_bytes: window + UploadRing::HOST_MAX,
+            serial_bytes: 4 + UploadRing::HOST_MAX,
+            upload_bytes: 0,
+        };
+        let room = || Ok((1 << 20, HostRead::MemAvailable));
         let (staged, first) = mpsc::channel();
-        let slow = Slow(std::sync::Mutex::new(first));
+        let slow = Slow(Mutex::new(first));
         let mut order = Vec::new();
         let mut stage = |p: &Planned, part: model::part::Part<'_>| {
             assert_eq!(part.spans(), [[p.info.offset as u8]]);
@@ -731,17 +861,52 @@ mod tests {
             order.push(p.info.offset);
             Ok(())
         };
-        read_staged(&slow, &run[..9], &mut stage).unwrap();
-        let error = read_staged(&slow, &run, &mut stage)
+        let whole = plan(9, 36, "p");
+        let refusing = plan(12, 48, "p");
+        let turning = plan(4, 8, "q");
+        read_staged(&slow, &whole, room, true, &mut stage).unwrap();
+        let mut released = std::mem::take(&mut *RELEASED.lock().unwrap());
+        released.sort_unstable();
+        assert_eq!(released, (0..9).collect::<Vec<u64>>());
+        let error = read_staged(&slow, &refusing, room, false, &mut stage)
             .unwrap_err()
             .to_string();
         assert!(error.contains("part 9 refused"), "{error}");
-        let want: Vec<u64> = (0..9).chain(0..9).collect();
+        assert!(RELEASED.lock().unwrap().is_empty());
+        let error = read_staged(&slow, &turning, room, true, &mut stage)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("q3 release refused"), "{error}");
+        let read_panics = plan(2, 8, "r");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read_staged(&slow, &read_panics, room, false, &mut stage)
+        }));
+        assert!(unwound.is_err());
+        let stage_panics = plan(2, 8, "s");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read_staged(&slow, &stage_panics, room, false, |_, _| {
+                panic!("a stage panicked")
+            })
+        }));
+        assert!(unwound.is_err());
+        let want: Vec<u64> = (0..9).chain(0..9).chain(0..4).collect();
         assert_eq!(order, want);
+        let mut released = std::mem::take(&mut *RELEASED.lock().unwrap());
+        released.sort_unstable();
+        // A reader may take q3's failing release before q2's and stop with q2 still queued.
+        assert!(released == [0, 1] || released == [0, 1, 2], "{released:?}");
+        finished.send(()).unwrap();
     }
 
+    /// A part reads beside the held parts only within the planned read-ahead and then the live
+    /// reading, which is not read while the read-ahead holds it back; with none held it reads
+    /// alone unless its own peak is over the live reading, which refuses it by name. Mutants:
+    /// admitting past the read-ahead turns the `Wait` red, ignoring the live reading the `Short`,
+    /// and dropping the lone part's check the refusal.
+    // PIN(2026-10-28): replaces later_reads_use_their_own_peak_under_a_falling_host_room; a load
+    // reads beside the held parts instead of in runs, so the live reading is checked per part.
     #[test]
-    fn later_reads_use_their_own_peak_under_a_falling_host_room() {
+    fn a_part_reads_beside_the_held_parts_within_the_read_ahead_and_the_live_room() {
         let mib = 1u64 << 20;
         let decls = [64, 8]
             .into_iter()
@@ -758,44 +923,32 @@ mod tests {
                 .unwrap();
         let shared =
             LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), 296 * mib).unwrap();
-        assert_eq!(shared.runs, [(0..2, 200 * mib)]);
+        assert_eq!(shared.window, 200 * mib);
         assert_eq!(shared.host_bytes, 296 * mib);
         let read = |bytes: u64| (bytes, HostRead::MemAvailable);
         shared.check(&read(288 * mib)).unwrap();
         assert!(shared.check(&read(288 * mib - 1)).is_err());
         let plan =
             LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), 288 * mib).unwrap();
-        assert_eq!(plan.runs, [(0..1, 192 * mib), (1..2, 24 * mib)]);
+        assert_eq!(plan.window, 192 * mib);
         assert_eq!(plan.host_bytes, 288 * mib);
         plan.check(&read(300 * mib)).unwrap();
         assert!(plan.check(&read(288 * mib - 1)).is_err());
-        for (load, readings, lens) in [
-            (&shared, &[200][..], &[2][..]),
-            (&shared, &[199, 199][..], &[1, 1][..]),
-            (&plan, &[228, 164][..], &[1, 1][..]),
-            (&plan, &[192, 24][..], &[1, 1][..]),
+        let live = |mb: u64| move || Ok(read(mb * mib));
+        let unread = || -> Result<(u64, HostRead), GpuError> { unreachable!("read-ahead first") };
+        for (load, held, room, want) in [
+            (&shared, 0..1, 200, Admit::Read),
+            (&shared, 0..1, 199, Admit::Short),
+            (&plan, 1..1, 24, Admit::Read),
+            (&shared, 0..0, 192, Admit::Read),
         ] {
-            let mut rooms = readings.iter();
-            let runs = load
-                .checked_runs(|| Ok(read(rooms.next().unwrap() * mib)))
-                .collect::<Result<Vec<_>, _>>()
-                .expect("each run fits its live room, shrunk to it when over");
-            assert_eq!(runs.iter().map(|r| r.len()).collect::<Vec<_>>(), lens);
-            assert_eq!(
-                runs.iter()
-                    .flat_map(|run| run.iter())
-                    .map(|p| p.info.name.as_str())
-                    .collect::<Vec<_>>(),
-                ["p64.weight", "p8.weight"]
-            );
+            assert_eq!(load.admits(held, live(room)).unwrap(), want);
         }
-        let mut rooms = [(228, HostRead::MemAvailable), (23, HostRead::Given)].into_iter();
-        let mut runs = plan.checked_runs(|| {
-            let (room, read) = rooms.next().unwrap();
-            Ok((room * mib, read))
-        });
-        assert!(runs.next().unwrap().is_ok());
-        let error = runs.next().unwrap().unwrap_err().to_string();
+        assert_eq!(plan.admits(0..1, unread).unwrap(), Admit::Wait);
+        let error = plan
+            .admits(1..1, || Ok((23 * mib, HostRead::Given)))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("needs 25165824 B"), "{error}");
         assert!(
             error.contains("the host room is 24117248 B (given by BLOOMERY_HOST_ROOM"),
@@ -833,7 +986,7 @@ mod tests {
         }
         let plan =
             LoadPlan::new(&Owned, |_, _, _| Ok::<_, String>(Take::Whole), 128 << 20).unwrap();
-        assert_eq!(plan.runs.len(), 256);
+        assert_eq!(plan.window + UploadRing::HOST_MAX, plan.serial_bytes);
         assert_eq!(plan.host_bytes, (192 + 3 * 32) << 20);
         let gpu = crate::Gpu::with_device(0).unwrap();
         let room = (128 << 20, HostRead::MemAvailable);
