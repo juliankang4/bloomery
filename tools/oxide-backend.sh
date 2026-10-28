@@ -125,17 +125,19 @@ build() {
     || refuse "$PATCH_REL does not apply to cuda-rust $rev: the pin may hold the change already (drop the patch) or have moved the code (rebase it)"
   patch -p1 -d "$src" -s --no-backup-if-mismatch < "$ROOT/$PATCH_REL"
   # cargo-oxide's backend command (crates/cargo-oxide/src/backend.rs backend_build_command_in): the backend crate's own cargo
-  # run for the host, with no ambient rustc flags and the toolchain's lib directory on the library path.
+  # run for the host, with no ambient rustc flags and the toolchain's lib directory on the library path. Plus --release:
+  # cargo-oxide builds the backend in the dev profile, where the device lowering of a crate as large as bloomery-gpu runs
+  # several times slower; the profile changes the compiler's speed, not the PTX it writes.
   cd "$src/cuda-oxide/crates/rustc-codegen-cuda"
   sysroot=$(rustc --print sysroot)
   start=$(date +%s)
   (
     unset RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_BUILD_TARGET
     export CARGO_ENCODED_RUSTFLAGS= RUSTC_BOOTSTRAP=1 LIBRARY_PATH="$sysroot/lib" LD_LIBRARY_PATH="$sysroot/lib"
-    cargo build --lib --target host-tuple --locked --target-dir "$target" --message-format=short
+    cargo build --lib --release --target host-tuple --locked --target-dir "$target" --message-format=short
   )
   wall=$(($(date +%s) - start))
-  so=$(ls "$target"/*/debug/librustc_codegen_cuda.so 2> /dev/null | head -n 1 || true)
+  so=$(ls "$target"/*/release/librustc_codegen_cuda.so 2> /dev/null | head -n 1 || true)
   [ -n "$so" ] && [ -f "$so" ] || refuse "the backend build left no librustc_codegen_cuda.so under $target"
   mkdir -p "$out"
   cp "$so" "$out/.librustc_codegen_cuda.so.tmp"
@@ -143,7 +145,7 @@ build() {
   md5=$( (md5sum "$out/librustc_codegen_cuda.so" 2> /dev/null || md5 -r "$out/librustc_codegen_cuda.so") | cut -d' ' -f1)
   printf '%s\n' "$rev" > "$out/.source-rev.tmp"
   mv "$out/.source-rev.tmp" "$out/source-rev.txt"
-  printf 'patch-sha256: %s %s\nsource: NVIDIA/cuda-rust %s, checkout %s copied without .git and patched\nbuild: cargo build --lib --target host-tuple --locked (cargo-oxide'"'"'s backend command), CARGO_ENCODED_RUSTFLAGS empty, RUSTFLAGS/CARGO_BUILD_RUSTFLAGS/CARGO_BUILD_TARGET unset, LIBRARY_PATH and LD_LIBRARY_PATH %s/lib\ntoolchain: %s\ntarget dir: %s, wall %s s, on %s\nmd5 %s\n' \
+  printf 'patch-sha256: %s %s\nsource: NVIDIA/cuda-rust %s, checkout %s copied without .git and patched\nbuild: cargo build --lib --release --target host-tuple --locked (cargo-oxide'"'"'s backend command plus --release), CARGO_ENCODED_RUSTFLAGS empty, RUSTFLAGS/CARGO_BUILD_RUSTFLAGS/CARGO_BUILD_TARGET unset, LIBRARY_PATH and LD_LIBRARY_PATH %s/lib\ntoolchain: %s\ntarget dir: %s, wall %s s, on %s\nmd5 %s\n' \
     "$(patch_sha)" "$PATCH_REL" "$rev" "$co" "$sysroot" "$(rustc -V)" "$target" "$wall" "$(date -u +%FT%TZ)" "$md5" > "$out/.PROVENANCE.tmp"
   mv "$out/.PROVENANCE.tmp" "$out/PROVENANCE"
   check "$out/librustc_codegen_cuda.so"
@@ -167,8 +169,8 @@ case "\$1" in
   metadata) printf '{"packages":[{"name":"cuda-device","source":"git+https://github.com/NVIDIA/cuda-rust.git?rev=$rev#0123456","manifest_path":"$t/ck/${rev:0:7}/cuda-oxide/crates/cuda-device/Cargo.toml"}]}' ;;
   build)
     while [ "\$#" -gt 0 ]; do [ "\$1" = --target-dir ] && dir=\$2; shift; done
-    mkdir -p "\$dir/x86_64-unknown-linux-gnu/debug"
-    cat "\$PWD/../../stub.txt" > "\$dir/x86_64-unknown-linux-gnu/debug/librustc_codegen_cuda.so" ;;
+    mkdir -p "\$dir/x86_64-unknown-linux-gnu/release"
+    cat "\$PWD/../../stub.txt" > "\$dir/x86_64-unknown-linux-gnu/release/librustc_codegen_cuda.so" ;;
 esac
 EOF
   printf '#!/bin/sh\ncase "$1" in --print) echo "%s/sysroot" ;; *) echo "rustc 0.0.0 (stub)" ;; esac\n' "$t" > "$t/bin/rustc"
