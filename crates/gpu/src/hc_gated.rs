@@ -738,7 +738,7 @@ impl Slots for DisjointSlice<'_, u16> {
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
-// PIN(2026-10-27): retain indexed ranges because CUDA unrolling needs range loops.
+// PIN(2026-10-26): retain indexed ranges because CUDA unrolling needs range loops.
 #[allow(
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
