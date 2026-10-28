@@ -49,16 +49,21 @@
 //! finite raises [`SITE`]; every value is written as computed.
 //!
 //! The wide arm ([`HcWideKernels`], a device module of its own) runs a mix
-//! over a whole ubatch of `m` columns, any count: the norm and the combine
-//! are the entries above with the eight-column cap lifted
-//! (`hc_gated_norm_4w`, `hc_gated_combine_4w`, the same bodies); the down
+//! over a whole ubatch of `m` columns, any count: the norm is the entry
+//! above with the eight-column cap lifted (`hc_gated_norm_4w`, the same
+//! body), over streams held as F32 values or, as a ubatch walk carries
+//! them, as BF16 values ([`Streams`]; `hc_gated_norm_4w16`), whose combine
+//! or init rounds each value it writes to nearest even before the norm
+//! reads it; the combine alone (`hc_gated_combine_4w`) reads BF16 streams
+//! and writes F32 ones, the walk's PLE input and last streams; the down
 //! and the up are the 32-value GEMM (`crate::gemm`'s `gemm_q8_0p` over a
 //! one-expert table) on `xn` and on the bottleneck quantized per 32 values;
 //! the inject rows are the wide F32 tile, and a BF16 down or up the BF16
 //! prompt product (`Q8F32Kernels::enqueue_bf16_prompt`) on `xn` or the
 //! bottleneck, with BF16 operands on GB10 and F32 activations otherwise.
 //! On GB10 a BF16 down's site keeps `xn` as BF16 values: the norm rounds
-//! each to nearest even as it writes it (`hc_gated_norm_4w_bf16`), and the
+//! each to nearest even as it writes it (`hc_gated_norm_4w_bf16`,
+//! `hc_gated_norm_4w16_bf16`), and the
 //! down, its inject rows and the mix read those values. The down and an
 //! inject site's inject rows are one product (`hc_gated_down_mma_4`,
 //! [`HcDownRows`]): the inject rows below the down's, rounded to BF16 as
@@ -664,40 +669,62 @@ unsafe fn up_bf16<const M: usize>(
     };
 }
 
-/// Where a norm writes `xn`: F32 values as computed, or BF16 halfwords,
-/// each value rounded to nearest even as [`land_values`] rounds it.
-trait NormedOut {
-    /// Writes value `i`.
+/// Values a kernel reads and writes in place ([`Streams`], `xn`): F32
+/// values as computed, or BF16 halfwords, each value rounded to nearest even
+/// as [`land_values`] rounds it and widened exactly as it is read.
+pub(crate) trait Slots {
+    /// Value `i`.
     ///
     /// # Safety
-    /// Value `i` is live in the output and this thread's alone.
-    unsafe fn put(&mut self, i: usize, v: f32);
+    /// Value `i` is live and this thread's alone.
+    unsafe fn load(&mut self, i: usize) -> f32;
+
+    /// Writes `v` as value `i` and returns the value it now holds.
+    ///
+    /// # Safety
+    /// Value `i` is live and this thread's alone.
+    unsafe fn store(&mut self, i: usize, v: f32) -> f32;
 }
 
-impl NormedOut for DisjointSlice<'_, f32> {
+impl Slots for DisjointSlice<'_, f32> {
     #[inline(always)]
-    unsafe fn put(&mut self, i: usize, v: f32) {
+    unsafe fn load(&mut self, i: usize) -> f32 {
+        // SAFETY: this thread's own live value (this fn's contract).
+        unsafe { *self.get_unchecked_mut(i) }
+    }
+
+    #[inline(always)]
+    unsafe fn store(&mut self, i: usize, v: f32) -> f32 {
         // SAFETY: this thread's own live value (this fn's contract).
         unsafe { *self.get_unchecked_mut(i) = v };
+        v
     }
 }
 
-impl NormedOut for DisjointSlice<'_, u16> {
+impl Slots for DisjointSlice<'_, u16> {
     #[inline(always)]
-    unsafe fn put(&mut self, i: usize, v: f32) {
+    unsafe fn load(&mut self, i: usize) -> f32 {
+        // SAFETY: this thread's own live value (this fn's contract).
+        Bf16Words::widen(u32::from(unsafe { *self.get_unchecked_mut(i) }), false)
+    }
+
+    #[inline(always)]
+    unsafe fn store(&mut self, i: usize, v: f32) -> f32 {
         // Both halves hold v's rounding; the low one is its BF16 bits.
         let pair = cvt_bf16x2_f32(v, v);
         // SAFETY: this thread's own live value (this fn's contract).
         unsafe { *self.get_unchecked_mut(i) = pair as u16 };
+        Bf16Words::widen(pair, false)
     }
 }
 
-/// One block of `hc_gated_norm_4`, `hc_gated_norm_4w` and
-/// `hc_gated_norm_4w_bf16`, which say what it computes and how `xn` is
-/// written: stream `s` of column `c`, this thread `tid` of its
+/// One block of `hc_gated_norm_4` and the `hc_gated_norm_4w` family, which
+/// say what it computes and how `res` and `xn` hold their values: stream `s`
+/// of column `c`, this thread `tid` of its
 /// [`NORM_THREADS`]. A thread walks its values `tid`, `tid + NORM_THREADS`
 /// and on in chunks of [`NORM_CHUNK`]: a pass loads a chunk's values, then
-/// uses them in that order.
+/// uses them in that order. A value the combine or the init writes into
+/// `res` enters the norm as `res` holds it.
 ///
 /// # Safety
 /// The entry's launch contract holds: `res` and `xn` hold `m * 4 * hidden`
@@ -716,14 +743,14 @@ impl NormedOut for DisjointSlice<'_, u16> {
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn norm_stream<X: NormedOut>(
+unsafe fn norm_stream<R: Slots, X: Slots>(
     y: &[f32],
     wgt: &[f32],
     gamma: &[f32],
     (hidden, eps): (u32, f32),
     (combine, init): (u32, u32),
     fault: FaultSink,
-    (res, xn): (&mut DisjointSlice<f32>, &mut X),
+    (res, xn): (&mut R, &mut X),
     (s, c, tid): (usize, usize, usize),
     ws: *mut f32,
 ) {
@@ -748,9 +775,9 @@ unsafe fn norm_stream<X: NormedOut>(
             thread::__unroll_config::<0>();
             let i = i0 + j * NORM_THREADS;
             if i < hid {
-                // SAFETY: base + i < m * 4 * hidden <= res.len(), this
+                // SAFETY: base + i < m * 4 * hidden values of res, this
                 // thread's own value (# Safety).
-                xv[j] = unsafe { *res.get_unchecked_mut(base + i) };
+                xv[j] = unsafe { res.load(base + i) };
                 if reads_y {
                     // SAFETY: c * hidden + i < m * hidden <= y.len() when
                     // combine or init is 1.
@@ -769,11 +796,13 @@ unsafe fn norm_stream<X: NormedOut>(
                 } else {
                     xv[j]
                 };
-                if reads_y {
-                    // SAFETY: base + i < m * 4 * hidden <= res.len(), this
+                let x = if reads_y {
+                    // SAFETY: base + i < m * 4 * hidden values of res, this
                     // thread's own value (# Safety).
-                    unsafe { *res.get_unchecked_mut(base + i) = x };
-                }
+                    unsafe { res.store(base + i, x) }
+                } else {
+                    x
+                };
                 xv[j] = x;
                 acc = f32::mul_add(x, x, acc);
             }
@@ -809,10 +838,10 @@ unsafe fn norm_stream<X: NormedOut>(
                 thread::__unroll_config::<0>();
                 let i = i0 + j * NORM_THREADS;
                 if i < hid {
-                    // SAFETY: base + i < m * 4 * hidden <= res.len(), this
+                    // SAFETY: base + i < m * 4 * hidden values of res, this
                     // thread's own value, which it wrote or read in the
                     // first pass (# Safety).
-                    xv[j] = unsafe { *res.get_unchecked_mut(base + i) };
+                    xv[j] = unsafe { res.load(base + i) };
                     // SAFETY: s * hidden + i < 4 * hidden <= gamma.len().
                     yv[j] = unsafe { *gamma.get_unchecked(s * hid + i) };
                 }
@@ -824,11 +853,50 @@ unsafe fn norm_stream<X: NormedOut>(
             if i < hid {
                 // SAFETY: base + i < m * 4 * hidden values of xn, this
                 // thread's own value (# Safety).
-                unsafe { xn.put(base + i, (xv[j] * r) * yv[j]) };
+                unsafe { xn.store(base + i, (xv[j] * r) * yv[j]) };
             }
         }
         i0 += NORM_CHUNK * NORM_THREADS;
     }
+}
+
+/// Block `b` of a `hc_gated_norm_4w` family launch: stream `b % 4` of column
+/// `b / 4` ([`norm_stream`]); a block past the `m` columns returns.
+///
+/// # Safety
+/// [`norm_stream`]'s, but for `c`, `s` and `tid`, which this fn derives
+/// from the block's 256 threads.
+#[inline(always)]
+unsafe fn norm_wide<R: Slots, X: Slots>(
+    (y, wgt, gamma): (&[f32], &[f32], &[f32]),
+    (hidden, eps): (u32, f32),
+    (m, combine, init): (u32, u32, u32),
+    fault: FaultSink,
+    (res, xn): (&mut R, &mut X),
+    ws: *mut f32,
+) {
+    let b = thread::blockIdx_x() as usize;
+    let (s, c) = (b % STREAMS, b / STREAMS);
+    if c >= m as usize {
+        return; // block-uniform
+    }
+    let tid = thread::threadIdx_x() as usize;
+    let at = (s, c, tid);
+    // SAFETY: c < m, s < 4 and tid < 256, and the rest is this fn's
+    // contract.
+    unsafe {
+        norm_stream(
+            y,
+            wgt,
+            gamma,
+            (hidden, eps),
+            (combine, init),
+            fault,
+            (res, xn),
+            at,
+            ws,
+        )
+    };
 }
 
 // ---------------------------------------------------------------- kernels
@@ -1445,16 +1513,12 @@ fn refused(what: &'static str, e: HcRefused) -> GpuError {
 fn check_mix(
     what: &'static str,
     (geo, z): (Geometry, Sizes),
-    (res, y, mixed): (
-        &DeviceBuffer<f32>,
-        Option<&DeviceBuffer<f32>>,
-        &DeviceBuffer<f32>,
-    ),
+    (res, y, mixed): (usize, Option<&DeviceBuffer<f32>>, &DeviceBuffer<f32>),
     w: &SiteWeights<'_>,
 ) -> Result<(), GpuError> {
     let (wide, r) = (geo.wide(), geo.r());
     let lens = [
-        ("res", res.len(), z.res),
+        ("res", res, z.res),
         ("gamma", w.gamma.len(), wide),
         ("mixed", mixed.len(), z.mixed),
         (
@@ -1529,7 +1593,7 @@ impl HcGatedKernels {
             Before::Combine { y } => (Some(y), 1, 0),
             Before::Init { y } => (Some(y), 0, 1),
         };
-        check_mix(what, (geo, geo.sizes(m)), (&*a.res, y, &*a.mixed), &a.w)?;
+        check_mix(what, (geo, geo.sizes(m)), (a.res.len(), y, &*a.mixed), &a.w)?;
         let hidden = launch_u32(what, "hidden", geo.d())?;
         let mu = launch_u32(what, "m", m)?;
         let inject = u32::from(a.w.inject.is_some());
@@ -2173,31 +2237,13 @@ mod hc_wide_kernels {
         mut xn: DisjointSlice<f32>,
     ) {
         static mut WS: SharedArray<f32, NORM_WARPS> = SharedArray::UNINIT;
-        let b = thread::blockIdx_x() as usize;
-        let (s, c) = (b % STREAMS, b / STREAMS);
-        if c >= m as usize {
-            return; // block-uniform
-        }
         // SAFETY: this block's own shared allocation, reached without a
         // reference; `norm_stream`'s `block_sum` is its only user.
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WS) };
-        let tid = thread::threadIdx_x() as usize;
-        // SAFETY: the launch contract above holds, c < m, s < 4 and tid <
-        // 256 (the contract's block), every thread of the block is here,
-        // and `ws` is this block's NORM_WARPS f32.
-        unsafe {
-            norm_stream(
-                y,
-                wgt,
-                gamma,
-                (hidden, eps),
-                (combine, init),
-                fault,
-                (&mut res, &mut xn),
-                (s, c, tid),
-                ws,
-            );
-        }
+        let (yw, rx) = ((y, wgt, gamma), (&mut res, &mut xn));
+        // SAFETY: the launch contract above holds, every thread of the block
+        // is here, and `ws` is this block's NORM_WARPS f32.
+        unsafe { norm_wide(yw, (hidden, eps), (m, combine, init), fault, rx, ws) };
     }
 
     /// [`hc_gated_norm_4w`] writing `xn` as BF16 values, each the F32 value
@@ -2235,35 +2281,105 @@ mod hc_wide_kernels {
         mut xn: DisjointSlice<u16>,
     ) {
         static mut WS: SharedArray<f32, NORM_WARPS> = SharedArray::UNINIT;
-        let b = thread::blockIdx_x() as usize;
-        let (s, c) = (b % STREAMS, b / STREAMS);
-        if c >= m as usize {
-            return; // block-uniform
-        }
         // SAFETY: this block's own shared allocation, reached without a
         // reference; `norm_stream`'s `block_sum` is its only user.
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WS) };
-        let tid = thread::threadIdx_x() as usize;
-        // SAFETY: the launch contract above holds, c < m, s < 4 and tid <
-        // 256 (the contract's block), every thread of the block is here,
-        // and `ws` is this block's NORM_WARPS f32.
-        unsafe {
-            norm_stream(
-                y,
-                wgt,
-                gamma,
-                (hidden, eps),
-                (combine, init),
-                fault,
-                (&mut res, &mut xn),
-                (s, c, tid),
-                ws,
-            );
-        }
+        let (yw, rx) = ((y, wgt, gamma), (&mut res, &mut xn));
+        // SAFETY: the launch contract above holds, every thread of the block
+        // is here, and `ws` is this block's NORM_WARPS f32.
+        unsafe { norm_wide(yw, (hidden, eps), (m, combine, init), fault, rx, ws) };
     }
 
-    /// [`hc_kernels::hc_gated_combine_4`] over any number of columns: value
-    /// `i` of `res` becomes `fma(wgt[c·4 + s], y[c][i % hidden], res[i])`.
+    /// [`hc_gated_norm_4w`] over streams held as BF16 values ([`Streams`]):
+    /// each value read widened, each the combine or the init writes rounded
+    /// to nearest even, and the norm over the values the streams hold.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            combine + init <= 1,
+            y.len() >= (combine + init) * m * hidden,
+            wgt.len() >= combine * m * 4,
+            gamma.len() >= 4 * hidden,
+            res.len() >= m * 4 * hidden,
+            xn.len() >= m * 4 * hidden
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn hc_gated_norm_4w16(
+        y: &[f32],
+        wgt: &[f32],
+        gamma: &[f32],
+        hidden: u32,
+        eps: f32,
+        m: u32,
+        combine: u32,
+        init: u32,
+        fault: FaultSink,
+        mut res: DisjointSlice<u16>,
+        mut xn: DisjointSlice<f32>,
+    ) {
+        static mut WS: SharedArray<f32, NORM_WARPS> = SharedArray::UNINIT;
+        // SAFETY: this block's own shared allocation, reached without a
+        // reference; `norm_stream`'s `block_sum` is its only user.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WS) };
+        let (yw, rx) = ((y, wgt, gamma), (&mut res, &mut xn));
+        // SAFETY: the launch contract above holds, every thread of the block
+        // is here, and `ws` is this block's NORM_WARPS f32.
+        unsafe { norm_wide(yw, (hidden, eps), (m, combine, init), fault, rx, ws) };
+    }
+
+    /// [`hc_gated_norm_4w16`] writing `xn` as [`hc_gated_norm_4w_bf16`] does.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            combine + init <= 1,
+            y.len() >= (combine + init) * m * hidden,
+            wgt.len() >= combine * m * 4,
+            gamma.len() >= 4 * hidden,
+            res.len() >= m * 4 * hidden,
+            xn.len() >= m * 4 * hidden
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn hc_gated_norm_4w16_bf16(
+        y: &[f32],
+        wgt: &[f32],
+        gamma: &[f32],
+        hidden: u32,
+        eps: f32,
+        m: u32,
+        combine: u32,
+        init: u32,
+        fault: FaultSink,
+        mut res: DisjointSlice<u16>,
+        mut xn: DisjointSlice<u16>,
+    ) {
+        static mut WS: SharedArray<f32, NORM_WARPS> = SharedArray::UNINIT;
+        // SAFETY: this block's own shared allocation, reached without a
+        // reference; `norm_stream`'s `block_sum` is its only user.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WS) };
+        let (yw, rx) = ((y, wgt, gamma), (&mut res, &mut xn));
+        // SAFETY: the launch contract above holds, every thread of the block
+        // is here, and `ws` is this block's NORM_WARPS f32.
+        unsafe { norm_wide(yw, (hidden, eps), (m, combine, init), fault, rx, ws) };
+    }
+
+    /// [`hc_kernels::hc_gated_combine_4`] over any number of columns, from
+    /// streams held as BF16 values into F32 ones: value `i` of `res` is
+    /// `fma(wgt[c·4 + s], y[c][i % hidden], streams[i])`, `streams[i]`
+    /// widened exactly.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -2272,12 +2388,14 @@ mod hc_wide_kernels {
         requires = (
             y.len() >= m * hidden,
             wgt.len() >= m * 4,
+            streams.len() >= m * 4 * hidden,
             res.len() >= m * 4 * hidden
         )
     )]
     pub fn hc_gated_combine_4w(
         y: &[f32],
         wgt: &[f32],
+        streams: &[u16],
         hidden: u32,
         m: u32,
         fault: FaultSink,
@@ -2288,12 +2406,16 @@ mod hc_wide_kernels {
         if i >= m as usize * STREAMS * hid {
             return;
         }
-        // SAFETY: the `requires` above were launcher-checked, `hid` is this
-        // kernel's parameter and `i` this thread's `index_1d` past the
-        // `i < m·4·hidden` guard, and the launch is `domain = 1` with the
-        // contract's exact 1-D block.
-        let cell = unsafe { StreamFma::<STREAMS>::new(y, wgt, &mut res, i, hid) };
-        let out = cell.map(f32::mul_add);
+        let (cs, h) = (i / hid, i % hid);
+        // SAFETY: i < m·4·hidden <= streams.len() (the `requires` above).
+        let x = Bf16Words::widen(u32::from(unsafe { *streams.get_unchecked(i) }), false);
+        // SAFETY: cs < m·4 <= wgt.len().
+        let w = unsafe { *wgt.get_unchecked(cs) };
+        // SAFETY: (cs / 4)·hidden + h < m·hidden <= y.len().
+        let yv = unsafe { *y.get_unchecked(cs / STREAMS * hid + h) };
+        let out = f32::mul_add(w, yv, x);
+        // SAFETY: i < m·4·hidden <= res.len(); one thread a value.
+        unsafe { *res.get_unchecked_mut(i) = out };
         if !out.is_finite() {
             fault.raise(SITE);
         }
@@ -2575,13 +2697,32 @@ impl HcWideScratch {
     }
 }
 
+/// Residual streams `[m][streams][hidden]` a kernel reads and writes in
+/// place: F32 values, or BF16 values (a ubatch walk's, as the reference
+/// engines carry them), each rounded to nearest even as it is written and
+/// widened exactly as it is read ([`Slots`]).
+pub enum Streams<'a> {
+    F32(&'a mut DeviceBuffer<f32>),
+    Bf16(&'a mut DeviceBuffer<u16>),
+}
+
+impl Streams<'_> {
+    /// Values it holds.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Streams::F32(b) => b.len(),
+            Streams::Bf16(b) => b.len(),
+        }
+    }
+}
+
 /// [`HcWideKernels::enqueue_mix`]'s arguments: [`MixArgs`]' over `m`
-/// columns of the wide scratch, and the GEMM family with the one-expert
-/// table its down and up read — filled for exactly `m` slots
-/// (`GemmKernels::enqueue_route_dense`, refused by name otherwise), which
-/// the caller owns.
+/// columns of the wide scratch, with the streams in either form, and the
+/// GEMM family with the one-expert table its down and up read — filled for
+/// exactly `m` slots (`GemmKernels::enqueue_route_dense`, refused by name
+/// otherwise), which the caller owns.
 pub struct WideMixArgs<'a> {
-    pub res: &'a mut DeviceBuffer<f32>,
+    pub res: Streams<'a>,
     pub before: Before<'a>,
     pub w: SiteWeights<'a>,
     pub eps: f32,
@@ -2615,8 +2756,9 @@ impl HcWideKernels {
     }
 
     /// Enqueue one site's mix over `m` columns (module doc's wide arm): the
-    /// norm after `before`, the down and optional inject projections, the
-    /// bottleneck and weights, and the up/mix. Q8 projections add activation
+    /// norm after `before` over the streams in either form, the down and
+    /// optional inject projections, the bottleneck and weights, and the
+    /// up/mix. Q8 projections add activation
     /// quantizers. On GB10 a BF16 down reads the normed streams as BF16
     /// words, which the norm writes in place of their F32 values, and the
     /// mix reads the same words: the down and an inject site's inject are one
@@ -2646,7 +2788,7 @@ impl HcWideKernels {
             Before::Combine { y } => (Some(y), 1, 0),
             Before::Init { y } => (Some(y), 0, 1),
         };
-        check_mix(what, (geo, z), (&*a.res, y, &*a.mixed), &a.w)?;
+        check_mix(what, (geo, z), (a.res.len(), y, &*a.mixed), &a.w)?;
         if a.dense.filled() != Some(m) {
             return Err(GpuError::shape(
                 what,
@@ -2702,19 +2844,38 @@ impl HcWideKernels {
         // Without a combine or an init the norm reads neither `y` nor `wgt`:
         // `γ` stands in.
         let y = y.unwrap_or(a.w.gamma);
-        if words.is_some() {
-            let prep = self.module.prepare_hc_gated_norm_4w_bf16(norm)?;
-            let mut xn = WindowMut::<u16>::of_mut(&mut s.xn, 0, z.xn)?;
-            self.module.hc_gated_norm_4w_bf16(
-                stream, &prep, y, &s.wgt, a.w.gamma, hidden, a.eps, mu, combine, init, a.fault,
-                a.res, &mut xn,
-            )?;
-        } else {
-            let prep = self.module.prepare_hc_gated_norm_4w(norm)?;
-            self.module.hc_gated_norm_4w(
-                stream, &prep, y, &s.wgt, a.w.gamma, hidden, a.eps, mu, combine, init, a.fault,
-                a.res, &mut s.xn,
-            )?;
+        let (wgt, gamma, eps, fault) = (&s.wgt, a.w.gamma, a.eps, a.fault);
+        match (a.res, words.is_some()) {
+            (Streams::F32(res), false) => {
+                let prep = self.module.prepare_hc_gated_norm_4w(norm)?;
+                self.module.hc_gated_norm_4w(
+                    stream, &prep, y, wgt, gamma, hidden, eps, mu, combine, init, fault, res,
+                    &mut s.xn,
+                )?;
+            }
+            (Streams::F32(res), true) => {
+                let prep = self.module.prepare_hc_gated_norm_4w_bf16(norm)?;
+                let mut xn = WindowMut::<u16>::of_mut(&mut s.xn, 0, z.xn)?;
+                self.module.hc_gated_norm_4w_bf16(
+                    stream, &prep, y, wgt, gamma, hidden, eps, mu, combine, init, fault, res,
+                    &mut xn,
+                )?;
+            }
+            (Streams::Bf16(res), false) => {
+                let prep = self.module.prepare_hc_gated_norm_4w16(norm)?;
+                self.module.hc_gated_norm_4w16(
+                    stream, &prep, y, wgt, gamma, hidden, eps, mu, combine, init, fault, res,
+                    &mut s.xn,
+                )?;
+            }
+            (Streams::Bf16(res), true) => {
+                let prep = self.module.prepare_hc_gated_norm_4w16_bf16(norm)?;
+                let mut xn = WindowMut::<u16>::of_mut(&mut s.xn, 0, z.xn)?;
+                self.module.hc_gated_norm_4w16_bf16(
+                    stream, &prep, y, wgt, gamma, hidden, eps, mu, combine, init, fault, res,
+                    &mut xn,
+                )?;
+            }
         }
         // The normed streams' BF16 words, two values a word.
         let xw = match words {
@@ -2894,12 +3055,13 @@ impl HcWideKernels {
     }
 
     /// Enqueue the combine alone over `m` columns with the wide scratch's
-    /// weights (the last inject site's): `res += wgt · y` per stream. One
-    /// launch. Asynchronous, allocation-free.
+    /// weights (the last inject site's), from BF16 streams into F32 ones:
+    /// `res = streams + wgt · y` per stream, each value of `streams` widened
+    /// exactly. One launch. Asynchronous, allocation-free.
     pub fn enqueue_combine(
         &self,
         stream: &CudaStream,
-        res: &mut DeviceBuffer<f32>,
+        (streams, res): (&DeviceBuffer<u16>, &mut DeviceBuffer<f32>),
         y: &DeviceBuffer<f32>,
         m: usize,
         fault: FaultSink,
@@ -2914,7 +3076,11 @@ impl HcWideKernels {
         }
         let geo = scratch.geo;
         let z = geo.sizes(m);
-        for (name, got, need) in [("res", res.len(), z.res), ("y", y.len(), z.y)] {
+        for (name, got, need) in [
+            ("streams", streams.len(), z.res),
+            ("res", res.len(), z.res),
+            ("y", y.len(), z.y),
+        ] {
             if got < need {
                 return Err(GpuError::shape(
                     what,
@@ -2931,6 +3097,7 @@ impl HcWideKernels {
             &prep,
             y,
             &scratch.wgt,
+            streams,
             launch_u32(what, "hidden", geo.d())?,
             launch_u32(what, "m", m)?,
             fault,

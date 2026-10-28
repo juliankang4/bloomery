@@ -32,10 +32,14 @@
 //!    (`hc_gated::SITE`, unlabelled) and leaves the other column bit for bit
 //!    the clean launch's, the NaN column's `mixed` all NaN; an infinity in
 //!    the combine's `y` raises it too; clean launches raise nothing.
-//! 7. shape: the ten entries compile with no local depot.
+//! 7. shape: the entries compile with no local depot.
 //! 8. wide: the wide arm (`HcWideKernels`, a ubatch's mix over any column
 //!    count): its norm and combine the capped entries' bits at three
-//!    columns, the combine alone the rule; over 37 columns its glue — the
+//!    columns, the combine alone from BF16 streams into F32 ones the rule
+//!    over the widened values; over BF16 streams (a ubatch walk's) at 3 and
+//!    37 columns, plain, combined and initialized, the streams the F32
+//!    step's rounded to nearest even and every output the F32 streams' mix
+//!    over them, bit for bit; over 37 columns its glue — the
 //!    bottleneck, the weights, the mixed values — the card rule on the
 //!    card's readback of its inputs, bit for bit; each column's `xn`, `lo`,
 //!    weights and `mixed` within the bands the error model derives for the q8
@@ -90,13 +94,13 @@ mod gate {
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmAct32, GemmKernels, GemmRoute, MmaForm};
     use bloomery_gpu::hc_gated::{
         Before, HcGatedKernels, HcMatrix, HcScratch, HcWideKernels, HcWideScratch, MixArgs, SITE,
-        SiteWeights, WideMixArgs, check_types,
+        SiteWeights, Streams, WideMixArgs, check_types,
     };
     use bloomery_gpu::linear::{sigmoid, silu};
     use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvMcolArgs, Q8F32Kernels};
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE};
-    use bloomery_gpu_gates::rounding::{bf16_dot_rel, check_mma, q8_32_rel};
+    use bloomery_gpu_gates::rounding::{U_BF16, bf16_dot_rel, bf16_round, check_mma, q8_32_rel};
     use bloomery_gpu_gates::{
         GateError, activations, bits_equal, max_rel_err, max_ulps, no_local_depot, verdict,
     };
@@ -381,6 +385,25 @@ mod gate {
         Init(&'a [f32]),
     }
 
+    impl Pre<'_> {
+        /// `y` on the card when the mix reads it: a combine's or an init's.
+        fn y_on(self, st: &CudaStream) -> Result<Option<DeviceBuffer<f32>>, GateError> {
+            Ok(match self {
+                Pre::Plain => None,
+                Pre::Combine(y) | Pre::Init(y) => Some(DeviceBuffer::from_host(st, y)?),
+            })
+        }
+
+        /// The launch's start over `y`, the card's copy [`Pre::y_on`] made.
+        fn before<'b>(self, y: Option<&'b DeviceBuffer<f32>>) -> Before<'b> {
+            match (self, y) {
+                (Pre::Combine(_), Some(y)) => Before::Combine { y },
+                (Pre::Init(_), Some(y)) => Before::Init { y },
+                _ => Before::Plain,
+            }
+        }
+    }
+
     fn mix(
         c: &mut Ctx,
         site: &Site,
@@ -393,15 +416,8 @@ mod gate {
         let z = c.geo.sizes(m);
         let mut res_d = DeviceBuffer::from_host(st, res)?;
         let mut mixed_d = DeviceBuffer::from_host(st, &vec![f32::NAN; z.mixed])?;
-        let y_d = match pre {
-            Pre::Plain => None,
-            Pre::Combine(y) | Pre::Init(y) => Some(DeviceBuffer::from_host(st, y)?),
-        };
-        let before = match (pre, y_d.as_ref()) {
-            (Pre::Combine(_), Some(y)) => Before::Combine { y },
-            (Pre::Init(_), Some(y)) => Before::Init { y },
-            _ => Before::Plain,
-        };
+        let y_d = pre.y_on(st)?;
+        let before = pre.before(y_d.as_ref());
         c.hc.enqueue_mix(
             st,
             MixArgs {
@@ -479,6 +495,8 @@ mod gate {
             "hc_gated_combine_4",
             "hc_gated_norm_4w",
             "hc_gated_norm_4w_bf16",
+            "hc_gated_norm_4w16",
+            "hc_gated_norm_4w16_bf16",
             "hc_gated_combine_4w",
             "hc_gated_lo_4x320",
             "hc_gated_mix_4",
@@ -1091,15 +1109,8 @@ mod gate {
         let z = c.geo.sizes(m);
         let mut res_d = DeviceBuffer::from_host(st, res)?;
         let mut mixed_d = DeviceBuffer::from_host(st, &vec![f32::NAN; z.mixed])?;
-        let y_d = match pre {
-            Pre::Plain => None,
-            Pre::Combine(y) | Pre::Init(y) => Some(DeviceBuffer::from_host(st, y)?),
-        };
-        let before = match (pre, y_d.as_ref()) {
-            (Pre::Combine(_), Some(y)) => Before::Combine { y },
-            (Pre::Init(_), Some(y)) => Before::Init { y },
-            _ => Before::Plain,
-        };
+        let y_d = pre.y_on(st)?;
+        let before = pre.before(y_d.as_ref());
         w.gemm
             .enqueue_route_dense(st, m, &mut w.route, c.gpu.unlabelled_sink())?;
         let (hcw, g32, route) = (&w.hcw, &w.g32, &w.route);
@@ -1110,7 +1121,7 @@ mod gate {
             hcw.enqueue_mix(
                 st,
                 WideMixArgs {
-                    res,
+                    res: Streams::F32(res),
                     before,
                     w: site.weights(inject),
                     eps: EPS,
@@ -1166,6 +1177,63 @@ mod gate {
         } else {
             c.gpu.take_fault()?
         };
+        let res = res_d.to_host_vec(st)?;
+        let mixed = mixed_d.to_host_vec(st)?;
+        wide_out(c, w, (site, inject), m, (res, mixed, found_fault))
+    }
+
+    /// [`wide_mix`] over streams held as BF16 values (`res16`, a ubatch
+    /// walk's), eager: the streams after it widened in `res`.
+    fn wide_mix16(
+        c: &mut Ctx,
+        w: &mut Wide,
+        (site, inject): (&Site, bool),
+        res16: &[u16],
+        pre: Pre<'_>,
+        m: usize,
+    ) -> Result<WideOut, GateError> {
+        let st = c.gpu.stream();
+        let mut res_d = DeviceBuffer::from_host(st, res16)?;
+        let mut mixed_d = DeviceBuffer::from_host(st, &vec![f32::NAN; c.geo.sizes(m).mixed])?;
+        let y_d = pre.y_on(st)?;
+        let before = pre.before(y_d.as_ref());
+        w.gemm
+            .enqueue_route_dense(st, m, &mut w.route, c.gpu.unlabelled_sink())?;
+        w.hcw.enqueue_mix(
+            st,
+            WideMixArgs {
+                res: Streams::Bf16(&mut res_d),
+                before,
+                w: site.weights(inject),
+                eps: EPS,
+                m,
+                fault: c.gpu.unlabelled_sink(),
+                scratch: &mut w.scratch,
+                gemm: &w.g32,
+                q8f32: &c.q8,
+                dense: &w.route,
+                mixed: &mut mixed_d,
+                out: None,
+            },
+        )?;
+        let fault = c.gpu.take_fault()?;
+        let res = widened(&res_d.to_host_vec(st)?);
+        let mixed = mixed_d.to_host_vec(st)?;
+        wide_out(c, w, (site, inject), m, (res, mixed, fault))
+    }
+
+    /// A wide mix's outputs read back from the scratch beside its streams,
+    /// mixed output and fault; the BF16 bottleneck words checked against the
+    /// F32 bottleneck.
+    fn wide_out(
+        c: &mut Ctx,
+        w: &mut Wide,
+        (site, inject): (&Site, bool),
+        m: usize,
+        (res, mixed, fault): (Vec<f32>, Vec<f32>, Option<Fault>),
+    ) -> Result<WideOut, GateError> {
+        let st = c.gpu.stream();
+        let z = c.geo.sizes(m);
         if let Planes::Bf16 { up, .. } = &site.planes
             && m > MAX_COLS
         {
@@ -1201,7 +1269,7 @@ mod gate {
             (dots[..z.lo].to_vec(), dots[z.lo..z.lo + z.wgt].to_vec())
         };
         Ok(WideOut {
-            res: res_d.to_host_vec(st)?,
+            res,
             xn: wide_xn(c, site, s, m)?,
             down,
             inj,
@@ -1209,8 +1277,8 @@ mod gate {
             lo_refused: s.lo_refused.to_host_vec(st)?[..m].to_vec(),
             g: s.g.to_host_vec(st)?[..z.xn].to_vec(),
             wgt: s.wgt.to_host_vec(st)?[..z.wgt].to_vec(),
-            mixed: mixed_d.to_host_vec(st)?,
-            fault: found_fault,
+            mixed,
+            fault,
         })
     }
 
@@ -1228,10 +1296,18 @@ mod gate {
     }
 
     /// `v` rounded to BF16 (nearest even) and widened back.
-    fn bf16_round(v: &[f32]) -> Vec<f32> {
-        v.iter()
-            .map(|&x| bf16_bits_to_f32(fp32_to_bf16_bits(x)))
-            .collect()
+    fn bf16_rounded(v: &[f32]) -> Vec<f32> {
+        v.iter().map(|&x| bf16_round(x)).collect()
+    }
+
+    /// `v` rounded to BF16 (nearest even), as BF16 bits.
+    fn bf16_bits(v: &[f32]) -> Vec<u16> {
+        v.iter().map(|&x| fp32_to_bf16_bits(x)).collect()
+    }
+
+    /// BF16 values widened.
+    fn widened(v: &[u16]) -> Vec<f32> {
+        v.iter().map(|&b| bf16_bits_to_f32(b)).collect()
     }
 
     /// The wide scratch's normed streams of `m` columns as values: its F32
@@ -1272,7 +1348,7 @@ mod gate {
         let got = w.hcw.enqueue_mix(
             st,
             WideMixArgs {
-                res: &mut res_d,
+                res: Streams::F32(&mut res_d),
                 before: Before::Combine { y: &y_d },
                 w: weights,
                 eps: EPS,
@@ -1401,7 +1477,7 @@ mod gate {
                         hcw.enqueue_mix(
                             st,
                             WideMixArgs {
-                                res,
+                                res: Streams::F32(res),
                                 before: Before::Plain,
                                 w: site.weights(true),
                                 eps: EPS,
@@ -1523,6 +1599,52 @@ mod gate {
         Ok(ok)
     }
 
+    /// Clause 8's BF16 streams (a ubatch walk's): a mix over streams held as
+    /// BF16 values leaves the combine's or the init's F32 value rounded to
+    /// nearest even and normalizes those values, so every output is the F32
+    /// streams' plain mix over them, bit for bit; a plain mix leaves the
+    /// streams as they were.
+    fn check_wide_bf16(c: &mut Ctx, w: &mut Wide, site: &Site) -> Result<bool, GateError> {
+        let mut ok = true;
+        for m in [3, WIDE_COLS] {
+            let res = activations(WIDE, m, 0x3a0c);
+            let res16 = bf16_bits(&res);
+            let held = widened(&res16);
+            let y = activations(D, m, 0x3a0d);
+            let wgt = padded(&activations(S, m, 0x3a0e), w.scratch.wgt.len());
+            for (name, pre) in [
+                ("plain", Pre::Plain),
+                ("combine", Pre::Combine(&y)),
+                ("init", Pre::Init(&y)),
+            ] {
+                w.scratch.wgt.copy_from_host(c.gpu.stream(), &wgt)?;
+                let got = wide_mix16(c, w, (site, true), &res16, pre, m)?;
+                // The F32 streams' value of the same step, rounded.
+                let streams = if matches!(pre, Pre::Plain) {
+                    held.clone()
+                } else {
+                    w.scratch.wgt.copy_from_host(c.gpu.stream(), &wgt)?;
+                    bf16_rounded(&wide_mix(c, w, site, true, &held, pre, m)?.res)
+                };
+                let want = wide_mix(c, w, site, true, &streams, Pre::Plain, m)?;
+                let p = bits_equal(&got.res, &streams)
+                    && bits_equal(&got.xn, &want.xn)
+                    && bits_equal(&got.lo, &want.lo)
+                    && bits_equal(&got.wgt, &want.wgt)
+                    && bits_equal(&got.mixed, &want.mixed)
+                    && got.fault.is_none()
+                    && want.fault.is_none();
+                ok &= p;
+                println!(
+                    "wide[bf16_streams] m={m} {name}: the streams the F32 step's rounded to \
+                     nearest even, every output the F32 streams' mix over them, bit_equal={p} {}",
+                    verdict(p)
+                );
+            }
+        }
+        Ok(ok)
+    }
+
     /// Clause 8 (module doc).
     fn check_wide(c: &mut Ctx, site: &Site) -> Result<bool, GateError> {
         let mut w = Wide::new(c)?;
@@ -1545,7 +1667,7 @@ mod gate {
         // to BF16.
         let bf16 = xn_bf16(c, site)?;
         let xn = if bf16 {
-            bf16_round(&narrow.xn)
+            bf16_rounded(&narrow.xn)
         } else {
             narrow.xn.clone()
         };
@@ -1556,25 +1678,32 @@ mod gate {
              bit_equal={p} {}",
             verdict(p)
         );
-        let mut want = res.clone();
+        // The combine alone reads BF16 streams (a ubatch walk's) and writes
+        // F32 ones: the rule over the widened values.
+        let res16 = bf16_bits(&res);
+        let mut want = widened(&res16);
         combine(c.geo, m, &mut want, &y, &first.wgt);
         w.scratch
             .wgt
             .copy_from_host(c.gpu.stream(), &padded(&first.wgt, w.scratch.wgt.len()))?;
         let st = c.gpu.stream();
-        let mut res_d = DeviceBuffer::from_host(st, &res)?;
+        let streams_d = DeviceBuffer::from_host(st, &res16)?;
+        let mut res_d = DeviceBuffer::from_host(st, &vec![f32::NAN; res.len()])?;
         let y_d = DeviceBuffer::from_host(st, &y)?;
+        let io = (&streams_d, &mut res_d);
         w.hcw
-            .enqueue_combine(st, &mut res_d, &y_d, m, c.gpu.unlabelled_sink(), &w.scratch)?;
+            .enqueue_combine(st, io, &y_d, m, c.gpu.unlabelled_sink(), &w.scratch)?;
         let alone = res_d.to_host_vec(st)?;
         let f = c.gpu.take_fault()?;
         let p = bits_equal(&alone, &want) && f.is_none();
         ok &= p;
         println!(
-            "wide[combine_alone] res the rule bit_equal={p} fault=\"{}\" {}",
+            "wide[combine_alone] F32 streams the rule over the BF16 streams bit_equal={p} \
+             fault=\"{}\" {}",
             shown(f),
             verdict(p)
         );
+        ok &= check_wide_bf16(c, &mut w, site)?;
         // (b) the glue: each output the card rule on the card's readback of
         // its inputs, bit for bit.
         let m = WIDE_COLS;
@@ -1693,7 +1822,7 @@ mod gate {
                 let x = if odd_rows.contains(&row) || odd_cols.contains(&col) {
                     input[col * k]
                 } else {
-                    bf16_bits_to_f32(fp32_to_bf16_bits(input[col * k]))
+                    bf16_round(input[col * k])
                 };
                 let expected = (f64::from(w) * f64::from(x) * k as f64) as f32;
                 value.to_bits() == expected.to_bits()
@@ -1711,7 +1840,7 @@ mod gate {
         // beyond `XN_BAND`.
         let xn_band = f64::from(XN_BAND)
             + if bf16 {
-                2f64.powi(-8) * (1.0 + f64::from(XN_BAND))
+                U_BF16 * (1.0 + f64::from(XN_BAND))
             } else {
                 0.0
             };

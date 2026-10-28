@@ -73,7 +73,7 @@ use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::graph::{Forked, StagedRows};
 use crate::hc_gated::{
-    Before, HcGatedKernels, HcMatrix, HcScratch, HcWideKernels, MixArgs, SiteWeights,
+    Before, HcGatedKernels, HcMatrix, HcScratch, HcWideKernels, MixArgs, SiteWeights, Streams,
 };
 use crate::head::{Head, HeadLaunches};
 use crate::host::handoff::{Handoff, HandoffKernels, Places};
@@ -994,7 +994,7 @@ fn ple_conv(
                 hc: geo::STREAMS,
                 m,
                 fault: sink,
-                out,
+                out: Streams::F32(out),
                 ring: ple_ring,
             },
         ),
@@ -1015,7 +1015,7 @@ fn ple_conv(
                         hc: geo::STREAMS,
                         m: r.len(),
                         fault: sink,
-                        out: &mut *rows_mut(out, r, wide)?,
+                        out: Streams::F32(&mut *rows_mut(out, r, wide)?),
                         ring: &mut *q.ple_ring,
                     },
                 )?;

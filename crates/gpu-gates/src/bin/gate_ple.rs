@@ -11,7 +11,10 @@
 //!    ([`exact_gate`], [`gate_bounds`]).
 //! 2. `conv`: `ple_conv` of 4,096 (a whole ubatch in one launch), 64, 9, 2 and
 //!    1 tokens at position 1,000 over a random ring against its host rule
-//!    (`ple::conv_host`) bit for bit, the output and the ring after it.
+//!    (`ple::conv_host`) bit for bit, the output and the ring after it; at
+//!    4,096 and 9 tokens the BF16 output (`ple_conv_bf16`, a ubatch walk's
+//!    streams) is the rule's output rounded to nearest even, and its ring the
+//!    rule's.
 //! 3. `mcol`: the gate at m = 8 and 40 is the m = 1 launches of its columns
 //!    bit for bit; the conv of 8 tokens from position 500 and of 40 from 1,000
 //!    (slots wrapping the ring twice, the first nine rows reading it) is the
@@ -28,8 +31,9 @@
 //!    over a random ring give the zero ring's output.
 //! 7. `fault`: a NaN key value, a key row of 1e30 (finite values whose squares
 //!    overflow), an infinite value (the gated value's norm), a NaN in the conv
-//!    input and a position out of line, each with a layer's sink: the word
-//!    names that layer and `ple`, the values the planted input reaches are
+//!    input, a position out of line and, in the BF16 output, a finite conv
+//!    output past BF16's largest finite value, each with a layer's sink: the
+//!    word names that layer and `ple`, the values the planted input reaches are
 //!    NaN, every other value is the clean launch's bit for bit, and the word
 //!    is clean before and after.
 //! 8. `refuse`: the launchers refuse, by name, a conv of another tap count or
@@ -43,13 +47,16 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use bloomery_gpu::hc_gated::Streams;
     use bloomery_gpu::ple::{
         CLAMP_MIN, ConvOut, DILATION, GateOut, PleConvArgs, PleGateArgs, PleKernels, RING_ROWS,
         ROW, TAPS, conv_host, gate_host, ring_len,
     };
     use bloomery_gpu::{Fault, FaultSink, FaultSite, Gpu};
+    use bloomery_gpu_gates::rounding::bf16_round;
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, no_local_depot, verdict};
     use cuda_core::DeviceBuffer;
+    use gguf::quant::bf16_bits_to_f32;
 
     /// Streams: Qwen3.8's `hyper_connection.count`.
     const HC: usize = 4;
@@ -240,11 +247,24 @@ mod gate {
             pos: &[u32],
             ring: &[f32],
         ) -> Result<ConvOut, GateError> {
+            self.conv_as(fault, i, (pos, ring), false)
+        }
+
+        /// [`Self::conv`], the output written as BF16 values when `bf16`
+        /// (`ple_conv_bf16`) and read back widened.
+        fn conv_as(
+            &self,
+            fault: FaultSink,
+            i: &ConvIn,
+            (pos, ring): (&[u32], &[f32]),
+            bf16: bool,
+        ) -> Result<ConvOut, GateError> {
             let s = self.gpu.stream();
             let up = |v: &[f32]| DeviceBuffer::from_host(s, v);
             let (ngv, gv, x, w) = (up(&i.ngv)?, up(&i.gv)?, up(&i.x)?, up(&i.w)?);
             let pd = DeviceBuffer::from_host(s, pos)?;
             let mut out = DeviceBuffer::<f32>::zeroed(s, i.m * CH)?;
+            let mut out16 = DeviceBuffer::<u16>::zeroed(s, i.m * CH)?;
             let mut rd = DeviceBuffer::from_host(s, ring)?;
             self.k.enqueue_conv(
                 s,
@@ -259,13 +279,23 @@ mod gate {
                     hc: HC,
                     m: i.m,
                     fault,
-                    out: &mut out,
+                    out: if bf16 {
+                        Streams::Bf16(&mut out16)
+                    } else {
+                        Streams::F32(&mut out)
+                    },
                     ring: &mut rd,
                 },
             )?;
             s.synchronize()?;
+            let out = if bf16 {
+                let bits = out16.to_host_vec(s)?;
+                bits.into_iter().map(bf16_bits_to_f32).collect()
+            } else {
+                out.to_host_vec(s)?
+            };
             Ok(ConvOut {
-                out: out.to_host_vec(s)?,
+                out,
                 ring: rd.to_host_vec(s)?,
             })
         }
@@ -320,7 +350,7 @@ mod gate {
             tally(pass);
         }
         tally(refuse(&cx)?);
-        tally(no_local_depot(&["ple_gate", "ple_conv"])?);
+        tally(no_local_depot(&["ple_gate", "ple_conv", "ple_conv_bf16"])?);
         let pass = failed == 0;
         println!(
             "gate_ple: {clauses} clauses, {failed} failed — {}",
@@ -522,12 +552,27 @@ mod gate {
             let i = ConvIn::new(m, 0x636f + m as u64);
             let pos = positions(1_000, m);
             let got = cx.conv(unl, &i, &pos, &ring)?;
-            let pass = conv_same(&got, &i.host(&pos, &ring));
+            let host = i.host(&pos, &ring);
+            let pass = conv_same(&got, &host);
             println!(
                 "conv m={m} at 1000 over a random ring: bit_exact_host out+ring {}",
                 verdict(pass)
             );
             out.push(pass);
+            if m == 4096 || m == 9 {
+                let got = cx.conv_as(unl, &i, (&pos, &ring), true)?;
+                let want = ConvOut {
+                    out: host.out.iter().map(|&v| bf16_round(v)).collect(),
+                    ring: host.ring,
+                };
+                let pass = conv_same(&got, &want);
+                println!(
+                    "conv bf16 m={m} at 1000: out the host rule's rounded to nearest even, ring \
+                     the rule's, bit_exact {}",
+                    verdict(pass)
+                );
+                out.push(pass);
+            }
         }
         Ok(out)
     }
@@ -785,10 +830,17 @@ mod gate {
         let ci = ConvIn::new(cm, 0x6663);
         let pos = positions(100, cm);
         let clean = cx.conv(unl, &ci, &pos, &ring)?;
+        let clean16 = cx.conv_as(unl, &ci, (&pos, &ring), true)?;
         for (layer, what, plant) in [
             (4usize, "conv NaN input (token 1, channel 77)", 0usize),
             (5, "conv position not p0 + t (token 2)", 1),
+            (
+                6,
+                "conv BF16 output past BF16's largest finite value (token 3, channel 5)",
+                2,
+            ),
         ] {
+            let bf16 = plant == 2;
             let sink = cx.gpu.layer_sink(layer)?;
             let before = cx.gpu.fault()?;
             let mut bad_in = ci.clone();
@@ -799,22 +851,28 @@ mod gate {
                     // Read at distances 0, 3, 6, 9 by tokens 1, 4, 7, 10.
                     [1usize, 4, 7, 10].iter().map(|t| t * CH + 77).collect()
                 }
-                _ => {
+                1 => {
                     bad_pos[2] += 1;
                     (2 * CH..3 * CH).collect()
                 }
+                _ => {
+                    // A finite F32 output that rounds to a BF16 infinity.
+                    bad_in.x[3 * CH + 5] = f32::MAX;
+                    vec![3 * CH + 5]
+                }
             };
-            let bad = cx.conv(sink, &bad_in, &bad_pos, &ring)?;
+            let bad = cx.conv_as(sink, &bad_in, (&bad_pos, &ring), bf16)?;
             let word = cx.gpu.take_fault()?;
-            let _ = cx.conv(sink, &ci, &pos, &ring)?;
+            let _ = cx.conv_as(sink, &ci, (&pos, &ring), bf16)?;
             let after = cx.gpu.fault()?;
             let want = Fault::at(u32::try_from(layer)?, FaultSite::Ple);
+            let clean_out = if bf16 { &clean16.out } else { &clean.out };
             out.push(judge_plant(
                 what,
                 want,
                 [before, word, after],
                 &hit,
-                &clean.out,
+                clean_out,
                 &bad.out,
             ));
         }
@@ -848,7 +906,7 @@ mod gate {
                     hc,
                     m,
                     fault: unl,
-                    out: &mut out,
+                    out: Streams::F32(&mut out),
                     ring,
                 },
             )

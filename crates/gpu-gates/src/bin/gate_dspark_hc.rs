@@ -58,7 +58,7 @@ mod gate {
         MARKOV_RANK, MARKOV_ROW_WORDS, MarkovKernels, MarkovWeights,
     };
     use bloomery_gpu_gates::hc_host::{self, exp_ours, hc_pre_f32};
-    use bloomery_gpu_gates::rounding::{butterfly, gamma};
+    use bloomery_gpu_gates::rounding::{bf16_round, butterfly, gamma};
     use bloomery_gpu_gates::{
         GateError, bits_equal, bytes_to_words, checks_failed, data_dir, verdict,
     };
@@ -252,11 +252,6 @@ mod gate {
             .iter()
             .map(|w| scalar_dot(w, &e))
             .collect()
-    }
-
-    /// `x` rounded to the nearest bf16, ties to even (finite `x`).
-    fn bf16_round(x: f32) -> f32 {
-        gguf::quant::bf16_bits_to_f32(gguf::quant::fp32_to_bf16_bits(x))
     }
 
     /// The first maximum (lowest index on a tie), `ggml_argmax`'s rule.

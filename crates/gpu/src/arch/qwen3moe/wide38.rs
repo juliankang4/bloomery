@@ -69,8 +69,8 @@
 //! mixers' and the block's outputs, the shared expert's output, the card
 //! sum, the host sums and the mixes' combine weights (which one site leaves
 //! for the next, a part apart: [`UnitHc`]). A unit also carries its width,
-//! first position, rows that select nothing, current stream buffer and
-//! one-expert table (the second unit its own, filled for its width). The
+//! first position, rows that select nothing and one-expert table (the
+//! second unit its own, filled for its width). The
 //! walk declares [`BatchOrder::Fronts`]: both units' first fronts, then per
 //! (layer, unit) the shadow, the serve, the back and the unit's next front,
 //! so the second unit's front runs on the card while the host waits for the
@@ -112,6 +112,16 @@
 //! quantizes the same blocks the pass's card leg quantizes (a q8_1 of 128
 //! values a scale for the gate·up's input, a 32-value q8_1 of the SwiGLU),
 //! so the two card legs differ only in their sums' order.
+//!
+//! The walk carries the residual streams as BF16 values, as the reference
+//! engines carry them, in the halfwords of the arena's other stream buffer
+//! ([`Arena38::res`]): each value a mix's combine or init or the PLE site
+//! writes is rounded to nearest even once, and each mix normalizes the
+//! values the streams hold. The PLE site reads the combined streams as F32
+//! values, and the last layer's combine writes them as F32 values into the
+//! final buffer ([`combine`]), which the head's mix and every reader of the
+//! target's rows read. The pass keeps F32 streams; against it the walk's
+//! streams differ by those roundings too.
 //!
 //! The walk runs the card route ([`CardRoute38`]) on a layer with card
 //! experts, and holds no card buffers on a map without them.
@@ -178,7 +188,7 @@ use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_s
 use super::program38::{Ctx38, beta_alpha_mut, beta_alpha_rows};
 use super::router::gated;
 use super::scratch::{Io, KvPlanes, RecStore, cells_view, param_view};
-use super::scratch38::{Arena38, ROUTE_ROWS, Store38, no_carry};
+use super::scratch38::{Arena38, ROUTE_ROWS, Store38, final_res, no_carry};
 use super::tier38::TierSide38;
 use super::wide::{RingStacks, with_ring_windows};
 use crate::GpuError;
@@ -191,7 +201,7 @@ use crate::gemm::{
     GateUp32Args, Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute,
     GemmWeight, MmaForm,
 };
-use crate::hc_gated::{Before, HcMatrix, HcWideScratch, SiteWeights, WideMixArgs};
+use crate::hc_gated::{Before, HcMatrix, HcWideScratch, SiteWeights, Streams, WideMixArgs};
 use crate::head::Head;
 use crate::host::BatchLeg;
 use crate::host::handoff::Places;
@@ -433,19 +443,24 @@ fn unit_widths(
 /// unit holds its windows no longer than the walk that cut them (module doc,
 /// "Units").
 fn rows_of<T>(name: &str, parent: &DeviceBuffer<T>, at: Span) -> Result<Win<T>, GpuError> {
-    if at.off + at.len > parent.len() {
+    window_of(name, parent, at)
+}
+
+/// [`rows_of`]'s window with `at` counted in `T`s over `parent`'s bytes.
+fn window_of<P, T>(name: &str, parent: &DeviceBuffer<P>, at: Span) -> Result<Win<T>, GpuError> {
+    let room = parent.len() * size_of::<P>() / size_of::<T>();
+    if at.off + at.len > room {
         return Err(GpuError::shape(
             WHAT,
             format!(
-                "{name}: a unit's window ends at word {} of {}",
-                at.off + at.len,
-                parent.len()
+                "{name}: a unit's window ends at element {} of {room}",
+                at.off + at.len
             ),
         ));
     }
     let ptr = parent.cu_deviceptr() + (at.off * size_of::<T>()) as u64;
-    // SAFETY: the window's words lie inside `parent` (checked above), which
-    // the walk that holds the window keeps alive and in place.
+    // SAFETY: the window's elements lie inside `parent`'s bytes (checked
+    // above), which the walk that holds the window keeps alive and in place.
     Ok(unsafe { WindowMut::from_raw(ptr, at.len, parent.context()) })
 }
 
@@ -459,8 +474,6 @@ struct UnitRows38 {
     pos0: usize,
     /// The unit's leading rows that select nothing ([`dense_rows`]).
     dense: usize,
-    /// Which of `res` holds the unit's streams now.
-    cur: usize,
     /// The walk's one-expert table ([`Wide38`]'s `dense`) the unit's width
     /// fills.
     route: usize,
@@ -471,7 +484,10 @@ struct UnitRows38 {
     emb: Win<f32>,
     pos: Win<u32>,
     n_keys: Win<u32>,
-    res: [Win<f32>; 2],
+    /// The unit's streams as BF16 values, and its rows of the final buffer
+    /// ([`Arena38::res`]): the PLE site's input, then the last streams.
+    streams: Win<u16>,
+    fin: Win<f32>,
     ple_e: Win<f32>,
     ffn_x: Win<f32>,
     ids: Win<u32>,
@@ -517,22 +533,20 @@ impl UnitRows38 {
         // The combine weights' window is made at each mix ([`UnitHc`]); its
         // rows are checked here, before any launch.
         rows_of("the mixes' combine weights", &x.hc.wgt, at.wgt)?;
+        let fin = final_res(p.plans);
         Ok(UnitRows38 {
             r0,
             m,
             pos0: p.pos0 + r0,
             dense: unit_dense(p.dense, r0, m),
-            cur: p.cur,
             route,
             first: p.io.first + r0,
             tok: rows_of("the record's ids", p.io.ids, at.tok)?,
             emb: rows_of("emb", &s.emb, at.emb)?,
             pos: rows_of("pos", &s.pos, at.pos)?,
             n_keys: rows_of("n_keys", &s.n_keys, at.n_keys)?,
-            res: [
-                rows_of("res[0]", &s.res[0], at.res)?,
-                rows_of("res[1]", &s.res[1], at.res)?,
-            ],
+            streams: window_of("the streams", &s.res[1 - fin], at.res)?,
+            fin: rows_of("the final streams", &s.res[fin], at.res)?,
             ple_e: rows_of("ple.e", &s.ple.e, at.ple_e)?,
             ffn_x: rows_of("ffn_x", &s.ffn_x, at.ffn_x)?,
             ids: rows_of("ids", &x.ids, at.ids)?,
@@ -564,9 +578,8 @@ impl UnitRows38 {
         self.emb = rows_of("emb", &self.emb, at.emb)?;
         self.pos = rows_of("pos", &self.pos, at.pos)?;
         self.n_keys = rows_of("n_keys", &self.n_keys, at.n_keys)?;
-        for (i, res) in self.res.iter_mut().enumerate() {
-            *res = rows_of(if i == 0 { "res[0]" } else { "res[1]" }, res, at.res)?;
-        }
+        self.streams = rows_of("the streams", &self.streams, at.res)?;
+        self.fin = rows_of("the final streams", &self.fin, at.res)?;
         self.ple_e = rows_of("ple.e", &self.ple_e, at.ple_e)?;
         self.ffn_x = rows_of("ffn_x", &self.ffn_x, at.ffn_x)?;
         self.ids = rows_of("ids", &self.ids, at.ids)?;
@@ -1768,10 +1781,9 @@ fn plan_of(plans: &[Layer38], l: usize) -> Result<&Layer38, GpuError> {
 
 /// The parts of the body a ubatch walk writes: [`super::program38::Parts38`]'s
 /// over the wide arena and the walk's own buffers, each taking the unit it
-/// runs for ([`UnitRows38`]). `m`, `pos0`, `dense` and `cur` are the walk's
-/// whole: its rows, the position of its first, its leading rows that select
-/// nothing ([`dense_rows`]) on the host, and the stream buffer it starts in;
-/// the walk cuts them into its units.
+/// runs for ([`UnitRows38`]). `m`, `pos0` and `dense` are the walk's whole:
+/// its rows, the position of its first and its leading rows that select
+/// nothing ([`dense_rows`]) on the host; the walk cuts them into its units.
 pub(super) struct WideParts<'a> {
     pub(super) c: Ctx38<'a>,
     pub(super) plans: &'a [Layer38],
@@ -1790,7 +1802,6 @@ pub(super) struct WideParts<'a> {
     pub(super) m: usize,
     pub(super) pos0: usize,
     pub(super) dense: usize,
-    pub(super) cur: usize,
     /// The walk's last rows something reads once it has walked (the head's
     /// row, a checkpoint's point row, a tap's rows), at most `m`: the last
     /// layer runs its rows past the mixer's store writes for those alone
@@ -1925,7 +1936,7 @@ fn wide_in<'a>(rows: &'a DeviceBuffer<f32>, act: &'a GemmAct32) -> WideIn<'a> {
 fn mix(
     c: &Ctx38<'_>,
     site: &HcSite,
-    res: &mut DeviceBuffer<f32>,
+    res: Streams<'_>,
     before: Before<'_>,
     m: usize,
     fault: FaultSink,
@@ -1963,9 +1974,9 @@ fn mix(
     )
 }
 
-/// The combine alone over unit `u`'s columns: `res += wgt · y` per stream,
-/// the weights the unit's last inject site left ([`UnitHc`]), a fault
-/// raised on `fault`.
+/// The combine alone over unit `u`'s columns into its F32 final streams:
+/// `fin = streams + wgt · y` per stream, the weights the unit's last inject
+/// site left ([`UnitHc`]), a fault raised on `fault`.
 fn combine(
     c: &Ctx38<'_>,
     u: &mut UnitRows38,
@@ -1973,8 +1984,9 @@ fn combine(
     fault: FaultSink,
 ) -> Result<(), GpuError> {
     let hc = UnitHc::on(scratch, u.wgt)?;
+    let io = (&*u.streams, &mut *u.fin);
     c.k.hcw
-        .enqueue_combine(c.gpu.stream(), &mut u.res[u.cur], &u.y, u.m, fault, &*hc.hc)
+        .enqueue_combine(c.gpu.stream(), io, &u.y, u.m, fault, &*hc.hc)
 }
 
 /// Unit `u` cut to its last `keep` rows ([`UnitRows38::narrow`]) and its
@@ -2057,7 +2069,7 @@ impl WideParts<'_> {
             mix(
                 c,
                 &p.attn_hc,
-                &mut u.res[u.cur],
+                Streams::Bf16(&mut u.streams),
                 Before::Init { y: &u.emb },
                 m,
                 sink,
@@ -2078,12 +2090,9 @@ impl WideParts<'_> {
             let table = (dense, sink);
             dense_gemm(c, &mut s.by, &pp.key, act, table, &mut pl.key)?;
             dense_gemm(c, &mut s.by, &pp.value, act, table, &mut pl.value)?;
-            let [res0, res1] = &mut u.res;
-            let (xs, out) = if u.cur == 0 {
-                (&*res0, res1)
-            } else {
-                (&*res1, res0)
-            };
+            // The site reads the combined streams as F32 values and writes
+            // the walk's BF16 streams.
+            let xs = &*u.fin;
             c.k.ple.enqueue_gate(
                 stream,
                 PleGateArgs {
@@ -2115,15 +2124,14 @@ impl WideParts<'_> {
                     hc: geo::STREAMS,
                     m,
                     fault: sink,
-                    out,
+                    out: Streams::Bf16(&mut u.streams),
                     ring: &mut *self.ple_ring,
                 },
             )?;
-            u.cur ^= 1;
             mix(
                 c,
                 &p.attn_hc,
-                &mut u.res[u.cur],
+                Streams::Bf16(&mut u.streams),
                 Before::Plain,
                 m,
                 sink,
@@ -2134,7 +2142,7 @@ impl WideParts<'_> {
             mix(
                 c,
                 &p.attn_hc,
-                &mut u.res[u.cur],
+                Streams::Bf16(&mut u.streams),
                 Before::Combine { y: &u.y },
                 m,
                 sink,
@@ -2176,7 +2184,7 @@ impl WideParts<'_> {
         mix(
             &self.c,
             &p.ffn_hc,
-            &mut u.res[u.cur],
+            Streams::Bf16(&mut u.streams),
             Before::Combine { y: &u.y },
             u.m,
             sink,
@@ -3002,9 +3010,10 @@ impl<'a> Gemm38<'a> {
 
     /// After the walk of a prompt call whose tap reads every row it ran
     /// ([`super::body38::Prompt38Sink`]), or of a unit a checkpoint keeps the
-    /// last row of: the last layer's combine alone over each unit the head's
-    /// mix leaves — every unit but the last when `head` runs after it, every
-    /// unit otherwise — at the unit's own combine weights ([`combine`]), over
+    /// last row of: the last layer's combine alone over each unit the head
+    /// leaves — every unit but the last when `head` runs after it
+    /// ([`Self::head`] combines that one), every unit otherwise — at the
+    /// unit's own combine weights ([`combine`]), over
     /// the unit's rows the last layer ran ([`WideParts::kept`]), so each row
     /// the walk read holds the target's final streams. One launch a unit that
     /// kept a row. Refused by name before a walk.
@@ -3025,10 +3034,11 @@ impl<'a> Gemm38<'a> {
         Ok(())
     }
 
-    /// After the walk: the head's mix over the last unit's columns the last
-    /// layer ran ([`WideParts::kept`]; the last layer's combine first), its
-    /// last row into `head`'s input, and the head. Refused by name before a
-    /// walk, and after one that read no row.
+    /// After the walk: the last layer's combine over the last unit's columns
+    /// the last layer ran ([`WideParts::kept`]) into their final streams
+    /// ([`combine`]), the head's mix over those streams, its last row into
+    /// `head`'s input, and the head. Refused by name before a walk, and after
+    /// one that read no row.
     pub(super) fn head(&mut self, head: &mut Head) -> Result<(), GpuError> {
         let (h, gpu) = (geo::HIDDEN, self.p.c.gpu);
         let fault = gpu.fault_sink(LAYER_HEAD);
@@ -3050,11 +3060,12 @@ impl<'a> Gemm38<'a> {
                 "a ubatch walk that reads its last row before its head",
             ));
         }
+        combine(&self.p.c, u, hc, fault)?;
         mix(
             &self.p.c,
             &head_site(),
-            &mut u.res[u.cur],
-            Before::Combine { y: &u.y },
+            Streams::F32(&mut u.fin),
+            Before::Plain,
             m,
             fault,
             (hc, u.wgt, &dense[u.route]),
