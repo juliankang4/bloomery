@@ -3053,8 +3053,8 @@ depth-gpu-glm5next *ARMS:
 # sets levers for that arm's server only, the arms rotate every round (BLOOMERY_AB_ROUNDS, default 4). Rows: tg and pp tok/s
 # from the server's own `timings`, the load seconds and the major faults; then per arm the mean and, against the first arm of
 # its D, the difference with its 95 % interval. BLOOMERY_MODEL names the profile (tools/ref/models/<name>.sh) and is required.
-# The context, n_predict and port ride BLOOMERY_BOX_ENV as DEPTH_SERVE_CTX, DEPTH_SERVE_N and DEPTH_SERVE_PORT (defaults 4160,
-# 128, 18180; D + n_predict - 1 must fit the context); the header of tools/ref/depth-serve.sh has the arms, the rates and the
+# The context, n_predict and port ride BLOOMERY_BOX_ENV as DEPTH_SERVE_CTX, DEPTH_SERVE_N and DEPTH_SERVE_PORT (defaults: the
+# serving default's context, 128, 18180; a set context must hold D + n_predict - 1); the header of tools/ref/depth-serve.sh has the arms, the rates and the
 # refusals. The binary requires the features of every seat (`required-features` of the bin), whatever the model: an arm that
 # names this tree builds it here, an arm of another tree needs that tree's own build of this line. Under
 # BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and no lease is taken: the plan and each binary's state.
