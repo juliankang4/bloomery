@@ -738,7 +738,7 @@ mod gate {
         Ok(ok)
     }
 
-    /// Clause 4 (module doc).
+    /// Clause 10 (module doc).
     /// Streams past one norm chunk a thread (`hidden` above 16 values of
     /// 256 threads, 4096): a Q8_0 site at hidden 4352 runs the norm's second
     /// walk over the streams, its `xn` the rule's bits, plain and after a
@@ -801,6 +801,7 @@ mod gate {
         Ok(ok)
     }
 
+    /// Clause 4 (module doc).
     fn check_combine(c: &mut Ctx, site: &Site) -> Result<bool, GateError> {
         let m = 3;
         let geo = c.geo;
