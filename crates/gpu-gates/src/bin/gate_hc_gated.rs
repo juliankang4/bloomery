@@ -64,6 +64,9 @@
 //!    form of the rows from before the mix is left unread; an output
 //!    scratch of another K is refused by name before any launch, the
 //!    streams as they went in.
+//! 10. hidden: at hidden 4352, past one norm chunk a thread (4096 values),
+//!     a Q8_0 site's `xn` the rule's bits in the capped arm, plain and after
+//!     a combine (the streams the rule's too), and in the wide arm.
 //!
 //! A BF16 site (down and up in their words, `HcMatrix::Bf16`, values on
 //! the Q8_0 site's ranges) runs clauses 1, 2, 3 and 8 again: its down and
@@ -211,21 +214,21 @@ mod gate {
     }
 
     impl Site {
-        /// The norm's gain and the inject rows from `seed`, with `planes`
-        /// and their host rows.
+        /// The norm's gain and the inject rows from `seed` for streams of
+        /// `d` values, with `planes` and their host rows.
         fn with(
             gpu: &Gpu,
-            seed: u64,
+            (seed, d): (u64, usize),
             dot: fn(&[f32], &[f32]) -> f32,
             planes: Planes,
             (down, up): (Vec<f32>, Vec<f32>),
         ) -> Result<Site, GateError> {
             let st = gpu.stream();
-            let gamma: Vec<f32> = activations(WIDE, 1, seed as u32)
+            let gamma: Vec<f32> = activations(S * d, 1, seed as u32)
                 .iter()
                 .map(|v| 1.0 + v / 64.0)
                 .collect();
-            let inject: Vec<f32> = activations(S * WIDE, 1, seed as u32 + 1)
+            let inject: Vec<f32> = activations(S * S * d, 1, seed as u32 + 1)
                 .iter()
                 .map(|v| v / 64.0)
                 .collect();
@@ -233,7 +236,7 @@ mod gate {
                 dot,
                 gamma_d: DeviceBuffer::from_host(st, &gamma)?,
                 planes,
-                inject_d: DeviceTensor::upload(st, &inject, S, WIDE)?,
+                inject_d: DeviceTensor::upload(st, &inject, S, S * d)?,
                 gamma,
                 down,
                 up,
@@ -241,21 +244,23 @@ mod gate {
             })
         }
 
-        fn new(gpu: &Gpu, seed: u64) -> Result<Site, GateError> {
+        /// The Q8_0 site for streams of `d` values.
+        fn new(gpu: &Gpu, seed: u64, d: usize) -> Result<Site, GateError> {
             let st = gpu.stream();
+            let wide = S * d;
             // Down scales in [2^-12, 2^-11), up scales in [2^-8, 2^-7): the
             // bottleneck and the gate both move off their flat ends.
-            let (dq, dd, down) = q8_rows(R, WIDE, 3, seed ^ 0xd0d0);
-            let (uq, ud, up) = q8_rows(WIDE, R, 7, seed ^ 0x0909);
+            let (dq, dd, down) = q8_rows(R, wide, 3, seed ^ 0xd0d0);
+            let (uq, ud, up) = q8_rows(wide, R, 7, seed ^ 0x0909);
             let planes = Planes::Q8_0 {
-                down_qs: DeviceTensor::upload(st, &dq, R, WIDE / 4)?,
-                down_d: DeviceTensor::upload(st, &dd, R, WIDE / 32)?,
-                up_qs: DeviceTensor::upload(st, &uq, WIDE, R / 4)?,
-                up_d: DeviceTensor::upload(st, &ud, WIDE, R / 32)?,
-                view_qs: DeviceTensor::upload(st, &dq, R * S, D / 4)?,
-                view_d: DeviceTensor::upload(st, &dd, R * S, D / 32)?,
+                down_qs: DeviceTensor::upload(st, &dq, R, wide / 4)?,
+                down_d: DeviceTensor::upload(st, &dd, R, wide / 32)?,
+                up_qs: DeviceTensor::upload(st, &uq, wide, R / 4)?,
+                up_d: DeviceTensor::upload(st, &ud, wide, R / 32)?,
+                view_qs: DeviceTensor::upload(st, &dq, R * S, d / 4)?,
+                view_d: DeviceTensor::upload(st, &dd, R * S, d / 32)?,
             };
-            Site::with(gpu, seed, card::q8_dot, planes, (down, up))
+            Site::with(gpu, (seed, d), card::q8_dot, planes, (down, up))
         }
 
         /// The BF16 site: down values on `±2^-4` and up values on `±1`,
@@ -269,7 +274,7 @@ mod gate {
                 up: DeviceTensor::upload(st, &uw, WIDE, R / 2)?,
                 view: DeviceTensor::upload(st, &dw, R * S, D / 2)?,
             };
-            Site::with(gpu, seed, card::f32_dot, planes, (down, up))
+            Site::with(gpu, (seed, D), card::f32_dot, planes, (down, up))
         }
 
         fn weights(&self, inject: bool) -> SiteWeights<'_> {
@@ -469,7 +474,7 @@ mod gate {
         if let Some(f) = c.gpu.take_fault()? {
             return Err(format!("gate_hc_gated: the fault word held {f} before any launch").into());
         }
-        let site = Site::new(&c.gpu, 0x38c0_0001)?;
+        let site = Site::new(&c.gpu, 0x38c0_0001, D)?;
         let mut ok = true;
         ok &= check_band(&mut c, &site)?;
         ok &= check_stages(&mut c, &site)?;
@@ -478,6 +483,7 @@ mod gate {
         ok &= check_refuse(&mut c, &site)?;
         ok &= check_fault(&mut c, &site)?;
         ok &= check_wide(&mut c, &site)?;
+        ok &= check_hidden(&mut c)?;
         let bf16 = Site::new_bf16(&c.gpu, 0x38c0_0002)?;
         println!("site=bf16");
         ok &= check_band(&mut c, &bf16)?;
@@ -519,8 +525,8 @@ mod gate {
              columns, planes and types refused by name; a NaN stream raises the site and \
              leaves the other column clean; the wide arm's norm and combine the capped \
              entries' bits, its glue the card rule, its mix within the error model's bands, \
-             each column its own, a NaN raised; a BF16 site the same over its widened \
-             values; no local depot"
+             each column its own, a NaN raised; the norm at hidden 4352 the rule's bits in \
+             both arms; a BF16 site the same over its widened values; no local depot"
         );
         Ok(())
     }
@@ -733,6 +739,68 @@ mod gate {
     }
 
     /// Clause 4 (module doc).
+    /// Streams past one norm chunk a thread (`hidden` above 16 values of
+    /// 256 threads, 4096): a Q8_0 site at hidden 4352 runs the norm's second
+    /// walk over the streams, its `xn` the rule's bits, plain and after a
+    /// combine (whose streams the rule's too) in the capped arm and plain in
+    /// the wide arm. The context's geometry and scratch are swapped in for
+    /// it and restored.
+    fn check_hidden(c: &mut Ctx) -> Result<bool, GateError> {
+        const HID: usize = 4352;
+        let geo = Geometry::new(S as u32, R as u32, HID as u32)?;
+        let scratch = HcScratch::new(c.gpu.stream(), geo)?;
+        let geo0 = std::mem::replace(&mut c.geo, geo);
+        let scratch0 = std::mem::replace(&mut c.scratch, scratch);
+        let ok = hidden_lines(c, HID);
+        c.geo = geo0;
+        c.scratch = scratch0;
+        ok
+    }
+
+    /// [`check_hidden`]'s lines over streams of `hid` values, on the
+    /// context's geometry.
+    fn hidden_lines(c: &mut Ctx, hid: usize) -> Result<bool, GateError> {
+        let (m, wide, geo) = (2, S * hid, c.geo);
+        let site = Site::new(&c.gpu, 0x38c0_0004, hid)?;
+        let res = activations(wide, m, 0x4352);
+        let y = activations(hid, m, 0x4353);
+        let norm = |r: &[f32]| -> Vec<f32> {
+            (0..m)
+                .flat_map(|k| card::norm(geo, col(r, wide, k), &site.gamma, EPS))
+                .collect()
+        };
+        let first = mix(c, &site, true, &res, Pre::Plain, m)?;
+        let after = mix(c, &site, true, &res, Pre::Combine(&y), m)?;
+        let mut streams = res.clone();
+        combine(geo, m, &mut streams, &y, &first.wgt);
+        let mut w = Wide::new(c)?;
+        let wide_out = wide_mix(c, &mut w, &site, true, &res, Pre::Plain, m)?;
+        let mut ok = true;
+        for (name, pass) in [
+            (
+                "plain",
+                bits_equal(&first.xn, &norm(&res)) && first.fault.is_none(),
+            ),
+            (
+                "combine",
+                bits_equal(&after.res, &streams)
+                    && bits_equal(&after.xn, &norm(&streams))
+                    && after.fault.is_none(),
+            ),
+            (
+                "wide_plain",
+                bits_equal(&wide_out.xn, &norm(&res)) && wide_out.fault.is_none(),
+            ),
+        ] {
+            ok &= pass;
+            println!(
+                "hidden[{name}] hidden={hid} m={m} xn the rule's bit_equal={pass} {}",
+                verdict(pass)
+            );
+        }
+        Ok(ok)
+    }
+
     fn check_combine(c: &mut Ctx, site: &Site) -> Result<bool, GateError> {
         let m = 3;
         let geo = c.geo;
@@ -992,7 +1060,7 @@ mod gate {
                 up: DeviceTensor::upload(st, &vec![ub | ub << 16; WIDE * R / 2], WIDE, R / 2)?,
                 view: DeviceTensor::upload(st, &vec![db | db << 16; R * WIDE / 2], R * S, D / 2)?,
             };
-            let mut site = Site::with(&c.gpu, 0x38c0_0003, card::f32_dot, planes, (down, up))?;
+            let mut site = Site::with(&c.gpu, (0x38c0_0003, D), card::f32_dot, planes, (down, up))?;
             site.gamma.fill(1.0);
             site.gamma_d.copy_from_host(st, &site.gamma)?;
             site.inject.fill(inj);
