@@ -564,11 +564,6 @@ gate-gpu-iq-sel *ARGS:
 gate-gpu-q6k-ids:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_q6k_ids && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_q6k_ids'
 
-# V4.1 하이퍼커넥션(B4): 사슬 커널(RMS·분할 K hc_fn gemv·HC_PRE), HC_POST와 접기를 우리 규칙과 V4.1 ik 덤프에 서브층마다
-# 대조한다. engram 층(1·14)의 분리 짝(HC_POST 단독 → 접기 단독)이 융합 런치와 비트 동일한지도 본다.
-gate-gpu-ds41-hc:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-hc && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_hc && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_hc'
-
 # 종단 게이트: 27층 + lm_head + argmax 전체 사슬을 ik CUDA greedy(33프롬프트 × 32스텝)와 대조하고,
 # 그래프 재생이 즉시 실행과 토큰 단위로 같은지 본다(정확성 실행, 측정 아님). 이름이 pN이 아닌 이유는
 # gate_e2e.rs 머리글 — P9·P10은 커널 꾸러미로 이미 쓰이고 있다.
@@ -1448,15 +1443,15 @@ gate-llama-meta:
 gate-gpu-rope-writers:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --doc rope_neox::RopeNeoxKernels && bash tools/gate.sh --oxide -p bloomery-gpu-gates --features gpu,mimo2 --release --lib --bin gate_qwen35moe_attn --bin gate_mimo2_flash -- --include-ignored writers --nocapture'
 
-# qwen3moe 커널 게이트(ik CPU 덤프 네 세트: 5토큰 프리필, 깊이 4·1,024·4,096의 디코드 스텝). `rope`는 헤드별 QK RMS
-# 노름과 NEOX 로프·K/V 캐시 쓰기(한 런치)를 두 절로, `router`는 소프트맥스 라우터 128/8과 재정규화, 그리고 ubatch 라우터를,
-# `down`은 다운 `_sel`(Q6_K, Q4_K)을, `head`는 argmax를 접은 Q6_K 헤드를, `flash`는 GQA 플래시 디코드 두 패스(스칼라·텐서
-# 코어)를 잰다. 레시피마다 바이너리 하나.
-gate-gpu-qwen3moe-rope:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-rope && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_rope && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_rope'
-
-gate-gpu-qwen3moe-router:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-router && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_router'
+# qwen3moe 커널 게이트 여섯을 한 프로세스(`gate_qwen3moe_kernels`)에서 차례로 돈다(ik CPU 덤프 네 세트: 5토큰 프리필, 깊이
+# 4·1,024·4,096의 디코드 스텝). 게이트는 그 바이너리의 모듈(`shared/qwen3moe_<이름>_gate.rs`)이고, 하나가 빨강이어도 나머지는
+# 돈다. ARGS에 게이트 이름(rope router down head flash experts)을 주면 그것만 돈다. `rope`는 헤드별 QK RMS 노름과 NEOX 로프·K/V
+# 캐시 쓰기(한 런치)를 두 절로, `router`는 소프트맥스 라우터 128/8과 재정규화, 그리고 ubatch 라우터를, `down`은 다운 `_sel`
+# (Q6_K, Q4_K)을, `head`는 argmax를 접은 Q6_K 헤드를, `flash`는 GQA 플래시 디코드 두 패스(스칼라·텐서 코어)를, `experts`는
+# 체인 커널 셋(Q4_K 임베딩 행(dequant_row·ik inp_embd와 비트 동일), expert gate·up·SwiGLU `_sel`(ffn_moe_gate_par 대조),
+# combine(routed_out 대조))을 잰다. 레시피 하나가 바이너리 하나를 돌고, 그 바이너리가 이 게이트들을 모듈로 품는다.
+gate-gpu-qwen3moe-kernels *ARGS:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-kernels && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_kernels && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_kernels {{ARGS}}'
 
 # Qwen3.6-35B-A3B MoE 블록: 257행 게이트 라우터(전문가 256 + 공유 전문가 게이트 행), 조인된 257-전문가 스택, K=512 down `_sel`,
 # 아홉 슬롯 FFN과 ubatch 경로를 호스트 규칙과 ik 밴드에 맞춘다. ARGS는 `--case <이름>[,…]`.
@@ -1687,14 +1682,6 @@ gate-gpu-qwen4exp-nvfp4:
 gate-gpu-qwen4exp-mtp:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_mtp'
 
-gate-gpu-qwen3moe-down:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-down && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_down && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_down'
-
-# qwen3moe 헤드: argmax를 접은 Q6_K 투영을 `q6k_gemv` + `argmax_fault`에 대고 — logits 비트 동일, 토큰과 폴트 워드 동일,
-# 동점, NaN 행, NaN 활성, 그래프.
-gate-gpu-qwen3moe-head:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-head && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_head && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_head'
-
 # 그룹 int8 텐서코어 GEMM(bloomery_gpu::gemm): 실파일 Qwen3 gate(Q4_K)·down(Q4_K, Q6_K) 스택과 V4.1 routed gate(Q3_K)
 # 하나, 같은 형상의 합성 스택(+ Q5_K), T ∈ {1,15,16,17,64,511,512,4096} × 라우팅 넷을 f64 참조의 유도 밴드에 대고 잰다.
 # fault·거부·그래프 재생 포함. ARGS는 `--case <부분문자열>` 필터. `--bench-kernels`는 판정 대신 런치 값을 잰다
@@ -1882,14 +1869,6 @@ gate-gpu-flint-twocard:
 # plus the bias clause: the selection follows the biased scores, the weights the unbiased ones.
 gate-gpu-muse-router:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_muse_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_muse_router'
-
-gate-gpu-qwen3moe-flash:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-flash && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_flash'
-
-# qwen3moe 체인 커널 셋(3090): Q4_K 임베딩 행(dequant_row·ik inp_embd와 비트 동일), expert gate·up·SwiGLU `_sel`
-# (ffn_moe_gate_par 대조), combine(routed_out 대조).
-gate-gpu-qwen3moe-experts:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-experts && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_experts && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_experts'
 
 # qwen3moe 전 체인 게이트(3090 한 장): 노드 수 핀, 층별 teacher-forced·자유 주행 l_out 대조, greedy(ik-greedy-qwen3moe의
 # 파일), graph = eager. 텐서 코어 플래시(엔진 경로)로 한 번 돈다. 스칼라 패스는 (u)의 자로 eager 안에서만 돈다.
@@ -2434,21 +2413,36 @@ census-stubs ROOT:
 gate-ds41-plan:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-ds41-plan && bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41::plan --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_deepseek41_plan && bash tools/host-gate.sh gate_deepseek41_plan'
 
-# V4.1 rope 계열(머리 꼬리 rope, ROPE_BACK, 잠재 K/V의 norm·rope·f16 링 기록)을 5토큰 세트와 디코드 스텝 세트 전부에 대조한다.
-# rope 사이트는 ik와 비트 동일, K/V 행은 유도한 밴드 안이어야 한다. 게이트가 V4.1 파일의 메타데이터를 읽으므로 모델을 고정한다.
-gate-gpu-ds41-rope:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-rope && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_rope && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_rope'
-
-# V4.1 압축기와 인덱스 키(상태 gemv, DS4_COMP 풀링, norm, 꼬리 rope, f16 캐시 행, 링 persist, 인덱스 키의
-# norm·rope·Hadamard)를 5토큰 세트와 디코드 스텝 세트의 모든 소스 층에서 대조한다.
-gate-gpu-ds41-comp:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-comp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_comp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_comp'
-
-# V4.1 인덱서(op F: 쿼리·가중치·점수·top-k 목록)를 d1·d2 세트와 그 unfused 쌍의 내는 층 전부에서 ik 덤프와 대조한다.
-# d1n의 항등 목록과 그 위의 attention을 접두 경로와 비트 대조하고, 16,384·32,768행의 합성 깊이 케이스(심어 둔 동점 포함),
-# 재실행 비트 동일과 캡처된 재생까지 본다. 목록은 행 오름차순, 동점은 낮은 행.
-gate-gpu-ds41-index:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-index && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_index && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_index'
+# V4.1 어텐션 쪽 게이트 아홉을 한 프로세스(`gate_deepseek41_kernels`)에서 차례로 돈다. 게이트는 그 바이너리의 모듈
+# (`shared/ds41_<이름>_gate.rs`)이고, 하나가 빨강이어도 나머지는 돈다. ARGS에 게이트 이름(hc rope comp index engram woa attn
+# chain_glue chain_attn)을 주면 그것만 돈다. 게이트마다 V4.1 파일의 메타데이터를 읽고 ik 덤프 세트를 읽으므로 모델을 고정한다.
+# - hc: V4.1 하이퍼커넥션(B4): 사슬 커널(RMS·분할 K hc_fn gemv·HC_PRE), HC_POST와 접기를 우리 규칙과 V4.1 ik 덤프에 서브층마다
+#   대조한다. engram 층(1·14)의 분리 짝(HC_POST 단독 → 접기 단독)이 융합 런치와 비트 동일한지도 본다.
+# - rope: V4.1 rope 계열(머리 꼬리 rope, ROPE_BACK, 잠재 K/V의 norm·rope·f16 링 기록)을 5토큰 세트와 디코드 스텝 세트 전부에
+#   대조한다. rope 사이트는 ik와 비트 동일, K/V 행은 유도한 밴드 안이어야 한다.
+# - comp: V4.1 압축기와 인덱스 키(상태 gemv, DS4_COMP 풀링, norm, 꼬리 rope, f16 캐시 행, 링 persist, 인덱스 키의
+#   norm·rope·Hadamard)를 5토큰 세트와 디코드 스텝 세트의 모든 소스 층에서 대조한다.
+# - index: V4.1 인덱서(op F: 쿼리·가중치·점수·top-k 목록)를 d1·d2 세트와 그 unfused 쌍의 내는 층 전부에서 ik 덤프와 대조한다.
+#   d1n의 항등 목록과 그 위의 attention을 접두 경로와 비트 대조하고, 16,384·32,768행의 합성 깊이 케이스(심어 둔 동점 포함),
+#   재실행 비트 동일과 캡처된 재생까지 본다. 목록은 행 오름차순, 동점은 낮은 행.
+# - engram: V4.1 engram 게이트: 키 norm, 그리고 쿼리 norm·f64 점곱·부호 붙은 제곱근 시그모이드·스트림 갱신을 5토큰 세트와 디코드
+#   스텝 세트의 engram 층(1·14)마다 우리 규칙과 ik 규칙 시뮬, 덤프에 대조한다. 토큰마다 gemv → 키 norm → 게이트 사슬도 본다.
+#   규칙은 파일의 형식이 고른다: engram_wkv가 Q8_0이면 q8_0_gemv와 ik의 q8_2 규칙, Q3_K(공개 파일)이면 q8_1 → q3k_gemv와
+#   ik의 q8_K × Q3_K 점곱(engram_kv와 비트 동일), 행 테이블과 gain 둘도 Q8_0/bf16 또는 Q3_K. 그 밖의 형식은 텐서 이름을 대며 거부한다.
+# - woa: V4.1 attn_output_a(블록 대각 여덟 그룹)를 q8_0_gemv_heads 한 번의 발사로, attn_output_b는 q8_0_gemv로 돌려 5토큰 세트와
+#   디코드 스텝 세트의 층마다 우리 규칙(비트 동일), ik 규칙 시뮬(덤프와 비트 동일), 덤프(값마다 유도한 밴드)에 대조한다.
+# - attn: V4.1 어텐션(B4): 세트 일곱(5토큰 배치와 디코드 스텝 여섯)의 모든 층을 접두 키와 선택 행 두 경로로 본다. ik 규칙
+#   시뮬 대 덤프, 커널 대 우리 f32 규칙과 덤프, 그래프 재생, 깊이 케이스. sink를 읽으려고 V4.1 모델 파일을 연다.
+# - chain_glue: The V4.1 glue piece (chain G1) on the step4 and d1n sets: the host engram row ids against the dump's int rows,
+#   the embedding broadcast bit for bit, each engram site's step within the band b4engram's pins propagate, and
+#   the head end (hc_out bit for bit, the logits against their predicted gap, the argmax); one captured graph
+#   replayed per set against the eager run, with its node count. The weights load through the engine's role
+#   formats, so a Q3_K engram_wkv (the public file) runs q8_1 + q3k_gemv, pinned within KERNEL_BAND of the exact
+#   dot and against ik's Q3_K dot bit for bit; the node count follows the format.
+# - chain_attn: V4.1 attention 조각(B5 1단계, chain G1): step4·d1n 세트의 40층 전부에 덤프의 입력을 주입하고, 스트림·접기·링·압축기
+#   캐시를 유도한 편차(σ 전파, z ≤ 9) 안에서 ik와 대조한다. 스텝이 안 쓴 슬롯은 비트 동일, 재생 = eager, 층 종류별 노드 수.
+gate-gpu-ds41-kernels *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-kernels && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_kernels && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_kernels {{ARGS}}'
 
 # V4.1 device-linked lib tests: rope tables match ggml even at positions outside the oracle set.
 # Include ignored hw_ checks for pre-activation gate/up errors under the common GPU card lock.
@@ -2502,42 +2496,11 @@ gate-ds41-place:
 gate-ds41-kld:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-ds41-kld && bash tools/gate.sh --release -p bloomery-gpu-gates --lib -- --ignored hw_ds41_kld --nocapture'
 
-# V4.1 engram 게이트: 키 norm, 그리고 쿼리 norm·f64 점곱·부호 붙은 제곱근 시그모이드·스트림 갱신을 5토큰 세트와 디코드
-# 스텝 세트의 engram 층(1·14)마다 우리 규칙과 ik 규칙 시뮬, 덤프에 대조한다. 토큰마다 gemv → 키 norm → 게이트 사슬도 본다.
-# 규칙은 파일의 형식이 고른다: engram_wkv가 Q8_0이면 q8_0_gemv와 ik의 q8_2 규칙, Q3_K(공개 파일)이면 q8_1 → q3k_gemv와
-# ik의 q8_K × Q3_K 점곱(engram_kv와 비트 동일), 행 테이블과 gain 둘도 Q8_0/bf16 또는 Q3_K. 그 밖의 형식은 텐서 이름을 대며 거부한다.
-gate-gpu-ds41-engram:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-engram && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_engram && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_engram'
-
 # A PLE site's two kernels (Qwen3.8's layer 1, bloomery_gpu::ple) on synthetic inputs, no model: the gate bit for bit
 # against its host rule and within a derived per-value bound of the exact f64 values; the dilated conv bit for bit
 # against its host rule; then the m-column, ring-wrap, rollback, reset, fault and refusal clauses.
 gate-gpu-ple:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_ple && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_ple'
-
-# The V4.1 glue piece (chain G1) on the step4 and d1n sets: the host engram row ids against the dump's int rows,
-# the embedding broadcast bit for bit, each engram site's step within the band b4engram's pins propagate, and
-# the head end (hc_out bit for bit, the logits against their predicted gap, the argmax); one captured graph
-# replayed per set against the eager run, with its node count. The weights load through the engine's role
-# formats, so a Q3_K engram_wkv (the public file) runs q8_1 + q3k_gemv, pinned within KERNEL_BAND of the exact
-# dot and against ik's Q3_K dot bit for bit; the node count follows the format.
-gate-gpu-ds41-chain-glue:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chain-glue && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_chain_glue && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_chain_glue'
-
-# V4.1 attn_output_a(블록 대각 여덟 그룹)를 q8_0_gemv_heads 한 번의 발사로, attn_output_b는 q8_0_gemv로 돌려 5토큰 세트와
-# 디코드 스텝 세트의 층마다 우리 규칙(비트 동일), ik 규칙 시뮬(덤프와 비트 동일), 덤프(값마다 유도한 밴드)에 대조한다.
-gate-gpu-ds41-woa:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-woa && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_woa && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_woa'
-
-# V4.1 어텐션(B4): 세트 일곱(5토큰 배치와 디코드 스텝 여섯)의 모든 층을 접두 키와 선택 행 두 경로로 본다. ik 규칙
-# 시뮬 대 덤프, 커널 대 우리 f32 규칙과 덤프, 그래프 재생, 깊이 케이스. sink를 읽으려고 V4.1 모델 파일을 연다.
-gate-gpu-ds41-attn:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-attn && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_attn'
-
-# V4.1 attention 조각(B5 1단계, chain G1): step4·d1n 세트의 40층 전부에 덤프의 입력을 주입하고, 스트림·접기·링·압축기
-# 캐시를 유도한 편차(σ 전파, z ≤ 9) 안에서 ik와 대조한다. 스텝이 안 쓴 슬롯은 비트 동일, 재생 = eager, 층 종류별 노드 수.
-gate-gpu-ds41-chain-attn:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chain-attn && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_chain_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_chain_attn'
 
 # 조립된 V4.1 스텝(B5 1단계, pos < 512·선택 없음)을 게이트 배치로 엔진 입구를 거쳐 돌린다. --structure: 캡처된 스텝의
 # 커널·메모리 연산 배치 수가 조각들이 예측한 수와 같고, step4 세트의 상태를 주입한 재생이 eager 실행과 비트까지 같다.
@@ -2688,9 +2651,9 @@ gate-gpu-ds41-long *ARGS:
 # are the reference's selection over its own scores and each consumer's compaction and list hold to them, and some list
 # the mask changed. G2b, gate_deepseek41_prefill --cand: positions 16,300-16,500 as one batch call and as 200 steps
 # from the same keep point, every ring, compressor state, compressed row, index key and the last logits bit for bit.
-# The landing batch runs no model-load prefill past 16,384: the wiring at depth lands on gate-gpu-ds41-chain-attn's
-# synthetic G2s, and below the bound every candidate launch is a no-op, so the batch-set indexing past it is proved
-# here alone. Weekly: `just weekly` runs it, and `just affected` names it when a file its triggers in
+# The landing batch runs no model-load prefill past 16,384: the wiring at depth lands on the chain_attn gate of
+# gate-gpu-ds41-kernels (synthetic G2s), and below the bound every candidate launch is a no-op, so the batch-set indexing
+# past it is proved here alone. Weekly: `just weekly` runs it, and `just affected` names it when a file its triggers in
 # tools/gate-paths.tsv match changes. Alone in a batch.
 [group('solo')]
 [group('v41-load')]

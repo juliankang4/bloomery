@@ -41,18 +41,12 @@ gate-gpu-block	tooling		harness	-
 gate-gpu-cand	common		kernel	moe_route
 gate-gpu-clef-hidden	family	qwen35	e2e	attn_linear_gdn_kda+attn_gqa
 gate-gpu-clef-serve	family	qwen35	serve	seats_serve_engine+constrain
-gate-gpu-ds41-attn	family	deepseek41	kernel	attn_ds41_csa_hca
+gate-gpu-ds41-kernels	family	deepseek41	kernel	attn_ds41_csa_hca
 gate-gpu-ds41-callstream	family	deepseek41	tier	prompt_walks+tier_legs
-gate-gpu-ds41-chain-attn	family	deepseek41	kernel	attn_ds41_csa_hca
 gate-gpu-ds41-chain-ffn	family	deepseek41	kernel	moe_route
-gate-gpu-ds41-chain-glue	family	deepseek41	kernel	attn_ds41_csa_hca
 gate-gpu-ds41-chat	family	deepseek41	e2e	seats_app
-gate-gpu-ds41-comp	family	deepseek41	kernel	attn_ds41_csa_hca
 gate-gpu-ds41-draft	family	deepseek41	draft	drafts_mtp
 gate-gpu-ds41-dspark-loop	family	deepseek41	draft	drafts_dspark
-gate-gpu-ds41-engram	family	deepseek41	kernel	attn_ds41_csa_hca
-gate-gpu-ds41-hc	family	deepseek41	kernel	attn_ds41_csa_hca
-gate-gpu-ds41-index	family	deepseek41	kernel	attn_ds41_csa_hca
 gate-gpu-ds41-lib	family	deepseek41	host	-
 gate-gpu-ds41-long	family	deepseek41	e2e	graph_fault
 gate-gpu-ds41-media	family	deepseek41	media	serve_media+prompt_walks
@@ -60,12 +54,10 @@ gate-gpu-ds41-moe	family	deepseek41	kernel	moe_route
 gate-gpu-ds41-nvtier	family	deepseek41	tier	tier_legs+residency
 gate-gpu-ds41-prefill	family	deepseek41	e2e	prompt_walks
 gate-gpu-ds41-residency-a	family	deepseek41	residency	residency+prompt_walks
-gate-gpu-ds41-rope	family	deepseek41	kernel	attn_ds41_csa_hca
 gate-gpu-ds41-step	family	deepseek41	e2e	graph_fault+attn_ds41_csa_hca+moe_route
 gate-gpu-ds41-tier	family	deepseek41	tier	tier_legs
 gate-gpu-ds41-twocard	family	deepseek41	tier	tier_legs+placement_sizing
 gate-gpu-ds41-unpack	common		residency	residency
-gate-gpu-ds41-woa	family	deepseek41	kernel	attn_ds41_csa_hca
 gate-gpu-dspark-experts	family	deepseek41	draft	drafts_dspark
 gate-gpu-dspark-graph	family	deepseek41	draft	drafts_dspark
 gate-gpu-dspark-hc	family	deepseek41	draft	drafts_dspark
@@ -171,13 +163,8 @@ gate-gpu-qwen38-residency	family	qwen4exp	residency	residency
 gate-gpu-qwen38-serve	family	qwen4exp	serve	seats_serve_engine+serve_http_api
 gate-gpu-qwen38-twocard	family	qwen4exp	tier	tier_legs+placement_sizing
 gate-gpu-qwen38d	family	qwen38d	e2e	attn_linear_gdn_kda+attn_gqa
-gate-gpu-qwen3moe-down	family	qwen3moe	kernel	quant_q6k
+gate-gpu-qwen3moe-kernels	family	qwen3moe	kernel	attn_gqa+head_sample+moe_route+quant_q4k+quant_q6k+weights_load
 gate-gpu-qwen3moe-e2e	family	qwen3moe	e2e	graph_fault+moe_route+attn_gqa
-gate-gpu-qwen3moe-experts	family	qwen3moe	kernel	quant_q4k+weights_load
-gate-gpu-qwen3moe-flash	family	qwen3moe	kernel	attn_gqa
-gate-gpu-qwen3moe-head	family	qwen3moe	kernel	head_sample
-gate-gpu-qwen3moe-rope	family	qwen3moe	kernel	attn_gqa
-gate-gpu-qwen3moe-router	family	qwen3moe	kernel	moe_route
 gate-gpu-qwen3moe-types	family	qwen3moe	place	placement_sizing+weights_load
 gate-gpu-qwen3moe-twocard	family	qwen3moe	tier	tier_legs+placement_sizing
 gate-gpu-qwen3vl-tower	family	qwen35	media	serve_media

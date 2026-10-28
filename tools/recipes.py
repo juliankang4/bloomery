@@ -11048,7 +11048,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
             fam = {
                 "q4": "gate-gpu-qwen4exp-e2e",  # BLOOMERY_MODEL=qwen4exp: qwen38
                 "glm": "gate-gpu-glm-sel",  # glm5next: glm5next
-                "ds41": "gate-gpu-ds41-hc",  # deepseek41: v41, its draft/ below it
+                "ds41": "gate-gpu-ds41-kernels",  # deepseek41: v41, its draft/ below it
                 "q35": "gate-gpu-qwen35moe-moe",  # qwen35moe: its own directory
                 "mimo": "gate-gpu-mimo2-flash",  # mimo2: no row, `none`
                 "envm": "gate-gpu-glm-sel@BLOOMERY_MODEL=qwen4exp",  # a BLOOMERY_MODEL in the item's env: no telling
@@ -13310,7 +13310,7 @@ def _st_basics(fails: list[str], side: Side) -> None:
             fh.write(
                 "check:\n    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu'\n"
                 "a:\n    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin generate_ds41'\n"
-                "b:\n    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_attn'\n"
+                "b:\n    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_kernels'\n"
                 "c:\n    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_swap'\n"
                 "d:\n    ./tools/box.sh 'bash tools/gate.sh -p bloomery-gpu-gates --release --lib -- --include-ignored'\n"
                 "e:\n    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --release --doc'\n"
@@ -13323,7 +13323,7 @@ def _st_basics(fails: list[str], side: Side) -> None:
             fails.append(f"combos: the synthetic justfile raised {err}")
         cmds = {c.command(): c.recipes for c in shapes}
         want = {
-            "cargo check -p bloomery-gpu-gates --features deepseek41,gpu --bin gate_deepseek41_attn --bin generate_ds41": ["a", "b"],
+            "cargo check -p bloomery-gpu-gates --features deepseek41,gpu --bin gate_deepseek41_kernels --bin generate_ds41": ["a", "b"],
             "cargo check -p bloomery-gpu-gates --features gpu --bin gate_swap": ["c"],
             "cargo check -p bloomery-gpu-gates --profile test --lib": ["d"],
             "cargo check -p bloomery-model --lib": ["e"],

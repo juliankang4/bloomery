@@ -206,11 +206,7 @@ name = "soak_ds41_serve"
 required-features = ["deepseek41"]
 
 [[bin]]
-name = "gate_deepseek41_attn"
-required-features = ["deepseek41"]
-
-[[bin]]
-name = "gate_deepseek41_chain_attn"
+name = "gate_deepseek41_kernels"
 required-features = ["deepseek41"]
 
 [[bin]]
@@ -218,32 +214,12 @@ name = "gate_deepseek41_chain_ffn"
 required-features = ["deepseek41"]
 
 [[bin]]
-name = "gate_deepseek41_chain_glue"
-required-features = ["deepseek41"]
-
-[[bin]]
-name = "gate_deepseek41_comp"
-required-features = ["deepseek41"]
-
-[[bin]]
 name = "gate_deepseek41_dsloop"
-required-features = ["deepseek41"]
-
-[[bin]]
-name = "gate_deepseek41_engram"
 required-features = ["deepseek41"]
 
 [[bin]]
 name = "gate_ple"
 required-features = ["gpu"]
-
-[[bin]]
-name = "gate_deepseek41_hc"
-required-features = ["deepseek41"]
-
-[[bin]]
-name = "gate_deepseek41_index"
-required-features = ["deepseek41"]
 
 [[bin]]
 name = "gate_deepseek41_load"
@@ -259,10 +235,6 @@ required-features = ["deepseek41"]
 
 [[bin]]
 name = "gate_deepseek41_prefill"
-required-features = ["deepseek41"]
-
-[[bin]]
-name = "gate_deepseek41_rope"
 required-features = ["deepseek41"]
 
 [[bin]]
@@ -291,10 +263,6 @@ required-features = ["deepseek41"]
 
 [[bin]]
 name = "gate_deepseek41_step"
-required-features = ["deepseek41"]
-
-[[bin]]
-name = "gate_deepseek41_woa"
 required-features = ["deepseek41"]
 
 [[bin]]
@@ -598,15 +566,7 @@ name = "gate_q6k_ids"
 required-features = ["gpu"]
 
 [[bin]]
-name = "gate_qwen3moe_down"
-required-features = ["gpu"]
-
-[[bin]]
 name = "gate_qwen3moe_e2e"
-required-features = ["gpu"]
-
-[[bin]]
-name = "gate_qwen3moe_experts"
 required-features = ["gpu"]
 
 [[bin]]
@@ -634,15 +594,7 @@ name = "gate_muse_router"
 required-features = ["gpu"]
 
 [[bin]]
-name = "gate_qwen3moe_flash"
-required-features = ["gpu"]
-
-[[bin]]
-name = "gate_qwen3moe_head"
-required-features = ["gpu"]
-
-[[bin]]
-name = "gate_qwen3moe_rope"
+name = "gate_qwen3moe_kernels"
 required-features = ["gpu"]
 
 [[bin]]
@@ -692,10 +644,6 @@ required-features = ["deepseek41", "gemma-embedding2", "vision", "hf"]
 [[bin]]
 name = "gate_gemma4v_tower"
 required-features = ["vision"]
-
-[[bin]]
-name = "gate_qwen3moe_router"
-required-features = ["gpu"]
 
 [[bin]]
 name = "gate_qwen35moe_moe"
