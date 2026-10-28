@@ -7,8 +7,8 @@
 #   tools/box.sh cargo oxide run q3k_gemv --arch sm_86
 #   tools/box.sh --hold up <owner> [reason…] | down <owner>   the hold on this side (below); `just box-hold`
 #   tools/box.sh --tree-id [DIR]                             the id a queued call gives DIR's tree (default: this tree)
-#   tools/box.sh --self-test [SCRIPT]                        the hold's rules against a stub ssh and rsync, no box;
-#                                                            SCRIPT (default: this one) is the box.sh under test
+#   tools/box.sh --self-test [SCRIPT]                        the hold's rules, the sync's skip and the connection sharing against
+#                                                            a stub ssh and rsync, no box; SCRIPT (default: this one) is the box.sh under test
 #
 # The guard. Before the command, on the box and in the same ssh, lease_guard (tools/ref/lease-probe.sh)
 # reads the timing lease (/root/bloomery-cpu.lock, through lease_free: a shared-lock probe) and every
@@ -90,6 +90,27 @@
 # or no regular file, ends the call with 64 naming it: a hold that does not hold is never silent. The hold on
 # this side refuses new calls; a call already waiting in the guard above waits on the box-side holds.
 #
+# Connection sharing. Every ssh this call makes, rsync's and the queue client's (BOXQ_SSH, when the caller names none) included, goes
+# through one OpenSSH master per host: ControlMaster=auto, ControlPath ~/.cache/bloomery/box-ssh/%C, ControlPersist=300, ServerAliveInterval=15 and ServerAliveCountMax=4. The first call
+# opens it and a call within five minutes of the last one joins it, with no key exchange or login of its own: a lane of short items
+# otherwise pays that three times each (the ssh that makes the directory, rsync's, the command's). ssh replaces a socket whose master is
+# gone with a fresh connection, and a call that meets a master whose connection died ends 255 like any dropped ssh, so the one retry
+# before the submit (below) covers it unchanged. A master whose box stops answering ends itself after a minute (four missed server
+# alives 15 s apart), so the calls on it end 255 too; one that still hangs is ended by hand:
+# `ssh -O exit -o ControlPath="$HOME/.cache/bloomery/box-ssh/%C" <host>`. Calls that start together with no master up each open
+# their own connection that once, and ssh prints `ControlSocket … already exists, disabling multiplexing` for all but one of them.
+# A socket's path holds 103 bytes on macOS, ssh binds it under a name 17 bytes longer than ControlPath, and %C is 40: a home whose
+# directory is over 45 bytes or holds a space uses /tmp/bloomery-box-ssh-<uid> instead, and a directory that cannot be made leaves the call
+# on plain ssh with one line on stderr saying so. Local mode makes none.
+#
+# The sync. The tree is sent only when the box does not already hold it. Its id (tree_id below) is read here, and the remote directory's
+# .sync-id in the ssh that makes the directory: the same id means there is nothing to send (`already holds this tree … not synced`), and
+# no id, another id or one that cannot be read means a sync, as every call did before. A sync removes the remote .sync-id before rsync
+# runs and puts this tree's id there only when rsync ended 0, so one that failed leaves no id and the next call sends again; the id is the
+# last sync's alone, so an edit that is put back is a sync too. A direct call and a queued one share it (the queue's lock and stale check
+# are below; a direct call takes neither). What a run changed in the remote tree (a `touch`, `just check`'s Cargo.lock) stays until the
+# tree's id moves, for a direct call as for a queued one.
+#
 # The box queue. BLOOMERY_BOX_QUEUE=1 makes the command a job of the box's signalbox daemon (unset or 0:
 # the path above, byte for byte). The daemon waits on the timing lease and the holds, so the job carries
 # no guard; tools/boxq.py runs it (submit, follow its out and err apart, exit with its rc; INT or TERM
@@ -143,6 +164,8 @@ BOX_HOLD_DIR=$HOME/.cache/bloomery/box-hold
 DROP_WAIT=5  # between a dropped rsync or ssh and its one retry
 SYNC_WAIT=120 # how long a queued call waits on another call's sync of this remote directory (its lock held, its tree id not there)
 SYNC_POLL=2  # between two looks at that sync
+# The ssh command of this call (the header's connection sharing): ssh_share fills them, and a call that shares nothing keeps plain ssh.
+SSH_OPTS=() SSH_CMD=ssh
 
 # hold_stamp <epoch>: the UTC stamp of an epoch second (BSD date -r on the Mac, GNU date -d elsewhere).
 hold_stamp() {
@@ -282,15 +305,33 @@ drop_note() {
   sleep "$DROP_WAIT"
 }
 
+# ssh_share: the options of the header's connection sharing in SSH_OPTS, and the ssh command that carries them (rsync's -e, the queue client) in
+# SSH_CMD. The socket directory is ~/.cache/bloomery/box-ssh; a path that would not fit a socket (45 bytes for the directory: 103, less the
+# 17 bytes ssh adds while it binds, the separator and the 40 of %C) or that holds a space goes to /tmp/bloomery-box-ssh-<uid>. A directory
+# that cannot be made or closed to others is no reason to stop a call: it runs on plain ssh, and says so.
+ssh_share() {
+  local dir=$HOME/.cache/bloomery/box-ssh
+  case $dir in
+    *[[:space:]]*) dir=/tmp/bloomery-box-ssh-$(id -u) ;;
+  esac
+  [ "${#dir}" -le 45 ] || dir=/tmp/bloomery-box-ssh-$(id -u)
+  if ! { mkdir -p "$dir" && chmod 700 "$dir"; } 2> /dev/null; then
+    echo "box.sh: $dir cannot be made or closed to others: this call runs without connection sharing" >&2
+    return 0
+  fi
+  SSH_OPTS=(-o ControlMaster=auto -o "ControlPath=$dir/%C" -o ControlPersist=300 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+  SSH_CMD="ssh ${SSH_OPTS[*]}"
+}
+
 # pre_ssh CMD: `ssh -n HOST CMD` before anything is submitted, its stdout in PRE_OUT and its rc the result. A 255 (the ssh itself
 # dropped: a tailnet restart, a closed connection) is retried once after drop_note; after the submit nothing is retried here.
 pre_ssh() {
   local r=0
-  PRE_OUT=$(ssh -n "$HOST" "$1") || r=$?
+  PRE_OUT=$(ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} "$HOST" "$1") || r=$?
   if [ "$r" = 255 ]; then
     drop_note "$r"
     r=0
-    PRE_OUT=$(ssh -n "$HOST" "$1") || r=$?
+    PRE_OUT=$(ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} "$HOST" "$1") || r=$?
   fi
   return "$r"
 }
@@ -390,11 +431,14 @@ default_lane() {
 # self_test [SCRIPT]: the hold's rules (the header) on a copy of SCRIPT (default: this file) in a scratch tree, under a fake HOME,
 # with ssh and rsync stubs ahead on PATH that record their arguments and reach nothing: a call the hold refuses leaves both logs empty.
 self_test() {
-  local script=${1:-$0} d t box bound bx= hd fails=0 rc=0 out= n=0 lrc=0 lpid stop
+  local script=${1:-$0} d hs t box bound bx= hd fails=0 rc=0 out= n=0 lrc=0 lpid stop
   [ -f "$script" ] || { echo "box.sh: --self-test: '$script' is no file" >&2; return 64; }
   d=$(mktemp -d "$(dirname "${TMPDIR:-/tmp}/x")/box-selftest.XXXXXX")
-  box=$d/tree/tools/box.sh bound=$d/tree/tools/box-bound.sh hd=$d/home/.cache/bloomery/box-hold
-  mkdir -p "$d/tree/tools" "$d/stub" "$d/home"
+  # The fake HOME is a short path of its own: a socket's path is short (ssh_share's 45 bytes for the directory), and a home under $d would
+  # send every call to the /tmp directory the header names for a long one.
+  hs=$(mktemp -d /tmp/bst.XXXXXX) || { rm -rf "$d"; return 70; }
+  box=$d/tree/tools/box.sh bound=$d/tree/tools/box-bound.sh hd=$hs/.cache/bloomery/box-hold
+  mkdir -p "$d/tree/tools" "$d/stub"
   # The script under test, with the drop wait and the sync poll shrunk (the constants' lines at the top). Its sync wait stays the real 120 s:
   # the sync cases answer their probes from a script and end on the probe that settles them, so that bound is only a failsafe, and a bound
   # the scripted answers must fit in reads the machine's load (each probe is a handful of forks). The one case that needs the bound to end
@@ -404,6 +448,7 @@ self_test() {
   sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$script" > "$box"
   sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=2 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$script" > "$bound"
   printf '%s\n' 'cuda-device = { git = "x", rev = "0123456789ab" }' > "$d/tree/Cargo.toml"
+  printf 'a\n' > "$d/tree/note.txt"
   # The scratch tree is a git repo with a committed HEAD (the real case): the version commit reads here, and the corrupt-index
   # case at the end has a HEAD whose dirt would otherwise read clean. Identity and hooks are pinned so the commit asks for neither.
   git -C "$d/tree" init -q
@@ -412,9 +457,11 @@ self_test() {
   # The queue client a queued call execs at its end: it logs its arguments and ends with boxq.rc (default 0).
   printf '%s\n' '#!/usr/bin/env python3' 'import os, sys' "D = '$d'" \
     "open(D + '/boxq.log', 'a').write(' '.join(sys.argv[1:2]) + chr(10))" \
+    "open(D + '/boxq.ssh', 'a').write(os.environ.get('BOXQ_SSH', '-') + chr(10))" \
     "sys.exit(int(open(D + '/boxq.rc').read()) if os.path.exists(D + '/boxq.rc') else 0)" > "$d/tree/tools/boxq.py"
   for t in ssh rsync; do
     printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/%s.log"\n' "$d" "$t" > "$d/stub/$t"
+    printf 'case "$*" in *ControlMaster=auto*ControlPath=*ControlPersist=*) echo shared ;; *) echo plain ;; esac >> "%s/%s.mux"\n' "$d" "$t" >> "$d/stub/$t"
     chmod +x "$d/stub/$t"
   done
   # The ssh stub also writes what BLOOMERY_BOX_PIDDIR holds while the call runs, and its parent (the box.sh that runs it), into pid.log;
@@ -435,8 +482,17 @@ pop() {
 }
 STUB
   done
+  # Under STUB_BOX=1 the stubs are a box that keeps its .sync-id: an rsync call removes it first and, ending 0, leaves the id its call shipped
+  # (the file the sync's wrapper moves into place) in remote.id; an ssh read of the id answers from it unless read.script scripts the answer.
   cat >> "$d/stub/rsync" << 'STUB'
-exit "$(pop "$D/rsync.script" 0)"
+[ "${STUB_BOX:-0}" != 1 ] || rm -f "$D/remote.id"
+r=$(pop "$D/rsync.script" 0)
+if [ "$r" = 0 ] && [ "${STUB_BOX:-0}" = 1 ]; then
+  for a do
+    case $a in */.sync-id.new) cat "$a" > "$D/remote.id" ;; esac
+  done
+fi
+exit "$r"
 STUB
   cat >> "$d/stub/ssh" << 'STUB'
 if [ "${STUB_EXEC_REMOTE:-0}" = 1 ]; then
@@ -449,6 +505,10 @@ case "$*" in
     [ "$1" != 0 ] || { echo "lock=$2"; [ -z "${3:-}" ] || echo "$3"; }
     exit "$1" ;;
   *.sync-id*)
+    if [ "${STUB_BOX:-0}" = 1 ] && [ ! -s "$D/read.script" ]; then
+      [ ! -s "$D/remote.id" ] || cat "$D/remote.id"
+      exit 0
+    fi
     set -- $(pop "$D/read.script" 0)
     [ "$1" != 0 ] || [ -z "${2:-}" ] || echo "$2"
     exit "$1" ;;
@@ -457,7 +517,7 @@ esac
 STUB
   if [ "$(PATH="$d/stub:/usr/bin:/bin"; command -v ssh)" != "$d/stub/ssh" ]; then
     echo "box.sh: --self-test: the ssh stub is not first on PATH: nothing was run" >&2
-    rm -rf "$d"
+    rm -rf "$d" "$hs"
     return 70
   fi
   fail() { echo "box.sh: self-test: $*" >&2; fails=$((fails + 1)); }
@@ -469,8 +529,11 @@ STUB
     : > "$d/ssh.log"
     : > "$d/rsync.log"
     : > "$d/boxq.log"
+    : > "$d/ssh.mux"
+    : > "$d/rsync.mux"
+    : > "$d/boxq.ssh"
     rc=0
-    out=$(env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' ${envs[@]+"${envs[@]}"} bash "${bx:-$box}" "$@" 2>&1 < /dev/null) || rc=$?
+    out=$(env -i PATH="$d/stub:/usr/bin:/bin" HOME="$hs" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' ${envs[@]+"${envs[@]}"} bash "${bx:-$box}" "$@" 2>&1 < /dev/null) || rc=$?
     rm -f "$d"/*.script "$d"/*.script.n "$d/boxq.rc"
   }
   # sc KIND LINE…: the stubs' script of KIND (rsync, probe, read, ssh) for the next call, one answer line per call of that kind.
@@ -482,6 +545,16 @@ STUB
   hasnt() { case $out in *"$1"*) fail "$2: '$1' in: $out" ;; esac; }
   untouched() { { [ ! -s "$d/ssh.log" ] && [ ! -s "$d/rsync.log" ]; } || fail "$1: ssh or rsync was reached: $(cat "$d/ssh.log" "$d/rsync.log" | head -c 160)"; }
   reached() { grep -q -- 'echo hi' "$d/ssh.log" || fail "$1: the command never reached ssh"; }
+  # muxed WHAT: the last call made an ssh call, and every ssh and rsync call it made carried the connection sharing options (ControlMaster,
+  # ControlPath and ControlPersist; the stubs record each call's answer in <tool>.mux).
+  muxed() {
+    [ -s "$d/ssh.mux" ] || fail "$1: no ssh call"
+    [ "$(count "$d/ssh.mux" plain)" = 0 ] || fail "$1: an ssh call without the connection sharing options: $(head -c 200 "$d/ssh.log")"
+    [ "$(count "$d/rsync.mux" plain)" = 0 ] || fail "$1: an rsync call without the connection sharing options: $(head -c 200 "$d/rsync.log")"
+  }
+  # nsync: how many times the last call ran rsync. synced WHAT N: the last call ended 0, reached its command and ran rsync N times.
+  nsync() { grep -c '' "$d/rsync.log" || true; }
+  synced() { want 0 "$1"; reached "$1"; [ "$(nsync)" = "$2" ] || fail "$1: rsync ran $(nsync) times, not $2"; }
   # wait_for WHAT CMD…: until CMD succeeds. Every wait below is for an event (a file, a line, a process's end); the 1200 passes of 0.1 s are only
   # the failsafe that catches a hang, never a bound a run must fit in: under load the subject is late, and a bound would read the load as its verdict.
   wait_for() {
@@ -574,7 +647,7 @@ STUB
     lrc=0
     # runs until a call is refused; the clock is only the failsafe that ends a caller nothing refused
     while [ "$SECONDS" -lt "$stop" ]; do
-      env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' bash "$box" 'echo hi' > /dev/null 2>&1 || { lrc=$?; break; }
+      env -i PATH="$d/stub:/usr/bin:/bin" HOME="$hs" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' bash "$box" 'echo hi' > /dev/null 2>&1 || { lrc=$?; break; }
       n=$((n + 1))
       sleep 0.2
     done
@@ -591,7 +664,7 @@ STUB
   # A drop before the submit (the header): an rsync or ssh that ends 12 or 255 before the job is sent is retried once, by name; a
   # second drop ends the call with its rc, and a job's own ssh is never retried.
   local sid drops='box.sh: rsync/ssh dropped (rc '
-  sid=$(env -i PATH=/usr/bin:/bin HOME="$d/home" bash "$box" --tree-id "$d/tree") || sid=
+  sid=$(env -i PATH=/usr/bin:/bin HOME="$hs" bash "$box" --tree-id "$d/tree") || sid=
   [ -n "$sid" ] || fail "the scratch tree's id could not be read"
   sc rsync 12 0
   call -- 'echo hi'
@@ -604,10 +677,10 @@ STUB
   sc rsync 23
   call -- 'echo hi'
   want 23 'direct: an rsync that ended 23 is not a drop'; hasnt 'retrying once' 'direct: an rsync that ended 23 is not a drop'
-  sc ssh 255 0
+  sc read 255 0
   call -- 'echo hi'
   want 0 'direct: the ssh before the sync dropped'; has "${drops}255) before submit; retrying once" 'direct: the ssh before the sync dropped'
-  sc ssh 0 255
+  sc ssh 255
   call -- 'echo hi'
   want 255 'direct: the job'"'"'s own ssh ends 255'; hasnt 'retrying once' 'direct: the job'"'"'s own ssh ends 255'
   [ "$(count "$d/ssh.log" 'echo hi')" = 1 ] || fail "direct: the job's own ssh ran $(count "$d/ssh.log" 'echo hi') times, not once"
@@ -681,6 +754,108 @@ STUB
   call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
   want 255 'queue: the queue client ends 255'; hasnt 'retrying once' 'queue: the queue client ends 255'
   [ "$(grep -c '' "$d/boxq.log")" = 1 ] || fail "queue: the queue client ran $(grep -c '' "$d/boxq.log") times, not once"
+  # The sync is skipped when the box holds the tree (the header): under STUB_BOX=1 the stubs are a box that keeps its .sync-id. The tree's
+  # id moves with an edit of one byte whose size and mtime stayed, a file added or taken away; a file rsync does not send moves nothing.
+  local note=$d/tree/note.txt m0 box_sig='ControlMaster=auto -o ControlPath=' fb fbhad=0 hx
+  fb=/tmp/bloomery-box-ssh-$(id -u)
+  mtime() { python3 -c 'import os, sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$1"; }
+  rm -f "$d/remote.id" "$d/mt"
+  call STUB_BOX=1 -- 'echo hi'
+  synced 'sync: a box with no id' 1
+  [ "$(cat "$d/remote.id" 2> /dev/null)" = "$sid" ] || fail "sync: the id the box was left is '$(cat "$d/remote.id" 2> /dev/null)', not the tree's $sid"
+  grep -qF -- 'rm -f ~/repo/x/.sync-id && rsync "$@" && mv -f ~/repo/x/.sync-id.new ~/repo/x/.sync-id' "$d/rsync.log" ||
+    fail "sync: the rsync path does not remove the id before the sync and put it back after it: $(head -c 300 "$d/rsync.log")"
+  muxed 'sync: a first call'
+  call STUB_BOX=1 -- 'echo hi'
+  synced 'sync: the second call of an unchanged tree' 0
+  has 'already holds this tree' 'sync: the second call of an unchanged tree'
+  muxed 'sync: the second call'
+  m0=$(mtime "$note")
+  touch -r "$note" "$d/mt"
+  printf 'b\n' > "$note"
+  touch -r "$d/mt" "$note"
+  [ "$(mtime "$note")" = "$m0" ] || fail 'sync: the test could not put the mtime back, so the next case would pass on it'
+  call STUB_BOX=1 -- 'echo hi'
+  synced 'sync: a tracked file edited by one byte, size and mtime as they were' 1
+  call STUB_BOX=1 -- 'echo hi'
+  synced 'sync: the edited tree again' 0
+  printf 'a\n' > "$note"
+  touch -r "$d/mt" "$note"
+  call STUB_BOX=1 -- 'echo hi'
+  synced 'sync: the edit put back (the box holds the edited tree)' 1
+  call STUB_BOX=1 -- 'echo hi'
+  synced 'sync: the tree after the edit was put back' 0
+  printf 'x\n' > "$d/tree/new.txt"
+  call STUB_BOX=1 -- 'echo hi'
+  synced 'sync: an untracked file' 1
+  call STUB_BOX=1 -- 'echo hi'
+  synced 'sync: the tree with the untracked file' 0
+  rm "$d/tree/new.txt"
+  call STUB_BOX=1 -- 'echo hi'
+  synced 'sync: the untracked file taken away' 1
+  mkdir -p "$d/tree/target"
+  printf 'x' > "$d/tree/target/o"
+  : > "$d/tree/x.ptx"
+  call STUB_BOX=1 -- 'echo hi'
+  synced 'sync: files rsync does not send (target/, a top-level .ptx)' 0
+  rm -rf "$d/tree/target" "$d/tree/x.ptx"
+  for hx in ffffffffffffffff ''; do
+    printf '%s\n' "$hx" > "$d/remote.id"
+    call STUB_BOX=1 -- 'echo hi'
+    synced "sync: the box holds the id '$hx'" 1
+    [ "$(cat "$d/remote.id")" = "$sid" ] || fail "sync: the id the box was left after '$hx' is '$(cat "$d/remote.id")', not $sid"
+  done
+  printf '%s\n' ffffffffffffffff > "$d/remote.id"
+  sc rsync 23
+  call STUB_BOX=1 -- 'echo hi'
+  want 23 'sync: a sync that failed'
+  [ ! -s "$d/remote.id" ] || fail "sync: a sync that failed left the id '$(cat "$d/remote.id")' on the box"
+  call STUB_BOX=1 -- 'echo hi'
+  synced 'sync: the call after a failed sync' 1
+  sc read 255 255
+  call STUB_BOX=1 -- 'echo hi'
+  want 255 'sync: the read of the id dropped twice'; [ "$(nsync)" = 0 ] || fail 'sync: the read of the id dropped twice: rsync ran'
+  # a read syncs nothing and a queued call shares the record with a direct one
+  call STUB_BOX=1 BLOOMERY_BOX_READONLY=1 -- 'echo hi'
+  synced 'sync: a read' 0
+  muxed 'sync: a read'
+  grep -qF -- "ControlPath=$hs/.cache/bloomery/box-ssh/%C" "$d/ssh.log" || fail "sync: the socket is not under ~/.cache/bloomery/box-ssh: $(head -c 300 "$d/ssh.log")"
+  [ -d "$hs/.cache/bloomery/box-ssh" ] || fail 'sync: the socket directory was not made'
+  call STUB_BOX=1 BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 0 'queue: after a direct call of the same tree'; [ "$(nsync)" = 0 ] || fail "queue: after a direct call of the same tree: rsync ran $(nsync) times"
+  [ -s "$d/boxq.log" ] || fail 'queue: after a direct call of the same tree: no job was queued'
+  muxed 'queue: the ssh before the submit'
+  case $(cat "$d/boxq.ssh") in
+    "ssh -o $box_sig"*"/%C -o ControlPersist=300 -o ServerAliveInterval=15 -o ServerAliveCountMax=4") ;;
+    *) fail "queue: the queue client's ssh is '$(cat "$d/boxq.ssh")', not one with the connection sharing options" ;;
+  esac
+  call BOXQ_SSH=mine STUB_BOX=1 BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  [ "$(cat "$d/boxq.ssh")" = mine ] || fail "queue: the caller's BOXQ_SSH became '$(cat "$d/boxq.ssh")'"
+  printf 'b\n' > "$note"
+  call STUB_BOX=1 BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 0 'queue: a changed tree'; [ "$(nsync)" = 1 ] || fail "queue: a changed tree: rsync ran $(nsync) times, not once"
+  muxed 'queue: a changed tree'
+  grep -qF -- 'flock -n -x /root/bloomery-queue/dir-x.lock' "$d/rsync.log" || fail 'queue: the sync is not behind the dir lock'
+  call STUB_BOX=1 -- 'echo hi'
+  synced 'sync: a direct call of the tree a queued call synced' 0
+  printf 'a\n' > "$note"
+  touch -r "$d/mt" "$note"
+  rm -f "$d/mt" "$d/remote.id"
+  # a home whose directory is too long for a socket (or holds a space) uses /tmp/bloomery-box-ssh-<uid>; one whose directory cannot be made
+  # leaves the call on plain ssh, with a line saying so
+  [ ! -d "$fb" ] || fbhad=1
+  for hx in "$hs/a-home-whose-directory-is-too-long-for-a-socket" "$hs/a b"; do
+    call HOME="$hx" -- 'echo hi'
+    want 0 "sharing: the home '${hx#"$hs"/}'"; muxed "sharing: the home '${hx#"$hs"/}'"
+    grep -qF -- "ControlPath=$fb/%C" "$d/ssh.log" || fail "sharing: the home '${hx#"$hs"/}' did not use $fb: $(head -c 300 "$d/ssh.log")"
+  done
+  [ "$fbhad" = 1 ] || rmdir "$fb" 2> /dev/null || true
+  mkdir -p "$hs/nh"
+  : > "$hs/nh/.cache"
+  call HOME="$hs/nh" -- 'echo hi'
+  want 0 'sharing: a directory that cannot be made'; reached 'sharing: a directory that cannot be made'
+  has 'cannot be made or closed to others: this call runs without connection sharing' 'sharing: a directory that cannot be made'
+  [ "$(count "$d/ssh.mux" shared)" = 0 ] && [ "$(count "$d/rsync.mux" shared)" = 0 ] || fail 'sharing: a directory that cannot be made: a call carried the options'
   # BLOOMERY_BOX_PIDDIR (tools/gate-batch.sh's reap): a call files its own pid there while it runs and removes it on exit, TERM included;
   # queue mode files nothing (it execs this shell away), and unset, nothing is filed anywhere.
   local pd=$d/pids line bpid
@@ -695,7 +870,7 @@ STUB
   call BLOOMERY_BOX_PIDDIR="$pd" BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
   [ ! -e "$pd" ] || fail "a queued call filed a pid: $(ls "$pd")"
   rm -f "$d/ssh.pid" "$d/release"
-  env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' BLOOMERY_BOX_PIDDIR="$pd" STUB_HOLD=1 \
+  env -i PATH="$d/stub:/usr/bin:/bin" HOME="$hs" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' BLOOMERY_BOX_PIDDIR="$pd" STUB_HOLD=1 \
     bash "$box" 'echo hi' > /dev/null 2>&1 &
   bpid=$!
   wait_for 'a running call: the ssh stub never held it' non_empty "$d/ssh.pid" || true
@@ -707,7 +882,7 @@ STUB
   # Execute the actual remote command under a fake environment: query failures must stop
   # both A6000 selections before the command's side effect, even when a Bloomery lock is held.
   mkdir -p "$d/tree/tools/ref/models"
-  printf ':\n' > "$d/home/bloomery-env.sh"
+  printf ':\n' > "$hs/bloomery-env.sh"
   printf 'BLOOMERY_MODEL=stub\nMODEL=/unused\nBLOOMERY_DATA=/unused\n' > "$d/tree/tools/ref/ref-paths.sh"
   printf 'V41_MODEL=/unused\n' > "$d/tree/tools/ref/models/deepseek41.sh"
   cat > "$d/stub/nvidia-smi" << 'STUB'
@@ -767,7 +942,7 @@ CASES
   has "box.sh: git status in $d/tree failed (git exit 128)" 'a corrupt index names the tree and Git exit code'
   has '-dirty mark' 'a corrupt index says what the mark would have been'
   grep -q -- 'echo hi' "$d/ssh.log" && fail "a corrupt index: the command reached ssh (REMOTE_CMD was built): $(head -c 160 "$d/ssh.log")"
-  rm -rf "$d"
+  rm -rf "$d" "$hs"
   if [ "$fails" != 0 ]; then
     echo "box.sh: self-test $fails failed" >&2
     return 1
@@ -983,6 +1158,7 @@ if [ "$READONLY" = 0 ]; then
   hold_check "$HOLD_OWNER" || hold_rc=$?
   [ "$hold_rc" = 0 ] || exit "$hold_rc"
 fi
+[ "$LOCAL" = 1 ] || ssh_share
 if [ "$LOCAL" = 1 ]; then
   :
 elif [ "$READONLY" = 1 ]; then
@@ -995,7 +1171,7 @@ elif [ "$READONLY" = 1 ]; then
     *) echo "box.sh: ssh $HOST failed looking for $REMOTE (rc $rc)" >&2; exit "$rc" ;;
   esac
 else
-  # A queued call reads the remote tree's id in the same ssh: this tree's id there means nothing to send (the header).
+  # The remote tree's id is read in the ssh that makes the directory: this tree's id there means nothing to send (the header).
   # 시각은 싣지 않는다(-t 없음) — 바뀐 파일은 내용 체크섬(-c)으로 고르고, 박스에 닿은 파일의 mtime은 박스 시계의 "지금"이 된다.
   # 맥의 mtime을 그대로 실으면 cargo가 낡은 바이너리를 내준다: 박스 시계가 맥보다 앞서 있어(실측 4.1초) 복원 직후의 touch조차
   # 직전 빌드 산출물보다 과거로 찍힌다(변이 바이너리가 두 번 그대로 돌았다).
@@ -1003,32 +1179,29 @@ else
   # 원격 디렉터리에서 빌드가 도는 사이 다른 box.sh 호출의 --delete가 그것을 지우면 빌드가 rc 101로 죽는다(dspark-q3k와
   # ds41splitk 라운드에서 한 번씩). `.oxide-artifacts/`(`embed.o` 등)도 같은 부류다(q3fix 라운드에서 한 번). 맥 트리에는 없으니
   # 삭제 대상에서 뺀다.
-  # A queued call syncs behind the remote directory's lock and ships the tree's id with it, put in place only after rsync ends 0
-  # (the header); the direct call adds neither.
-  [ "$QUEUE" = 0 ] || SYNC_ID=$(tree_id "$HERE") || { echo "box.sh: the tree's id (tree_id $HERE) could not be read" >&2; exit 70; }
+  # A sync ships the tree's id with it, put in place only after rsync ends 0 (the header); a queued call syncs behind the remote
+  # directory's lock, a direct one without.
+  SYNC_ID=$(tree_id "$HERE") || { echo "box.sh: the tree's id (tree_id $HERE) could not be read" >&2; exit 70; }
   SYNC_TMP= SYNC_PATH=() SYNC_ID_SRC=() DROPS=0 SYNC_TRIES=0 PRE_OUT=
   while :; do
-    HAVE_ID=
-    if [ "$QUEUE" = 1 ]; then
-      pre_ssh "mkdir -p $REMOTE && { cat $REMOTE/.sync-id 2>/dev/null || true; }" || sync_bail $?
-      HAVE_ID=$PRE_OUT
-    else
-      pre_ssh "mkdir -p $REMOTE" || sync_bail $?
-    fi
-    if [ "$QUEUE" = 1 ] && [ "$HAVE_ID" = "$SYNC_ID" ]; then
+    pre_ssh "mkdir -p $REMOTE && { cat $REMOTE/.sync-id 2>/dev/null || true; }" || sync_bail $?
+    HAVE_ID=$PRE_OUT
+    if [ "$HAVE_ID" = "$SYNC_ID" ]; then
       echo "box.sh: $REMOTE already holds this tree (sync-id $SYNC_ID): not synced" >&2
       break
     fi
+    if [ -z "$SYNC_TMP" ]; then
+      SYNC_TMP=$(mktemp -d "${TMPDIR:-/tmp}/box-sync.XXXXXX")
+      printf '%s\n' "$SYNC_ID" > "$SYNC_TMP/.sync-id.new"
+    fi
+    SYNC_ID_SRC=("$SYNC_TMP/.sync-id.new")
     if [ "$QUEUE" = 1 ]; then
-      if [ -z "$SYNC_TMP" ]; then
-        SYNC_TMP=$(mktemp -d "${TMPDIR:-/tmp}/box-sync.XXXXXX")
-        printf '%s\n' "$SYNC_ID" > "$SYNC_TMP/.sync-id.new"
-      fi
       SYNC_PATH=(--rsync-path="mkdir -p $QLOCK_DIR && flock -n -x $QLOCK sh -c 'rm -f $REMOTE/.sync-id && rsync \"\$@\" && mv -f $REMOTE/.sync-id.new $REMOTE/.sync-id' rsync")
-      SYNC_ID_SRC=("$SYNC_TMP/.sync-id.new")
+    else
+      SYNC_PATH=(--rsync-path="sh -c 'rm -f $REMOTE/.sync-id && rsync \"\$@\" && mv -f $REMOTE/.sync-id.new $REMOTE/.sync-id' rsync")
     fi
     rc=0
-    rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' --exclude '/*.ll' --exclude '/.oxide-artifacts/' ${SYNC_PATH[@]+"${SYNC_PATH[@]}"} "$HERE"/ ${SYNC_ID_SRC[@]+"${SYNC_ID_SRC[@]}"} "$HOST:$REMOTE/" || rc=$?
+    rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' --exclude '/*.ll' --exclude '/.oxide-artifacts/' -e "$SSH_CMD" ${SYNC_PATH[@]+"${SYNC_PATH[@]}"} "$HERE"/ ${SYNC_ID_SRC[@]+"${SYNC_ID_SRC[@]}"} "$HOST:$REMOTE/" || rc=$?
     [ "$rc" != 0 ] || break
     # rsync's rc is 12 for a held lock and for a dead ssh alike: the lock and the remote tree's id decide (sync_refused).
     SYNC_NEXT=again
@@ -1242,7 +1415,7 @@ if [ "$LOCAL" = 1 ]; then
     bash -c "export BLOOMERY_LOCK_DIR=$(printf %q "$LOCK_DIR") && ${GUARD}$REMOTE_CMD"
 fi
 if [ "$QUEUE" = 0 ]; then
-  ssh "$HOST" "${GUARD}$REMOTE_CMD"
+  ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} "$HOST" "${GUARD}$REMOTE_CMD"
   exit
 fi
 # The queued job (the header): the command as it runs directly, minus the guard, behind the stale-tree check and the dir lock.
@@ -1264,4 +1437,6 @@ qargs=(run --card "$QLANE" --class "$QCLASS" --name "$QNAME")
 [ -z "$QPRED" ] || qargs+=(--expected-s "$QPRED")
 PRED_TEXT=${QPRED:+$QPRED s}
 echo "box.sh: queue $QCLASS card=$QLANE predicted ${PRED_TEXT:-unknown} remote=$REMOTE tree=$SYNC_ID" >&2
+# the queue client's ssh joins the master too, unless the caller names its own
+export BOXQ_SSH=${BOXQ_SSH:-$SSH_CMD}
 exec python3 "$HERE/tools/boxq.py" ${qargs[@]+"${qargs[@]}"} -- "$JOB"

@@ -776,11 +776,13 @@ box() {
     STUB_BOXQ_ARGS="$tmp/boxq.args" STUB_BOXQ_JOB="$tmp/boxq.job" \
     HOME="$tmp/home" PATH="$tmp/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' "$@" < "${BOX_STDIN:-/dev/null}"
 }
+# MUX: the five -o pairs of box.sh's connection sharing, which come before the host in every ssh line (PIN(2026-10-28): the lines began `stub`).
+MUX='(-o [^ ]+ ){5}'
 sshlog() {
   if grep -Eq -- "$2" "$tmp/ssh.log"; then pass "$1"; else fail "$1" "no ssh line matches /$2/" "$tmp/ssh.log"; fi
 }
 rc_is 'box.sh: a command reaches the stub ssh' 0 box "$B/tools/box.sh" 'cargo check'
-sshlog 'box.sh: the guard comes first, before the environment' '^stub \( cd ~/repo/x && \. tools/ref/lease-probe\.sh && lease_guard 1800  \) && source ~/bloomery-env\.sh && \{ :$'
+sshlog 'box.sh: the guard comes first, before the environment' "^${MUX}stub "'\( cd ~/repo/x && \. tools/ref/lease-probe\.sh && lease_guard 1800  \) && source ~/bloomery-env\.sh && \{ :$'
 sshlog 'box.sh: the command comes last' '^\} && cd ~/repo/x && .*cargo check$'
 # A cargo oxide command checks Cargo's selected executable against the pin; any other command does not.
 # The root-aware cargo install stub distinguishes the executable's metadata from other installs.
@@ -865,9 +867,9 @@ run 'box.sh: a failed install-list cannot verify the pin' 70 'cannot read cargo-
   env HOME="$tmp/oxdefault" CARGO_HOME="$tmp/oxempty" CARGO_INSTALL_ROOT="$tmp/oxhome" STUB_OXLIST_RC=23 \
   PATH="$tmp/oxstub:$tmp/oxpath/bin:/usr/bin:/bin" bash -c "${OXCLI} echo ran"
 rc_is 'box.sh: BLOOMERY_BOX_WAIT and BLOOMERY_HOLD_OWNER reach the guard' 0 box env BLOOMERY_BOX_WAIT=0 BLOOMERY_HOLD_OWNER=03 "$B/tools/box.sh" true
-sshlog 'box.sh: lease_guard 0 03' '^stub \( cd ~/repo/x && \. tools/ref/lease-probe\.sh && lease_guard 0 03 \) && source '
+sshlog 'box.sh: lease_guard 0 03' "^${MUX}stub "'\( cd ~/repo/x && \. tools/ref/lease-probe\.sh && lease_guard 0 03 \) && source '
 rc_is 'box.sh: a read-only command runs' 0 box env BLOOMERY_BOX_READONLY=1 "$B/tools/box.sh" 'ps -e | wc -l'
-sshlog 'box.sh: the read-only command has no guard' '^stub source ~/bloomery-env\.sh && \{ :$'
+sshlog 'box.sh: the read-only command has no guard' "^${MUX}stub "'source ~/bloomery-env\.sh && \{ :$'
 sshlog 'box.sh: the read-only command is the command' '^\} && cd ~/repo/x && .*ps -e \| wc -l$'
 for word in 'cargo --version' 'just check' 'make -j' 'cmake ..' 'ninja -C build' './target/release/generate_ds41 --time'; do
   w=${word%% *}
@@ -941,13 +943,18 @@ nofile() {
 }
 # The unset path: no queue words anywhere, and BLOOMERY_BOX_QUEUE=0 is the same bytes.
 rc_is 'box.sh: a direct call' 0 box "$B/tools/box.sh" 'cargo check'
-cp "$tmp/ssh.log" "$Q/direct.ssh"; cp "$tmp/rsync.log" "$Q/direct.rsync"
+# PIN(2026-10-28): the direct call's rsync names the id's temp dir (box-sync.<random>/.sync-id.new), so the two runs are compared with that name read as X.
+norm_rsync() { sed 's#box-sync\.[A-Za-z0-9]*#box-sync.X#' "$tmp/rsync.log" > "$tmp/rsync.norm"; }
+cp "$tmp/ssh.log" "$Q/direct.ssh"; norm_rsync; cp "$tmp/rsync.norm" "$Q/direct.rsync"
 nofile 'box.sh: a direct call runs no queue client' "$tmp/boxq.args"
-notinlog 'box.sh: a direct call has no dir lock in its rsync' "$tmp/rsync.log" 'rsync-path|\.sync-id|bloomery-queue'
+notinlog 'box.sh: a direct call has no dir lock in its rsync' "$tmp/rsync.log" 'bloomery-queue|flock'
+inlog 'box.sh: a direct call removes the id before its sync and puts it back after it' "$tmp/rsync.log" "--rsync-path=sh -c 'rm -f ~/repo/x/\\.sync-id && rsync \"\\\$@\" && mv -f ~/repo/x/\\.sync-id\\.new ~/repo/x/\\.sync-id' rsync"
 rc_is 'box.sh: BLOOMERY_BOX_QUEUE=0 is the direct call' 0 box env BLOOMERY_BOX_QUEUE=0 "$B/tools/box.sh" 'cargo check'
-if cmp -s "$Q/direct.ssh" "$tmp/ssh.log" && cmp -s "$Q/direct.rsync" "$tmp/rsync.log"; then pass 'box.sh: BLOOMERY_BOX_QUEUE=0 sends the same ssh and rsync arguments as unset'; else fail 'box.sh: BLOOMERY_BOX_QUEUE=0 sends the same ssh and rsync arguments as unset' 'they differ' "$tmp/ssh.log"; fi
+norm_rsync
+if cmp -s "$Q/direct.ssh" "$tmp/ssh.log" && cmp -s "$Q/direct.rsync" "$tmp/rsync.norm"; then pass 'box.sh: BLOOMERY_BOX_QUEUE=0 sends the same ssh and rsync arguments as unset'; else fail 'box.sh: BLOOMERY_BOX_QUEUE=0 sends the same ssh and rsync arguments as unset' 'they differ' "$tmp/ssh.log"; fi
 box env BLOOMERY_BOX_LOCAL=0 "$B/tools/box.sh" 'cargo check' > "$tmp/out" 2>&1
-if cmp -s "$Q/direct.ssh" "$tmp/ssh.log" && cmp -s "$Q/direct.rsync" "$tmp/rsync.log"; then pass 'box.sh: BLOOMERY_BOX_LOCAL=0 sends the same ssh and rsync arguments as unset'; else fail 'box.sh: BLOOMERY_BOX_LOCAL=0 sends the same ssh and rsync arguments as unset' 'they differ' "$tmp/ssh.log"; fi
+norm_rsync
+if cmp -s "$Q/direct.ssh" "$tmp/ssh.log" && cmp -s "$Q/direct.rsync" "$tmp/rsync.norm"; then pass 'box.sh: BLOOMERY_BOX_LOCAL=0 sends the same ssh and rsync arguments as unset'; else fail 'box.sh: BLOOMERY_BOX_LOCAL=0 sends the same ssh and rsync arguments as unset' 'they differ' "$tmp/ssh.log"; fi
 run 'box.sh: BLOOMERY_BOX_QUEUE takes 1 or 0' 64 'BLOOMERY_BOX_QUEUE is 1' box env BLOOMERY_BOX_QUEUE=yes "$B/tools/box.sh" ls
 nofile 'box.sh: a queue refusal syncs nothing' "$tmp/rsync.log"
 
@@ -973,7 +980,7 @@ inlog 'box.sh: the job exits 80 on a stale tree' "$tmp/boxq.job" 'exit[ ]80; \}'
 inlog 'box.sh: the job is the command as it runs directly' "$tmp/boxq.job" "^\} && cd ~/repo/x && .*echo hi'\$"
 notinlog 'box.sh: the job has no guard' "$tmp/boxq.job" 'lease_guard|lease-probe'
 notinlog 'box.sh: the ssh of a queued call has no guard and no command' "$tmp/ssh.log" 'lease_guard|source ~/bloomery-env'
-inlog 'box.sh: the remote directory is made, and its id read, before the sync' "$tmp/ssh.log" '^-n stub mkdir -p ~/repo/x && \{ cat ~/repo/x/\.sync-id 2>/dev/null \|\| true; \}$'
+inlog 'box.sh: the remote directory is made, and its id read, before the sync' "$tmp/ssh.log" "^-n ${MUX}stub "'mkdir -p ~/repo/x && \{ cat ~/repo/x/\.sync-id 2>/dev/null \|\| true; \}$'
 # The tree's id: the paths rsync sends, with mode, size, mtime, a regular file's bytes and a link's target. One the remote
 # directory already holds is not synced, so jobs queued one after another from one tree all run; another id, or none, syncs as above.
 TT=$tmp/idtree
@@ -1035,7 +1042,7 @@ inlog 'box.sh: the name holds only [A-Za-z0-9._-]' "$tmp/boxq.args" '^x-FOO_1-[0
 run 'box.sh: a failed sync with the dir lock held by another tree ends 83, named' 83 'a job of this remote directory is running .*bloomery-queue/dir-x\.lock is held on stub.; its tree cannot be replaced under it' \
   box env BLOOMERY_BOX_QUEUE=1 STUB_RSYNC_RC=12 STUB_PROBE_RC=1 STUB_SYNC_ID=0123456789abcdef "$B/tools/box.sh" true
 nofile 'box.sh: the 83 submitted no job' "$tmp/boxq.args"
-inlog 'box.sh: the 83 probed the dir lock and the remote id in one call' "$tmp/ssh.log" '^-n stub mkdir -p /root/bloomery-queue && \{ flock -n -x /root/bloomery-queue/dir-x\.lock true; echo lock=\$\?; cat ~/repo/x/\.sync-id 2>/dev/null \|\| true; \}$'
+inlog 'box.sh: the 83 probed the dir lock and the remote id in one call' "$tmp/ssh.log" "^-n ${MUX}stub "'mkdir -p /root/bloomery-queue && \{ flock -n -x /root/bloomery-queue/dir-x\.lock true; echo lock=\$\?; cat ~/repo/x/\.sync-id 2>/dev/null \|\| true; \}$'
 if [ -e "$(cat "$tmp/rsync.sync-path" 2> /dev/null || echo "$tmp/none")" ]; then fail 'box.sh: the 83 left the id'"'"'s temp dir' 'it is still there'; else pass 'box.sh: the 83 left no temp dir'; fi
 rc_is 'box.sh: a failed sync with the dir lock free is rsync'"'"'s own code' 12 box env BLOOMERY_BOX_QUEUE=1 STUB_RSYNC_RC=12 STUB_PROBE_RC=0 "$B/tools/box.sh" true
 rc_is 'box.sh: a failed sync whose probe cannot reach the box is rsync'"'"'s own code' 12 box env BLOOMERY_BOX_QUEUE=1 STUB_RSYNC_RC=12 STUB_PROBE_RC=255 "$B/tools/box.sh" true
@@ -1122,7 +1129,7 @@ notinlog 'box.sh: none picks no card' "$tmp/boxq.job" 'CUDA_VISIBLE_DEVICES|SIGN
 rc_is 'box.sh: a read under BLOOMERY_BOX_QUEUE=1 runs' 0 box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_BOX_READONLY=1 BLOOMERY_Q_CARD=any "$B/tools/box.sh" 'ps -e | wc -l'
 nofile 'box.sh: a read under the queue submits no job' "$tmp/boxq.args"
 nofile 'box.sh: a read under the queue syncs nothing' "$tmp/rsync.log"
-inlog 'box.sh: a read under the queue is the direct read' "$tmp/ssh.log" '^stub source ~/bloomery-env\.sh && \{ :$'
+inlog 'box.sh: a read under the queue is the direct read' "$tmp/ssh.log" "^${MUX}stub "'source ~/bloomery-env\.sh && \{ :$'
 notinlog 'box.sh: a read under the queue has no dir lock' "$tmp/ssh.log" 'bloomery-queue|flock'
 run 'box.sh: a read under the queue still refuses a build' 64 "names 'cargo'" box env BLOOMERY_BOX_QUEUE=1 BLOOMERY_BOX_READONLY=1 "$B/tools/box.sh" 'cargo --version'
 
