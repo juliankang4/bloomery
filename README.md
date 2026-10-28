@@ -194,7 +194,7 @@ accelerators for the prompt's GEMMs. What each part of the machine costs in a de
 
 ## Status (0.3.10)
 
-Three common machines, one table each, tok/s. Every other record (two cards, older releases, other cards and Macs, the
+Four common machines, one table each, tok/s. Every other record (two cards, older releases, other cards and Macs, the
 reference engines) is in [`docs/numbers.md`](docs/numbers.md), with its machine and conditions.
 
 **One RTX 3090 24 GB**, on our workstation (32-core AVX2 host, 256 GB of RAM, the 3090 at its 250 W cap): the tagged
@@ -213,15 +213,28 @@ reference engines) is in [`docs/numbers.md`](docs/numbers.md), with its machine 
 
 ¹ rounds from 31.90 to 40.67 · ² the first round after a load read 1,440.33, the next three 1,735 to 1,739.
 
-**DGX Spark (GB10, 128 GB)**, measured by [@juliankang4](https://github.com/juliankang4) on their own machine at 0.3.0,
-one request at the serving defaults ([#46](https://github.com/midagedev/bloomery/issues/46)). Their 0.3.9 work made
-prompts up to about twice as fast ([release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.9#from-our-contributors));
-these rows are not re-measured yet.
+**DGX Spark (GB10, 128 GB)**, measured by [@juliankang4](https://github.com/juliankang4) on their own machine, one
+request at a time, greedy, 128 tokens, median of three rounds. The newest row is main `cb8d92eb` (inside 0.3.10) on
+NVIDIA's FP4-Local folder as downloaded, with the MTP draft from Unsloth's `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`
+([#565](https://github.com/midagedev/bloomery/issues/565#issuecomment-6438094863)); the GGUF rows are 0.3.0's
+([#46](https://github.com/midagedev/bloomery/issues/46#issuecomment-6116080838)).
+
+| Model (release) | ~4,096-token prompt: first token | Decode after it | Short prompt decode |
+|---|---|---|---|
+| Qwen3.8-Flash-Next, FP4-Local folder, MTP on (0.3.10) | 2.00 s code, 1.97 s prose | 55.7 code, 39.1 prose | — |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL`, MTP on (0.3.0) | 4.11 s | 41.6 | 41.5 |
+| Qwen3.6-35B-A3B `Q4_K_M` (0.3.0) | 0.90 s | 89.8 | 93.5 |
+
+**RTX 5090 32 GB**, measured by [@juliankang4](https://github.com/juliankang4) at 0.3.0 on native Linux with 64 GB of
+RAM, one request at the serving defaults, greedy, thinking off, 256 tokens
+([#46](https://github.com/midagedev/bloomery/issues/46)).
 
 | Model | ~4K prompt: prefill tok/s, first token | Decode after it | Short prompt decode |
 |---|---|---|---|
-| Qwen3.6-35B-A3B `Q4_K_M` | 4,576, 899 ms | 89.8 | 93.5 |
-| Qwen3.8-Flash-Next `UD-Q4_K_XL`, MTP draft on | 1,038, 4.11 s | 41.6 | 41.5 |
+| Qwen3.6-35B-A3B `Q4_K_M`, whole on the card | 14,937, 276 ms | 345.2 | 356.1 |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL`, card + CPU ³ | 447, 9.12 s | 54.5 | 47.7 |
+
+³ with `BLOOMERY_HOST_ROOM=56G` on 64 GB of RAM: 0.3.0 refused this load at the defaults.
 
 **M5 Ultra**, measured by [@avlp12](https://github.com/avlp12) at 0.3.9's Metal code
 ([#593](https://github.com/midagedev/bloomery/issues/593); conditions in [`docs/mac.md`](docs/mac.md#numbers)).
