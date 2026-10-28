@@ -325,13 +325,15 @@ ssh_share() {
 
 # pre_ssh CMD: `ssh -n HOST CMD` before anything is submitted, its stdout in PRE_OUT and its rc the result. A 255 (the ssh itself
 # dropped: a tailnet restart, a closed connection) is retried once after drop_note; after the submit nothing is retried here.
+# It runs from /: the first ssh of a call becomes the shared master and keeps its cwd for ControlPersist, and a master born
+# in a worktree would hold that tree open (wt retire's LIVE refusal) after the call ends.
 pre_ssh() {
   local r=0
-  PRE_OUT=$(ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} "$HOST" "$1") || r=$?
+  PRE_OUT=$(cd / && exec ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} "$HOST" "$1") || r=$?
   if [ "$r" = 255 ]; then
     drop_note "$r"
     r=0
-    PRE_OUT=$(ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} "$HOST" "$1") || r=$?
+    PRE_OUT=$(cd / && exec ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} "$HOST" "$1") || r=$?
   fi
   return "$r"
 }
