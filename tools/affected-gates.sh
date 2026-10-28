@@ -29,9 +29,15 @@
 # not every reader of the file), and so is the root Cargo.toml of a virtual workspace: [workspace] members and
 # exclude select the recipes that read a package that entered or left the workspace (`exclude = [.., "fuzz"]`
 # where fuzz held no member selects nothing), default-members the recipes with a cargo line naming no -p and
-# no --workspace, and every other table (workspace.dependencies, profile, patch, ...), Cargo.lock and the
-# toolchain files select every cargo recipe. The `manifests:` block prints, per changed manifest, what changed
-# by table and the recipes each change selects, and the recipes that read it whole.
+# no --workspace, a moved workspace.dependencies entry the recipes whose closure holds a package that inherits it
+# (`name = { workspace = true }`; an entry no package inherits stays whole), and workspace.lints (like a package's
+# [lints]) selects no recipe: the static tier (`just lint`, `just check`) holds it, and the `affected:` line says so. Every other
+# table (profile, patch, workspace.package, ...) and the toolchain files select every cargo recipe. Cargo.lock is read
+# by package: the packages its diff moves (added, removed, another version, another dependency list, a workspace
+# member's own entry) select the recipes whose build on their host reaches one, walking the lock from the packages the
+# recipe links, so a package every target reaches still selects every recipe; a lock the reader cannot take apart
+# stays whole, with a note. The `manifests:` block prints, per changed manifest, what changed by table and the
+# recipes each change selects, and the recipes that read it whole.
 # The lever registry (crates/levers/src/registry.rs) is read by row when every edit to it is a row (an added, changed or removed
 # `LeverSpec`/`runner`/`path` element, or the `&str` const that names one): it selects the recipe that tests the registry and the
 # recipes whose inputs hold a file outside crates/levers, or whose own command lines, that name a moved row (its variable or const). Code beside the rows,

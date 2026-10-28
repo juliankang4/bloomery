@@ -93,18 +93,25 @@ A recipe's inputs are:
   - for a cargo recipe, Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo/config.toml, and
     tools/oxide-host.sh (the host's CPU flags and llc), tools/oxide-backend.sh and its patch when the recipe runs `cargo oxide`. A virtual workspace's Cargo.toml is read by
     table too (`root_moves`): of [workspace], `members`/`exclude` select the recipes that read a package that
-    entered or left the workspace (an exclude of a path that held no member selects nothing) and
-    `default-members` the recipes with a cargo line naming no `-p` and no `--workspace`; every other table,
-    rust-toolchain.toml and .cargo/config.toml select every cargo recipe. So does Cargo.lock, unless the build for
-    x86_64-unknown-linux-gnu reaches nothing its diff names (`lock_outside`): the packages that appeared, went or
-    took another dependency name, each outside the closure of the workspace members on that target (a member's
-    `[target.<key>]` edge counts by `table_read`; an external package's lock edges are all followed, except one
-    only one side's lock has, which a feature the box does not enable puts there). Such a diff selects no recipe
-    and prints a note naming the packages. A package manifest's `[target.<key>]` table is left out of its view the
-    same way when its `cfg(…)` is false for x86_64-unknown-linux-gnu or its key is another triple; a predicate this tool
-    cannot decide stays, with a note. A recipe that runs tools/mac-gate.sh builds on aarch64-apple-darwin: both rules
-    read that target for it, so a macOS-only change selects the Mac gates and no box gate. The ledger key still hashes
-    Cargo.lock and the manifests whole;
+    entered or left the workspace (an exclude of a path that held no member selects nothing),
+    `default-members` the recipes with a cargo line naming no `-p` and no `--workspace`, and each moved
+    `[workspace.dependencies]` entry the recipes whose closure holds a package that inherits it (`name = { workspace = true }`
+    in a table the recipe's host reads; an entry no package inherits stays whole, with a note); `[workspace.lints]`, like a
+    package's `[lints]`, selects no recipe: a lint level moves no codegen or behaviour, the static tier holds it (`just lint`,
+    `just check`), and the `affected:` line names it; every other table ([profile.*], [patch], [workspace.package], ...),
+    rust-toolchain.toml and .cargo/config.toml select every cargo recipe. Cargo.lock is read by package (`LockDiff`):
+    the packages its diff moves (appeared, went, a version, source or checksum, a dependency list; a workspace member's
+    own entry too) select the recipes whose build on their host reaches one, by a walk over the lock from the packages
+    the recipe's targets link, on x86_64-unknown-linux-gnu for a box recipe and aarch64-apple-darwin for one that runs
+    tools/mac-gate.sh (a member's `[target.<key>]` edge counts by `table_read`; an external package's lock edges are all
+    followed, except one only one side's lock has, which a feature the host does not enable puts there). A package every
+    target reaches selects every recipe, by that same rule; a diff no recipe reaches selects none and prints a note
+    naming the packages. A lock the reader cannot take apart (one side missing or not parsing, a moved top-level key
+    beside `package`, a diff that names no package) stays whole for every cargo recipe, with a note. A package manifest's `[target.<key>]` table is
+    left out of its view the same way when its `cfg(…)` is false for x86_64-unknown-linux-gnu or its key is another
+    triple; a predicate this tool cannot decide stays, with a note. A recipe that runs tools/mac-gate.sh builds on
+    aarch64-apple-darwin: these rules read that target for it, so a macOS-only change selects the Mac gates and no box
+    gate. The ledger key still hashes Cargo.toml, Cargo.lock and the manifests whole;
   - its own text in the justfile (a recipe whose text changed is selected), and its dependencies'
     inputs.
 
@@ -937,6 +944,39 @@ def target_notes(f: str, da: dict | None, db: dict | None) -> list[str]:
     return out
 
 
+# what holds a lint level: it moves no codegen and no behaviour, so no gate runs for it
+STATIC_TIER = "just lint, just check"
+
+
+def lints_moved(da: dict | None, db: dict | None) -> bool:
+    """Whether the `[lints]` table of a package manifest differs between two parses of it: held by the static tier, so
+    `view_moves` leaves it out. A side with no file is the whole file, not a lint move."""
+    return da is not None and db is not None and canon(da.get("lints")) != canon(db.get("lints"))
+
+
+_DEP_SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies", "dev_dependencies", "build_dependencies")
+
+
+def inherits(doc: dict, name: str, host: str | None) -> bool:
+    """Whether package manifest `doc` takes dependency `name` from the root's `[workspace.dependencies]`
+    (`name = { workspace = true }`, or `name.workspace = true`) in a table a build on `host` reads: a plain table, or
+    a `[target.<key>]` table `table_read` does not say False for (None: any table)."""
+
+    def takes(tables: dict) -> bool:
+        for sec in _DEP_SECTIONS:
+            deps = tables.get(sec)
+            spec = deps.get(name) if isinstance(deps, dict) else None
+            if isinstance(spec, dict) and spec.get("workspace") is True:
+                return True
+        return False
+
+    if takes(doc):
+        return True
+    target = doc.get("target")
+    return isinstance(target, dict) and any(isinstance(body, dict) and (host is None or table_read(k, host) is not False) and takes(body)
+                                            for k, body in target.items())
+
+
 def _by_name(entries: list[dict] | None) -> dict[str, str]:
     """A target array's entries by name ("" for the nameless), each name's entries in canonical form."""
     acc: dict[str, list[str]] = {}
@@ -957,7 +997,7 @@ def view_moves(da: dict | None, db: dict | None, pkg_dir: str, wants: frozenset[
     out: list[tuple[str, bool]] = []
     for k in sorted(set(va) | set(vb)):
         x, y = va.get(k), vb.get(k)
-        if canon(x) == canon(y):
+        if canon(x) == canon(y) or k == "lints":  # a lint level moves no build: the static tier holds it (`lints_moved`)
             continue
         if k in TARGET_TABLES and all(v is None or _target_array(k, v) for v in (x, y)):
             nx, ny = _by_name(x), _by_name(y)
@@ -977,7 +1017,7 @@ def view_moves(da: dict | None, db: dict | None, pkg_dir: str, wants: frozenset[
 # ---- the root manifest, read by table ----
 #
 # A virtual workspace's root Cargo.toml is every cargo recipe's input, and a change of it names the recipes it reaches
-# by table, as a package manifest does:
+# by table and by entry, as a package manifest does:
 #   - [workspace] `members` and `exclude` decide which packages are members. The reach is the recipes that read a
 #     package that entered or left (TableReads.delta: both sides' `cargo metadata` member sets, which hold cargo's own
 #     rules — globs, an explicit member against an exclude, a path dependency inside the root being a member — and
@@ -985,9 +1025,15 @@ def view_moves(da: dict | None, db: dict | None, pkg_dir: str, wants: frozenset[
 #     set equal on both sides moves no recipe (`exclude = [..., "fuzz"]` where fuzz was no member, a reorder, a glob).
 #   - [workspace] `default-members` decides the build that names no `-p` and no `--workspace`: the recipes with such
 #     an invocation (RecipeInputs.bare_cargo), none while every cargo line names its packages.
-#   - everything else is whole: every recipe that reads the file, as before. [workspace.dependencies], .package,
-#     .lints and .metadata, `resolver`, [profile.*], [patch.*], [replace], a key this code does not know, a manifest
-#     that does not parse, a file added or removed, a `workspace` that is not a table on both sides.
+#   - [workspace.dependencies] is read by entry: a moved entry reaches the recipes whose closure holds a package that
+#     inherits it (`name = { workspace = true }`, TableReads.inheritors) in a dependency table, or a `[target.<key>]`
+#     one, that the recipe's host reads. An entry no package of either side inherits, or a manifest that does not
+#     parse while the inheritors are read, leaves the entry whole.
+#   - [workspace.lints] moves no recipe: a lint level changes no codegen and no behaviour, and the static tier
+#     (`just lint`, `just check`) holds it. `affected` names it on its summary line (TableReads.static_moved).
+#   - everything else is whole: every recipe that reads the file, as before. [workspace.package] and .metadata,
+#     `resolver`, [profile.*], [patch.*], [replace], a key this code does not know, a manifest that does not parse, a
+#     file added or removed, a `workspace` that is not a table on both sides.
 # A recipe that reads the file as a file is whole whatever moved (ManifestUse.whole). Today only a bin's box dep-info
 # can say so: a script names a path under tools/ or crates/ (_SCRIPT_PATH) and a literal one under tools/, crates/ or
 # docs/ (Tree._LITERAL), so a script that opens Cargo.toml by its bare name is not seen, here or anywhere in the mapping.
@@ -1009,8 +1055,9 @@ def _str_list(v) -> bool:
 
 def root_moves(da: dict | None, db: dict | None) -> list[tuple[str, str]]:
     """What moved between two parses of the root manifest, one (label, kind) per table: `members` for [workspace]
-    members and exclude, `default` for default-members, `whole` for every other table. A side with no file or one
-    that does not parse is the whole file. Empty when no table moved (a comment, the layout)."""
+    members and exclude, `default` for default-members, `dep` for each moved [workspace.dependencies] entry, `lints` for
+    [workspace.lints], `whole` for every other table. A side with no file or one that does not parse is the whole file.
+    Empty when no table moved (a comment, the layout)."""
     if da is None or db is None or isinstance(da, Unparsed) or isinstance(db, Unparsed):
         if da is None and db is None:
             return []
@@ -1029,10 +1076,16 @@ def root_moves(da: dict | None, db: dict | None) -> list[tuple[str, str]]:
             if canon(u) == canon(v):
                 continue
             listed = all(w is None or _str_list(w) for w in (u, v))
+            tabled = all(w is None or isinstance(w, dict) for w in (u, v))
             if s in ROOT_MEMBERSHIP and listed:
                 out.append((f"[workspace] {s}", "members"))
             elif s == ROOT_DEFAULT_MEMBERS and listed:
                 out.append((f"[workspace] {s}", "default"))
+            elif s == "dependencies" and tabled:
+                ua, va = u or {}, v or {}
+                out += [(f"[workspace.dependencies] {e}", "dep") for e in sorted(set(ua) | set(va)) if canon(ua.get(e)) != canon(va.get(e))]
+            elif s == "lints" and tabled:
+                out.append(("[workspace.lints]", "lints"))
             elif any(isinstance(w, dict) for w in (u, v)):
                 out.append((f"[workspace.{s}]", "whole"))
             else:
@@ -2150,15 +2203,20 @@ class TableReads:
     changed file picks recipes (select, narrow); the key reads the same manifest view. `hit` records each answer, which `lines` prints. The root Cargo.toml of a virtual
     workspace is read here too (`root`), by the tables `root_moves` names; a root that is a package's own
     manifest is a package manifest and a cargo global, whole. A recipe sees the `[target.<key>]` tables of its host
-    (`host`: the box, or the Mac for a recipe that runs MAC_GATE), and a Cargo.lock whose diff its host's build does not
-    reach (`lock_outside`, kept in `unreached`) is read by no such recipe (`outside`). `notes` holds the box's lock line
-    and one for each `[target.<key>]` table the box's view leaves out or cannot decide (`select` hands them to `affected`)."""
+    (`host`: the box, or the Mac for a recipe that runs MAC_GATE), and Cargo.lock by the packages its build reaches
+    (`lock`, a `LockDiff`: `outside` is true for a recipe whose closure on its host holds none of the packages the diff
+    moved). A `[lints]` table moves no recipe (`static_moved` names it). `notes` holds one line for each
+    `[target.<key>]` table the box's view leaves out or cannot decide and one for a Cargo.lock the reader keeps whole
+    (`select` hands them to `affected`)."""
 
     def __init__(self, changed: list[str], a: Side | None, b: Side):
         self.a, self.b = a, b
         self.docs: dict[str, tuple[dict | None, dict | None]] = {}
         self.root: str | None = None
         self._delta: tuple[dict[str, str], dict[str, str]] | None = None
+        self._root_kinds: list[tuple[str, str]] | None = None
+        self._inheritors: dict[tuple[str, str | None], set[str] | None] = {}
+        self._roots: dict[str, frozenset[str] | None] = {}
         for f in changed:
             if a is not None and (f in b.tree.manifest_paths or f in a.tree.manifest_paths):
                 self.docs[f] = (self._doc(a, f), self._doc(b, f))
@@ -2170,24 +2228,97 @@ class TableReads:
         self.notes: list[str] = []
         if self.levers.why_whole is not None:
             self.notes.append(self.levers.summary())
-        self.unreached: dict[str, dict[str, str]] = {}  # changed file -> host -> why a build on that host does not reach it
+        self.static_moved: list[str] = []  # the lint tables that moved: held by the static tier, selecting no recipe
         for f, (da, db) in self.docs.items():
             if f != self.root:
                 self.notes += target_notes(f, da, db)
+                if lints_moved(da, db):
+                    self.static_moved.append(f"{f} [lints]")
+        if self.root is not None and any(k == "lints" for _, k in self.root_kinds()):
+            self.static_moved.append(f"{ROOT_MANIFEST} [workspace.lints]")
+        self.lock: LockDiff | None = None  # Cargo.lock read by package; None when it is read whole
         if a is not None and LOCK_FILE in changed:
-            outside = lock_outside(a, b)
-            if outside:
-                self.unreached[LOCK_FILE] = outside
-                if "box" in outside:
-                    self.notes.append(outside["box"])
+            self._read_lock(a, b)
+
+    def _read_lock(self, a: Side, b: Side) -> None:
+        """Parse both locks; a side the reader cannot take apart leaves `lock` None, so every cargo recipe reads the file whole."""
+        if not (a.tree.exists(LOCK_FILE) and b.tree.exists(LOCK_FILE)):
+            self.notes.append(f"{LOCK_FILE}: {'added' if not a.tree.exists(LOCK_FILE) else 'removed'}; read whole by every cargo recipe")
+            return
+        try:
+            diff = LockDiff(a, b)
+        except RecipeError as err:
+            self.notes.append(f"{LOCK_FILE}: not read by package ({err}); read whole by every cargo recipe")
+            return
+        if diff.rest_moved:
+            self.notes.append(f"{LOCK_FILE}: a top-level key beside `package` moved; read whole by every cargo recipe")
+            return
+        if not diff.moved:
+            self.notes.append(f"{LOCK_FILE}: the diff names no package the parse sees (a comment or the layout); read whole by every cargo recipe")
+            return
+        self.lock = diff
 
     def host(self, n: str) -> str:
         """Where recipe `n` builds, read on both sides: the Mac when either side's recipe runs MAC_GATE (`recipe_host`)."""
         return "mac" if any(s is not None and recipe_host(s.recipes, n) == "mac" for s in (self.a, self.b)) else "box"
 
+    @staticmethod
+    def _feature_param(side: Side, n: str, _seen: frozenset[str] = frozenset()) -> bool:
+        """Whether recipe `n` or a recipe it depends on builds with features a recipe parameter names: the closure of such
+        a build is known at run time only."""
+        if n in _seen or n not in side.recipes:
+            return False
+        if any("{{" in f for inv in side.graph.inputs(n).commands.invocations for f in inv.features):
+            return True
+        return any(TableReads._feature_param(side, d, _seen | {n}) for d in side.recipes[n].deps)
+
+    def lock_roots(self, n: str) -> frozenset[str] | None:
+        """The workspace packages recipe `n` builds or links on either side: the packages of its manifest views. None when
+        it names none, its inputs have errors or its features come from a recipe parameter (a build the walk may not have
+        seen whole): the file is then read whole."""
+        if n not in self._roots:
+            out: set[str] | None = set()
+            for s in (self.a, self.b):
+                if s is None or n not in s.recipes:
+                    continue
+                ri = s.graph.inputs(n)
+                if ri.errors or self._feature_param(s, n):
+                    out = None
+                    break
+                by_manifest = {p.manifest: p.name for p in s.tree.packages.values()}
+                out |= {by_manifest[m] for m in ri.manifests.views if m in by_manifest}
+            self._roots[n] = frozenset(out) if out else None
+        return self._roots[n]
+
     def outside(self, n: str, f: str) -> bool:
-        """Whether changed file `f` reaches nothing recipe `n` builds on its host: a Cargo.lock whose diff that host does not reach."""
-        return f in self.unreached and self.host(n) in self.unreached[f]
+        """Whether changed file `f` reaches nothing recipe `n` builds on its host: a Cargo.lock whose moved packages the
+        recipe's closure on its host does not hold."""
+        if f != LOCK_FILE or self.lock is None:
+            return False
+        roots = self.lock_roots(n)
+        return roots is not None and not self.lock.differs(self.host(n), roots)
+
+    def lock_hint(self) -> str:
+        """Why no recipe read the changed Cargo.lock, for `unmapped`."""
+        assert self.lock is not None
+        if self.a is not None and "box" in lock_outside(self.a, self.b, self.lock):
+            return "the packages it changes are not in the x86_64-linux build (notes:)"
+        return "no recipe's build reaches a package that moved (notes:)"
+
+    def lock_notes(self, names: list[str]) -> list[str]:
+        """The line for a Cargo.lock read by package: the packages that moved and how many of the recipes `names` that read
+        the file it selects. None when it selects every one of them."""
+        if self.lock is None or self.b is None:
+            return []
+        readers = [n for n in names if n in self.b.recipes and self.b.graph.inputs(n).match(LOCK_FILE) is not None]
+        chosen = [n for n in readers if not self.outside(n, LOCK_FILE)]
+        if len(chosen) == len(readers):
+            return []
+        shown = ", ".join(self.lock.moved[:8]) + (f" and {len(self.lock.moved) - 8} more" if len(self.lock.moved) > 8 else "")
+        if not chosen:
+            out = lock_outside(self.a, self.b, self.lock) if self.a is not None else {}
+            return [out["box"] if "box" in out else f"{LOCK_FILE}: {shown} changed; no recipe's build reaches a package that moved"]
+        return [f"{LOCK_FILE}: {shown} changed; {len(chosen)} of {len(readers)} recipes' builds reach a package that moved"]
 
     @staticmethod
     def _doc(side: Side, f: str) -> dict | None:
@@ -2229,14 +2360,65 @@ class TableReads:
             out += [f"-{x}" for m, x in left.items() if ia.match(m) is not None]
         return out
 
+    def inheritors(self, name: str, host: str | None) -> set[str] | None:
+        """The manifests of the packages that inherit root entry `name` (`name = { workspace = true }`) on either side, in
+        a table a build on `host` reads (None: in any table). None when a manifest does not parse."""
+        key = (name, host)
+        if key not in self._inheritors:
+            out: set[str] | None = set()
+            for s in (self.a, self.b):
+                if s is None:
+                    continue
+                for p in s.tree.packages.values():
+                    try:
+                        doc = read_manifest(s.tree.root, p.manifest)
+                    except RecipeError:
+                        out = None
+                        break
+                    if out is not None and inherits(doc, name, host):
+                        out.add(p.manifest)
+                if out is None:
+                    break
+            self._inheritors[key] = out
+        return self._inheritors[key]
+
+    def root_kinds(self) -> list[tuple[str, str]]:
+        """`root_moves` of the root manifest with each moved `[workspace.dependencies]` entry settled: an entry that no
+        package of either side inherits, or that a manifest which does not parse may, is read whole."""
+        if self._root_kinds is None:
+            assert self.root is not None
+            out: list[tuple[str, str]] = []
+            for label, kind in root_moves(*self.docs[self.root]):
+                if kind == "dep":
+                    names = self.inheritors(label.split("] ", 1)[1], None)
+                    if names is None or not names:
+                        why = "a manifest does not parse" if names is None else "no package inherits it"
+                        self.notes.append(f"{ROOT_MANIFEST}: {label} changed and {why}; read whole by every cargo recipe")
+                        kind = "whole"
+                out.append((label, kind))
+            self._root_kinds = out
+        return self._root_kinds
+
+    def _closure(self, n: str) -> dict[str, str]:
+        """The manifest -> package name of every package recipe `n` builds or links, on either side."""
+        out: dict[str, str] = {}
+        for s in (self.a, self.b):
+            if s is None or n not in s.recipes:
+                continue
+            by_manifest = {p.manifest: p.name for p in s.tree.packages.values()}
+            out.update({m: by_manifest[m] for m in s.graph.inputs(n).manifests.views if m in by_manifest})
+        return out
+
     def _root_moves(self, n: str, f: str) -> list[tuple[str, bool]] | None:
         """moves() for the root manifest: None (read as a file) when a table that stays whole moved or the recipe
-        reads the file as a file; else the membership and default-members moves that reach `n`."""
+        reads the file as a file; else the membership, default-members and `[workspace.dependencies]` moves that reach `n`:
+        an entry reaches the recipes whose closure holds a package that inherits it in a table its host reads. A lint
+        table reaches none."""
         sides = [s for s in (self.a, self.b) if s is not None and n in s.recipes]
         reads = [s for s in sides if s.graph.inputs(n).match(f) is not None]
         if not reads:
             return None
-        kinds = root_moves(*self.docs[f])
+        kinds = self.root_kinds()
         if any(k == "whole" for _, k in kinds) or any(f in s.graph.inputs(n).manifests.whole for s in reads):
             self.seen[f][n] = None
             return None
@@ -2248,6 +2430,11 @@ class TableReads:
                 mv.append((f"{label} ({', '.join(reach)})", False))
             elif kind == "default" and bare:
                 mv.append((label, False))
+            elif kind == "dep":
+                held = self.inheritors(label.split("] ", 1)[1], self.host(n)) or set()
+                who = sorted(name for m, name in self._closure(n).items() if m in held)
+                if who:
+                    mv.append((f"{label} ({', '.join(who[:4])}{f', +{len(who) - 4}' if len(who) > 4 else ''})", False))
         self.seen[f][n] = mv
         return mv
 
@@ -2255,7 +2442,7 @@ class TableReads:
         """The tables of manifest `f` that moved in the box's view whatever recipe reads it, (label, whether a named entry of a target)."""
         da, db = self.docs[f]
         if f == self.root:
-            return [(label, False) for label, _ in root_moves(da, db)]
+            return [(label, False) for label, kind in self.root_kinds() if kind != "lints"]
         return view_moves(da, db, os.path.dirname(f), None)
 
     def moves(self, n: str, f: str) -> list[tuple[str, bool]] | None:
@@ -2298,6 +2485,10 @@ class TableReads:
             why = self.a.graph.inputs(n).match(f)
         if why is None or self.outside(n, f):
             return None, None
+        if f == LOCK_FILE and self.lock is not None:
+            roots = self.lock_roots(n)
+            moved = self.lock.differs(self.host(n), roots) if roots else []
+            return (f"{why}: {', '.join(moved[:3])}{f', +{len(moved) - 3}' if len(moved) > 3 else ''}" if moved else why), None
         mv = self.moves(n, f)
         if mv is None:
             return why, None
@@ -2315,11 +2506,13 @@ class TableReads:
             whole = sorted(n for n, mv in seen.items() if mv is None)
             out.append(f"  {f}: {len(by_table)} recipes read it by table, {len(whole)} whole")
             root = f == self.root
-            kinds = root_moves(da, db) if root else [(label, "table") for label, _ in self.moved(f)]
+            kinds = self.root_kinds() if root else [(label, "table") for label, _ in self.moved(f)]
             if not root:  # a table only a Mac recipe's view moves, then the tables the box's view leaves out: named, selecting no box recipe
                 have = {label for label, _ in kinds}
                 kinds += [(m, "table") for m in sorted({m for mv in by_table.values() for m, _ in mv} - have)]
                 kinds += [(f"[target.{k}] (not in the x86_64-linux build)", "table") for k, v in target_moves(da, db) if v is False]
+            if not root and lints_moved(da, db):
+                kinds.append(("[lints]", "lints"))
             for label, kind in kinds or [("nothing (comments or layout only)", "table")]:
                 if kind == "whole":  # a root table that stays whole: every recipe that reads the file
                     sel, pool = whole, whole
@@ -2327,7 +2520,8 @@ class TableReads:
                     pool = list(by_table)
                     sel = [n for n, mv in by_table.items() if any(m == label or m.startswith(label + " (") for m, _ in mv)]
                 every = len(sel) == len(pool) and len(sel) > 3
-                out.append(f"    {label} -> " + (f"every reader ({len(sel)})" if every else " ".join(sel) if sel else "no recipe"))
+                held = f" (held by the static tier: {STATIC_TIER})" if kind == "lints" else ""
+                out.append(f"    {label} -> " + (f"every reader ({len(sel)})" if every else " ".join(sel) if sel else "no recipe") + held)
             if root and any(k == "members" for _, k in kinds):
                 entered, left = self.delta()
                 assert self.a is not None
@@ -2689,6 +2883,7 @@ def select(changed: list[str], a: Side | None, b: Side, prefix: str, tables: Tab
             if old is None or old.text != b.recipes[n].text:
                 hits[n].append(("justfile", "new recipe" if old is None else "recipe text"))
                 mapped.add("justfile")
+    notes += tables.lock_notes(names)
     sels = []
     for n in names:
         if hits[n]:
@@ -2701,8 +2896,8 @@ def select(changed: list[str], a: Side | None, b: Side, prefix: str, tables: Tab
         side = b if b.tree.exists(f) or a is None else a
         if f == "justfile":
             hint = "no gate-* recipe text changed"
-        elif f in tables.unreached:
-            hint = "the packages it changes are not in the x86_64-linux build (notes:)"
+        elif f == LOCK_FILE and tables.lock is not None:
+            hint = tables.lock_hint()
         elif any(mv is not None for mv in tables.seen.get(f, {}).values()):
             hint = "read by table: no recipe's view of it moved (manifests:)"
         else:
@@ -2814,6 +3009,8 @@ def cmd_affected(args: argparse.Namespace) -> int:
         mac_note = f", {len(deferred)} deferred to weekly (CUDA gate, GGUF input)" if deferred else ""
         lever_why = tables.levers.summary()
         lever_note = f"; {lever_why}" if lever_why else ""
+        if tables.static_moved:
+            lever_note += f"; {', '.join(tables.static_moved)} moved: a lint level is held by the static tier ({STATIC_TIER}) and selects no gate"
         if narrowed:
             by_derivation = f"; {len(nar.derived)} files by derivation" if nar.derived else ""
             print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected "
@@ -7386,6 +7583,7 @@ class Lock:
     deps: dict[str, set[str]]  # package name -> the names it depends on, every version merged
     entries: dict[LockKey, tuple[str, ...]] = field(default_factory=dict)  # every package -> its dependencies as the file writes them
     by_name: dict[str, list[LockKey]] = field(default_factory=dict)
+    rest: str = ""  # canon of every top-level key but `package` (the format version, `[metadata]`, `[[patch.unused]]`)
 
     def resolve(self, owner: LockKey, dep: str) -> list[LockKey]:
         """The packages a dependency string of `owner` names: `name`, `name version` or `name version (source)`, as the file
@@ -7421,24 +7619,29 @@ def load_lock(root: str) -> Lock:
         key = (name, p.get("version", ""), p.get("source", ""), p.get("checksum", ""))
         entries[key] = tuple(p.get("dependencies", []))
         by_name.setdefault(name, []).append(key)
-    return Lock(roots, deps, entries, by_name)
+    return Lock(roots, deps, entries, by_name, canon({k: v for k, v in data.items() if k != "package"}))
 
 
-# ---- Cargo.lock as a selecting input: only what the recipe's host builds ----
+# ---- Cargo.lock as a selecting input: by package, for what each recipe's host builds ----
 #
-# `affected` reads Cargo.lock as an input of every cargo recipe unless its diff reaches nothing the recipe's host builds
-# (HOSTS: the box, or the Mac for a recipe that runs MAC_GATE). The diff
-# names the packages that appeared or went (a key is name, version, source and checksum) and those on both sides that
-# depend on another set of names (`shlex` on one side and `shlex 1.3.0` on the other is one name). A host reaches what a
-# walk finds from the workspace members over the lock's edges: a member's edge counts when some dependency of that name
-# sits in a plain table or in a `[target.<key>]` table `table_read` does not say False for on that host (all features;
-# normal, build and dev). The lock lists every platform's edges of an external package, so all of them are followed, except a name
-# one side's lock has and the other's has not for a package of the same key: a feature turns an optional dependency on
-# somewhere (`sha2`'s new `sha2-asm`, asked for under an aarch64 table), and nothing says the box enables it. A package
-# of one version changes its box edges only through a feature some manifest asks of it (the recipes that read that
-# manifest are selected by table) or through another package of the diff (which the walk reaches or not by the same
-# rule), so dropping those names loses no box input. When both walks reach the same packages the diff selects no recipe;
-# the key still hashes the file whole.
+# `affected` reads Cargo.lock per recipe (`LockDiff`). The diff names the packages that moved: a key (name, version,
+# source, checksum) that appeared or went, and those on both sides that depend on another set of names (`shlex` on one
+# side and `shlex 1.3.0` on the other is one name); a workspace member's own entry counts, so a version bump or a new
+# member is a package of the diff. A recipe's build on its host (HOSTS: the box, or the Mac for a recipe that runs
+# MAC_GATE) reaches what a walk finds from the workspace packages its targets link (the packages of its manifest views)
+# over the lock's edges: a member's edge counts when some dependency of that name sits in a plain table or in a
+# `[target.<key>]` table `table_read` does not say False for on that host (all features; normal, build and dev), and a
+# member outside the recipe's closure is not entered. The lock lists every platform's edges of an external package, so
+# all of them are followed, except a name one side's lock has and the other's has not for a package of the same key: a
+# feature turns an optional dependency on somewhere (`sha2`'s new `sha2-asm`, asked for under an aarch64 table), and
+# nothing says the host enables it. A package of one version changes its edges only through a feature some manifest asks
+# of it (the recipes that read that manifest are selected by table) or through another package of the diff (which the
+# walk reaches or not by the same rule), so dropping those names loses no input of the host.
+# A recipe is selected when the walk over the lock of A and the walk over the lock of B reach different packages: a
+# package every target reaches selects every recipe by that same rule, and one no recipe links selects none. What the
+# reader cannot decide keeps the file whole for every cargo recipe, and a note says why: a side with no lock or one that
+# does not parse, an edge the lock does not resolve, a top-level key beside `package` that moved, a diff that names no
+# package (a comment, the layout), a recipe whose inputs have errors. The key still hashes the file whole.
 
 
 def _dep_names(deps: tuple[str, ...]) -> set[str]:
@@ -7458,45 +7661,96 @@ def lock_changed(a: Lock, b: Lock, members: set[str]) -> list[str]:
     return sorted(out)
 
 
-def lock_reach(tree: Tree, lock: Lock, other: Lock, host: str) -> set[LockKey]:
-    """The external packages of `lock` that the workspace members of `tree` reach on `host`, following only the names
-    a package has in both `lock` and `other` (see the block above)."""
-    members = set(tree.packages)
-    seen: set[LockKey] = set()
-    todo: list[LockKey] = []
-
-    def take(keys: list[LockKey]) -> None:
-        for k in keys:
-            if (k[2] or k[0] not in members) and k not in seen:
-                seen.add(k)
-                todo.append(k)
-
-    for m in sorted(members):
-        built = {d.pkg for d in tree.packages[m].deps if d.target is None or table_read(d.target, host) is not False}
-        for k in lock.by_name.get(m, ()):
-            if not k[2]:
-                take([t for dep in lock.entries[k] if dep.split(" ", 1)[0] in built for t in lock.resolve(k, dep)])
-    while todo:
-        k = todo.pop()
-        theirs = other.entries.get(k)
-        common = None if theirs is None else _dep_names(theirs)
-        take([t for dep in lock.entries[k] if common is None or dep.split(" ", 1)[0] in common for t in lock.resolve(k, dep)])
-    return seen
+def lock_moved(a: Lock, b: Lock) -> list[str]:
+    """Every package the diff of two locks names, as `name version`, sorted: the ones that appeared or went, and the ones
+    on both sides with another set of dependency names. A workspace member's own entry counts."""
+    out = {f"{k[0]} {k[1]}" for k in a.entries.keys() ^ b.entries.keys()}
+    out |= {f"{k[0]} {k[1]}" for k in a.entries.keys() & b.entries.keys() if _dep_names(a.entries[k]) != _dep_names(b.entries[k])}
+    return sorted(out)
 
 
-def lock_outside(a: Side, b: Side) -> dict[str, str]:
-    """host -> the note `affected` prints, for each host whose build the diff of Cargo.lock does not reach (the two walks
-    reach the same packages). A host missing from the answer reads the file whole, as a global input: a side with no
-    lock, a diff that names no package, and a diff whose packages the host reaches."""
+class LockWalk:
+    """What the workspace packages of `tree` reach in `lock` on `host` (the block above), `other` being the lock of the
+    diff's other side. The edges of a package are resolved once."""
+
+    def __init__(self, tree: Tree, lock: Lock, other: Lock, host: str):
+        self.tree, self.lock, self.other, self.host = tree, lock, other, host
+        self._edges: dict[LockKey, list[LockKey]] = {}
+
+    def member(self, k: LockKey) -> bool:
+        return not k[2] and k[0] in self.tree.packages
+
+    def edges(self, k: LockKey) -> list[LockKey]:
+        if k not in self._edges:
+            if self.member(k):
+                names = {d.pkg for d in self.tree.packages[k[0]].deps if d.target is None or table_read(d.target, self.host) is not False}
+                kept = [dep for dep in self.lock.entries[k] if dep.split(" ", 1)[0] in names]
+            else:
+                theirs = self.other.entries.get(k)
+                common = None if theirs is None else _dep_names(theirs)
+                kept = [dep for dep in self.lock.entries[k] if common is None or dep.split(" ", 1)[0] in common]
+            self._edges[k] = [t for dep in kept for t in self.lock.resolve(k, dep)]
+        return self._edges[k]
+
+    def reach(self, roots: Iterable[str] | None = None) -> frozenset[LockKey]:
+        """The packages of the lock reached from the workspace packages `roots` (None: every member): those and, of the
+        members, only the ones in `roots`; every external package an edge leads to."""
+        allowed = set(self.tree.packages) if roots is None else set(roots) & set(self.tree.packages)
+        seen: set[LockKey] = set()
+        todo: list[LockKey] = []
+
+        def take(keys: Iterable[LockKey]) -> None:
+            for k in keys:
+                if k not in seen and (not self.member(k) or k[0] in allowed):
+                    seen.add(k)
+                    todo.append(k)
+
+        for m in sorted(allowed):
+            take(k for k in self.lock.by_name.get(m, ()) if not k[2])
+        while todo:
+            take(self.edges(todo.pop()))
+        return frozenset(seen)
+
+
+class LockDiff:
+    """Cargo.lock of one diff, read per recipe: the packages that moved (`moved`) and, for a recipe's host and the
+    workspace packages it links, those one side's walk reaches and the other's does not (`differs`). Raises
+    `RecipeError` for a lock that does not parse or an edge it does not resolve: the caller reads the file whole."""
+
+    def __init__(self, a: Side, b: Side):
+        self.la, self.lb = load_lock(a.tree.root), load_lock(b.tree.root)
+        for lock in (self.la, self.lb):
+            for k, deps in lock.entries.items():
+                for dep in deps:
+                    lock.resolve(k, dep)
+        self.moved = lock_moved(self.la, self.lb)
+        self.rest_moved = self.la.rest != self.lb.rest
+        self._walks = {(host, side): LockWalk(t.tree, lock, other, host)
+                       for host in HOSTS for side, t, lock, other in (("a", a, self.la, self.lb), ("b", b, self.lb, self.la))}
+        self._differs: dict[tuple[str, frozenset[str] | None], list[str]] = {}
+
+    def differs(self, host: str, roots: frozenset[str] | None = None) -> list[str]:
+        """The packages (`name version`, sorted) that the walk over A's lock reaches and B's does not, or the reverse, from
+        the workspace packages `roots` (None: every member) on `host`."""
+        key = (host, roots)
+        if key not in self._differs:
+            ra, rb = (self._walks[host, s].reach(roots) for s in ("a", "b"))
+            self._differs[key] = sorted({f"{k[0]} {k[1]}" for k in ra ^ rb})
+        return self._differs[key]
+
+
+def lock_outside(a: Side, b: Side, diff: LockDiff | None = None) -> dict[str, str]:
+    """host -> the note `affected` prints, for each host whose build no external package of the diff of Cargo.lock reaches
+    (the two walks from every workspace member reach the same packages). A host missing from the answer reads the file as
+    a global input: a side with no lock, a diff that names no external package, and a diff the host reaches."""
     if not (a.tree.exists(LOCK_FILE) and b.tree.exists(LOCK_FILE)):
         return {}
-    la, lb = load_lock(a.tree.root), load_lock(b.tree.root)
-    names = lock_changed(la, lb, set(a.tree.packages) | set(b.tree.packages))
+    diff = diff if diff is not None else LockDiff(a, b)
+    names = lock_changed(diff.la, diff.lb, set(a.tree.packages) | set(b.tree.packages))
     if not names:
         return {}
     shown = ", ".join(names[:8]) + (f" and {len(names) - 8} more" if len(names) > 8 else "")
-    return {host: f"{LOCK_FILE}: {shown} changed, not in the {label} build" for host, (_, _, _, label) in HOSTS.items()
-            if lock_reach(a.tree, la, lb, host) == lock_reach(b.tree, lb, la, host)}
+    return {host: f"{LOCK_FILE}: {shown} changed, not in the {label} build" for host, (_, _, _, label) in HOSTS.items() if not diff.differs(host)}
 
 
 def device_chain(tree: Tree, lock: Lock, name: str) -> str | None:
@@ -10876,6 +11130,21 @@ def manifest_self_test(expect) -> None:
             kb = keys(b)
             moved = {n for n in kb if kb[n] != ka[n]}
             expect(moved == want, f"tables: {what} moves the keys of {sorted(moved)}, not {sorted(want)} (the key reads the view selection reads)")
+        # a package's [lints] moves no build: no recipe reads it but the one that reads the file whole (gate-whole's script), `affected` names
+        # the table as held by the static tier, and beside a table that does move a build it adds nothing. The key still hashes the view
+        # whole, so it moves for every recipe
+        lints = base + '\n[lints.clippy]\npedantic = "deny"\n'
+        b = build(lints)
+        tables = TableReads(["crates/g/Cargo.toml"], a, b)
+        sels, unmapped, _ = select(["crates/g/Cargo.toml"], a, b, GATE_PREFIX, tables)
+        block = "\n".join(tables.lines())
+        expect({x.recipe for x in sels} == {"gate-whole"} and not unmapped, f"tables: a [lints] edit selects {[x.recipe for x in sels]}, unmapped {unmapped}")
+        expect(getattr(tables, "static_moved", None) == ["crates/g/Cargo.toml [lints]"] and "[lints] -> no recipe (held by the static tier: just lint, just check)" in block,
+               f"tables: a [lints] edit is not named as held by the static tier: {getattr(tables, 'static_moved', None)}\n{block}")
+        kb = keys(b)
+        expect(all(kb[n] != ka[n] for n in every), f"tables: a [lints] edit leaves a ledger key where it was: {[n for n in every if kb[n] == ka[n]]}")
+        sels, _, _ = select(["crates/g/Cargo.toml"], a, build(lints.replace("fy = []", "fy = []\nfz = []")), GATE_PREFIX)
+        expect({x.recipe for x in sels} == every, f"tables: a [lints] edit beside [features] selects {sorted(x.recipe for x in sels)}, not every recipe")
         # a manifest no recipe's view of which moved is printed under unmapped, never dropped
         quiet = just.replace("gate-whole:\n    ./tools/box.sh 'cargo build -p g --lib && bash tools/s.sh'\n", "")
         sels, unmapped, _ = select(["crates/g/Cargo.toml"], build(base, quiet), build(base + "# a comment\n", quiet), GATE_PREFIX)
@@ -10914,7 +11183,9 @@ def root_manifest_self_test(expect) -> None:
     makes a member or not; a root manifest of [workspace] alone). Only a change of the packages that are members
     selects by what reads them (2026-10-12, PR #64: `exclude` gaining `fuzz` selected all 149 gates); the two
     ways the file stays whole are pinned beside it: any other table, and a bin whose box dep-info lists the file
-    (the one route a read of the root manifest reaches the tool: no script regex or path literal names it). The
+    (the one route a read of the root manifest reaches the tool: no script regex or path literal names it). A
+    [workspace.dependencies] entry selects the recipes whose closure holds a package that inherits it (an entry no package
+    inherits stays whole, with a note), and [workspace.lints] selects none: the static tier holds it. The
     ledger key still hashes the file whole, so a selected recipe's key must move."""
     base = (
         '[workspace]\nresolver = "3"\nmembers = ["crates/g", "crates/user"]\n# the reproducer is not a member\n'
@@ -10939,7 +11210,10 @@ def root_manifest_self_test(expect) -> None:
             fh.write(f"# {MANIFEST_VERSION} host=selftest data=/d\n# end\n")
         made: list[str] = []
 
-        def build(root_toml: str, member: tuple[str, ...] = ("g", "user"), justfile: str = just, depinfo: set[str] | None = None) -> Side:
+        def build(root_toml: str, member: tuple[str, ...] = ("g", "user"), justfile: str = just, depinfo: set[str] | None = None,
+                  inherit: dict[str, str] | None = None, raw: dict[str, str] | None = None) -> Side:
+            """`inherit`: a package -> the `[workspace.dependencies]` names its `[dependencies]` takes (`name = { workspace = true }`);
+            `raw`: a package -> text appended to its manifest (a target table)."""
             root = os.path.join(tmp, f"t{len(made)}")
             made.append(root)
             files = {
@@ -10950,9 +11224,10 @@ def root_manifest_self_test(expect) -> None:
             }
             for n, deps in pkgs.items():
                 toml = f'[package]\nname = "{n}"\nversion = "0.1.0"\n'
-                if deps:
-                    toml += "\n[dependencies]\n" + "".join(f'{d} = {{ path = "../{d}" }}\n' for d in deps)
-                files[f"crates/{n}/Cargo.toml"] = toml
+                taken = "".join(f"{e} = {{ workspace = true }}\n" for e in (inherit or {}).get(n, "").split())
+                if deps or taken:
+                    toml += "\n[dependencies]\n" + "".join(f'{d} = {{ path = "../{d}" }}\n' for d in deps) + taken
+                files[f"crates/{n}/Cargo.toml"] = toml + (raw or {}).get(n, "")
                 files[f"crates/{n}/src/" + ("main.rs" if n == "user" else "lib.rs")] = "fn main() {}\n" if n == "user" else ""
             for f in BOX_GLOBALS + [f"tools/ref/models/{DEFAULT_PROFILE}.sh"]:
                 files[f] = ""
@@ -11001,8 +11276,27 @@ def root_manifest_self_test(expect) -> None:
             ("default-members added", a0, build(base.replace(members, members + 'default-members = ["crates/g"]\n')), {"gate-bare"}),
             ("default-members added, no recipe builds without -p", build(base, justfile=just.replace("gate-bare:\n    ./tools/box.sh 'cargo build'\n", "")),
              build(base.replace(members, members + 'default-members = ["crates/g"]\n'), justfile=just.replace("gate-bare:\n    ./tools/box.sh 'cargo build'\n", "")), set()),
-            # every other table: the conservative path holds
-            ("[workspace.dependencies]", a0, build(base.replace('serde = "1"', 'serde = "2"')), every),
+            # [workspace.dependencies] by entry: the recipes whose closure holds a package that inherits the moved entry. g does, so
+            # g's recipe, user's (it links g) and the two that build every package; h is no member and reads nothing
+            ("an entry g inherits", build(base, inherit={"g": "serde"}), build(base.replace('serde = "1"', 'serde = "2"'), inherit={"g": "serde"}),
+             {"gate-g", "gate-user", "gate-ws", "gate-bare"}),
+            # user is linked by nothing but the workspace-wide recipes
+            ("an entry only user inherits", build(base, inherit={"user": "serde"}), build(base.replace('serde = "1"', 'serde = "2"'), inherit={"user": "serde"}),
+             {"gate-user", "gate-ws", "gate-bare"}),
+            # an entry added while a package starts to inherit it: the inheritors of either side count
+            ("an entry added that user takes", a0, build(base.replace('serde = "1"\n', 'serde = "1"\nanyhow = "1"\n'), inherit={"user": "anyhow"}),
+             {"gate-user", "gate-ws", "gate-bare"}),
+            # the box builds no macOS table: an entry only a macOS table inherits is in no box recipe's build, and is still inherited
+            ("an entry only a macOS table inherits", build(base, raw={"user": '\n[target.\'cfg(target_os = "macos")\'.dependencies]\nserde = { workspace = true }\n'}),
+             build(base.replace('serde = "1"', 'serde = "2"'), raw={"user": '\n[target.\'cfg(target_os = "macos")\'.dependencies]\nserde = { workspace = true }\n'}), set()),
+            # a lint level moves no build: no recipe, the static tier holds it
+            ("[workspace.lints]", a0, build(base + '\n[workspace.lints.clippy]\npedantic = "deny"\n'), set()),
+            ("[workspace.lints] beside an entry g inherits", build(base, inherit={"g": "serde"}),
+             build(base.replace('serde = "1"', 'serde = "2"') + '\n[workspace.lints.clippy]\npedantic = "deny"\n', inherit={"g": "serde"}),
+             {"gate-g", "gate-user", "gate-ws", "gate-bare"}),
+            ("[workspace.lints] beside a profile", a0, build(base.replace("opt-level = 3", "opt-level = 2") + '\n[workspace.lints.clippy]\npedantic = "deny"\n'), every),
+            # every other table: the conservative path holds; an entry no package inherits is read whole, the reader cannot say what it reaches
+            ("[workspace.dependencies], an entry no package inherits", a0, build(base.replace('serde = "1"', 'serde = "2"')), every),
             ("[profile.release]", a0, build(base.replace("opt-level = 3", "opt-level = 2")), every),
             ("[workspace] resolver", a0, build(base.replace('resolver = "3"', 'resolver = "2"')), every),
             ("[workspace.package]", a0, build(base + '\n[workspace.package]\nedition = "2024"\n'), every),
@@ -11040,7 +11334,22 @@ def root_manifest_self_test(expect) -> None:
                f"root: the manifests: block of a member added is\n{block}")
         tables = TableReads(["Cargo.toml"], a0, build(base.replace('serde = "1"', 'serde = "2"')))
         select(["Cargo.toml"], a0, build(base.replace('serde = "1"', 'serde = "2"')), GATE_PREFIX, tables)
-        expect("[workspace.dependencies] -> every reader (5)" in "\n".join(tables.lines()), f"root: the manifests: block of a whole table is\n" + "\n".join(tables.lines()))
+        expect("[workspace.dependencies] serde -> every reader (5)" in "\n".join(tables.lines()), f"root: the manifests: block of a whole table is\n" + "\n".join(tables.lines()))
+        # an entry no package inherits is named in a note; one a package inherits is printed with the packages that reach it
+        _, _, notes = select(["Cargo.toml"], a0, build(base.replace('serde = "1"', 'serde = "2"')), GATE_PREFIX)
+        expect(any("[workspace.dependencies] serde changed and no package inherits it; read whole" in n for n in notes), f"root: an entry no package inherits has no note: {notes}")
+        a_g, b_g = build(base, inherit={"g": "serde"}), build(base.replace('serde = "1"', 'serde = "2"'), inherit={"g": "serde"})
+        tables = TableReads(["Cargo.toml"], a_g, b_g)
+        select(["Cargo.toml"], a_g, b_g, GATE_PREFIX, tables)
+        block = "\n".join(tables.lines())
+        expect("[workspace.dependencies] serde -> gate-g gate-user gate-ws gate-bare" in block, f"root: the manifests: block of an entry g inherits is\n{block}")
+        # a lint table is held by the static tier: named as such, selecting no recipe
+        lints_b = build(base + '\n[workspace.lints.clippy]\npedantic = "deny"\n')
+        tables = TableReads(["Cargo.toml"], a0, lints_b)
+        select(["Cargo.toml"], a0, lints_b, GATE_PREFIX, tables)
+        block = "\n".join(tables.lines())
+        expect(getattr(tables, "static_moved", None) == ["Cargo.toml [workspace.lints]"] and "[workspace.lints] -> no recipe (held by the static tier: just lint, just check)" in block,
+               f"root: the lint table is not named as held by the static tier: {getattr(tables, 'static_moved', None)}\n{block}")
         # --narrow with an identical scan pair: the exclude of pr64 picks nothing and no longer holds the full list; a whole table still does
         lines = ["ptx-scan: mod1 bundle=bloomery-gpu bytes=100",
                  "ptx-scan bin=target/release/gx section=.oxart bytes=9 ptxas=/p ptxas-version=13.3.73 arch=sm_86 modules=1 "
@@ -11055,6 +11364,8 @@ def root_manifest_self_test(expect) -> None:
         expect(not nar.full and not nar.picks, f"root: --narrow on pr64-exclude gives full {nar.full}, picks {sorted(nar.picks)}")
         nar = narrow(["Cargo.toml"], a0, build(base.replace('serde = "1"', 'serde = "2"')), [pair], [])
         expect(any("Cargo.toml" in r for r in nar.full), f"root: --narrow on [workspace.dependencies] gives full {nar.full}, not the full list")
+        nar = narrow(["Cargo.toml"], a0, lints_b, [pair], [])
+        expect(not nar.full and not nar.picks, f"root: --narrow on [workspace.lints] gives full {nar.full}, picks {sorted(nar.picks)}")
 
 
 def lock_view_self_test(expect) -> None:
@@ -11065,7 +11376,10 @@ def lock_view_self_test(expect) -> None:
     feature under an aarch64 table brought sha2-asm, cc, find-msvc-tools and shlex, and 249 of 249 gates were selected);
     one that bumps or removes a package a member reaches on the box still selects every recipe. A recipe that runs
     tools/mac-gate.sh reads the same tables and lock for aarch64-apple-darwin: a macOS-only change selects it and no box
-    recipe. The ledger key still moves for every case: it reads the manifests and the lock whole."""
+    recipe. A lock diff selects by package: a recipe whose closure holds none of the packages it moves (a package only
+    user links, for a recipe that builds g) reads nothing of it, a member's own entry is such a package, and a lock the
+    reader cannot take apart is read whole with a note. The ledger key still moves for every case: it reads the manifests
+    and the lock whole."""
     import tomllib
 
     reg = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11162,13 +11476,15 @@ def lock_view_self_test(expect) -> None:
                     add(body.get(section, {}), kind, key)
             return out
 
-        def build(g_toml: str, lock_text: str, justfile: str = just) -> Side:
+        def build(g_toml: str, lock_text: str, justfile: str = just, user_deps: tuple[str, ...] = ()) -> Side:
+            """`user_deps`: external dependencies only user's manifest names."""
             root = os.path.join(tmp, f"t{len(made)}")
             made.append(root)
             files = {
                 gm: g_toml,
                 "crates/g/src/lib.rs": "",
-                "crates/user/Cargo.toml": '[package]\nname = "user"\nversion = "0.1.0"\n\n[dependencies]\ng = { path = "../g" }\n',
+                "crates/user/Cargo.toml": '[package]\nname = "user"\nversion = "0.1.0"\n\n[dependencies]\ng = { path = "../g" }\n'
+                                          + "".join(f'{d} = "1"\n' for d in user_deps),
                 "crates/user/src/main.rs": "fn main() {}\n",
                 "Cargo.lock": lock_text,
                 "tools/mac-gate.sh": "",
@@ -11188,7 +11504,7 @@ def lock_view_self_test(expect) -> None:
                      "dependencies": deps_of(tomllib.loads(g_toml)),
                      "targets": [{"kind": ["lib"], "name": "g", "src_path": os.path.join(root, "crates/g/src/lib.rs")}]},
                     {"id": "user", "name": "user", "manifest_path": os.path.join(root, "crates/user/Cargo.toml"), "features": {},
-                     "dependencies": [{"name": "g", "kind": None, "optional": False, "features": [], "uses_default_features": True}],
+                     "dependencies": [{"name": d, "kind": None, "optional": False, "features": [], "uses_default_features": True} for d in ("g", *user_deps)],
                      "targets": [{"kind": ["bin"], "name": "user", "src_path": os.path.join(root, "crates/user/src/main.rs")}]},
                 ],
             }
@@ -11246,6 +11562,56 @@ def lock_view_self_test(expect) -> None:
             sels, _, _ = select(changed, base, build(g_toml, lock_text, just_mac), GATE_PREFIX)
             got = {x.recipe for x in sels}
             expect(got == want, f"lock view: with a Mac recipe, {what} selects {sorted(got)}, not {sorted(want)}")
+        # Cargo.lock by package: a recipe reads the diff by what its own closure reaches. serde is linked by user alone, so gate-g
+        # (g, no user) holds no package of a diff in it; a workspace member's own entry is a package of the diff too; and a lock the
+        # reader cannot take apart is read whole, with a note
+        pk_u = [(n, v, d + ["serde"] if n == "user" else d) for n, v, d in pk] + [("serde", "1.0.0", [])]
+        user_only = {"gate-user"}
+        a_u = build(g_base, lock(pk_u), user_deps=("serde",))
+
+        def moved_to(who: str, version: str) -> str:
+            return lock([(n, version if n == who else v, d) for n, v, d in pk_u])
+
+        pkg_cases = [
+            ("a bump of a package only user links", a_u, build(g_base, moved_to("serde", "1.0.1"), user_deps=("serde",)), user_only),
+            ("a package only user links, removed", a_u, build(g_base, lock0), user_only),
+            ("a member no other links, bumped", a, build(g_base, bumped("user", "0.2.0")), user_only),
+            ("a member another links, bumped", a, build(g_base, bumped("g", "0.2.0")), every),
+            ("a lock that moved a comment only", a, build(g_base, lock0 + "# regenerated\n"), every),
+            ("the lock's format version", a, build(g_base, lock0.replace("version = 4", "version = 3", 1)), every),
+            ("a lock that does not parse", a, build(g_base, lock0 + "[[package\n"), every),
+            ("an edge no package resolves", a, build(g_base, lock0.replace(' "digest",\n', ' "digest",\n "nosuch",\n', 1)), every),
+        ]
+        notes_of: dict[str, list[str]] = {}
+        for what, base_side, b, want in pkg_cases:
+            tables = TableReads(["Cargo.lock"], base_side, b)
+            sels, unmapped, notes = select(["Cargo.lock"], base_side, b, GATE_PREFIX, tables)
+            notes_of[what] = notes
+            got = {x.recipe for x in sels}
+            expect(got == want, f"lock view: {what} selects {sorted(got)}, not {sorted(want)}")
+            ka_p, kb_p = keys(base_side), keys(b)
+            expect(all(kb_p[n] != ka_p[n] for n in every), f"lock view: {what} leaves a ledger key where it was (the key reads the lock whole)")
+        expect("Cargo.lock: serde 1.0.0, serde 1.0.1 changed; 1 of 2 recipes' builds reach a package that moved" in notes_of["a bump of a package only user links"],
+               f"lock view: the note of a package only user links is {notes_of['a bump of a package only user links']}")
+        for what, text in (("the lock's format version", "a top-level key beside `package` moved"), ("a lock that does not parse", "does not parse as TOML"),
+                           ("a lock that moved a comment only", "names no package the parse sees"),
+                           ("an edge no package resolves", "depends on `nosuch`, which no package of the file is")):
+            expect(any(n.startswith("Cargo.lock: ") and text in n and n.endswith("read whole by every cargo recipe") for n in notes_of[what]),
+                   f"lock view: {what} is read whole with no note naming why: {notes_of[what]}")
+        sels, _, _ = select(["Cargo.lock"], a_u, build(g_base, moved_to("serde", "1.0.1"), user_deps=("serde",)), GATE_PREFIX)
+        expect([x.why for x in sels] == ["cargo (every build): serde 1.0.0, serde 1.0.1"], f"lock view: the origin of a selection by package is {[x.why for x in sels]}")
+        # a recipe whose inputs the reader could not read whole (a package it names is no member) reads the lock whole
+        bad = just + "gate-bad:\n    ./tools/box.sh 'cargo test -p g --lib && cargo test -p nosuch --lib'\n"
+        sels, _, _ = select(["Cargo.lock"], build(g_base, lock(pk_u), bad, user_deps=("serde",)), build(g_base, moved_to("serde", "1.0.1"), bad, user_deps=("serde",)), GATE_PREFIX)
+        expect({x.recipe for x in sels} == user_only | {"gate-bad"}, f"lock view: a recipe with an unreadable build selects {sorted(x.recipe for x in sels)}, not user's and its own")
+        # features a recipe parameter names are known at run time only: such a recipe reads the lock whole
+        par = just + "gate-par F:\n    ./tools/box.sh 'cargo test -p g --features {{F}} --lib'\n"
+        sels, _, _ = select(["Cargo.lock"], build(g_base, lock(pk_u), par, user_deps=("serde",)), build(g_base, moved_to("serde", "1.0.1"), par, user_deps=("serde",)), GATE_PREFIX)
+        expect({x.recipe for x in sels} == user_only | {"gate-par"}, f"lock view: a recipe whose features are a parameter selects {sorted(x.recipe for x in sels)}, not user's and its own")
+        # a Mac recipe builds g alone: the package only user links is outside its build too
+        sels, _, _ = select(["Cargo.lock"], build(g_base, lock(pk_u), just_mac, user_deps=("serde",)),
+                            build(g_base, moved_to("serde", "1.0.1"), just_mac, user_deps=("serde",)), GATE_PREFIX)
+        expect({x.recipe for x in sels} == user_only, f"lock view: with a Mac recipe that builds g, a package only user links selects {sorted(x.recipe for x in sels)}, not {sorted(user_only)}")
         # --narrow reads the same answer: with every scan pair identical, the spill ratchet takes Cargo.lock as its own input
         # only when the box builds what the diff names
         lines = ["ptx-scan: mod1 bundle=bloomery-gpu bytes=100",
@@ -11263,6 +11629,10 @@ def lock_view_self_test(expect) -> None:
         expect(not nar.full and not nar.picks, f"lock view: --narrow gives full {nar.full}, picks {sorted(nar.picks)} for a Cargo.lock outside the x86_64-linux build")
         nar = narrow(["Cargo.lock"], na, build(g_base, bumped("sha2", "0.10.10"), ratchet), [pair], [])
         expect("gate-ptx-spill" in nar.picks, f"lock view: --narrow picks {sorted(nar.picks)} for a Cargo.lock the box reaches, not the spill ratchet")
+        # the ratchet links g alone: a package only user links is outside its build
+        nar = narrow(["Cargo.lock"], build(g_base, lock(pk_u), ratchet, user_deps=("serde",)),
+                     build(g_base, moved_to("serde", "1.0.1"), ratchet, user_deps=("serde",)), [pair], [])
+        expect("gate-ptx-spill" not in nar.picks, f"lock view: --narrow picks {sorted(nar.picks)} for a package the ratchet's closure does not link")
 
 
 def range_base_self_test(expect) -> None:
