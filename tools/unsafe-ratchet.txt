@@ -877,7 +877,10 @@ model 110 32 13
 # each with its SAFETY line; no new unsafe.
 # PIN(2026-10-22): model-hf 0 -> 1 block, new code, not old code relaxed: Checkpoint::release calls
 # release_file_pages on the shard mapping safetensors::Folder::mapped gives, with its SAFETY line.
-model-hf 1 0 0
+# PIN(2026-10-28): model-hf 1 -> 3 blocks, 0 -> 2 fns, 0 -> 1 impl, new test code, not old code relaxed: the part
+# tests' global allocator forwards alloc and dealloc to System and counts each thread's held bytes, so a read's
+# peak is measured against its read bytes; the impl and each block with its SAFETY line.
+model-hf 3 2 1
 models 0 0 0
 # PIN(2026-10-21): os 24 blocks, 5 fns, not old code relaxed: the host chain's OS calls moved here from threads,
 # gguf, engram and model (their pins come down), each beside its macOS body, each block with its SAFETY line.
