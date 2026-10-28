@@ -81,25 +81,18 @@ experts from NVMe through a 19 GB RAM arena; a paged plan runs with the MTP draf
 defaults.
 
 
-## DGX Spark, Qwen3.8-Flash-Next on the FP4-Local folder (main `cb8d92eb`, inside 0.3.10)
+## DGX Spark, Qwen3.8-Flash-Next on the FP4-Local and NVFP4 folders (0.3.10)
 
-Measured by [@juliankang4](https://github.com/juliankang4) on one DGX Spark: `nvidia/Qwen3.8-Flash-Next-FP4-Local` as
-downloaded, the MTP draft from Unsloth's `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, 128 tokens, greedy,
-`cache_prompt` off, median of three rounds; draft off and on were measured on two Sparks of the same kind, which agree
-within 1.5 % with the draft off ([#565](https://github.com/midagedev/bloomery/issues/565#issuecomment-6438094863)).
-Decode is 1000 / TPOT; prefill is prompt tokens / TTFT.
+Measured by [@juliankang4](https://github.com/juliankang4) on one DGX Spark at 0.3.10: `nvidia/Qwen3.8-Flash-Next-FP4-Local`
+and NVIDIA's NVFP4 folder as downloaded, the MTP draft from Unsloth's `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, 128
+tokens, greedy, `cache_prompt` off, median of three rounds. Decode is 1000 / TPOT; prefill is prompt tokens / TTFT.
 
 | Prompt | Text | Decode, draft off | Decode, MTP on | First token, off / on | Prefill, draft off |
 |---|---|---|---|---|---|
-| 4K | code | 30.4 | 55.7 | 1,916 / 2,003 ms | 2,135 |
-| 4K | English prose | 30.1 | 39.1 | 1,881 / 1,967 ms | 2,176 |
-| 8K | code / prose | 29.9 / 29.9 | 57.1 / 38.2 | 3,878 / 3,999 and 3,750 / 3,882 ms | 2,112 / 2,185 |
-| 16K | code / prose | 29.9 / 29.9 | 58.7 / 37.0 | 7,829 / 8,106 and 7,566 / 7,927 ms | 2,093 / 2,165 |
-| 32K | code / prose | 29.5 / 29.7 | 49.6 / 37.2 | 16,069 / 16,629 and 15,395 / 16,020 ms | 2,039 / 2,129 |
-
-On main `7f3efbf` (one request, 4K code, draft off), the FP4-Local folder decoded at 30.18 tok/s and NVIDIA's NVFP4 folder
-at 22.56, with prefill 2,053.8 and 1,954.0 tok/s
-([#565](https://github.com/midagedev/bloomery/issues/565#issuecomment-6402089817)).
+| 4K, FP4-Local | code | 30.8 | 54.2 | 1,984 / 2,053 ms | 2,065 |
+| 4K, FP4-Local | English prose | 29.8 | 39.9 | 2,078 / 2,078 ms | 1,971 |
+| 4K, NVFP4 | code | 22.7 | 47.9 | 2,112 / 2,215 ms | 1,939 |
+| 4K, NVFP4 | English prose | 22.7 | 33.4 | 2,068 / 2,192 ms | 1,981 |
 
 ## Contributors' cards: RTX 5090, DGX Spark (0.3.0, by @juliankang4)
 
