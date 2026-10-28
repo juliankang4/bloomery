@@ -39,6 +39,12 @@ A recipe that a row of tools/fixture-variants.tsv lists also prints its variant 
 its own and in the `recipes:` line (a batch `--list` takes the first word of the line). A row that was added or edited prints the items of its
 recipes whether or not the diff selected them: the variant's file lives outside the repository, so the row is what a change to it is.
 
+The lever registry (crates/levers/src/registry.rs) is read by row when every edit to it is a row (`LeverReads`): an added, changed or removed
+element of its REGISTRY array, or the `&str` const that names one. It selects the recipe that tests the registry and the recipes whose inputs
+hold a file outside crates/levers that names a moved row, by its variable or by a const that spells it; a recipe that links the crate and
+reads no such file is not selected. Code beside the rows (an item, a helper's body, a non-string const), a row the reader cannot name, rows in
+another order and a text it cannot lex keep the file whole, the `affected:` line saying why, and so does any other file of crates/levers.
+
 The class stage (on; `--no-class` turns it off) is the third stage, after select() and narrow(): the class tables (tools/gate-class.tsv,
 tools/families.tsv, tools/owners.tsv, read through tools/gate_class.py's loader) say what a gate-* recipe is, and a family gate is kept only
 when the change can have moved it — the family's own file changed, the recipe's own text or one of its own target files changed, the family is
@@ -2135,8 +2141,8 @@ class Selection:
 
 class TableReads:
     """The package manifests of one diff, each parsed on both sides, and what moved in each recipe's view
-    of them (manifest_view). One reader for every place a changed file picks recipes (select, narrow); the
-    key reads the same view. `hit` records each answer, which `lines` prints. The root Cargo.toml of a virtual
+    of them (manifest_view); the lever registry's rows (`LeverReads`, `levers`). One reader for every place a
+    changed file picks recipes (select, narrow); the key reads the same manifest view. `hit` records each answer, which `lines` prints. The root Cargo.toml of a virtual
     workspace is read here too (`root`), by the tables `root_moves` names; a root that is a package's own
     manifest is a package manifest and a cargo global, whole. A recipe sees the `[target.<key>]` tables of its host
     (`host`: the box, or the Mac for a recipe that runs MAC_GATE), and a Cargo.lock whose diff its host's build does not
@@ -2155,7 +2161,10 @@ class TableReads:
                 self.root = f
                 self.docs[f] = (self._root_doc(a), self._root_doc(b))
         self.seen: dict[str, dict[str, list[tuple[str, bool]] | None]] = {f: {} for f in self.docs}
+        self.levers = LeverReads(changed, a, b)  # the lever registry, when it is among the changed files and its diff is rows
         self.notes: list[str] = []
+        if self.levers.why_whole is not None:
+            self.notes.append(self.levers.summary())
         self.unreached: dict[str, dict[str, str]] = {}  # changed file -> host -> why a build on that host does not reach it
         for f, (da, db) in self.docs.items():
             if f != self.root:
@@ -2275,7 +2284,10 @@ class TableReads:
         """(why recipe `n` reads changed file `f` on `side`, with what moved in its view — None when it does
         not read it or its view did not move; whether every move is an entry of its own targets — None when
         `f` is read as a file). A manifest of the diff is read on A too: a recipe whose B build no longer
-        reaches it (a renamed entry, a target a required-features edit leaves out) read it before."""
+        reaches it (a renamed entry, a target a required-features edit leaves out) read it before. The lever registry whose
+        diff is rows only is read by row (`LeverReads.hit`): its answer is a recipe's own."""
+        if self.levers.reads(f):
+            return self.levers.hit(n, f, side)
         why = side.graph.inputs(n).match(f)
         if why is None and f in self.docs and self.a is not None and n in self.a.recipes:
             why = self.a.graph.inputs(n).match(f)
@@ -2318,6 +2330,333 @@ class TableReads:
                            f"entered {', '.join(sorted(entered.values())) or 'none'}, left {', '.join(sorted(left.values())) or 'none'}")
             if whole and not any(k == "whole" for _, k in kinds):
                 out.append("    read whole -> " + " ".join(whole))
+        return out
+
+
+# ----------------------------------------------------------------------------------------------
+# lever rows
+# ----------------------------------------------------------------------------------------------
+#
+# Every bin links bloomery-levers, so the crate graph reads a one-row edit of its registry as a change to every gate. A row is
+# data: a name parsed only when set, whose readers name its const or its variable. `LeverReads` takes the registry apart on both
+# sides of a diff, and when the rows are all that moved it selects the recipe that tests the registry and the recipes whose
+# inputs hold a file naming a moved row; any text the reader cannot account for as rows leaves the file whole.
+
+LEVER_REGISTRY = "crates/levers/src/registry.rs"
+LEVER_CRATE = "crates/levers/"  # the registry crate's own files are read by its own gate, never as a reader of a row
+LEVER_PREFIX = "BLOOMERY_"
+
+
+class LeverDoubt(Exception):
+    """The registry is not text the row reader can take apart; the message is why the file stays whole."""
+
+
+_RS_TOKEN = re.compile(
+    r"""(?P<ws>\s+)|(?P<lc>//[^\n]*)|(?P<bc>/\*)|(?P<str>[bc]?"(?:[^"\\]|\\.)*")|(?P<raw>[bc]?r(?P<h>\#*)")"""
+    r"""|(?P<chr>b?'(?:\\.[^']*|[^\\'])')|(?P<life>'[A-Za-z_]\w*)|(?P<id>[A-Za-z_]\w*)|(?P<num>\d[\w.]*)|(?P<p>.)""",
+    re.S,
+)
+
+
+def _rs_tokens(text: str) -> list[tuple[str, str]]:
+    """(kind, text) of each token of Rust source, comments and whitespace left out; a string keeps its quotes and its bytes.
+    An unterminated string or comment is a doubt: the registry is never read past it."""
+    out: list[tuple[str, str]] = []
+    i, n = 0, len(text)
+    while i < n:
+        m = _RS_TOKEN.match(text, i)
+        assert m is not None  # `p` matches any character
+        kind = m.lastgroup
+        if kind in ("ws", "lc"):
+            i = m.end()
+            continue
+        if kind == "bc":
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            if depth:
+                raise LeverDoubt("a block comment never ends")
+            i = j
+            continue
+        if kind == "raw":
+            close = '"' + m.group("h")
+            j = text.find(close, m.end())
+            if j < 0:
+                raise LeverDoubt("a raw string never ends")
+            out.append(("str", text[i:j + len(close)]))
+            i = j + len(close)
+            continue
+        if kind == "p" and text[i] == '"':
+            raise LeverDoubt("a string never ends")
+        out.append((kind or "p", m.group()))
+        i = m.end()
+    return out
+
+
+@dataclass
+class LeverRows:
+    """One side of the registry: its `&str` consts (identifier -> the string, None when it has an escape), the tokens that are not
+    rows (the code before and after the array, those consts left out), and each row's text keyed by the variable it names, the
+    consts a row spells written out."""
+
+    consts: dict[str, str | None]
+    rest: list[str]
+    order: list[str]
+    rows: dict[str, str]
+
+
+def _const_runs(toks: list[tuple[str, str]]) -> tuple[dict[str, str | None], list[tuple[str, str]]]:
+    """The `[pub[(crate)]] const NAME: &['static] str = "...";` items of `toks` and the tokens left."""
+    words = [t for _, t in toks]
+    consts: dict[str, str | None] = {}
+    drop: set[int] = set()
+    for c, w in enumerate(words):
+        if w != "const" or toks[c][0] != "id" or c + 3 >= len(toks):
+            continue
+        j = c + 1
+        if toks[j][0] != "id" or words[j + 1:j + 3] != [":", "&"]:
+            continue
+        name, j = words[j], j + 3
+        if j < len(toks) and toks[j][0] == "life":
+            j += 1
+        if words[j:j + 2] != ["str", "="] or j + 3 >= len(toks) or toks[j + 2][0] != "str" or words[j + 3] != ";":
+            continue
+        if name in consts:
+            raise LeverDoubt(f"the const {name} is defined twice")
+        lit = words[j + 2]
+        consts[name] = lit[1:-1] if lit.startswith('"') and "\\" not in lit else None
+        start = c
+        if words[max(0, c - 4):c] == ["pub", "(", "crate", ")"]:
+            start = c - 4
+        elif c and words[c - 1] == "pub":
+            start = c - 1
+        drop.update(range(start, j + 4))
+    return consts, [t for i, t in enumerate(toks) if i not in drop]
+
+
+def parse_lever_rows(text: str) -> LeverRows:
+    """The registry's `REGISTRY` array as rows, or a LeverDoubt naming what it could not read. A row is a top-level element of the
+    array, `LeverSpec { name: <name>, … }` or `<fn>(<name>, …)`, its name a string literal or a `&str` const of the file."""
+    toks = _rs_tokens(text)
+    words = [t for _, t in toks]
+    at = next((i for i in range(len(words) - 1) if words[i] == "static" and words[i + 1] == "REGISTRY"), None)
+    if at is None:
+        raise LeverDoubt("no `static REGISTRY`")
+    if words[at + 2:at + 10] != [":", "&", "[", "LeverSpec", "]", "=", "&", "["]:
+        raise LeverDoubt("the declaration of REGISTRY is not `&[LeverSpec] = &[`")
+    head = at - 4 if words[at - 4:at] == ["pub", "(", "crate", ")"] else at - 1 if words[at - 1:at] == ["pub"] else at
+    open_, depth, close = at + 9, 0, -1
+    for i in range(open_, len(toks)):
+        if toks[i][0] != "p":
+            continue
+        if words[i] in "([{":
+            depth += 1
+        elif words[i] in ")]}":
+            depth -= 1
+            if depth == 0:
+                close = i
+                break
+    if close < 0 or words[close] != "]" or words[close + 1:close + 2] != [";"]:
+        raise LeverDoubt("the array of REGISTRY does not close with `];`")
+    consts, outside = _const_runs(toks[:head] + [("p", "REGISTRY")] + toks[close + 2:])
+    spelled = {name: ("str", f'"{v}"') for name, v in consts.items() if v is not None}
+    elems: list[list[tuple[str, str]]] = [[]]
+    depth = 0
+    for kind, w in toks[open_ + 1:close]:
+        if kind == "p" and w in "([{":
+            depth += 1
+        elif kind == "p" and w in ")]}":
+            depth -= 1
+        if kind == "p" and w == "," and depth == 0:
+            elems.append([])
+        else:
+            elems[-1].append((kind, w))
+    if not elems[-1]:
+        elems.pop()
+    order: list[str] = []
+    rows: dict[str, str] = {}
+    for elem in elems:
+        if not elem:
+            raise LeverDoubt("an empty element between two commas")
+        e = [spelled.get(w, (k, w)) if k == "id" else (k, w) for k, w in elem]
+        w = [t for _, t in e]
+        if len(e) > 5 and w[:4] == ["LeverSpec", "{", "name", ":"] and e[4][0] == "str" and w[5] == ",":
+            lit = w[4]
+        elif len(e) > 3 and e[0][0] == "id" and w[0][0].islower() and w[1] == "(" and e[2][0] == "str" and w[3] == ",":
+            lit = w[2]
+        else:
+            raise LeverDoubt(f"a row the reader cannot name: `{' '.join(w[:6])}`")
+        if not lit.startswith('"') or "\\" in lit:
+            raise LeverDoubt(f"a row whose name is not a plain string: `{' '.join(w[:6])}`")
+        name = lit[1:-1]
+        if name in rows:
+            raise LeverDoubt(f"{name} names two rows")
+        order.append(name)
+        rows[name] = " ".join(w)
+    return LeverRows(consts, [t for _, t in outside], order, rows)
+
+
+@dataclass(frozen=True)
+class LeverSubject:
+    """What moved in the registry that a reader can name: a row (added, changed, removed) or a variable const, with the words
+    that name it in a file — its variable and every const identifier that spells it."""
+
+    kind: str  # added | changed | removed | const
+    label: str
+    words: frozenset[str]
+
+
+def diff_lever_rows(a: LeverRows, b: LeverRows) -> list[LeverSubject]:
+    """What moved from `a` to `b`, or a LeverDoubt when anything but rows did: code outside the array (an item, a helper's body, a
+    non-string const), a different order of the rows both sides hold."""
+    if a.rest != b.rest:
+        i = next((i for i in range(min(len(a.rest), len(b.rest))) if a.rest[i] != b.rest[i]), min(len(a.rest), len(b.rest)))
+        raise LeverDoubt(f"code outside the rows moved near `{' '.join((b.rest or a.rest)[max(0, i - 4):i + 2])}`")
+    if [k for k in a.order if k in b.rows] != [k for k in b.order if k in a.rows]:
+        raise LeverDoubt("the rows both sides hold changed their order")
+    spelled: dict[str, set[str]] = {}
+    for consts in (a.consts, b.consts):
+        for ident, v in consts.items():
+            if v is not None:
+                spelled.setdefault(v, set()).add(ident)
+    out = [LeverSubject("removed", k, frozenset({k} | spelled.get(k, set()))) for k in a.order if k not in b.rows]
+    for k in b.order:
+        if k not in a.rows:
+            out.append(LeverSubject("added", k, frozenset({k} | spelled.get(k, set()))))
+        elif a.rows[k] != b.rows[k]:
+            out.append(LeverSubject("changed", k, frozenset({k} | spelled.get(k, set()))))
+    named = {w for subj in out for w in subj.words}
+    for ident in sorted(set(a.consts) | set(b.consts)):
+        old, new = a.consts.get(ident), b.consts.get(ident)
+        vals = {v for v in (old, new) if v and v.startswith(LEVER_PREFIX)}
+        if old != new and vals and ident not in named:
+            out.append(LeverSubject("const", ident, frozenset({ident} | vals)))
+    return out
+
+
+class LeverReads:
+    """The lever registry of one diff, read by row (`TableReads` holds it; select and narrow ask it through `TableReads.hit`).
+    When every edit to crates/levers/src/registry.rs is a row (parse_lever_rows on both sides, diff_lever_rows), a recipe is
+    selected by the file when it tests the registry as its own target, or when its inputs hold a file outside the registry's
+    crate that names a moved row (its variable, or a const that spells it). Anything else is `why_whole`, and the file selects as
+    any source file does."""
+
+    def __init__(self, changed: list[str], a: Side | None, b: Side):
+        self.subjects: list[LeverSubject] = []
+        self.why_whole: str | None = None
+        self.by_rows = False
+        self.own: set[str] = set()  # the recipes that test the registry
+        self.readers: dict[str, dict[str, set[str]]] = {}  # label -> reader file -> recipes whose inputs hold it
+        self._named: dict[tuple[str, str], tuple[LeverSubject, ...]] = {}  # (tree root, file) -> the subjects it names
+        self._dirs: dict[tuple[str, str], set[str]] = {}
+        self._needle: re.Pattern[bytes] | None = None
+        if LEVER_REGISTRY not in changed or a is None:
+            return
+        try:
+            if not (a.tree.exists(LEVER_REGISTRY) and b.tree.exists(LEVER_REGISTRY)):
+                raise LeverDoubt("the file is added or removed")
+            self.subjects = diff_lever_rows(parse_lever_rows(a.tree.read(LEVER_REGISTRY)), parse_lever_rows(b.tree.read(LEVER_REGISTRY)))
+            self.by_rows = True
+        except LeverDoubt as err:
+            self.why_whole = str(err)
+        if self.subjects:
+            words = sorted({w for subj in self.subjects for w in subj.words}, key=len, reverse=True)
+            self._needle = re.compile(rb"\b(?:" + b"|".join(re.escape(w.encode()) for w in words) + rb")\b")
+
+    def reads(self, f: str) -> bool:
+        """Whether `f` is the registry and its diff is rows only."""
+        return self.by_rows and f == LEVER_REGISTRY
+
+    def _candidates(self, side: Side, ri: RecipeInputs) -> list[str]:
+        """The files outside the registry's crate that recipe inputs `ri` hold, a directory it reads walked."""
+        files = set(ri.files)
+        for p in ri.prefixes:
+            key = (side.tree.root, p)
+            if key not in self._dirs:
+                self._dirs[key] = side.tree.directory_files(p.rstrip("/"))
+            files |= self._dirs[key]
+        return sorted(f for f in files if not f.startswith(LEVER_CRATE))
+
+    def _names(self, side: Side, rel: str) -> tuple[LeverSubject, ...]:
+        """The moved subjects file `rel` of `side` names; a name a recipe lists but the tree lacks (a cargo global) names none."""
+        key = (side.tree.root, rel)
+        if key not in self._named:
+            assert self._needle is not None
+            try:
+                with open(os.path.join(side.tree.root, rel), "rb") as fh:
+                    found = {m.decode() for m in self._needle.findall(fh.read())}
+            except FileNotFoundError:
+                found = set()
+            self._named[key] = tuple(subj for subj in self.subjects if subj.words & found)
+        return self._named[key]
+
+    @staticmethod
+    def _recipe_chain(side: Side, n: str) -> list[str]:
+        """Recipe `n` and every recipe it depends on, each once."""
+        out: list[str] = []
+        stack = [n]
+        while stack:
+            r = stack.pop()
+            if r in out or r not in side.recipes:
+                continue
+            out.append(r)
+            stack.extend(side.recipes[r].deps)
+        return out
+
+    def hit(self, n: str, f: str, side: Side) -> tuple[str | None, bool | None]:
+        """(why recipe `n` reads the registry's rows on `side`, True — a row's readers are the recipe's own path); (None, None) when
+        it does not. The recipe that tests the registry keeps its own origin. A reader the diff removed, or one it moved off a
+        row, is itself a changed file and selects by its own."""
+        ri = side.graph.inputs(n)
+        why = ri.match(f)
+        if why is not None and _own_origin(why):
+            self.own.add(n)
+            return why, True
+        found: dict[str, str] = {}
+        for rel in self._candidates(side, ri) if self.subjects else []:
+            for subj in self._names(side, rel):
+                found.setdefault(subj.label, rel)
+                self.readers.setdefault(subj.label, {}).setdefault(rel, set()).add(n)
+        # A recipe's own command lines set levers too (`BLOOMERY_BOX_ENV='BLOOMERY_X=…'`): its text and its deps' are readers.
+        for r in self._recipe_chain(side, n) if self.subjects else []:
+            assert self._needle is not None
+            hits = {m.decode() for m in self._needle.findall(side.recipes[r].text.encode())}
+            for subj in self.subjects:
+                if subj.words & hits:
+                    found.setdefault(subj.label, f"recipe {r}")
+                    self.readers.setdefault(subj.label, {}).setdefault(f"recipe {r}", set()).add(n)
+        if not found:
+            return None, None
+        shown = [f"{label} named in {rel}" for label, rel in list(found.items())[:2]]
+        return f"lever {'; '.join(shown)}" + (f" (+{len(found) - 2} rows)" if len(found) > 2 else ""), True
+
+    def counts(self) -> str:
+        n = collections.Counter(subj.kind for subj in self.subjects)
+        return f"{n['added']} added, {n['changed']} changed, {n['removed']} removed" + (f", {n['const']} consts" if n["const"] else "")
+
+    def summary(self) -> str:
+        """The clause of the `affected:` line: how the registry file was read."""
+        if not (self.by_rows or self.why_whole):
+            return ""
+        if self.why_whole is not None:
+            return f"{LEVER_REGISTRY} read whole: {self.why_whole}"
+        return f"{LEVER_REGISTRY} read by row: {self.counts()}"
+
+    def lines(self) -> list[str]:
+        """The `lever rows:` block of `affected`: each moved row and the recipes whose inputs name it."""
+        if not self.by_rows:
+            return []
+        out = [f"lever rows ({LEVER_REGISTRY}): {self.counts()}; the recipe that tests the registry: {' '.join(sorted(self.own)) or 'none'}"]
+        for subj in self.subjects:
+            files = self.readers.get(subj.label, {})
+            recipes = sorted({n for ns in files.values() for n in ns})
+            shown = ", ".join(sorted(files)[:3]) + (f" (+{len(files) - 3})" if len(files) > 3 else "")
+            out.append(f"  {subj.kind} {subj.label}: " + (f"named in {shown} -> {' '.join(recipes)}" if files else "named in no file the recipes' inputs hold"))
         return out
 
 
@@ -2468,12 +2807,14 @@ def cmd_affected(args: argparse.Namespace) -> int:
         vitems = variant_items(list(picks), a, b, changed, prefix) if prefix == GATE_PREFIX else []
         class_note = f"class-staged: {len(stage.kept)} kept, {len(stage.left_out)} left out" if stage else "class stage off (--no-class)"
         mac_note = f", {len(deferred)} deferred to weekly (CUDA gate, GGUF input)" if deferred else ""
+        lever_why = tables.levers.summary()
+        lever_note = f"; {lever_why}" if lever_why else ""
         if narrowed:
             print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected "
-                  f"(narrowed from {len(sels)} by ptx-scan; {class_note}){weekly}{mac_note}")
+                  f"(narrowed from {len(sels)} by ptx-scan; {class_note}){weekly}{mac_note}{lever_note}")
         else:
             print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected"
-                  + f" ({class_note})" + weekly + mac_note)
+                  + f" ({class_note})" + weekly + mac_note + lever_note)
         if nar is not None:
             for r in nar.full:
                 print(f"narrow: full list — {r}")
@@ -2538,6 +2879,8 @@ def cmd_affected(args: argparse.Namespace) -> int:
             print(f"manifests ({len(tables.docs)}), read by table:")
             for line in tables.lines():
                 print(line)
+        for line in tables.levers.lines():
+            print(line)
         if not args.no_box:
             di = b.tree.depinfo
             if di:
@@ -5774,10 +6117,15 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
                 (own if (own_entry if own_entry is not None else _own_origin(w)) else dep).append((n, w))
         for n, w in own:
             pick(n, f"{f} [{w}]")
-        hit_rows = [r for r in rows if r.pattern.match(f) and r.gates()]
+        # the lever registry whose diff is rows only: the recipes that read a moved row are its own picks, and no row of the table
+        # (the registry's is `*`) speaks for a diff that moved no code
+        by_rows = tables.levers.reads(f)
+        hit_rows = [] if by_rows else [r for r in rows if r.pattern.match(f) and r.gates()]
         star = next((r for r in hit_rows if r.every()), None)
         rule: list[str] = [f"own target of {len(own)}"] if own else []
-        if NOT_HOST.search(f):
+        if by_rows:
+            rule.append(f"lever rows: {tables.levers.counts()}")
+        elif NOT_HOST.search(f):
             rule.append("not a host path")
         elif star is not None:
             res.full.append(f"{f} maps to * ({GATE_PATHS}:{star.line}: {star.why})")
@@ -5793,9 +6141,9 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
             rule.append("no row")
         elif not own:
             rule.append("no gate reads it")
-        # a manifest whose diff moved only named entries changes no kernel: the bins whose entries moved
-        # are picked above as their own targets
-        entries_only = f in tables.docs and all(own for _, own in tables.moved(f))
+        # a manifest whose diff moved only named entries, or the registry whose diff moved only rows, changes no kernel:
+        # the recipes that read what moved are picked above as their own targets
+        entries_only = by_rows or (f in tables.docs and all(own for _, own in tables.moved(f)))
         for c in carriers:
             if f in c.files and not entries_only and not any(carrier_covered(c, v.bin, v.bundles) for v in res.verdicts):
                 for n in c.recipes:
@@ -10187,6 +10535,175 @@ def scan_set_self_test(expect, side: Side) -> None:
                "scan-set: a lib carrier is covered by its sibling bin carrier's scan")
 
 
+def lever_rows_self_test(expect) -> None:
+    """The lever registry read by row, on a synthetic workspace (levers: a lib holding the registry; reader: a bin that names the
+    const HOST_ROOM; plain: a bin that names no lever; solo: a bin that links no lever and runs a script naming BLOOMERY_GEN_CTX, and a recipe that sets BLOOMERY_SPIN in its
+    command).
+    A diff whose only edits to the registry are rows selects gate-levers and the recipes that read a file naming the row; each
+    other shape of change (code beside the rows, a row the reader cannot name, rows reordered, lib.rs moved beside a row) keeps
+    the crate graph's whole selection, and --narrow follows the same split."""
+    host_row = "    LeverSpec {\n        name: HOST_ROOM,\n        doc: \"Room, (a comma) and [brackets] in a string \\\n              that continues.\",\n    },\n"
+    spin_row = "    LeverSpec {\n        name: SPIN,\n        at: &[OPS],\n        doc: \"Spin.\",\n    },\n"
+    runners = "    // ---------- the runners\n    runner(\"BLOOMERY_GEN_CTX\", \"The context.\"),\n    runner(\"BLOOMERY_OTHER_\", \"Other.\"),\n"
+    rows = host_row + spin_row + runners
+    lib = "mod registry;\n#[cfg(test)]\nmod tests;\npub use registry::{HOST_ROOM, SPIN};\n"
+
+    def registry(body: str = rows, *, limit: str = "8", ops: str = "crates/model/src/ops.rs", host: str = "BLOOMERY_HOST_ROOM",
+                 cls: str = "R", head: str = "", before: str = "") -> str:
+        return (
+            "//! The rows.\n\nuse crate::{Class, LeverSpec};\n\n"
+            f'pub const HOST_ROOM: &str = "{host}";\npub const SPIN: &str = "BLOOMERY_SPIN";\npub const LIMIT: u64 = {limit};\n'
+            f'const OPS: &str = "{ops}";\n{head}\n'
+            "const fn runner(name: &'static str, doc: &'static str) -> LeverSpec {\n"
+            f"    LeverSpec {{ name, class: Class::{cls}, doc }}\n}}\n\n"
+            f"pub(crate) static REGISTRY: &[LeverSpec] = &[\n{before}{body}];\n"
+        )
+
+    just = (
+        "gate-levers:\n    ./tools/box.sh 'bash tools/gate.sh -p levers --lib -- --nocapture'\n"
+        "gate-reader:\n    ./tools/box.sh 'cargo build -p reader --bin reader'\n"
+        "gate-plain:\n    ./tools/box.sh 'cargo build -p plain --bin plain'\n"
+        "gate-script:\n    ./tools/box.sh 'cargo build -p solo --bin solo && bash tools/s.sh'\n"
+        "gate-envset:\n    BLOOMERY_BOX_ENV='BLOOMERY_SPIN=1' ./tools/box.sh 'cargo build -p solo --bin solo'\n"
+    )
+    every = {"gate-levers", "gate-reader", "gate-plain"}  # the recipes that link the lib: what the crate graph says of any file of it
+    with tempfile.TemporaryDirectory(prefix="recipes-levers-") as tmp:
+        made: list[str] = []
+
+        def build(reg: str, lib_text: str = lib) -> Side:
+            root = os.path.join(tmp, f"t{len(made)}")
+            made.append(root)
+            files = {
+                "crates/levers/Cargo.toml": '[package]\nname = "levers"\nversion = "0.1.0"\n',
+                "crates/levers/src/lib.rs": lib_text,
+                "crates/levers/src/registry.rs": reg,
+                "crates/levers/src/tests.rs": "",
+                "crates/reader/Cargo.toml": '[package]\nname = "reader"\nversion = "0.1.0"\n',
+                "crates/reader/src/main.rs": "fn main() {\n    let _ = (levers::HOST_ROOM, levers::NEWC);\n}\n",
+                "crates/plain/Cargo.toml": '[package]\nname = "plain"\nversion = "0.1.0"\n',
+                "crates/plain/src/main.rs": "fn main() {}\n",
+                "crates/solo/Cargo.toml": '[package]\nname = "solo"\nversion = "0.1.0"\n',
+                "crates/solo/src/main.rs": "fn main() {}\n",
+                "tools/s.sh": 'echo "$BLOOMERY_GEN_CTX"\n',
+                "tools/gate.sh": "",
+                "justfile": just,
+            }
+            for f in BOX_GLOBALS + [f"tools/ref/models/{DEFAULT_PROFILE}.sh"]:
+                files[f] = ""
+            for rel, text in files.items():
+                os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+                with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
+                    fh.write(text)
+
+            def pkg(name: str, src: str, kind: str, deps: list[str]) -> dict:
+                return {"id": name, "name": name, "manifest_path": os.path.join(root, f"crates/{name}/Cargo.toml"), "features": {},
+                        "dependencies": [{"name": d, "kind": None, "optional": False, "features": [], "uses_default_features": True} for d in deps],
+                        "targets": [{"kind": [kind], "name": name, "src_path": os.path.join(root, f"crates/{name}/src/{src}")}]}
+
+            meta = {"workspace_root": root, "workspace_members": ["levers", "reader", "plain", "solo"],
+                    "packages": [pkg("levers", "lib.rs", "lib", []), pkg("reader", "main.rs", "bin", ["levers"]),
+                                 pkg("plain", "main.rs", "bin", ["levers"]), pkg("solo", "main.rs", "bin", [])]}
+            return side_at(root, meta)
+
+        reg_file, lib_file = "crates/levers/src/registry.rs", "crates/levers/src/lib.rs"
+        base = registry()
+        a = build(base)
+        new_c = 'pub const NEWC: &str = "BLOOMERY_NEWC_";\n'
+        # (what moved, the registry on B, lib.rs on B, the recipes selected, the reason the file is read whole — None: read by row)
+        cases: list[tuple[str, str, str, set[str], str | None]] = [
+            ("a new row nothing names", registry(rows + '    runner("BLOOMERY_NEW_", "New."),\n'), lib, {"gate-levers"}, None),
+            ("a new row whose const a reader names", registry(rows + "    LeverSpec {\n        name: NEWC,\n        doc: \"New.\",\n    },\n", head=new_c), lib,
+             {"gate-levers", "gate-reader"}, None),
+            ("a row edited that a reader names by its const", registry(rows.replace("Room,", "Rooms,")), lib, {"gate-levers", "gate-reader"}, None),
+            ("a runner row edited that a script names by its variable", registry(rows.replace("The context.", "The context, bytes.")), lib,
+             {"gate-levers", "gate-script"}, None),
+            ("a row edited that nothing names", registry(rows.replace('"Other."', '"Others."')), lib, {"gate-levers"}, None),
+            ("a row edited that a recipe sets in its command", registry(rows.replace('"Spin."', '"Spins."')), lib, {"gate-levers", "gate-envset"}, None),
+            ("a row removed that a reader names", registry(spin_row + runners), lib, {"gate-levers", "gate-reader"}, None),
+            ("a row removed that nothing names", registry(rows.replace('    runner("BLOOMERY_OTHER_", "Other."),\n', "")), lib, {"gate-levers"}, None),
+            ("a runner row removed that a script names by its variable", registry(rows.replace('    runner("BLOOMERY_GEN_CTX", "The context."),\n', "")), lib,
+             {"gate-levers", "gate-script"}, None),
+            ("a name const whose value moved", registry(host="BLOOMERY_HOST_ROOM2_"), lib, {"gate-levers", "gate-reader"}, None),
+            ("a string const the rows spell moved", registry(ops="crates/model/src/other.rs"), lib, {"gate-levers", "gate-envset"}, None),
+            ("comments and layout only", registry(rows.replace("    // ---------- the runners\n", "    // ---------- the runners, again\n").replace(
+                '    runner("BLOOMERY_OTHER_", "Other."),', '    runner(\n        "BLOOMERY_OTHER_",\n        "Other.",\n    ),'), before="    // a note\n"),
+             lib, {"gate-levers"}, None),
+            ("lib.rs moved beside a row", registry(rows.replace("Room,", "Rooms,")), lib + "fn f() {}\n", every, None),
+            ("a pub const that is no name moved", registry(limit="9"), lib, every, "code outside the rows moved near `LIMIT : u64 = 9"),
+            ("the row helper's body moved", registry(cls="A"), lib, every, "code outside the rows moved near"),
+            ("a new item beside the rows", registry(head="fn helper() {}\n"), lib, every, "code outside the rows moved near"),
+            ("a row the reader cannot name", registry(rows + "    make_row(1),\n"), lib, every, "a row the reader cannot name: `make_row ( 1 )`"),
+            ("rows reordered", registry(spin_row + host_row + runners), lib, every, "changed their order"),
+            ("one name twice", registry(rows + '    runner("BLOOMERY_OTHER_", "Again."),\n'), lib, every, "BLOOMERY_OTHER_ names two rows"),
+            ("a string that never ends", registry(rows + '    runner("BLOOMERY_NEW_, "New."),\n'), lib, every, "a string never ends"),
+        ]
+        for what, reg, lib_b, want, whole in cases:
+            b = build(reg, lib_b)
+            changed = [reg_file] + ([lib_file] if lib_b != lib else [])
+            tables = TableReads(changed, a, b)
+            sels, _, notes = select(changed, a, b, GATE_PREFIX, tables)
+            got = {x.recipe for x in sels}
+            expect(got == want, f"lever rows: {what} selects {sorted(got)}, not {sorted(want)}")
+            lv = tables.levers
+            if whole is None:
+                expect(lv.by_rows and lv.why_whole is None and lv.summary().startswith(f"{reg_file} read by row: "),
+                       f"lever rows: {what} is not read by row: {lv.why_whole}")
+            else:
+                expect(not lv.by_rows and lv.why_whole is not None and whole in lv.why_whole and any(whole in n for n in notes),
+                       f"lever rows: {what} is read whole for the wrong reason: {lv.why_whole}, notes {notes}")
+        # the block `affected` prints: a moved row, the file that names it and the recipes that read the file
+        b = build(registry(rows + "    LeverSpec {\n        name: NEWC,\n        doc: \"New.\",\n    },\n", head=new_c))
+        tables = TableReads([reg_file], a, b)
+        select([reg_file], a, b, GATE_PREFIX, tables)
+        got = tables.levers.lines()
+        expect(got == [f"lever rows ({reg_file}): 1 added, 0 changed, 0 removed; the recipe that tests the registry: gate-levers",
+                       "  added BLOOMERY_NEWC_: named in crates/reader/src/main.rs -> gate-reader"], f"lever rows: the printed block: {got}")
+        # the lexer: a raw string, a byte string, a char and a lifetime, a nested block comment and a line comment; a literal or comment
+        # that never ends is a doubt, never a token that runs to the end of the file
+        got = [t for _, t in _rs_tokens('a r#"x "y" z"# b"q" \'c\' &\'static /* o /* i */ o */ d // e\n f "g\\"h"')]
+        expect(got == ["a", 'r#"x "y" z"#', 'b"q"', "'c'", "&", "'static", "d", "f", '"g\\"h"'], f"lever rows: the lexer read {got}")
+        for bad in ('"x', "/* x", 'r#"x"'):
+            try:
+                _rs_tokens(bad)
+                expect(False, f"lever rows: the lexer accepted {bad!r}")
+            except LeverDoubt:
+                pass
+        # the real registry: every row is read (the count is the file's own row starts), a row edit, an added row and a removed row
+        # are each one subject, and the file against itself moves nothing
+        with open(os.path.join(ROOT, LEVER_REGISTRY), encoding="utf-8") as fh:
+            real = fh.read()
+        parsed = parse_lever_rows(real)
+        starts = len(re.findall(r"^    (?:LeverSpec \{|path\(|runner\()", real[real.index("static REGISTRY"):], re.M))
+        expect(len(parsed.rows) == starts and starts > 200, f"lever rows: the real registry has {starts} row starts and parses to {len(parsed.rows)} rows")
+        expect(diff_lever_rows(parsed, parse_lever_rows(real)) == [], "lever rows: the real registry against itself moved a row")
+        name = next(iter(parsed.rows))
+        edited = real.replace(f"        name: {name.removeprefix(LEVER_PREFIX)},\n", f"        name: {name.removeprefix(LEVER_PREFIX)},\n        // a note\n", 1)
+        expect(diff_lever_rows(parsed, parse_lever_rows(edited)) == [], "lever rows: a comment in the real registry moved a row")
+        grown = real.rstrip("\n").removesuffix("];") + '    runner("BLOOMERY_LEVSEL_PROBE_", "Probe."),\n];\n'
+        got = diff_lever_rows(parsed, parse_lever_rows(grown))
+        expect([(x.kind, x.label) for x in got] == [("added", "BLOOMERY_LEVSEL_PROBE_")], f"lever rows: a runner row added to the real registry: {got}")
+        last = list(parsed.rows)[-1]
+        got = diff_lever_rows(parsed, parse_lever_rows(real.replace(f'"{last}"', f'"{last}_X"', 1)))
+        expect(sorted((x.kind, x.label) for x in got) == sorted([("added", f"{last}_X"), ("removed", last)]), f"lever rows: a row renamed in the real registry: {got}")
+        # --narrow with an identical scan pair and the table's row for the registry (every gate): a rows-only diff narrows to the
+        # recipes that read the rows; any other diff keeps the full list
+        lines = ["ptx-scan: mod1 bundle=bloomery-gpu bytes=100",
+                 "ptx-scan bin=target/release/gx section=.oxart bytes=9 ptxas=/p ptxas-version=13.3.73 arch=sm_86 modules=1 "
+                 "jit-card=NVIDIA_RTX_A6000 jit-cc=8.6 jit-cuda=13.4",
+                 "entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill blk/SM(static) jit_regs jit_local",
+                 f"{'alpha':<24} 256 no 0 0 0 0 12 0 0 6 12 0", "ptx-scan-md5: method=decl1", f"alpha {'1' * 32} 41"]
+        log = os.path.join(tmp, "scan.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        pair = (read_scan(log), read_scan(log))
+        star = [PathRow(1, reg_file, ["*"], "why", glob_regex(reg_file))]
+        nar = narrow([reg_file], a, build(registry(rows.replace("Room,", "Rooms,"))), [pair], star)
+        expect(not nar.full and set(nar.picks) == {"gate-levers", "gate-reader"},
+               f"lever rows: --narrow on a row edit gives full {nar.full}, picks {sorted(nar.picks)} (want gate-levers gate-reader)")
+        nar = narrow([reg_file], a, build(registry(limit="9")), [pair], star)
+        expect(nar.full and "maps to *" in nar.full[0], f"lever rows: --narrow on code beside the rows keeps the full list: {nar.full}")
+
+
 def manifest_self_test(expect) -> None:
     """A package manifest read by table, on a synthetic workspace (package g: a lib and bins x, y, v; user: a
     bin linking g; a script that reads g's manifest whole). Each change gives the recipes it must select and
@@ -14402,6 +14919,7 @@ def self_test(serial: bool = False) -> int:
     def narrow(f: list[str]) -> None:
         expect = _expecting(f)
         narrow_self_test(expect, side)  # affected --narrow
+        lever_rows_self_test(expect)  # the lever registry read by row
         variant_items_self_test(expect)
 
     # Independent sections, each on the same parsed real tree: they run side by side, the wall is the longest one.

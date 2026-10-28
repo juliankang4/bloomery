@@ -45,7 +45,8 @@ reference; what follows is the contract.
     just build-ref            # the C++ reference harnesses that link ggml (rerun when ik moves; gate-qdot reads them)
     just deny                 # cargo deny; fails if the cuda-oxide pin floats; reaches the network
     just affected [BASE|A..B] # the gate-* recipes a change selects, from the crate graph and module trees, the scripts
-                              # a recipe names, the cargo globals and each manifest by table; builds nothing. A gate
+                              # a recipe names, the cargo globals, each manifest by table and each lever-registry row
+                              # by the files that name it; builds nothing. A gate
                               # of an F family (tools/families.tsv) stays only when its family's files, its recipe or
                               # its own targets changed, each left out one named with its reason; --no-class keeps all
     just gate / smoke         # static checks, lint, fast library gates / the round loop's subset

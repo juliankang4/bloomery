@@ -31,6 +31,11 @@
 # no --workspace, and every other table (workspace.dependencies, profile, patch, ...), Cargo.lock and the
 # toolchain files select every cargo recipe. The `manifests:` block prints, per changed manifest, what changed
 # by table and the recipes each change selects, and the recipes that read it whole.
+# The lever registry (crates/levers/src/registry.rs) is read by row when every edit to it is a row (an added, changed or removed
+# `LeverSpec`/`runner`/`path` element, or the `&str` const that names one): it selects the recipe that tests the registry and the
+# recipes whose inputs hold a file outside crates/levers, or whose own command lines, that name a moved row (its variable or const). Code beside the rows,
+# a row the reader cannot name, rows in another order, or a moved lib.rs keeps the crate graph's selection, and the `affected:` line
+# says why. The `lever rows:` block prints each moved row and the recipes that name it.
 #
 # The mapping (tools/recipes.py, shared with tools/check-recipes.sh) is the crate graph, feature-aware,
 # plus the module tree of each target, the scripts the recipe names, box.sh's profile files and the
