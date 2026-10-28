@@ -20,7 +20,7 @@ under "Notes" and go on.
 The workflow gives you these paths in the prompt's last section:
 - `PR_TREE`: the PR head. Read and Grep the code here (use absolute paths; your working directory is `OUT`).
 - `BASE_TREE`: the base branch. Read the contracts here, not in `PR_TREE` (the PR may change them):
-  `AGENTS.md`, `CONTRIBUTING.md`, `docs/rust-quality.md` (rules R1 to R29), and
+  `AGENTS.md`, `CONTRIBUTING.md`, `docs/rust-quality.md` (rules R1 to R42), and
   `.github/review/escape-catalog.md` (read it before you decide; a pattern there applies as written).
 - `CTX`: `pr.json` (number, title, body, author, base and head sha), `diff.patch` (what to review), `files.txt`
   (changed paths with added and deleted line counts), and on a re-review `prev-review.md` (your last review) with
@@ -148,7 +148,11 @@ escape catalog).
 
 **Code shape.** Judge structure by `docs/rust-quality.md` and cite the rule number (for example "R14"). Deep nesting,
 one function with several jobs, or a new boolean that splits an existing field's meaning are design findings, not
-style.
+style. A rule that a `deny` lint in the root `Cargo.toml` enforces is clippy's job, not yours: do not report it. Spend
+the turns on the rules no lint holds (for example R33's bool at the call, R37's check-then-unwrap, R39's allocation in a
+kernel or a step, R40, R41). R30 to R42 are this project's reading of Google's Rust style guide; never ask for a guide
+habit that §9 lists under "Guide clauses that stay as they are" (`#[non_exhaustive]`, `Copy` errors, `format!` in a
+kernel or a step, and the rest of that list).
 
 **Fix PRs** (the title or branch says fix, or the body describes a bug). Ask for the three layers: (1) structural
 closure: the class is fixed at its single owner, not tuned around at one call site; (2) recurrence prevention: a gate
