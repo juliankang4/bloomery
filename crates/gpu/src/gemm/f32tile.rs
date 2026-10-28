@@ -46,7 +46,9 @@
 //! A cell whose row or column stages an operand outside the tensor cores'
 //! range is recomputed by the exact F32 owner, in its exponent range and
 //! reduction order; every other cell keeps its MMA value, so a cell's bits
-//! depend on its own row and column alone. The exact tile entries stay
+//! depend on its own row and column alone. Activations held only as BF16
+//! words ([`Bf16WordCols`]) are checked as their copies land and replay on
+//! their widened values, which are exact. The exact tile entries stay
 //! available. A narrow block ([`bf16_mma_narrow`]: sixteen rows of a BF16
 //! weight against up to eight columns, one fragment) runs the same
 //! arithmetic, so its cells are the tile's bits; a decode launch that must
@@ -308,10 +310,9 @@ pub(crate) unsafe fn f32_tile_body<W: TileRows>(
     if c0 >= n {
         return; // block-uniform, before the first barrier
     }
+    let (x, dims) = (F32Rows(x), (rows, k as usize, n));
     // SAFETY: the wrapper supplies this block's checked tile and all its threads.
-    unsafe {
-        f32_tile_at::<W, FULL_ROWS, false>(w, x, (rows, k as usize, n), y, sh, (row0, c0, 0))
-    };
+    unsafe { f32_tile_at::<W, _, FULL_ROWS, false>(w, x, dims, y, sh, (row0, c0, 0)) };
 }
 
 /// Exact tile owner (module doc): a pass of [`F32T_THREADS`] threads over
@@ -325,14 +326,14 @@ pub(crate) unsafe fn f32_tile_body<W: TileRows>(
 /// All threads of the block call converged, the block [`F32T_THREADS`]
 /// wide. RT is [`FULL_ROWS`], 1 or 2 and `pass · ROW_GROUPS · RT
 /// < TILE_ROWS`. Rows and n are positive, row0 < rows and c0 < n; kk is a
-/// positive multiple of LINE. The weight holds rows*kk values, x holds n*kk
-/// aligned values, and y holds rows*n outputs. The aligned shared
-/// allocation holds STAGES*STAGE_FLOATS values. No other block writes this
-/// output tile.
+/// positive multiple of LINE. The weight holds rows*kk values, the columns
+/// `x` n*kk values (each [`TileRows::stage`]'s bound), and y holds rows*n
+/// outputs. The aligned shared allocation holds STAGES*STAGE_FLOATS values.
+/// No other block writes this output tile.
 #[inline(always)]
-unsafe fn f32_tile_at<W: TileRows, const RT: usize, const MARKED: bool>(
+unsafe fn f32_tile_at<W: TileRows, X: TileRows, const RT: usize, const MARKED: bool>(
     w: W,
-    x: &[f32],
+    x: X,
     (rows, kk, n): (usize, usize, usize),
     y: &mut DisjointSlice<f32>,
     sh: *mut f32,
@@ -372,15 +373,10 @@ unsafe fn f32_tile_at<W: TileRows, const RT: usize, const MARKED: bool>(
                     unsafe { w.stage(dst.add(line * LINE + piece), w_off + s * LINE) };
                 }
                 let x_off = (c0 + line).min(n - 1) * kk + piece;
-                // SAFETY: x_off selects a live aligned column piece and the
-                // destination is this thread's disjoint aligned piece of the
-                // stage.
-                unsafe {
-                    cp_async_cg_16(
-                        dst.add((TILE_ROWS + line) * LINE + piece).cast::<u32>(),
-                        x.as_ptr().add(x_off + s * LINE).cast::<u32>(),
-                    )
-                };
+                // SAFETY: x_off selects a live column's piece of four values
+                // and the destination is this thread's disjoint aligned piece
+                // of the stage; no warp reads it until the wait/barrier.
+                unsafe { x.stage(dst.add((TILE_ROWS + line) * LINE + piece), x_off + s * LINE) };
             }
         }};
     }
@@ -744,8 +740,11 @@ pub(crate) trait MmaCols: Copy {
     /// [`Self::land`].
     type Piece: Copy + Default;
 
-    /// The f32 columns the exact owner replays.
-    fn exact(&self) -> &[f32];
+    /// The columns the exact owner replays, as it stages their values.
+    type Exact: TileRows;
+
+    /// The columns the exact owner replays.
+    fn exact(&self) -> Self::Exact;
 
     /// Whether column `c` holds a value [`mma_fits`] refuses, known before
     /// any piece is staged; false when [`Self::land`] checks each piece.
@@ -771,6 +770,18 @@ pub(crate) trait MmaCols: Copy {
     /// `piece` is one [`Self::fetch`]'s, and `dst` is its 16 bytes.
     unsafe fn land(piece: Self::Piece, dst: *mut u32) -> bool;
 
+    /// After this thread's wait completed its copy to `dst`, whether the
+    /// piece's values pass [`mma_fits`]: true where [`Self::refused`] or
+    /// [`Self::land`] already checked them.
+    ///
+    /// # Safety
+    ///
+    /// [`MmaRows::landed_fits`]'.
+    #[inline(always)]
+    unsafe fn landed_fits(_dst: *const u32) -> bool {
+        true
+    }
+
     /// Whether the staged units are E4M3 value pairs with one UE8M0 scale a
     /// 32-value block ([`Self::scale_word`]); the weight's
     /// [`MmaRows::SCALED`] must agree.
@@ -793,12 +804,13 @@ pub(crate) trait MmaCols: Copy {
 #[derive(Clone, Copy)]
 pub(crate) struct F32Cols<'a>(pub &'a [f32]);
 
-impl MmaCols for F32Cols<'_> {
+impl<'a> MmaCols for F32Cols<'a> {
     type Piece = [f32; 8];
+    type Exact = F32Rows<'a>;
 
     #[inline(always)]
-    fn exact(&self) -> &[f32] {
-        self.0
+    fn exact(&self) -> F32Rows<'a> {
+        F32Rows(self.0)
     }
 
     #[inline(always)]
@@ -834,12 +846,13 @@ pub(crate) struct Bf16Cols<'a> {
     pub exact: &'a [f32],
 }
 
-impl MmaCols for Bf16Cols<'_> {
+impl<'a> MmaCols for Bf16Cols<'a> {
     type Piece = ();
+    type Exact = F32Rows<'a>;
 
     #[inline(always)]
-    fn exact(&self) -> &[f32] {
-        self.exact
+    fn exact(&self) -> F32Rows<'a> {
+        F32Rows(self.exact)
     }
 
     #[inline(always)]
@@ -858,6 +871,46 @@ impl MmaCols for Bf16Cols<'_> {
     #[inline(always)]
     unsafe fn land(_: (), _: *mut u32) -> bool {
         true
+    }
+}
+
+/// Activations held only as BF16 words, two values a word in increasing
+/// order, column `c`'s value `i` at `c·K + i`: copied asynchronously as a
+/// BF16 weight's are, each piece checked against [`mma_fits`] once its copy
+/// lands, and replayed on their widened values.
+#[derive(Clone, Copy)]
+pub(crate) struct Bf16WordCols<'a>(pub &'a [u32]);
+
+impl<'a> MmaCols for Bf16WordCols<'a> {
+    type Piece = ();
+    type Exact = Bf16Rows<'a>;
+
+    #[inline(always)]
+    fn exact(&self) -> Bf16Rows<'a> {
+        Bf16Rows(self.0)
+    }
+
+    #[inline(always)]
+    unsafe fn refused(self, _: usize) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    unsafe fn fetch(self, dst: *mut u32, at: usize) {
+        // SAFETY: the columns' words are laid out as a BF16 weight's rows, and
+        // this fn's contract is Bf16Rows::fetch's over them.
+        unsafe { Bf16Rows(self.0).fetch(dst, at) };
+    }
+
+    #[inline(always)]
+    unsafe fn land(_: (), _: *mut u32) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    unsafe fn landed_fits(dst: *const u32) -> bool {
+        // SAFETY: this fn's contract is the weight's over the same words.
+        unsafe { <Bf16Rows<'_> as MmaRows>::landed_fits(dst) }
     }
 }
 
@@ -1090,17 +1143,17 @@ impl MmaTile {
     }
 
     /// Recomputes the cells [`Self::needs_replay`] marked, which
-    /// `store::<true>` left NaN, with the exact owner; every other cell keeps
-    /// its stored value.
+    /// `store::<true>` left NaN, with the exact owner over the columns `x`
+    /// stages; every other cell keeps its stored value.
     ///
     /// # Safety
     /// All 256 threads call converged with this tile's checked spans and shared
     /// allocation. Prior output stores and shared readers have completed.
     #[inline(always)]
-    pub(crate) unsafe fn replay<W: MmaRows>(
+    pub(crate) unsafe fn replay<W: MmaRows, X: TileRows>(
         &self,
         w: W,
-        x: &[f32],
+        x: X,
         dims: (usize, usize, usize),
         y: &mut DisjointSlice<f32>,
         sh: *mut f32,
@@ -1119,9 +1172,9 @@ impl MmaTile {
                     // of threads (the const assert beside MMA_THREADS).
                     unsafe {
                         if W::REPLAY_ROWS == 1 {
-                            f32_tile_at::<W, 1, true>(w, x, dims, y, sh, at)
+                            f32_tile_at::<W, X, 1, true>(w, x, dims, y, sh, at)
                         } else {
-                            f32_tile_at::<W, 2, true>(w, x, dims, y, sh, at)
+                            f32_tile_at::<W, X, 2, true>(w, x, dims, y, sh, at)
                         }
                     };
                     thread::sync_threads();
@@ -1338,6 +1391,10 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, X: MmaCols>(
                             // s, which no warp overwrites before the next pass's barrier.
                             unsafe { W::landed_fits(words.add(buf * STAGE_FLOATS + w_dst[i])) };
                         bad |= u32::from(!fits) << i;
+                        let fits =
+                            // SAFETY: as the weight's, this thread's activation piece.
+                            unsafe { X::landed_fits(words.add(buf * STAGE_FLOATS + x_dst[i])) };
+                        bad |= u32::from(!fits) << (2 + i);
                     }
                 }
                 if ahead {
@@ -2311,7 +2368,8 @@ pub(crate) struct HcUpMixArgs<'a> {
     pub(crate) lo: &'a DeviceBuffer<f32>,
     pub(crate) lo_words: &'a DeviceBuffer<u32>,
     pub(crate) lo_refused: &'a DeviceBuffer<u32>,
-    pub(crate) xn: &'a DeviceBuffer<f32>,
+    /// The normed streams' BF16 words.
+    pub(crate) xn: &'a DeviceBuffer<u32>,
     pub(crate) hidden: u32,
     pub(crate) m: u32,
     pub(crate) fault: FaultSink,

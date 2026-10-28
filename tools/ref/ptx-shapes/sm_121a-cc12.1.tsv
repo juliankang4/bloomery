@@ -15,11 +15,15 @@
 # driver 595.84): the exact-tile replay it inlines now sums two rows a thread a pass over the shared
 # two-lanes-a-thread tile body.
 # PIN(2026-10-25): HC up BF16 input: sm_86 spill 484 -> 608 B, GB10 JIT local unchanged at 88 B; native sm_121/sm_121a spill 364 -> 332 B; deferred flags and u32 columns each measured 532 B spill / 96 B JIT local.
-generate_ds41 hc_gated_up_mma_mix_4 332 88
+# PIN(2026-10-28): 332 -> 252 spill bytes, 88 -> 64 JIT local bytes (ptxas 13.3.73 sm_121a, GB10 driver
+# 595.84): the mix reads the normed streams as BF16 words, not F32 values.
+generate_ds41 hc_gated_up_mma_mix_4 252 64
 # PIN(2026-10-25): the HC up/mix entries that also write mixed's BF16 or MXFP8 form, spill and GB10 JIT local
 # measured with ptxas 13.3.73, driver 595.84, sm_121a.
-generate_ds41 hc_gated_up_mma_mix_4_bf16 348 88
-generate_ds41 hc_gated_up_mma_mix_4_mxfp8 348 88
+# PIN(2026-10-28): _bf16 348 -> 292 and _mxfp8 348 -> 276 spill bytes, both 88 -> 56 JIT local bytes (ptxas
+# 13.3.73 sm_121a, GB10 driver 595.84): the mix reads the normed streams as BF16 words, not F32 values.
+generate_ds41 hc_gated_up_mma_mix_4_bf16 292 56
+generate_ds41 hc_gated_up_mma_mix_4_mxfp8 276 56
 generate_ds41 mamba2_steps 0 0
 generate_ds41 nvfp4_gemv_sel_f32 0 0
 # PIN(2026-10-23): measured on sm_121a, GB10, driver 595.84, CUDA 13.3.1. Shared GEMM epilogues retain exceptional range; the native 4K pair showed no throughput loss.
@@ -36,7 +40,11 @@ generate_ds41 bf16_gemv 0 0
 generate_ds41 bf16_gemv_ids 0 0
 generate_ds41 bf16_mma_cols_gemm 0 0
 # PIN(2026-10-25): formed BF16 norm-gate spill and GB10 JIT local measured with ptxas 13.3.73, driver 595.84, sm_121a.
-generate_ds41 bf16_mma_norm_gate 572 160
+# PIN(2026-10-28): 572 -> 644 spill bytes, 160 -> 168 JIT local bytes (ptxas 13.3.73 sm_121a, GB10 driver
+# 595.84) once the shared MMA tile's columns stage and replay through generic types (`MmaCols::Exact`,
+# `landed_fits`, the replay's `X: TileRows`). The BF16 norm-gate projection runs for a BF16 weight (the NVFP4
+# checkpoint), not FP4-Local's MXFP8 one.
+generate_ds41 bf16_mma_norm_gate 644 168
 generate_ds41 bf16_mma_gemm 0 0
 generate_ds41 bf16_tile_gemm 0 0
 generate_ds41 cand_block_max 0 0
@@ -254,8 +262,10 @@ generate_ds41 hc_gated_down_bf16_4x320 0 0
 generate_ds41 hc_gated_down_mma_4 0 0
 generate_ds41 hc_gated_lo_4x320 0 0
 generate_ds41 hc_gated_mix_4 0 0
+generate_ds41 hc_gated_mix_4_bf16 0 0
 generate_ds41 hc_gated_norm_4 0 0
 generate_ds41 hc_gated_norm_4w 0 0
+generate_ds41 hc_gated_norm_4w_bf16 0 0
 generate_ds41 hc_gated_up_mix_4x320 0 0
 generate_ds41 hc_gated_up_mix_bf16_1col 0 0
 generate_ds41 hc_gated_up_mix_bf16_4x320 0 0

@@ -67,12 +67,16 @@
 //! dense gemv beside them `bf16_gemv`, and its wide arm the BF16 prompt
 //! product with no quantizer, so a NaN raises the mix's site alone and a
 //! subnormal column leaves the other columns' bits unchanged. On GB10 that
-//! product runs on BF16 tensor cores: the down and up within the BF16
-//! operand bands (`check_mma`), the inject rows in the down's product
+//! product runs on BF16 tensor cores over `xn` kept as BF16 values: the
+//! wide norm's `xn` is the capped entry's rounded to nearest even, within
+//! `XN_BAND` plus BF16's unit roundoff of the rule, the glue's `mixed` the
+//! rule on those values; the down and up within the BF16 operand bands
+//! (`check_mma`), the inject rows in the down's product
 //! (`hc_gated_down_mma_4`, dots `[m][324]`) within the same band and its
-//! weights within the F32 band plus that bound through `2·σ(·/4)`, and in a
-//! range fixture each cell the MMA product when its row and column are in
-//! range and the exact replay when either is not. Maximum-finite BF16 up weights that overflow the up
+//! weights within the F32 band plus that bound through `2·σ(·/4)`, a
+//! subnormal column's down dots the F32 tile's bits over its widened `xn`,
+//! and in a range fixture each cell the MMA product when its row and column
+//! are in range and the exact replay when either is not. Maximum-finite BF16 up weights that overflow the up
 //! projection raise the site and leave NaN mixed outputs in both capped and
 //! wide arms, with a finite bottleneck.
 
@@ -474,9 +478,11 @@ mod gate {
             "hc_gated_up_mix_bf16_4x320",
             "hc_gated_combine_4",
             "hc_gated_norm_4w",
+            "hc_gated_norm_4w_bf16",
             "hc_gated_combine_4w",
             "hc_gated_lo_4x320",
             "hc_gated_mix_4",
+            "hc_gated_mix_4_bf16",
             "hc_gated_up_mma_mix_4",
             "hc_gated_up_mma_mix_4_bf16",
             "hc_gated_down_mma_4",
@@ -1196,7 +1202,7 @@ mod gate {
         };
         Ok(WideOut {
             res: res_d.to_host_vec(st)?,
-            xn: s.xn.to_host_vec(st)?[..z.xn].to_vec(),
+            xn: wide_xn(c, site, s, m)?,
             down,
             inj,
             lo,
@@ -1208,13 +1214,37 @@ mod gate {
         })
     }
 
+    /// Whether the wide arm keeps `site`'s normed streams as BF16 values: a
+    /// BF16 site on GB10.
+    fn xn_bf16(c: &Ctx, site: &Site) -> Result<bool, GateError> {
+        Ok(matches!(site.planes, Planes::Bf16 { .. }) && bloomery_gpu::dense_mma(c.gpu.context())?)
+    }
+
     /// Whether the wide arm runs `site`'s down and inject as one product, its
     /// dots `[m][R + S]` in the scratch's `down` (else `[m][R]`, then
     /// `[m][S]`): a BF16 inject site on GB10.
     fn packs(c: &Ctx, site: &Site, inject: bool) -> Result<bool, GateError> {
-        Ok(inject
-            && matches!(site.planes, Planes::Bf16 { .. })
-            && bloomery_gpu::dense_mma(c.gpu.context())?)
+        Ok(inject && xn_bf16(c, site)?)
+    }
+
+    /// `v` rounded to BF16 (nearest even) and widened back.
+    fn bf16_round(v: &[f32]) -> Vec<f32> {
+        v.iter()
+            .map(|&x| bf16_bits_to_f32(fp32_to_bf16_bits(x)))
+            .collect()
+    }
+
+    /// The wide scratch's normed streams of `m` columns as values: its F32
+    /// values, or for a BF16 site on GB10 its BF16 halfwords widened.
+    fn wide_xn(c: &Ctx, site: &Site, s: &HcWideScratch, m: usize) -> Result<Vec<f32>, GateError> {
+        let n = c.geo.sizes(m).xn;
+        let raw = s.xn.to_host_vec(c.gpu.stream())?;
+        if !xn_bf16(c, site)? {
+            return Ok(raw[..n].to_vec());
+        }
+        Ok((0..n)
+            .map(|i| bf16_bits_to_f32((raw[i / 2].to_bits() >> (16 * (i % 2))) as u16))
+            .collect())
     }
 
     /// One wide mix of `m` columns after a combine, the one-expert table
@@ -1511,10 +1541,19 @@ mod gate {
             .wgt
             .copy_from_host(c.gpu.stream(), &padded(&first.wgt, w.scratch.wgt.len()))?;
         let wide = wide_mix(c, &mut w, site, true, &res, Pre::Combine(&y), m)?;
-        let p = bits_equal(&wide.res, &narrow.res) && bits_equal(&wide.xn, &narrow.xn);
+        // A BF16 site on GB10 keeps xn as the capped entry's values rounded
+        // to BF16.
+        let bf16 = xn_bf16(c, site)?;
+        let xn = if bf16 {
+            bf16_round(&narrow.xn)
+        } else {
+            narrow.xn.clone()
+        };
+        let p = bits_equal(&wide.res, &narrow.res) && bits_equal(&wide.xn, &xn);
         ok &= p;
         println!(
-            "wide[norm_combine] m={m} streams and xn the capped entries' bit_equal={p} {}",
+            "wide[norm_combine] m={m} streams and xn the capped entries' (xn_bf16={bf16}) \
+             bit_equal={p} {}",
             verdict(p)
         );
         let mut want = res.clone();
@@ -1613,9 +1652,9 @@ mod gate {
             let (got, _) = wide_try(c, &mut w, weights, (m, m), None)?;
             got?;
             let st = c.gpu.stream();
+            let xn_d = DeviceBuffer::from_host(st, &wide_xn(c, site, &w.scratch, m)?)?;
             let mut want = DeviceBuffer::from_host(st, &vec![f32::NAN; m * S])?;
-            w.g32
-                .enqueue_f32_tile(st, &odd_d, &w.scratch.xn, m, &mut want)?;
+            w.g32.enqueue_f32_tile(st, &odd_d, &xn_d, m, &mut want)?;
             let (dots, want) = (w.scratch.down.to_host_vec(st)?, want.to_host_vec(st)?);
             let replayed = (0..m).all(|k| dots[k * (R + S) + R].to_bits() == want[k * S].to_bits());
             ok &= replayed;
@@ -1666,6 +1705,16 @@ mod gate {
             );
         }
         // (c) the error model's bands against the f64 rule, per column.
+        // PIN(2026-10-28): BF16 xn (a BF16 site on GB10) is the F32 norm
+        // rounded to nearest even once, each value within BF16's unit
+        // roundoff 2^-8 of itself: within 2^-8 · (1 + `XN_BAND`) of max|xn|
+        // beyond `XN_BAND`.
+        let xn_band = f64::from(XN_BAND)
+            + if bf16 {
+                2f64.powi(-8) * (1.0 + f64::from(XN_BAND))
+            } else {
+                0.0
+            };
         let mut worst = [0.0f64; 4];
         let mut past = Vec::new();
         for k in 0..m {
@@ -1708,7 +1757,7 @@ mod gate {
                 (
                     "xn",
                     f64::from(max_rel_err(col(&o.xn, WIDE, k), &as32(&r.xn))?),
-                    f64::from(XN_BAND),
+                    xn_band,
                 ),
                 (
                     "lo",
@@ -1824,15 +1873,30 @@ mod gate {
                 .iter()
                 .enumerate()
                 .all(|(k, &word)| word == u32::from(k == 2));
+            // On GB10 the column's normed values are BF16 subnormals, which the
+            // down's tile refuses as their copies land: its dots are the F32
+            // tile's bits over the widened values.
+            let replayed = if xn_bf16(c, site)? {
+                let st = c.gpu.stream();
+                let rows = DeviceTensor::upload(st, &site.down, R, WIDE)?;
+                let xn_d = DeviceBuffer::from_host(st, &one.xn)?;
+                let mut want = DeviceBuffer::from_host(st, &vec![f32::NAN; R])?;
+                w.g32.enqueue_f32_tile(st, &rows, &xn_d, 1, &mut want)?;
+                bits_equal(col(&many.down, R, 2), &want.to_host_vec(st)?)
+            } else {
+                true
+            };
             let p = others
                 && same
                 && refused
+                && replayed
                 && one.lo_refused == [1]
                 && many.fault.is_none()
                 && one.fault.is_none();
             ok &= p;
             println!(
-                "wide[subnormal_columns] other_columns_clean={others} one_column_bits={same} {}",
+                "wide[subnormal_columns] other_columns_clean={others} one_column_bits={same} \
+                 down_replayed_f32_tile={replayed} {}",
                 verdict(p)
             );
         }

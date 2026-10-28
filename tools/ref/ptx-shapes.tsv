@@ -260,8 +260,10 @@ generate_ds41   hc_gated_down_bf16_4x320                 0           0
 generate_ds41   hc_gated_down_mma_4                      0           0
 generate_ds41   hc_gated_lo_4x320                        0           0
 generate_ds41   hc_gated_mix_4                           0           0
+generate_ds41   hc_gated_mix_4_bf16                      0           0
 generate_ds41   hc_gated_norm_4                          0           0
 generate_ds41   hc_gated_norm_4w                         0           0
+generate_ds41   hc_gated_norm_4w_bf16                    0           0
 generate_ds41   hc_gated_up_mix_4x320                    0           0
 # PIN(2026-10-23): the new HC fused entry uses sm_86 ptxas 13.3.73 spill/stack (24/16).
 # cc8.6 JIT was not measured; this new entry's jit_local pin uses the measured ptxas stack frame.
