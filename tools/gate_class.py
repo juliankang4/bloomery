@@ -12,16 +12,20 @@ Three tables, one row a thing:
   tools/owners.tsv      owner<TAB>kind<TAB>globs
 
 `class` is `common` (family-agnostic: a synthetic input or a shape-generic owner), `family` (one family's own weights
-or code) or `tooling` (harness, static, fixture writer, PTX). `family` is the registry's canonical name
-(tools/arch-registry.tsv column 1, the first name of a comma list) or a declared non-arch group; a `common` or a
-`tooling` row names none. `owners` is the `+` list of the owners the gate tests, names from tools/owners.tsv, or `-`.
-`rep` is `R` (a representative family, run whole on a landing) or `F` (a fixture family, run on its own change and
-in the rotation). `globs` are the family's own files and the owner's files; a glob matches a file or the round is red.
+or code) or `tooling` (harness, static, fixture writer, PTX). `topic` is what the gate tests, or `by-hand`: a gate no
+batch runs, because its recipe needs an environment only a person supplies (its box command opens with
+tools/ref/needs-env.sh, which tools/gate-batch.sh reads to defer the item by name); its class and family stay its own.
+`family` is the registry's canonical name (tools/arch-registry.tsv column 1, the first name of a comma list) or a
+declared non-arch group; a `common` or a `tooling` row names none. `owners` is the `+` list of the owners the gate
+tests, names from tools/owners.tsv, or `-`. `rep` is `R` (a representative family, run whole on a landing) or `F` (a
+fixture family, run on its own change and in the rotation). `globs` are the family's own files and the owner's files; a
+glob matches a file or the round is red.
 
 `check` runs the checks of the design (§4.4): every `gate-*` recipe has a row and every row names a recipe that
 exists; the families of both tables are the registry's canonical names plus the declared non-arch groups; every
-glob of both tables matches a file in the tree. One line per finding, rc 1 when there is one. A table that does not
-load is a named error, rc 2.
+glob of both tables matches a file in the tree; the `by-hand` rows are exactly the recipes that call
+tools/ref/needs-env.sh, in their own text or through a dependency. One line per finding, rc 1 when there is one. A
+table that does not load is a named error, rc 2.
 
 Nothing reads the tables yet: the class stage of `just affected` comes later, and until it does this tool only
 reports. The justfile's recipe names are read through tools/recipes.py, the one parser.
@@ -43,6 +47,9 @@ CLASSES = ("common", "family", "tooling")
 REPS = ("R", "F")
 GATE_PREFIX = recipes.GATE_PREFIX
 DEFAULT_ROTATION_DAYS = 7
+# The topic of a gate that only a person runs, and the script whose call in a recipe makes it one.
+BY_HAND = "by-hand"
+NEEDS_ENV_SCRIPT = "tools/ref/needs-env.sh"
 # The families that are not architectures: a group of gates with no registry row of its own. A family that is not in
 # the registry and not here has no owner, and the check is red.
 DECLARED_GROUPS = ("flint", "gemma4a", "gemma4v", "minicpmv47", "qwen38d")
@@ -63,6 +70,10 @@ class GateRow:
     family: str
     topic: str
     owners: tuple[str, ...]
+
+    @property
+    def by_hand(self) -> bool:
+        return self.topic == BY_HAND
 
 
 @dataclasses.dataclass(frozen=True)
@@ -242,6 +253,14 @@ def registry_families(root: Path) -> set[str]:
 # ---------------------------------------------------------------------------------------------- the checks
 
 
+def calls_needs_env(recs: dict[str, recipes.Recipe], name: str, seen: frozenset[str] = frozenset()) -> bool:
+    """Whether recipe `name` calls tools/ref/needs-env.sh in its own text or through a dependency."""
+    rec = recs.get(name)
+    if rec is None or name in seen:
+        return False
+    return NEEDS_ENV_SCRIPT in rec.text or any(calls_needs_env(recs, d, seen | {name}) for d in rec.deps)
+
+
 def check(root: Path, tables: Tables) -> list[str]:
     """The findings of the design's checks: one line each, empty when the tables are honest."""
     findings: list[str] = []
@@ -262,6 +281,15 @@ def check(root: Path, tables: Tables) -> list[str]:
             findings.append(f"gate-class.tsv names {name}, which is not a {GATE_PREFIX} recipe of the justfile")
         else:
             findings.append(f"gate-class.tsv names {name}, which is not a recipe of the justfile")
+
+    # A by-hand gate is a recipe that calls tools/ref/needs-env.sh and the other way round: a batch defers such a recipe
+    # by name and nothing else runs it, so one the table did not declare would drop out of every list without a row.
+    for name in sorted(gate_names & set(tables.gates)):
+        row, needs = tables.gates[name], calls_needs_env(recs, name)
+        if needs and not row.by_hand:
+            findings.append(f"{name} calls {NEEDS_ENV_SCRIPT} and its topic is {row.topic!r}, not {BY_HAND!r}: nothing runs it unattended")
+        if row.by_hand and not needs:
+            findings.append(f"{name} is declared {BY_HAND} and its recipe calls no {NEEDS_ENV_SCRIPT}")
 
     # The families of both tables are the registry's canonical names plus the declared groups.
     want = registry_families(root) | set(DECLARED_GROUPS)
@@ -310,6 +338,9 @@ def summary(tables: Tables) -> str:
     without = [f for f in sorted(tables.families) if not per_family[f]]
     if without:
         out.append("families with no gate of their own: " + " ".join(without))
+    hand = sorted(n for n, row in tables.gates.items() if row.by_hand)
+    if hand:
+        out.append(f"{BY_HAND} gates ({len(hand)}): " + " ".join(hand))
     return "\n".join(out)
 
 
@@ -464,6 +495,32 @@ def self_test() -> int:
         expect(any("nothing" in f for f in found), f"check: a family glob that matches no file is red: {found}")
         _write(root / "tools" / "families.tsv", "\n".join(fam_rows) + "\n")
         expect(check(root, load(root)) == [], "check: the restored tree is green again")
+
+        # A by-hand gate is a recipe that calls tools/ref/needs-env.sh, in its text or through a dependency, and a row whose
+        # topic is by-hand: the two sets are one.
+        base_gates = "\n".join(gate_rows) + "\n"
+        _write(root / "justfile", "gate-a:\n    echo a\n\ngate-b:\n    echo b\n\n"
+                                  "gate-c:\n    ./tools/box.sh 'bash tools/ref/needs-env.sh gate-c NE_VAR && echo c'\n\n"
+                                  "gate-d: gate-c\n    echo d\n\nother:\n    echo o\n")
+
+        def hand_rows(c: str, d: str, b: str = "host") -> str:
+            return base_gates.replace("gate-b\tcommon\t\thost", f"gate-b\tcommon\t\t{b}") + f"gate-c\tcommon\t\t{c}\t-\ngate-d\tcommon\t\t{d}\t-\n"
+
+        _write(root / "tools" / "gate-class.tsv", hand_rows(BY_HAND, BY_HAND))
+        found = check(root, load(root))
+        expect(found == [], f"check: the two by-hand gates, one through a dependency, are green: {found}")
+        expect(f"{BY_HAND} gates (2): gate-c gate-d" in summary(load(root)), "summary: the by-hand gates are listed by name")
+        _write(root / "tools" / "gate-class.tsv", hand_rows("host", BY_HAND))
+        found = check(root, load(root))
+        expect(any("gate-c calls" in f and BY_HAND in f for f in found), f"check: a recipe that calls needs-env.sh and is not declared is red: {found}")
+        _write(root / "tools" / "gate-class.tsv", hand_rows(BY_HAND, "host"))
+        found = check(root, load(root))
+        expect(any("gate-d calls" in f for f in found), f"check: a recipe that reaches the call through a dependency is red when not declared: {found}")
+        _write(root / "tools" / "gate-class.tsv", hand_rows(BY_HAND, BY_HAND, BY_HAND))
+        found = check(root, load(root))
+        expect(any("gate-b is declared by-hand and its recipe calls no" in f for f in found), f"check: a by-hand row whose recipe calls no needs-env.sh is red: {found}")
+        _write(root / "justfile", "gate-a:\n    echo a\n\ngate-b:\n    echo b\n\nother:\n    echo o\n")
+        _write(root / "tools" / "gate-class.tsv", base_gates)
 
         # The tree's own tables: they load and they are green.
         try:

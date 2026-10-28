@@ -106,7 +106,7 @@ fn child_logits(profile_level: Option<&str>) -> Vec<f32> {
 /// other test here is the child helper, which by then has long returned and touches
 /// neither the environment nor the profiler.
 #[test]
-#[ignore = "hw: needs the box and the model file; run via `just gate-profile`"]
+#[ignore = "hw: needs the box and the model file; run via `just gate-model-host`"]
 fn hw_profile_gate() {
     // 1. Bit identity: off vs level 2 (the level that adds Instant pairs inside the
     //    row loops, i.e. the maximum code a hook edit can put on the hot path).

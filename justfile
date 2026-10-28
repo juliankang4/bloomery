@@ -1349,50 +1349,42 @@ ik-ppl TREE TAG *ARGS:
 gate-ops:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --lib --test ops -- --include-ignored --nocapture'
 
-gate-attn:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test attn -- --ignored --nocapture'
+# The V2-Lite sub-block gates that run in the debug profile (their debug_assert!s are coverage), one cargo call that runs every
+# target even when an earlier one is red: the MLA attention (attn), the dense FFN and the shared expert (ffn), the MoE block
+# (moe) and the output head (head), each against the oracle's staged tensors.
+gate-ds2-debug:
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --no-fail-fast --test attn --test ffn --test moe --test head -- --ignored --nocapture'
 
-gate-ffn:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test ffn -- --ignored --nocapture'
-
-gate-moe:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test moe -- --ignored --nocapture'
-
-gate-head:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test head -- --ignored --nocapture'
-
-# 1-4 조립 게이트. --release로 도는 유일한 게이트다 — 27블록 전체를 디버그 빌드로 돌리면
-# 분 단위로 늘어나고, Rust는 f32를 재결합하지 않으므로 수치는 프로파일과 무관하게 같다.
-gate-forward:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test forward -- --ignored --nocapture'
-
-# 1-5 KV 캐시 게이트: 캐시가 있는 경로와 없는 경로의 로짓이 비트 동일한가.
-gate-kv:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test kv -- --ignored --nocapture'
-
-# 할당 게이트: 정상 상태 디코드 스텝 하나가 할당자를 몇 번 부르는가(전 스레드 합).
-# 속도를 지키는 게이트는 없지만 이 원인 하나는 정수로 환원된다 — 메인 스레드가
-# 할당·0 채우기를 하는 동안 워커 전부가 논다.
-gate-alloc:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test alloc -- --ignored --nocapture'
-
-# Derived 게이트: 토큰과 무관한 wk_b Q8_0 재양자화를 로드시 한 번으로 옮겼다 —
+# The V2-Lite assembled-model gates, one cargo call in the release profile that runs every target even when an earlier one is red:
+# the 27 blocks end to end in a debug build would take minutes, and Rust does not reassociate f32, so the numbers do not depend
+# on the profile.
+# forward: 1-4 조립 게이트.
+# kv: 1-5 KV 캐시 게이트: 캐시가 있는 경로와 없는 경로의 로짓이 비트 동일한가.
+# derived: Derived 게이트: 토큰과 무관한 wk_b Q8_0 재양자화를 로드시 한 번으로 옮겼다 —
 # 사전 계산이 값을 바꾸지 않는다. 블록은 참조 구현(테스트 안의 예전 두 루프)과
 # 바이트 동일, step(명시적 Derived)과 forward(래퍼)의 로짓은 비트 동일.
-gate-derived:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test derived -- --ignored --nocapture'
+# prompts: 1-4 판정 게이트: 프롬프트 32개의 argmax를 ik와 대조한다. just argmax-ref가 먼저다.
+gate-ds2-release:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --no-fail-fast --test forward --test kv --test derived --test prompts -- --ignored --nocapture'
 
-# 행 병렬 게이트: 스레드 수(1/3/32)가 로짓을 한 비트도 안 바꾸는가. BLOOMERY_THREADS는
+# The CPU engine's host gates in the release profile: one cargo call for the three that take libtest's default threads (alloc, mt,
+# r8file; --include-ignored because most of r8file's tests are not ignored), then profile's own call, whose --test-threads=1 keeps
+# the gate body's set_var from racing its child helper tests (the test file's SAFETY comment). Both calls run, and the recipe is
+# red when either is.
+# alloc: 할당 게이트: 정상 상태 디코드 스텝 하나가 할당자를 몇 번 부르는가(전 스레드 합).
+# 속도를 지키는 게이트는 없지만 이 원인 하나는 정수로 환원된다 — 메인 스레드가
+# 할당·0 채우기를 하는 동안 워커 전부가 논다.
+# mt: 행 병렬 게이트: 스레드 수(1/3/32)가 로짓을 한 비트도 안 바꾸는가. BLOOMERY_THREADS는
 # 프로세스당 한 번 읽히므로 자식 프로세스 재실행으로 덤프를 뽑아 바이트 비교한다
 # (tests/mt.rs의 패턴 설명 참조).
-gate-mt:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test mt -- --ignored --nocapture'
-
-# 1-5 프로파일러 게이트: 계측이 로짓을 한 비트도 안 바꾸고, 스텝 시간의 80% 이상을 커버하며,
-# 세 site가 전부 살아 있는가. --test-threads=1은 게이트 본체의 set_var이 자식 헬퍼 테스트와
-# 경쟁하지 않게 하는 장치다(테스트 파일의 SAFETY 주석 참조).
-gate-profile:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test profile -- --ignored --nocapture --test-threads=1'
+# r8file: r8 사이드카(model::r8file) 게이트: gguf::write로 쓴 합성 두 샤드 원본에서 변환, Sidecar::open, verify가
+# 통과하고, 원본과의 식별 차이와 변환 거부는 모두 이름으로 거부된다. r8conv 바이너리는 변환부터 검증까지
+# 끝까지 돈다. 호스트 티어 적재는 원본이 달라진 사이드카를, 호스트 층은 down까지 담은 사이드카를 이름으로
+# 거부한다. 모델 파일은 읽지 않는다.
+# profile: 1-5 프로파일러 게이트: 계측이 로짓을 한 비트도 안 바꾸고, 스텝 시간의 80% 이상을 커버하며,
+# 세 site가 전부 살아 있는가.
+gate-model-host:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --no-fail-fast --test alloc --test mt --test r8file -- --include-ignored --nocapture; multi=$?; bash tools/gate.sh --release -p bloomery-model --test profile -- --ignored --nocapture --test-threads=1; single=$?; echo "gate-model-host rc: multi $multi single $single"; [ "$multi" = 0 ] && [ "$single" = 0 ]'
 
 # B1a 배치 게이트: V4.1 샤드 아홉의 헤더만으로 텐서마다 역할·장치·형식·상주 바이트를 정하고, 설계 §5의 두 안
 # ((a) A6000 + DDR4, (b) A6000 0–19층 + 3090 20–39층)이 설계의 핀과 같은지 본다. 텐서 바이트·GPU·임대 없이 초 단위다.
@@ -1953,13 +1945,6 @@ gate-ds41-host:
 gate-union:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test union -- --ignored --nocapture --test-threads=1'
 
-# r8 사이드카(model::r8file) 게이트: gguf::write로 쓴 합성 두 샤드 원본에서 변환, Sidecar::open, verify가
-# 통과하고, 원본과의 식별 차이와 변환 거부는 모두 이름으로 거부된다. r8conv 바이너리는 변환부터 검증까지
-# 끝까지 돈다. 호스트 티어 적재는 원본이 달라진 사이드카를, 호스트 층은 down까지 담은 사이드카를 이름으로
-# 거부한다. 모델 파일은 읽지 않는다.
-gate-r8:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test r8file -- --include-ignored --nocapture'
-
 # The gate fixture generator (model::fixture, bin fixture of crates/model-hf) on the V4.1 spec (model::arch::deepseek41::fixture) against
 # the real file's header and the real DSpark draft's: the plan (the map's nine layers, the metadata overrides, the engine
 # reading the header-only files as the source's layer kinds), determinism, every sampled block's scales and RMS, small
@@ -2141,17 +2126,17 @@ dump-ref-tokenizer VOCAB='all' *ARGS:
 gate-embed:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-embed --lib --test request --test oracle -- --nocapture'
 
-# Clef's request encoder, joint schema head and SystemOne answer (crates/decision, host only) against the
+# Clef's and lev's host gates (crates/decision, host only), one cargo call in the release profile at the feature set the Clef head
+# reads its weights with: the lib's tests, then both test targets, every one run even when an earlier one is red.
+# clef: Clef's request encoder, joint schema head and SystemOne answer against the
 # release's own Python (tools/ref/clef_ref.py's files under $BLOOMERY_DATA/clef/flash/ref): ids and spans
 # exact, f32 logits inside the derived band of the f64 referee, the body's shape and top options.
-gate-decision-clef:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-decision --features safetensors --lib --test clef -- --include-ignored --nocapture'
-# lev's label readout (crates/decision, host only) against llama.cpp mainline's server (tools/ref/lev_ref.py's files
+# lev: lev's label readout against llama.cpp mainline's server (tools/ref/lev_ref.py's files
 # under $BLOOMERY_DATA/lev/4b/ref): the label list and every prompt's ids of the 14 requests equal the server's, the
 # answer math by hand-computed cases (temperatures, buckets, the variants' softmax average, the rating scale), and the
 # policy (option order, prompt shape, refusals).
-gate-decision-lev:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-decision --features safetensors --test lev -- --include-ignored --nocapture'
+gate-decision:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-decision --features safetensors --no-fail-fast --lib --test clef --test lev -- --include-ignored --nocapture'
 # lev's oracle: the patched mainline server answering tools/ref/lev/{suite,edge}.jsonl on the lev file, its prompts' ids
 # and bodies into $BLOOMERY_DATA/lev/4b/ref (tools/ref/lev_ref.py; the server is built by tools/ref/build-lcpp-lev.sh,
 # the file fetched into /root/models/lev-4b/). A functional dump, no lease: the server runs through tools/gpu-gate.sh
@@ -2219,10 +2204,6 @@ measure-engram *ARGS: build-engram
 # 측정이 아니라서 임대도, 조용한 기계도 필요 없다(초 단위).
 engram-corpus *ARGS:
     ./tools/box.sh 'bash tools/ref/engram-corpus.sh {{ARGS}}'
-
-# 1-4 판정 게이트: 프롬프트 32개의 argmax를 ik와 대조한다. just argmax-ref가 먼저다.
-gate-prompts:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test prompts -- --ignored --nocapture'
 
 # ik의 답(프롬프트 32개의 greedy 다음 토큰). 오라클과 달리 파일 하나만 쓰고
 # $BLOOMERY_DATA/ref는 건드리지 않는다 — argmax.sh가 끝에서 매니페스트 해시로 확인한다.

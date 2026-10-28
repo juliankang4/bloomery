@@ -5,18 +5,16 @@
 #           code) or tooling (harness, static, fixture writer, corpus)
 #   family  the registry's canonical name (tools/arch-registry.tsv column 1, the first name of a comma list) or a
 #           declared non-arch group (gemma4a, gemma4v, minicpmv47, qwen38d); empty for a common or a tooling row
-#   topic   what the gate tests
+#   topic   what the gate tests, or by-hand: a gate no batch runs because its recipe calls tools/ref/needs-env.sh, an
+#           environment only a person supplies (tools/gate_class.py holds the by-hand rows to those recipes)
 #   owners  the owners it tests, a '+' list of names in tools/owners.tsv, or '-'
 gate-1-1	common		host	quant_host_qdot
-gate-alloc	common		host	model_host_ops
 gate-app	common		host	seats_app+drafts_mtp+drafts_dspark
 gate-arch-registry	common		registry	arch_registry
-gate-attn	family	deepseek2	host	model_host_ops
+gate-ds2-debug	family	deepseek2	host	model_host_ops+moe_route
 gate-chain	common		host	chain_plan
-gate-decision-clef	common		constrain	decision_head
-gate-decision-lev	common		constrain	decision_head
+gate-decision	common		constrain	decision_head
 gate-deepseek4-meta	family	deepseek41	meta	arch_registry
-gate-derived	family	deepseek2	host	model_host_ops
 gate-ds41-bind	family	deepseek41	host	-
 gate-ds41-host	family	deepseek41	host	-
 gate-ds41-kld	family	deepseek41	host	-
@@ -30,11 +28,10 @@ gate-dspark-read	family	deepseek41	draft	drafts_dspark
 gate-emb2-mel	family	gemma4a	media	serve_media
 gate-embed	common		host	ple_embed
 gate-engram	common		host	engram_verbs
-gate-ffn	family	deepseek2	host	model_host_ops
-gate-flint-meta	family	flint	meta	arch_registry
+gate-flint-meta	family	flint	by-hand	arch_registry
 gate-fixture	tooling		fixture-writer	-
 gate-fixture-budget	tooling		fixture-writer	-
-gate-forward	family	deepseek2	host	model_host_ops
+gate-ds2-release	family	deepseek2	host	model_host_ops+kv_pool_checkpoint
 gate-gemma-embedding-meta	family	gemma-embedding	meta	arch_registry
 gate-gemma-embedding2-meta	family	gemma-embedding2	meta	arch_registry
 gate-glm5next-hf-map	family	glm5next	meta	refset_readers
@@ -169,7 +166,7 @@ gate-gpu-qwen35moe-mtp	family	qwen35moe	draft	drafts_mtp
 gate-gpu-qwen35moe-verify	family	qwen35moe	draft	drafts_mtp
 gate-gpu-qwen38-media	family	qwen4exp	media	serve_media
 gate-gpu-qwen38-nodes	family	qwen4exp	tier	node_link+placement_nodes
-gate-gpu-qwen38-nodes-remote	family	qwen4exp	tier	node_link+placement_nodes
+gate-gpu-qwen38-nodes-remote	family	qwen4exp	by-hand	node_link+placement_nodes
 gate-gpu-qwen38-residency	family	qwen4exp	residency	residency
 gate-gpu-qwen38-serve	family	qwen4exp	serve	seats_serve_engine+serve_http_api
 gate-gpu-qwen38-twocard	family	qwen4exp	tier	tier_legs+placement_sizing
@@ -187,7 +184,7 @@ gate-gpu-qwen3vl-tower	family	qwen35	media	serve_media
 gate-gpu-qwen4exp-e2e	family	qwen4exp	e2e	graph_fault+attn_linear_gdn_kda+moe_route+attn_ds41_csa_hca
 gate-gpu-qwen4exp-iqleg	family	qwen4exp	tier	tier_legs+quant_iq
 gate-gpu-qwen4exp-mtp	family	qwen4exp	draft	drafts_mtp
-gate-gpu-qwen4exp-nvfp4	family	qwen4exp	kernel	quant_mxfp4
+gate-gpu-qwen4exp-nvfp4	family	qwen4exp	by-hand	quant_mxfp4
 gate-gpu-radio-tower	family	nemotron_h	media	serve_media
 gate-gpu-routed-legs	common		tier	tier_legs+placement_sizing
 gate-gpu-rope-writers	common		kernel	attn_gqa
@@ -202,23 +199,20 @@ gate-gpu-vision	family	deepseek41	media	serve_media
 gate-gpu-vision-hw	common		kernel	serve_media
 gate-gpu-vision-lib	common		lib	serve_media
 gate-gpu-xstream	common		tier	tier_legs
-gate-head	family	deepseek2	host	model_host_ops
 gate-hf	common		host	refset_readers
-gate-hf-minimax	tooling		corpus	-
-gate-hf-vocab-qwen38	tooling		corpus	-
+gate-hf-minimax	tooling		by-hand	-
+gate-hf-vocab-qwen38	tooling		by-hand	-
 gate-safetensors	common		host	refset_readers
 gate-jinja	common		host	tokenizer_jinja
-gate-kv	family	deepseek2	host	kv_pool_checkpoint
 gate-levers	common		lever	levers
 gate-device	common		device	device_seam
 gate-gpu-device	common		device	device_seam
 gate-llama-meta	family	llama	meta	arch_registry
 gate-mimo2-meta	family	mimo2	meta	arch_registry
-gate-minimax31-folder	family	minimax-m3	host	arch_registry
+gate-minimax31-folder	family	minimax-m3	by-hand	arch_registry
 gate-model-hf	common		host	arch_registry+checkpoint_folder
 gate-models	common		host	arch_registry
-gate-moe	family	deepseek2	host	model_host_ops+moe_route
-gate-mt	common		host	threads_pool+model_host_ops
+gate-model-host	common		host	model_host_ops+threads_pool+residency
 gate-nemotron-h-moe-host	family	nemotron_h_moe	host	model_host_ops
 gate-nemotron-h-moe-meta	family	nemotron_h_moe	meta	arch_registry
 gate-nemotron-meta	family	nemotron_h	meta	arch_registry
@@ -227,9 +221,7 @@ gate-os	common		host	os_calls
 gate-record	common		host	record_core
 gate-placement	common		place	placement_sizing
 gate-prepare	tooling		corpus	-
-gate-prepare-corpus	tooling		corpus	-
-gate-profile	common		host	model_host_ops
-gate-prompts	family	deepseek2	host	model_host_ops
+gate-prepare-corpus	tooling		by-hand	-
 gate-ptx-spill	tooling		static	-
 gate-q38-serve-rules	family	qwen4exp	serve	seats_serve_engine
 gate-qdot	common		host	quant_host_qdot
@@ -239,7 +231,6 @@ gate-musespark-meta	family	muse-spark	meta	arch_registry+placement_sizing
 gate-qwen35moe-meta	family	qwen35moe	meta	arch_registry
 gate-qwen3moe-meta	family	qwen3moe	meta	arch_registry
 gate-qwen4exp-meta	family	qwen4exp	meta	arch_registry
-gate-r8	common		residency	residency
 gate-refset	common		refset	refset_readers
 gate-runtime	common		host	prompt_walks+drafts_mtp+kv_pool_checkpoint+recur_state
 gate-sampler	common		host	head_sample

@@ -1,4 +1,4 @@
-//! `just gate-decision-lev`: lev's label readout against llama.cpp mainline's `/v1/systemone` server.
+//! `just gate-decision`: lev's label readout against llama.cpp mainline's `/v1/systemone` server.
 //!
 //! The reference is `$BLOOMERY_DATA/lev/4b/ref/` (`tools/ref/lev_ref.py`, the server at
 //! [`LCPP_BUILD`] answering the 14 requests of `tools/ref/lev/{suite,edge}.jsonl` on [`LEV_GGUF`]):
@@ -85,7 +85,7 @@ fn requests() -> std::collections::HashMap<String, Json> {
 /// the 14 requests the server's ids, one prompt each, in its order, and the body's `usage` is their
 /// count.
 #[test]
-#[ignore = "needs the lev reference under $BLOOMERY_DATA and the lev GGUF; just gate-decision-lev"]
+#[ignore = "needs the lev reference under $BLOOMERY_DATA and the lev GGUF; just gate-decision"]
 fn hw_lev_ids_equal_mainline() {
     let reqs = requests();
     let split = Split::open(LEV_GGUF).unwrap_or_else(|e| panic!("{LEV_GGUF}: {e}"));

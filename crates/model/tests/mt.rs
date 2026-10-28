@@ -127,7 +127,7 @@ fn assert_byte_identical(a: &[u8], b: &[u8], la: &str, lb: &str) {
 }
 
 #[test]
-#[ignore = "hw: needs the box and the model file; run via `just gate-mt`"]
+#[ignore = "hw: needs the box and the model file; run via `just gate-model-host`"]
 fn hw_mt_gate() {
     let (one, one_err) = child_logits("1");
     let (wide, wide_err) = child_logits("32");
@@ -304,7 +304,7 @@ fn ccd_child(threads_env: Option<&str>, poison: bool) -> String {
 }
 
 #[test]
-#[ignore = "hw: needs the box; reads no model file; run via `just gate-mt`"]
+#[ignore = "hw: needs the box; reads no model file; run via `just gate-model-host`"]
 fn hw_ccd_lanes_gate() {
     // The last child runs at the machine's own width and the poison lever's default.
     for (threads_env, poison) in [

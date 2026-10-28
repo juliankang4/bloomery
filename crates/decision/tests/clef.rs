@@ -1,4 +1,4 @@
-//! `just gate-decision-clef`: Clef's encoder, head and answer against the release's own Python.
+//! `just gate-decision`: Clef's encoder, head and answer against the release's own Python.
 //!
 //! The reference is `$BLOOMERY_DATA/clef/flash/ref/` (`tools/ref/clef_ref.py`): `reference.jsonl`
 //! (the suite's 8 requests: ids, spans, the head's logits in bf16 as shipped, in f32 on the card and
@@ -157,7 +157,7 @@ fn f32_file(path: &PathBuf) -> Vec<f32> {
 /// ids: our encoder over all 14 requests gives the release's ids and every span exactly, and our
 /// render gives the release's state text.
 #[test]
-#[ignore = "needs the Clef reference under $BLOOMERY_DATA and the Flash GGUF; just gate-decision-clef"]
+#[ignore = "needs the Clef reference under $BLOOMERY_DATA and the Flash GGUF; just gate-decision"]
 fn hw_clef_ids_equal_the_release() {
     let reqs = requests();
     let tok =
@@ -240,7 +240,7 @@ fn image_request(sent: &Json, state_render: &str) -> Json {
 /// clause holds it to what the same run left beside it: `reference.jsonl` names the release's
 /// revision, the recipe's, and carries the same `input_ids` for every request.
 #[test]
-#[ignore = "needs set D under $BLOOMERY_DATA/clefvis/ref and the Flash GGUF; just gate-decision-clef"]
+#[ignore = "needs set D under $BLOOMERY_DATA/clefvis/ref and the Flash GGUF; just gate-decision"]
 fn hw_clef_image_ids_equal_the_release() {
     let dir = images_dir();
     let rows = jsonl(&dir.join("images.jsonl"));
@@ -358,7 +358,7 @@ fn logits_of(row: &Json, key: &str) -> Vec<Vec<f64>> {
 const HEAD_BAND: f64 = 2e-5;
 
 #[test]
-#[ignore = "needs the Clef reference under $BLOOMERY_DATA; just gate-decision-clef"]
+#[ignore = "needs the Clef reference under $BLOOMERY_DATA; just gate-decision"]
 fn hw_clef_head_matches_the_f64_referee() {
     let head = load_head();
     let (p, j, g) = head.scales();
@@ -444,7 +444,7 @@ fn numbers(v: &Json, path: &str, out: &mut Vec<(String, f64)>) -> Json {
 /// (keys, order, legends, usage) and the same top option for every question; |Δp| against the bf16
 /// body is a diagnostic, printed beside the same body built from the f64 referee's logits.
 #[test]
-#[ignore = "needs the Clef reference under $BLOOMERY_DATA; just gate-decision-clef"]
+#[ignore = "needs the Clef reference under $BLOOMERY_DATA; just gate-decision"]
 fn hw_clef_answer_matches_the_release() {
     let head = load_head();
     let reqs = requests();
@@ -542,7 +542,7 @@ fn load_gguf_head(split: &gguf::Split) -> ClefHead {
 /// f16, which would add `2 · 127 · 2^-11 d`). The three scalars are stored transformed: within
 /// two ulps of the f32 formula (`clef.py` computes them in f64).
 #[test]
-#[ignore = "needs the clef-layout GGUF and the release's head; just gate-decision-clef"]
+#[ignore = "needs the clef-layout GGUF and the release's head; just gate-decision"]
 fn hw_clef_layout_tensors_are_the_releases_within_q8_0() {
     let release = safetensors::Safetensors::open(&PathBuf::from(CLEF_HEAD)).unwrap();
     let split = gguf::Split::open(CLEF_LAYOUT_GGUF).unwrap_or_else(|e| panic!("{e}"));
@@ -656,7 +656,7 @@ fn slack(a: &Json) -> f64 {
 /// [`LAYOUT_LOGIT_BAND`], every probability within [`LAYOUT_PROB_BAND`], and every question's top
 /// the same unless its decision was within the probability band of flipping ([`slack`]).
 #[test]
-#[ignore = "needs the Clef reference under $BLOOMERY_DATA and the clef-layout GGUF; just gate-decision-clef"]
+#[ignore = "needs the Clef reference under $BLOOMERY_DATA and the clef-layout GGUF; just gate-decision"]
 fn hw_clef_layout_head_scores_as_the_release_head() {
     let release = load_head();
     let split = gguf::Split::open(CLEF_LAYOUT_GGUF).unwrap_or_else(|e| panic!("{e}"));

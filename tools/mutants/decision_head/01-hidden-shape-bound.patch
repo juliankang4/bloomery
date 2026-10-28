@@ -1,4 +1,4 @@
-# mutant: decision_head: hidden shape bound; expected killer: gate-decision-clef
+# mutant: decision_head: hidden shape bound; expected killer: gate-decision
 --- a/crates/decision/src/head.rs
 +++ b/crates/decision/src/head.rs
 @@ -467,7 +467,7 @@

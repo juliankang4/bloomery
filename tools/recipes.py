@@ -11576,10 +11576,10 @@ def key_reach_self_test(expect, side: Side) -> None:
     chain = why_chains(side, "gate-hf", "crates/hf/src/lib.rs")
     expect(chain == ["bloomery-hf libtest: its own package", "bloomery-hf test minimax_encode: its own package"],
            f"why: gate-hf's chain to hf is {chain}")
-    for name in ("gate-decision-clef", "gate-decision-lev"):
+    for name in ("gate-decision",):
         expect(side.graph.inputs(name).match("crates/hf/src/lib.rs") is None, f"{name} keys unrelated hub code")
     expect(
-        side.graph.inputs("gate-decision-clef").match("crates/safetensors/src/lib.rs") is not None,
+        side.graph.inputs("gate-decision").match("crates/safetensors/src/lib.rs") is not None,
         "the feature-on decision gate must key its mapped head reader",
     )
 
@@ -11869,8 +11869,8 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
     expect(stats.get("rows", 0) > 0, f"gate-paths: the summary counts no row held to the derivation: {stats}")
     # a hand-written row that leaves out a gate reaching its files through another lib: gate-gpu-ds41-step runs
     # moe.rs's experts_step_union_into through bloomery_gpu's host tier, and its bin names no model module
-    draft = ("gate-attn gate-ffn gate-moe gate-head gate-forward gate-kv gate-alloc gate-derived gate-mt gate-profile gate-union "
-             "gate-ds41-host gate-r8 gate-gpu-hybrid gate-gpu-ds41-tier gate-gpu-nvtier gate-gpu-qwen4exp-e2e gate-gpu-glm5next-e2e "
+    draft = ("gate-ds2-debug gate-ds2-release gate-model-host gate-union "
+             "gate-ds41-host gate-gpu-hybrid gate-gpu-ds41-tier gate-gpu-nvtier gate-gpu-qwen4exp-e2e gate-gpu-glm5next-e2e "
              "gate-gpu-qwen38-serve gate-gpu-ds41-chain-ffn gate-gpu-qwen4exp-iqleg gate-gpu-p8b gate-gpu-glm5next-twocard "
              "gate-gpu-glm5next-serve").split(" ")
     got = gate_paths_problems(tree, recipes, [row("crates/model/src/{ops.rs,moe.rs}", draft)])
@@ -12178,7 +12178,7 @@ def narrow_self_test(expect, side: Side) -> None:
         # Clef's suite is read by one bin by a file literal and by the decision test by a directory literal: both are
         # own targets of it, so a diff of it alone picks both and no row stands for either
         n = narrow(["tools/ref/clef/suite.jsonl"], side, side, covering, table)
-        expect(not n.full and {"gate-gpu-clef-serve", "gate-decision-clef"} <= set(n.picks), f"narrow: Clef's suite alone drops a reader or keeps the full list: {n.full} {sorted(n.picks)}")
+        expect(not n.full and {"gate-gpu-clef-serve", "gate-decision"} <= set(n.picks), f"narrow: Clef's suite alone drops a reader or keeps the full list: {n.full} {sorted(n.picks)}")
         # a trigger names its weekly recipe and maps nothing: a file only a trigger row matches, which every gate reads
         # through a dependency, keeps the full list; beside a gate row it narrows as that row says
         trig = [row("rust-toolchain.toml", ["weekly-gpu-ds41-serve"], 9)]
@@ -13021,9 +13021,9 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     ds41 = sel("crates/gpu-deepseek41/src/lib.rs")
     expect(ds41 and not any("qwen3moe" in n for n in ds41) and "gate-gpu-e2e" not in ds41, f"gpu-deepseek41 lib selects qwen3/e2e: {sorted(ds41)[:6]}")
     prompts = sel("tools/ref/prompts.tsv")
-    expect({"gate-prompts", "gate-gpu-e2e", "gate-gpu-hybrid"} <= prompts, f"prompts.tsv selects {sorted(prompts)}")
+    expect({"gate-ds2-release", "gate-gpu-e2e", "gate-gpu-hybrid"} <= prompts, f"prompts.tsv selects {sorted(prompts)}")
     common = sel("crates/model/tests/common/asserts.rs")
-    expect("gate-attn" in common and "gate-kv" not in common, f"tests/common/asserts.rs selects {sorted(common)}")
+    expect("gate-ds2-debug" in common and "gate-union" not in common, f"tests/common/asserts.rs selects {sorted(common)}")
     fixture = sel("crates/serve/tests/fixtures/qwen3-renders.json")
     expect(fixture == {"gate-serve"}, f"serve fixture selects {sorted(fixture)}")
     # every table the recipe names: the base and the directory of the other archs and capabilities, a table added there too
