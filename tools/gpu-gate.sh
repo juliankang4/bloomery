@@ -348,7 +348,7 @@ pace() {
 # The runner's own tests: each case runs this script with --test-locks <tmp> (the three locks under <tmp>,
 # the V4.1 load lock's bound 6 s, the card locks' 4 s, the polls 1 s), BLOOMERY_LEASE_LOCK at a file the test holds or not, a stub
 # nvidia-smi on PATH (two cards, no compute process) and a stub target/release/ok that, when asked (STUB_PID, STUB_TERM, STUB_READY,
-# STUB_ORDER, STUB_HOLD), writes its pid and its parent's (the binary's timeout), ends with code STUB_TERM a second after a TERM, says it
+# STUB_ORDER, STUB_HOLD), writes its pid and its parent's (the binary's timeout), exits STUB_TERM when it gets a TERM, says it
 # is running, appends its STUB_ID to a marker file and holds until the test releases it. Concurrent runs are started with & and waited
 # for by their $!. One line per case;
 # exit 0 iff none failed.
@@ -358,7 +358,30 @@ pace() {
 # runs one (K, or `all`: the parts one after another here).
 # No verdict reads the machine's load: a wait that is not a judged bound ends on its event, and its clock (fs seconds for one wait, cap
 # seconds for a helper's whole life) only catches a hang. A run that is late is waited for while its process lives.
+# GPU_GATE_SELFTEST_LOAD=N (unset: off, and not set by CI): N spinning processes beside this process's cases. Each part
+# process of `--self-test` does not start its own; the parent does. The pids are this shell's, stopped when it exits.
 SELFTEST_PARTS=4
+SELFTEST_LOAD_PIDS=()
+selftest_load_up() {
+  local n=${GPU_GATE_SELFTEST_LOAD:-} i
+  SELFTEST_LOAD_PIDS=()
+  [ -n "$n" ] || return 0
+  case $n in
+    *[!0-9]* | 0) echo "gpu-gate.sh: GPU_GATE_SELFTEST_LOAD is a whole number from 1, got '$n'" >&2; return 64 ;;
+  esac
+  for ((i = 0; i < n; i++)); do
+    yes > /dev/null &
+    SELFTEST_LOAD_PIDS+=("$!")
+  done
+}
+selftest_load_down() {
+  local p
+  for p in ${SELFTEST_LOAD_PIDS[@]+"${SELFTEST_LOAD_PIDS[@]}"}; do
+    kill "$p" 2> /dev/null || true
+    wait "$p" 2> /dev/null || true
+  done
+  SELFTEST_LOAD_PIDS=()
+}
 self_test() {
   local self t n=0 bad=0 out rc rc1 p1 r1 r2 prc fs=300 cap=870 part=${1:-all}
   gg_part() { [ "$part" = all ] || [ "$part" = "$1" ]; }
@@ -367,7 +390,8 @@ self_test() {
   unset BLOOMERY_LOCK_DIR
   t=$(mktemp -d "${TMPDIR:-/tmp}/gpu-gate-test.XXXXXX") || return 70
   # shellcheck disable=SC2064 # the path is fixed now
-  trap "rm -rf '$t'" EXIT
+  trap "selftest_load_down; rm -rf '$t'" EXIT
+  selftest_load_up || return $?
   mkdir -p "$t/bin" "$t/tree/target/release"
   # The stub nvidia-smi is written before the tree's cards.sh is sourced (below, once PATH holds
   # it), so the resolution reads made-up UUIDs (depth-stub-cards.sh's, never the box's) and the
@@ -378,7 +402,7 @@ self_test() {
     '  *query-compute-apps=*) [ -z "${STUB_COMPUTE_UUID:-}" ] || printf "%s\n" "$STUB_COMPUTE_UUID"; exit "${STUB_COMPUTE_RC:-0}" ;;' \
     'esac' > "$t/bin/nvidia-smi"
   printf '%s\n' '#!/bin/sh' '[ -z "${STUB_PID:-}" ] || echo "$$ $PPID" > "$STUB_PID"' \
-    '[ -z "${STUB_TERM:-}" ] || trap "sleep 1; exit $STUB_TERM" TERM' \
+    '[ -z "${STUB_TERM:-}" ] || trap "exit $STUB_TERM" TERM' \
     '[ -z "${STUB_READY:-}" ] || echo up > "$STUB_READY"' '[ -z "${STUB_ORDER:-}" ] || echo "${STUB_ID:-?}" >> "$STUB_ORDER"' \
     '[ -z "${STUB_HOLD:-}" ] || read -r _ < "$STUB_HOLD"' \
     'echo "ran on $CUDA_VISIBLE_DEVICES"' > "$t/tree/target/release/ok"
@@ -429,7 +453,7 @@ PY
   local gate_args=()
   local gate_env=(env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES
     -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S
-    -u GATE_TEST_PACE -u STUB_ORDER -u STUB_ID -u STUB_COMPUTE_UUID -u STUB_COMPUTE_RC PATH="$t/bin:$PATH")
+    -u GATE_TEST_PACE -u GATE_TIMEOUT_PID -u STUB_ORDER -u STUB_ID -u STUB_COMPUTE_UUID -u STUB_COMPUTE_RC PATH="$t/bin:$PATH")
   # gate <out file> <BLOOMERY_GATE_CARD> <lease file> [K=V…]: one run of the runner, its rc (TL=<dir>: the dir its locks and its
   # batch hold live in, default the test's own; GB=<s>: its own bound, default the failsafe $fs s, and for a run that takes
   # GATE_TEST_CAP (a helper waiter or a paced loader, which the test lets go by events) 30 s over its cap; GK=<s>: its kill-after,
@@ -439,9 +463,19 @@ PY
     shift 3
     case " $* " in *" GATE_TEST_CAP="*) gb=${GB:-$((cap + 30))} ;; esac
     # Under a failsafe bound: a runner that hangs ends the case red (124), it does not hang the check; a run that is only late ends itself.
-    (cd "$t/tree" && timeout --kill-after="${GK:-5}" "$gb" "${gate_env[@]}" \
-      BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$l" BLOOMERY_LEASE_PROC="$t/proc" "$@" \
-      bash "$self" --test-locks "${TL:-$t}" "${GATE_BIN:-ok}" ${gate_args[@]+"${gate_args[@]}"}) > "$o" 2>&1
+    # GATE_TIMEOUT_PID, when set, is the timeout monitor: the background pid, the process a SIGALRM ends.
+    # $$ in a subshell is the invoking shell, so the pid is $! of this timeout, not $$.
+    (
+      cd "$t/tree" || exit 70
+      timeout --kill-after="${GK:-5}" "$gb" "${gate_env[@]}" \
+        BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$l" BLOOMERY_LEASE_PROC="$t/proc" "$@" \
+        bash "$self" --test-locks "${TL:-$t}" "${GATE_BIN:-ok}" ${gate_args[@]+"${gate_args[@]}"} &
+      tp=$!
+      if [ -n "${GATE_TIMEOUT_PID:-}" ]; then
+        printf '%s\n' "$tp" > "$GATE_TIMEOUT_PID" || { kill "$tp" 2> /dev/null || true; exit 70; }
+      fi
+      wait "$tp"
+    ) > "$o" 2>&1
   }
   # judge <name> <rc> <want rc> <ERE that must match> [ERE that must not]. The output is matched as a here-string, never piped into
   # grep -q: under pipefail a writer still writing when grep exits on its first match fails the pipeline (Broken pipe), which read a
@@ -454,7 +488,7 @@ PY
     else
       bad=$((bad + 1))
       echo "FAIL $1: $(helper_cap)rc $2 (want $3), /$4/${5:+, not /$5/}"
-      printf '%s\n' "$out" | sed 's/^/    | /'
+      sed 's/^/    | /' <<< "$out"
     fi
   }
   # judge_all <name> <rc> <want rc> <ERE>…: every ERE must match a line of the output ($t/out), and one that starts with ! must match none.
@@ -474,7 +508,7 @@ PY
     else
       bad=$((bad + 1))
       echo "FAIL $name: rc $got (want $want), failed:${miss:- none}"
-      printf '%s\n' "$out" | sed 's/^/    | /'
+      sed 's/^/    | /' <<< "$out"
     fi
   }
   # helper_cap: names a helper waiter that ended on its safety cap ($cap s, GATE_TEST_CAP) in a red's reason: it ends 75, never 0.
@@ -655,28 +689,38 @@ PY
   flock -u 6
   exec 6>&-
   judge 'a run that is not a V4.1 load does not wait for one' "$rc" 0 'ok on the 3090 \(asked 3090\)' 'V4\.1'
-  # A run gate()'s own bound ends goes with its binary, under the watch too: when the bound returns 124 the stub and its timeout are
-  # gone and the card lock is free, then the run's output reaches its end, and the runner's code is the stub's (it ends 7 a second after
-  # the TERM). The stub holds on STUB_HOLD, the runner's own bound (900 s) far off. How long the run takes to start the stub is the
-  # host's: a bound that came before the stub's pid file says nothing of the contract, and the case is run again with more room, the
-  # last bound the failsafe (a stub that never ran then is a red by name). The kill-after is the failsafe too: a runner that ends on
-  # the TERM is waited for however late it is. A stub still there once the checks are made is let go.
-  local w gb ended left sp ip lk
+  # gate()'s bound ends a held run, under the watch too. The stub writes `up` once its TERM handler is installed
+  # and then holds; that line is the event, and SIGALRM to the outer timeout is the bound (the signal its own timer
+  # sends). A clock from the spawn can run out before the stub holds, and says nothing of the contract. The failsafe
+  # bound ($fs) only catches a hang: a run that never parks and never exits has no exit to wait on. The handler exits
+  # 7 with no sleep. The runner's cleanup sends KILL at LEASE_STOP_GRACE-2 s (grace 9, 2 s kept so the KILL and reap
+  # finish before an enclosing kill-after of 10 s), and a sleep in the handler is a clock that KILL can win, so the
+  # runner records 137. The judge waits on the run's exit and on the output's `end` line. A stub still held is let go.
+  local w ended left sp ip lk tp line ready
   for w in '' "BLOOMERY_GATE_STACKS=$((fs + 60))"; do
-    for gb in 10 40 "$fs"; do
-      fifos
-      streams "$t/s1"
-      rm -f "$t/stub.pid"
-      rc=0
-      # shellcheck disable=SC2086 # w is a K=V word or none
-      GB=$gb GK=$fs gate "$t/s1" 3090 "$t/lease" STUB_PID="$t/stub.pid" STUB_TERM=7 STUB_HOLD="$t/hold" $w &
-      p1=$!
-      { cat "$t/s1" > "$t/first"; echo end >&3; } &
-      r1=$!
-      wait "$p1" || rc=$?
-      [ ! -s "$t/stub.pid" ] || break
-      wait "$r1" || true
-    done
+    fifos
+    streams "$t/s1"
+    rm -f "$t/stub.pid" "$t/timeout.pid"
+    rc=0 ready=no ended=no line=
+    # shellcheck disable=SC2086 # w is a K=V word or none
+    GATE_TIMEOUT_PID=$t/timeout.pid GB=$fs GK=$fs \
+      gate "$t/s1" 3090 "$t/lease" STUB_PID="$t/stub.pid" STUB_TERM=7 STUB_READY="$t/ready" STUB_HOLD="$t/hold" $w &
+    p1=$!
+    { cat "$t/s1" > "$t/first"; echo end >&3; } &
+    r1=$!
+    if read -t "$fs" -r line <&3; then
+      if [ "$line" = up ]; then ready=yes
+      elif [ "$line" = end ]; then ended=yes
+      fi
+    fi
+    if [ "$ready" = yes ] && [ -s "$t/timeout.pid" ]; then
+      read -r tp < "$t/timeout.pid" || tp=
+      [ -z "$tp" ] || kill -s ALRM -- "$tp" 2> /dev/null || true
+    fi
+    wait "$p1" || rc=$?
+    if [ "$ready" = yes ] && read -t "$fs" -r line <&3; then
+      [ "$line" = end ] && ended=yes
+    fi
     left=
     if [ -s "$t/stub.pid" ]; then
       read -r sp ip < "$t/stub.pid"
@@ -685,8 +729,6 @@ PY
     fi
     lk=free
     flock -n "$t/gate.lock" true || lk=held
-    ended=no
-    if read -t "$fs" -r _ <&3; then ended=yes; fi
     echo go >&4
     wait "$r1" || true
     echo "stub ran: $([ -s "$t/stub.pid" ] && echo yes || echo no), left:${left:- none}, output ended: $ended, gate lock: $lk" > "$t/out"
@@ -1771,6 +1813,7 @@ PY
     case_ "shared card lock is free after lib $stop" 0 '^ran on ' 3090 "$t/lease"
   done
   fi
+  selftest_load_down
   echo "gpu-gate self-test: $((n - bad)) of $n ok"
   [ "$bad" = 0 ]
 }
@@ -1787,11 +1830,14 @@ self_test_parts() {
   fi
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/gpu-gate-parts.XXXXXX") || return 70
   # shellcheck disable=SC2064 # the path is fixed now
-  trap "rm -rf '$tmp'" EXIT
+  trap "selftest_load_down; rm -rf '$tmp'" EXIT
+  selftest_load_up || return $?
   for ((k = 1; k <= SELFTEST_PARTS; k++)); do
-    ( set +e; s0=$SECONDS; bash "$self" --self-test --part "$k" > "$tmp/$k.out" 2>&1; echo $? > "$tmp/$k.rc"; echo $((SECONDS - s0)) > "$tmp/$k.s" ) &
+    # The load runs once, in this parent. A part that also saw the variable would start another set.
+    ( set +e; s0=$SECONDS; env -u GPU_GATE_SELFTEST_LOAD bash "$self" --self-test --part "$k" > "$tmp/$k.out" 2>&1; echo $? > "$tmp/$k.rc"; echo $((SECONDS - s0)) > "$tmp/$k.s" ) &
   done
   wait
+  selftest_load_down
   for ((k = 1; k <= SELFTEST_PARTS; k++)); do
     cat "$tmp/$k.out"
     line=$(tail -n 1 "$tmp/$k.out")
