@@ -66,6 +66,11 @@ crates/app/src/arch/glm5next/**	derive	the GLM session impls: the GLM e2e gate
 crates/app/src/{mtp.rs,mtp/**,arch/qwen3moe/**}	derive	the shared MTP window and the qwen3moe session impls: the app tests, the qwen3moe e2e gate, the Qwen3.8 serve seat and MTP gates, and the Qwen3.6 draft gate (its Session<Body35> taps)
 crates/runtime/src/**	derive gate-placement gate-union gate-ds41-host gate-dspark-read gate-ptx-spill gate-gpu-qwen3moe-experts gate-gpu-qwen3moe-flash gate-gpu-qwen3moe-head gate-gpu-qwen3moe-rope gate-gpu-ds41-comp gate-gpu-ds41-unpack gate-gpu-dspark-hc	the generation loop and its stores: every gate that names a runtime path in its own code (runtime::combine in gate_kquant and the chain-ffn/prefill bins, hc_gated, qsa, seqstate, swaprule, stores), loads weights through bloomery_gpu::weights (whose every loader entry funnels into upload_rows → runtime::words::stream_words), or opens a model or session (arch place.rs → runtime::stores; clef-hidden opens the Qwen3.5 body, whose body35.rs reads runtime::seqstate). The gates left out load no model and name no runtime path: the synthetic kernel gates upload through DeviceTensor::upload/from_host and read reference values host-side, the CPU oracle gates read the model host-side, and gate-runtime is picked as its own lib's tests
 crates/hf/src/dspark.rs	derive	the DSpark draft geometry read by the Qwen3.6 draft gate
+crates/hf/src/lib.rs	derive	the repo string, hub listing, GGUF set pick and cache paths every bloomery-hf user reads through the crate root
+crates/hf/src/{source.rs,card.rs}	derive	where a resolved model file lives and what its model-card JSON says; model-hf's folder and remote open read them
+crates/hf/src/{schema.rs,quant_config.rs,modelopt.rs,csf.rs}	derive	the checkpoint quantization schema, placement plan, ModelOpt normalization and CSF block scales; model-hf's folder and part read them
+crates/hf/src/vocab.rs	derive	the byte-level BPE tokenizer keys read from a checkpoint folder; model-hf's folder and the prepare bin
+crates/hf/src/sentence_transformers.rs	derive	sentence-transformers prompt prefixes from config_sentence_transformers.json; embedding checkpoint readers
 crates/safetensors/src/**	derive	the shared mapped checkpoint and shard reader used by Clef heads, DSpark drafts and checkpoint preparation
 
 crates/serve/{src/**,build.rs}	derive gate-gpu-routed-legs	the llama-server-compatible API: gpu-gates' bind tests (bloomery-serve-ds41's gate is weekly-gpu-ds41-serve, a trigger below); gate-serve is its own
@@ -196,6 +201,14 @@ crates/threads/src/lib.rs	derive	the pool: upload's memcpy_pool, ops' matmul and
 crates/engram/src/lib.rs	derive	EngramError (direct.rs) and Engram, which the V4.1 chain's glue holds
 crates/models/src/headpick.rs	derive	models::headpick, the row-list head's reader, digest and loaded set: every gate whose load reads a head list gate-gpu-p6 gate-gpu-e2e gate-gpu-hybrid gate-gpu-p8 gate-gpu-moe gate-gpu-ds41-moe gate-gpu-ds41-chain-ffn gate-gpu-block gate-gpu-p10 gate-qwen35moe-meta gate-gpu-qwen3moe-router gate-gpu-qwen35moe-moe gate-gpu-qwen35-dspark gate-gpu-gemm gate-gpu-head gate-gpu-lib gate-gpu-ds41-lib gate-gpu-ds41-step gate-gpu-ds41-tier gate-gpu-ds41-callstream gate-gpu-ds41-residency-a gate-gpu-ds41-nvtier gate-gpu-ds41-long gate-gpu-ds41-prefill gate-gpu-ds41-media gate-ds41-load gate-gpu-p8b gate-gpu-dspark-experts gate-gpu-dspark-kv gate-gpu-dspark-graph gate-gpu-glm5next-mtp gate-gpu-glm5next-nvtier gate-gpu-glm5next-twocard gate-gpu-glm5next-residency
 crates/engram/src/rows.rs	derive	SplitTable, which the Qwen3.8 body opens
+crates/model-hf/src/{folder.rs,model_file.rs}	derive	the one checkpoint-folder reader and the owner of GGUF-or-folder ModelFile; every arch map and the gpu checkpoint gates plug into folder
+crates/model-hf/src/{part.rs,cut.rs}	derive	reading a load's tensors from a checkpoint folder and writing fixture cuts; gpu-glm5next's hf tests and refset fixture cut
+crates/model-hf/src/remote.rs	derive	HTTP Range reads of a hub listing for fixture fetch; the fixture bin
+crates/model-hf/src/arch/mod.rs	derive	the MAPS dispatch folder::open uses to pick a checkpoint map by model_type
+crates/model-hf/src/arch/glm5next.rs	derive	the GLM-5.3-Flash checkpoint map; gpu-glm5next's folder test with the hf feature
+crates/model-hf/src/arch/minimaxm3.rs	derive	the MiniMax-M3 checkpoint map; the minimax family gates that open checkpoint folders
+crates/model-hf/src/arch/{qwen3moe.rs,trunk.rs,section.rs}	derive	the Qwen3-MoE MLX checkpoint map and its trunk and section layout; qwen35moe folder tests and prepare
+crates/model-hf/src/arch/{qwen35moe.rs,qwen35moe/folder.rs}	derive	the Qwen3.8-Flash-Next and Qwen3.6 MLX maps onto qwen4exp and qwen35moe; the qwen38 and qwen36 gates with the checkpoint feature
 crates/hf/src/fetch.rs	derive	the fetch Event that model_file.rs reports; the fixture fetch's range reads
 crates/decision/src/lib.rs	derive	the decision crate's Error: the decision gates
 crates/vision/src/lib.rs	derive gate-gpu-routed-legs	VisionError, which the media and preprocess paths return
