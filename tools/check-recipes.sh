@@ -368,6 +368,9 @@ blk_releasebuild() { tool_selftest release/build.sh; }
 # install.sh's archive choice (x86-64, GB10 aarch64 and Apple Silicon, and each refusal) on stub uname and nvidia-smi: the
 # installer runs on users' machines only, so its choice is held here.
 blk_releaseinstall() { tool_selftest release/install.sh; }
+# publish.sh's first step: tools/rotation.py check refuses the publish on rc 1 (and on rc 2 or 70, named) before the tag
+# check, on a stub rotation.py in a temporary repository; the script runs on the lead's Mac only at a release.
+blk_releasepublish() { tool_selftest release/publish.sh; }
 # Every Python tool's own tests, on the Mac and the Linux host nightly (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison (unit pytools.list) fails on one that is not. Each tool is a unit of its own
 # (pytools.K, the K-th line, run from the repository root), so the scheduler bounds them with every other unit.
@@ -1179,7 +1182,7 @@ proc_leg_gpu() {
 }
 
 BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall pytools boxqcodes fixturevariants fixturedirs dsparkread
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish pytools boxqcodes fixturevariants fixturedirs dsparkread
   refsetpublish orphan archowner treecommit archivepipe fnowner wt macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
 # narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are

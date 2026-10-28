@@ -7,8 +7,8 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
 
     python3 tools/recipes.py check            # the target checks of `just check-recipes`, one feature set a bin, and the plan files records-refresh writes (presence)
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
-    python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...] [--class]
-    python3 tools/recipes.py release-list [TAG | TAG..HEAD] [--wall]  # the release batch's list: the S0 gates, the R families' gates, the class-staged affected and the rotation's due gates
+    python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...] [--no-class]
+    python3 tools/recipes.py release-list [TAG | TAG..HEAD] [--wall]  # the release batch's list: the S0 gates, the R families' gates, affected without the F families' gates and the rotation's due gates
     python3 tools/recipes.py scan-set [REV]    # the bins whose ptx-scans cover every kernel carrier: bin<TAB>features<TAB>carriers (just narrow scans them)
     python3 tools/recipes.py ships [--rev REV] [--base REV] FILE...  # the FILEs inside the shipped closure (tools/release/build.sh's bins at its features), with why; exit 1 when any is (tools/release/late-commit.sh)
     python3 tools/recipes.py ship-scan [--rev REV] BASE_LOG HEAD_LOG...  # the shipped bins' ptx-scan pairs: a verdict line each; exit 0 only when every shipped bin has a pair and all are identical
@@ -39,14 +39,16 @@ A recipe that a row of tools/fixture-variants.tsv lists also prints its variant 
 its own and in the `recipes:` line (a batch `--list` takes the first word of the line). A row that was added or edited prints the items of its
 recipes whether or not the diff selected them: the variant's file lives outside the repository, so the row is what a change to it is.
 
-The class stage (`--class`, off by default) is the third stage, after select() and narrow(): the class tables (tools/gate-class.tsv,
+The class stage (on; `--no-class` turns it off) is the third stage, after select() and narrow(): the class tables (tools/gate-class.tsv,
 tools/families.tsv, tools/owners.tsv, read through tools/gate_class.py's loader) say what a gate-* recipe is, and a family gate is kept only
 when the change can have moved it — the family's own file changed, the recipe's own text or one of its own target files changed, the family is
 a representative one and the pick reaches a changed file, or the family was added since the last release tag. The gate it leaves out is printed
-with its reason, in the same `left out` block the ptx-scan stage uses. Without the flag that stage is not applied.
+with its reason, in the same `left out` block the ptx-scan stage uses. With `--no-class` that stage is not applied and every gate the graph
+reaches stays.
 A change whose selecting files all sit under `MAC_CRATES` does not select a CUDA gate on a GGUF input (`mac_landing_deferred`); the gate is
 printed under `deferred`. `release-list` is the release batch's list: every S0 gate (a common or a tooling gate the fixture tier runs), every
-gate of a representative family, the class-staged affected(TAG), the rotation's due gates and every CUDA gate on a GGUF input (`mac_gguf_cuda`).
+gate of a representative family, affected(TAG) without the gates of the F families (the rotation holds those: tools/rotation.py check), the
+rotation's due gates and every CUDA gate on a GGUF input (`mac_gguf_cuda`).
 
 A recipe's inputs are:
   - the files of every cargo target it builds or tests: the target's own module tree (`mod`,
@@ -2464,14 +2466,14 @@ def cmd_affected(args: argparse.Namespace) -> int:
         for n, _reason in deferred:
             picks.pop(n, None)
         vitems = variant_items(list(picks), a, b, changed, prefix) if prefix == GATE_PREFIX else []
-        class_note = f"class-staged: {len(stage.kept)} kept, {len(stage.left_out)} left out" if stage else ""
+        class_note = f"class-staged: {len(stage.kept)} kept, {len(stage.left_out)} left out" if stage else "class stage off (--no-class)"
         mac_note = f", {len(deferred)} deferred to weekly (CUDA gate, GGUF input)" if deferred else ""
         if narrowed:
             print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected "
                   f"(narrowed from {len(sels)} by ptx-scan; {class_note}){weekly}{mac_note}")
         else:
             print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected"
-                  + (f" ({class_note})" if stage else "") + weekly + mac_note)
+                  + f" ({class_note})" + weekly + mac_note)
         if nar is not None:
             for r in nar.full:
                 print(f"narrow: full list — {r}")
@@ -2506,7 +2508,7 @@ def cmd_affected(args: argparse.Namespace) -> int:
             else:
                 reasons = [(n, f"ptx-scan {let_out}") for n in out]
                 reasons += [(n, why) for n, why in stage.left_out.items()]
-                print(f"left out ({len(reasons)}), each by its reason:")
+                print(f"left out ({len(reasons)}), each by its reason (--no-class keeps the class stage's gates):")
                 for n, why in reasons:
                     print(f"  - {n}  ({why})")
         else:
@@ -2521,7 +2523,7 @@ def cmd_affected(args: argparse.Namespace) -> int:
             print("recipes: " + " ".join([*picks, *(i for i, _ in vitems), *(t.recipe for t in trig)]))
             print("always: " + " ".join(ALWAYS))
             if stage is not None and stage.left_out:
-                print(f"left out ({len(stage.left_out)}), each by its reason:")
+                print(f"left out ({len(stage.left_out)}), each by its reason (--no-class keeps the class stage's gates):")
                 for n, why in stage.left_out.items():
                     print(f"  - {n}  ({why})")
         if deferred:
@@ -10727,7 +10729,7 @@ def range_base_self_test(expect) -> None:
             run("git", "commit", "-q", "-am", f"{branch} moves {rel}")
 
         def affected(spec: str) -> tuple[str, list[str]]:
-            done = run(sys.executable, "tools/recipes.py", "affected", spec, "--no-box")
+            done = run(sys.executable, "tools/recipes.py", "affected", spec, "--no-box", "--no-class")  # the fixture has no class tables
             if done.returncode != 0:
                 expect(False, f"range: affected {spec} failed (rc {done.returncode}): {done.stderr.strip()[-300:]}")
             lines = done.stdout.splitlines()
@@ -13881,7 +13883,7 @@ def _st_selection(fails: list[str], side: Side) -> None:
 # tools/gate_class.py's loader, the one reader) say what a gate-* recipe is: a common gate (family-agnostic), a
 # tooling gate (harness, static, fixture writer) or a family gate (one family's own weights or code). The class
 # stage is the third stage of `affected`, after select() and narrow(): it keeps every common and every tooling
-# pick, and keeps a family pick only when the change can have moved it. It is off by default (`--class`).
+# pick, and keeps a family pick only when the change can have moved it. It is on by default (`--no-class` turns it off).
 #
 # A family:X pick is kept when
 #   (a) X is a representative family (families.tsv's rep R) and the pick reaches a changed file through the
@@ -13909,6 +13911,13 @@ def class_tables(root: str = ROOT):
         return gate_class.load(root)
     except gate_class.GateClassError as err:
         raise RecipeError(f"the class tables of {root}: {err}") from err
+
+
+def f_family_gates(tables) -> dict[str, str]:
+    """The gates of the F families (families.tsv rep F), recipe -> family: the gates a landing runs only on their
+    family's own change, which the rotation (tools/rotation.py) schedules and the release list leaves to it."""
+    return {n: row.family for n, row in tables.gates.items()
+            if row.cls == "family" and tables.families[row.family].rep == "F"}
 
 
 _CLASS_GLOBS: dict[str, re.Pattern] = {}
@@ -14080,7 +14089,7 @@ def class_narrow(picks: dict[str, str], changed: list[str], tables, reach, new_f
 
 def class_stage(picks: dict[str, str], changed: list[str], tables, reach, new_families: set[str],
                 enabled: bool) -> ClassStage:
-    """The class stage, off by default: without the flag the picks stand as they are."""
+    """The class stage, unless `--no-class` turned it off: then the picks stand as they are."""
     if not enabled:
         return ClassStage(dict(picks), {})
     return class_narrow(picks, changed, tables, reach, new_families)
@@ -14180,10 +14189,28 @@ def predicted_wall(names: list[str], fixture: dict[str, list[tuple[str, int]]],
             "wall": int((lanes["A"] + lanes["B"]) / 2 + lanes["X"])}
 
 
+def release_affected(kept: list[str], tables) -> tuple[list[str], dict[str, str]]:
+    """(affected(TAG) without its F-family gates, the F-family gates it dropped as recipe -> family): the F
+    families are the rotation's, and `tools/release/publish.sh` refuses the tag while `tools/rotation.py check`
+    is red."""
+    f = f_family_gates(tables)
+    return [n for n in kept if n not in f], {n: f[n] for n in kept if n in f}
+
+
+def rotation_left(dropped: dict[str, str], ledger: Ledger) -> list[str]:
+    """One line per F-family gate left to the rotation: its family and its last green row in the ledger."""
+    out = []
+    for n, fam in sorted(dropped.items(), key=lambda kv: (kv[1], kv[0])):
+        rec = ledger.by_recipe.get(n)
+        out.append(f"  {n}  (family {fam}, " + (f"last green {rec.date}" if rec else "no green row in the ledger") + ")")
+    return out
+
+
 def cmd_release_list(args: argparse.Namespace) -> int:
     """The release batch's list: every S0 gate (a common or a tooling gate the fixture tier runs), every gate of
-    a representative family, the class-staged affected(BASE), the rotation's due gates and every CUDA gate on a
-    GGUF input. One recipe per line, sorted, no duplicate; the counts per part on stderr."""
+    a representative family, the class-staged affected(BASE) without its F-family gates, the rotation's due gates
+    and every CUDA gate on a GGUF input. One recipe per line, sorted, no duplicate; the counts per part on stderr,
+    and each F-family gate left to the rotation with its last green date."""
     changed, a_rev, b_rev, _ = changed_files(args.base)
     tmp = tempfile.mkdtemp(prefix="recipes-release-")
     try:
@@ -14195,15 +14222,20 @@ def cmd_release_list(args: argparse.Namespace) -> int:
               if row.cls in ("common", "tooling") and classes.get(n) in ("A", "B", "F", "X")]
         reps = [n for n, row in tables.gates.items()
                 if row.family and tables.families[row.family].rep == "R"]
-        affected = list(class_picks(changed, a, b, tables).kept)
+        affected, dropped = release_affected(list(class_picks(changed, a, b, tables).kept), tables)
         due = rotation_due(b.tree.root)
         mac = [n for n, _why in mac_gguf_cuda(b.recipes, b.tree.root)]
+        mac_f = [n for n in mac if n in f_family_gates(tables)]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     names, counts = release_union({"S0": s0, "R families": reps, "affected": affected, "rotation due": due, "mac GGUF": mac})
     for n in names:
         print(n)
     print("release-list: " + ", ".join(f"{k} {v}" for k, v in counts.items()) + f", {len(names)} recipe(s) in all", file=sys.stderr)
+    print(f"release-list: {len(dropped)} F-family gate(s) of affected are left to the rotation (tools/rotation.py check holds them before the tag)"
+          + (f"; the mac GGUF part still holds {len(mac_f)} F-family gate(s)" if mac_f else "") + (":" if dropped else ""), file=sys.stderr)
+    for line in rotation_left(dropped, Ledger(args.ledger)):
+        print(line, file=sys.stderr)
     if args.wall:
         fixture, plain = times_rows(args.times)
         w = predicted_wall(names, fixture, plain)
@@ -14215,7 +14247,7 @@ def cmd_release_list(args: argparse.Namespace) -> int:
 def class_stage_self_test(fails: list[str]) -> None:
     """The class stage on a synthetic tree and tables: the four rules that keep a family gate, the reason a family
     gate is left out, the check that the stage never adds a pick and never drops a common or a tooling one, the
-    default-off identity and the release list's union."""
+    stage on by default and off with `--no-class`, and the release list's union without the F families."""
     expect = _expecting(fails)
     t0 = time.monotonic()
 
@@ -14299,11 +14331,15 @@ def class_stage_self_test(fails: list[str]) -> None:
                "class: check 6 refuses a pick the stage added")
         expect(refused(lambda: class_check6(picks, {}, {"gate-com": "why"}, tables), "dropped the common pick"),
                "class: check 6 refuses a common pick the stage dropped")
-        # the stage is off by default
-        st = class_stage(picks, changed, tables, lambda n: reach[n], set(), False)
-        expect(st.kept == picks and not st.left_out, f"class: the stage off by default keeps every pick: {st.kept}")
-        expect("gate-fix" in class_stage(picks, changed, tables, lambda n: reach[n], set(), True).left_out,
-               "class: the stage on leaves the family gate out")
+        # the stage is on by default (no flag drops the F gate whose family did not change) and `--no-class` keeps it
+        parser = build_parser()
+        on = parser.parse_args(["affected"]).class_stage
+        off = parser.parse_args(["affected", "--no-class"]).class_stage
+        st = class_stage(picks, changed, tables, lambda n: reach[n], set(), on)
+        expect(on is True and "gate-fix" in st.left_out and "gate-fix" not in st.kept,
+               f"class: with no flag the family gate whose family did not change is left out: {on} {st.left_out}")
+        st = class_stage(picks, changed, tables, lambda n: reach[n], set(), off)
+        expect(off is False and st.kept == picks and not st.left_out, f"class: --no-class keeps every pick: {off} {st.kept}")
         # the tree's own tables: every common gate is kept, and a family gate of an F family is left out
         real = class_tables(ROOT)
         st = class_narrow({n: "why" for n in real.gates}, ["crates/gpu/src/lib.rs"], real,
@@ -14316,6 +14352,20 @@ def class_stage_self_test(fails: list[str]) -> None:
         names, counts = release_union({"S0": ["b", "a"], "R families": ["a", "c"], "rotation due": ["c"]})
         expect(names == ["a", "b", "c"], f"release: the union is sorted and holds no duplicate: {names}")
         expect(counts == {"S0": 2, "R families": 2, "rotation due": 1}, f"release: the count of each part: {counts}")
+
+        # the release list leaves the F families to the rotation, each gate named with its last green row
+        expect(f_family_gates(tables) == {"gate-fix": "fam-fix", "gate-new": "fam-new"},
+               f"release: the F-family gates of the tables (not the R family's, a common's or a tooling's): {f_family_gates(tables)}")
+        affected, dropped = release_affected(["gate-com", "gate-fix", "gate-rep", "gate-tool"], tables)
+        expect(affected == ["gate-com", "gate-rep", "gate-tool"] and dropped == {"gate-fix": "fam-fix"},
+               f"release: affected loses its F-family gate and keeps the common, R-family and tooling ones: {affected} {dropped}")
+        led = os.path.join(tmp, "ledger.tsv")
+        with open(led, "w", encoding="utf-8") as fh:
+            fh.write("\t".join(["a" * 64, "gate-fix", "gate-fix", "abc123456789", "2026-10-20T10:00:00+0900", "/x"]) + "\n")
+        lines = rotation_left({"gate-new": "fam-new", "gate-fix": "fam-fix"}, Ledger(led))
+        expect(lines == ["  gate-fix  (family fam-fix, last green 2026-10-20T10:00:00+0900)",
+                         "  gate-new  (family fam-new, no green row in the ledger)"],
+               f"release: each dropped F gate is named with its last green date, or its lack: {lines}")
 
     print(f"class stage self-test: {'ok' if not fails else f'{len(fails)} failure(s)'} ({time.monotonic() - t0:.1f} s)")
 
@@ -14383,7 +14433,7 @@ def self_test(serial: bool = False) -> int:
     return 1 if fails else 0
 
 
-def main(argv: list[str]) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--serial", action="store_true", help="with --self-test: run its sections one after another in this process (a debugger, a traceback in order)")
@@ -14402,7 +14452,7 @@ def main(argv: list[str]) -> int:
     a.add_argument("--depinfo-remote", default=os.environ.get("BLOOMERY_DEPINFO_REMOTE", "~/repo/bloomery"))
     a.add_argument("--narrow", action="store_true", help=f"the gates that run the changed host path, when every --scan pair is identical or added (the rule and {GATE_PATHS}: the section above narrow())")
     a.add_argument("--scan", nargs=2, action="append", metavar=("BASE_LOG", "NEW_LOG"), help="a pair of `just ptx-scan <bin>` logs, the base tree's and the change's (repeatable)")
-    a.add_argument("--class", dest="class_stage", action="store_true", help="the class stage: keep a family gate only when the change can have moved it (the class tables; off by default)")
+    a.add_argument("--no-class", dest="class_stage", action="store_false", help="turn the class stage off: keep every gate the graph reaches (by default a family gate stays only when the change can have moved it, by the class tables)")
     ss = sub.add_parser("scan-set", help="the bins whose ptx-scans cover every kernel carrier, one line each: bin<TAB>features<TAB>the carriers it covers (tools/narrow-scan.sh scans them)")
     ss.add_argument("rev", nargs="?", help="the commit to read (a git archive of it); default the working tree")
     ss.add_argument("--ship", action="store_true", help=f"the shipped bins at the release features (tools/release/build.sh) are the first picks; {SCAN_SHIP_ENV}=1 does the same")
@@ -14471,11 +14521,17 @@ def main(argv: list[str]) -> int:
     op = sub.add_parser("opens", help="per RECIPE, whether a cargo target it builds or runs reaches the fixture fence (Tier::check_file): opens<TAB>recipe<TAB>pkg:kind:target<TAB>path:line<TAB>called, or none<TAB>recipe (tools/gate-batch.sh's real-file deferral)")
     op.add_argument("items", nargs="*", metavar="RECIPE")
     op.add_argument("--explain", action="store_true", help="the fence, the openers and each recipe's targets, on stderr")
-    rl = sub.add_parser("release-list", help="the release batch's list: every S0 gate, every gate of a representative family, the class-staged affected(BASE) and the rotation's due gates")
+    rl = sub.add_parser("release-list", help="the release batch's list: every S0 gate, every gate of a representative family, affected(BASE) without the F families' gates (the rotation holds those) and the rotation's due gates")
     rl.add_argument("base", nargs="?", default="main", help="the release tag (or TAG..HEAD): the diff the list covers")
     rl.add_argument("--wall", action="store_true", help="the predicted wall of the list on stderr (the fixture tier's medians)")
     rl.add_argument("--lock-wait", type=float, default=1.57, help="the factor the predicted wall carries over the medians (the lock waits)")
     rl.add_argument("--times", default=os.environ.get("BLOOMERY_GATE_TIMES", os.path.expanduser("~/.cache/bloomery/gate-times.tsv")), help="the times file the medians come from")
+    rl.add_argument("--ledger", default=os.environ.get("BLOOMERY_GATE_LEDGER", os.path.expanduser("~/.cache/bloomery/gate-ledger.tsv")), help="the green ledger the last green dates of the F-family gates left to the rotation come from")
+    return ap
+
+
+def main(argv: list[str]) -> int:
+    ap = build_parser()
     args = ap.parse_args(argv)
     try:
         if args.self_test:

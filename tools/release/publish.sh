@@ -4,8 +4,11 @@
 # mistake (gh named the assets from temp filenames and every download URL 404'd).
 #
 #   tools/release/publish.sh <version> [--dry-run] [--no-tap]
+#   tools/release/publish.sh --self-test     (the rotation's refusal on stub rotation.py exits; check-recipes runs it)
 #
 # What it owns, in order:
+#   0. the rotation: `python3 tools/rotation.py check` must be green (every F family has a green ledger row inside the
+#      rotation's window: the release batch leaves those gates to the rotation); rc 1 stops here, and so does rc 2 or 70, each named;
 #   1. the tag: HEAD must carry tag v<version> (the release is the tag; the binaries'
 #      --version names this commit);
 #   2. the versions: the serve AND gpu-gates crates must both say <version> (--version
@@ -35,7 +38,57 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
-VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap]}
+
+# rotation_gate: tools/rotation.py check's verdict as this script's: 0 green, 1 and the named reason otherwise. The check's own lines
+# (the families it names) go to stderr first.
+rotation_gate() {
+    local rc=0
+    python3 tools/rotation.py check >&2 || rc=$?
+    case "$rc" in
+        0) ;;
+        1) echo "publish.sh: the rotation is red: the lines above name each family with no green ledger row in the rotation's window — run \`just rotation-due\` and the batch it lists on the lead's ledger, then publish" >&2; return 1 ;;
+        *) echo "publish.sh: tools/rotation.py check could not run (rc $rc; 2 a bad input, 70 a tool it runs failed): the lines above name it" >&2; return 1 ;;
+    esac
+}
+
+# --self-test: a copy of this script in a temporary repository with no tag, beside a stub tools/rotation.py that exits with each
+# code. rc 1, 2 and 70 stop at the rotation with a message that names it; rc 0 passes it and stops at the tag check after it, so the
+# rotation is the first step and a green one lets the rest run.
+if [ "${1:-}" = --self-test ]; then
+    [ $# = 1 ] || { echo "usage: tools/release/publish.sh --self-test" >&2; exit 64; }
+    t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
+    mkdir -p "$t/tools/release"
+    cp "$0" "$t/tools/release/publish.sh"
+    git -C "$t" init -q
+    git -C "$t" -c user.name=selftest -c user.email=selftest@invalid commit -q --allow-empty -m selftest
+    cases=0 fails=0
+    # expect <stub rotation.py exit code> <message the run must print>: the run must fail, naming it, and print nothing of a later step
+    expect() {
+        cases=$((cases + 1))
+        printf 'import sys\nsys.exit(%s)\n' "$1" > "$t/tools/rotation.py"
+        rc=0
+        got=$(bash "$t/tools/release/publish.sh" 0.0.0 2>&1) || rc=$?
+        case "$rc:$got" in
+            1:*"$2"*) ;;
+            *) echo "publish.sh self-test: rotation exit $1: rc $rc, want rc 1 with '$2'; got: $got" >&2; fails=$((fails + 1)) ;;
+        esac
+        case "$got" in
+            *"does not carry"*) [ "$1" = 0 ] || { echo "publish.sh self-test: rotation exit $1: the tag step ran after a refusal: $got" >&2; fails=$((fails + 1)); } ;;
+        esac
+    }
+    expect 1 "the rotation is red"
+    expect 2 "could not run (rc 2"
+    expect 70 "could not run (rc 70"
+    expect 0 "does not carry v0.0.0"
+    if [ "$fails" = 0 ]; then
+        echo "publish.sh: self-test ok ($cases cases)"
+        exit 0
+    fi
+    echo "publish.sh: self-test: $fails failure(s) in $cases cases" >&2
+    exit 1
+fi
+
+VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] | --self-test}
 DRY=0; TAP=1
 for a in "${@:2}"; do
     case "$a" in
@@ -54,6 +107,9 @@ MAC_NAME="bloomery-$VERSION-macos-arm64-metal"
 TAG="v$VERSION"
 
 fail() { echo "publish.sh: $*" >&2; exit 1; }
+
+# 0. the rotation
+rotation_gate || exit 1
 
 # 1. the tag
 COMMIT=$(git rev-parse --short=12 HEAD)

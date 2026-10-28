@@ -45,7 +45,9 @@ reference; what follows is the contract.
     just build-ref            # the C++ reference harnesses that link ggml (rerun when ik moves; gate-qdot reads them)
     just deny                 # cargo deny; fails if the cuda-oxide pin floats; reaches the network
     just affected [BASE|A..B] # the gate-* recipes a change selects, from the crate graph and module trees, the scripts
-                              # a recipe names, the cargo globals and each manifest by table; builds nothing
+                              # a recipe names, the cargo globals and each manifest by table; builds nothing. A gate
+                              # of an F family (tools/families.tsv) stays only when its family's files, its recipe or
+                              # its own targets changed, each left out one named with its reason; --no-class keeps all
     just gate / smoke         # static checks, lint, fast library gates / the round loop's subset
     just gate-<name>          # one subsystem's tests, bounded, real exit code
     just gate-ptx-spill       # every PTX entry's spill/jit_local bytes against tools/ref/ptx-shapes.tsv
@@ -82,7 +84,9 @@ reference; what follows is the contract.
   both cards, checked byte for byte; solo) is never selected: a change to `crates/model/src/placement.rs`,
   `placement/{workstation,host_lock}.rs`, `crates/gpu/src/{hybrid,weights}.rs` or `gate_load_v41.rs` runs it by name.
   `just weekly` also runs the rotation (`tools/rotation.py due`): every gate a fixture-tier landing defers (real-only,
-  real-file, no-fixture, needs-env) that has no green row at its current key and none in 7 days; `just rotation-due` prints it.
+  real-file, no-fixture, needs-env) and every gate of an F family that has no green row at its current key and none in
+  7 days; `just rotation-due` prints it. The release list leaves the F families' gates to it, and
+  `tools/release/publish.sh` stops while `tools/rotation.py check` (an F family with no green row in 7 days) is red.
 - `just gate` excludes the measure targets (they need a quiet machine and a lock) and `just deny`. Build artifacts land
   in the workspace root `target/`; the measure runners read only from there.
 

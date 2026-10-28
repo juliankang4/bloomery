@@ -209,6 +209,8 @@ check-recipes:
     ./tools/check-recipes.sh
 
 # The gate-* recipes that read a file changed since the merge-base with BASE (default main), or in A..B (from merge-base(A, B) to B, as `git diff A...B`) — on the Mac, no build, runs nothing (tools/affected-gates.sh).
+# The class stage is on: a gate of an F family (tools/families.tsv) stays only when its family's files, its recipe or its own targets changed,
+# and each one left out is printed with its reason; `--no-class` keeps every gate the graph reaches.
 # `--narrow --scan BASE_LOG NEW_LOG …` (ptx-scan logs of the base and the change): the gates that run the changed host path.
 affected BASE='main' *ARGS:
     ./tools/affected-gates.sh {{BASE}} {{ARGS}}
@@ -2292,20 +2294,21 @@ smoke *ARGS:
 # The weekly tier and the rotation: every `weekly-*` recipe (a gate taken out of the landing batch; `just affected`
 # selects only `gate-*`, and names a weekly recipe when a file one of its trigger rows in tools/gate-paths.tsv matches
 # changes), then every gate the fixture tier defers (real-only, real-file, no-fixture, needs-env) that has no green row
-# at its current key and none newer than 7 days (tools/rotation.py due), in one sitting through tools/gate-batch.sh, on
-# the lead's ledger. `just affected` never selects the rotation.
+# at its current key and none newer than 7 days (tools/rotation.py due), and every gate of an F family likewise, in one sitting through
+# tools/gate-batch.sh, on the lead's ledger. `just affected` never selects the rotation.
 # ARGS go to the batch (--dry-run, --out DIR, --rerun).
 weekly *ARGS:
     mkdir -p target && python3 tools/rotation.py due --with-weekly --out target/weekly.list && ./tools/gate-batch.sh --ledger --list target/weekly.list {{ARGS}}
 
-# The rotation's due list alone, as a `--list` file for tools/gate-batch.sh: the gates no landing runs, stalest family
-# first, each with its predicted wall. It reads the box once, for the keys.
+# The rotation's due list alone, as a `--list` file for tools/gate-batch.sh: the gates no landing runs and those of an F family, stalest
+# family first, each with its predicted wall. It reads the box once, for the keys.
 # ARGS go to tools/rotation.py due (--days N, --classes FILE).
 rotation-due *ARGS:
     python3 tools/rotation.py due {{ARGS}}
 
-# The release batch's `--list`: every S0 gate, every gate of an R family, the class-staged `affected` since TAG and the
-# rotation's due list, one recipe a line; the counts per part (and with --wall the predicted wall) on stderr.
+# The release batch's `--list`: every S0 gate, every gate of an R family, the class-staged `affected` since TAG without the gates of
+# the F families (the rotation holds those; each is named on stderr with its last green date) and the rotation's due list, one recipe a
+# line; the counts per part (and with --wall the predicted wall) on stderr.
 release-list TAG *ARGS:
     python3 tools/recipes.py release-list {{TAG}} {{ARGS}}
 

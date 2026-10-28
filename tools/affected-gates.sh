@@ -6,6 +6,8 @@
 #   tools/affected-gates.sh A..B         # B against merge-base(A, B) (A itself when it is an ancestor of B), each read from its own
 #                                        # `git archive`; the `affected:` line says `<mb> (merge-base of A and B)..B` when it moved
 #   tools/affected-gates.sh … --no-box   # skip the box's dep-info (read-only ssh otherwise)
+#   tools/affected-gates.sh … --no-class # without the class stage, which is on: a gate of an F family (tools/families.tsv) stays only when
+#                                        # its family's files, its recipe or its own targets changed, each one left out named with its reason
 #   tools/affected-gates.sh … --narrow --scan BASE_LOG NEW_LOG [--scan …]
 #                                        # narrowed by ptx-scan pairs (base, change) and tools/gate-paths.tsv:
 #                                        # identical or added pairs keep the gates whose own target changed and

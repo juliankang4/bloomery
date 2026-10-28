@@ -7,7 +7,10 @@
 
 A landing runs the fixture tier. The gates it defers (class D: a real-only gate, a gate of a family with no fixture file, a real-file
 gate, a needs-env gate; tools/gate-batch.sh's classifier, read from `--classes`, never re-implemented) and the `weekly-*` recipes run
-only in a real-tier batch, and nothing else schedules them. The rotation is that schedule: one list for one batch.
+only in a real-tier batch, and nothing else schedules them. A landing also runs a gate of an F family (tools/families.tsv rep F; the gates
+are the class tables' family rows, through recipes.f_family_gates) only when its family's own files changed, and the release list leaves
+those gates out. The rotation is the schedule for all of them: one list for one batch. A gate of an F family is grouped under its
+class-table family (`<family> (F family)`), every other gate under the family of its recipe's BLOOMERY_MODEL.
 
   due    the rotation's gates with no green ledger row at their current input key (tools/recipes.py key, as gate-batch.sh --ledger
          computes it) and whose last green row, of any key, is N days old or older (default 7) or missing. Output: a `--list` file for
@@ -20,7 +23,8 @@ only in a real-tier batch, and nothing else schedules them. The rotation is that
          The key status comes from one `tools/gate-batch.sh --ledger --dry-run` over the gates stale by date: it reads the box once
          (the manifest, through tools/box.sh) and only when some gate is stale by date. When it cannot, every gate stale by date is
          listed as due with `key unknown` and the reason on stderr: the batch's own ledger check skips any that is green at its key.
-  check  rc 1 naming each family whose gates (the same set) have no green ledger row newer than N days.
+  check  rc 1 naming each family whose gates (the same set) have no green ledger row newer than N days. tools/release/publish.sh runs it
+         before a release is published and stops on rc 1.
 
 The ledger and the times file are the ones gate-batch.sh reads: BLOOMERY_GATE_LEDGER and BLOOMERY_GATE_TIMES, else
 ~/.cache/bloomery/. `--classes FILE` reads a saved `tools/gate-batch.sh --tier fixture --classes` (the classifier is slow: every
@@ -54,6 +58,7 @@ DATE_FMT = "%Y-%m-%dT%H:%M:%S%z"
 # The class D kinds a fixture-tier batch defers to the real tier (gate-batch.sh's header, «deferred»); the real tier's own D kinds
 # (variant, fixture-only) run in a fixture batch, which is a landing, and are not the rotation's.
 DEFERRED_KINDS = ("real-only", "real-file", "no-fixture", "needs-env")
+F_KIND = "family"  # the kind of an F-family gate no landing defers: a landing runs it only on its family's own change
 CLASS_LETTERS = "ABCDFRTX"
 NEEDS_ENV = re.compile(r"needs-env call (\w+)")
 
@@ -78,7 +83,7 @@ class Row:
 @dataclasses.dataclass(frozen=True)
 class Gate:
     name: str
-    kind: str  # the deferred kind, or `weekly` for a weekly-* recipe the fixture tier does not defer
+    kind: str  # the deferred kind, `weekly` for a weekly-* recipe the fixture tier does not defer, or `family` for an F-family gate it does not defer
     weekly: bool
     family: str
     env: str  # the variable a needs-env gate waits for, else ""
@@ -145,9 +150,20 @@ def family_of(rs: dict[str, recipes.Recipe], name: str) -> str:
 ROTATION_CHECKS = ("refset-check",)
 
 
-def rotation_gates(rows: dict[str, Row], family: Callable[[str], str]) -> list[Gate]:
-    """The rotation's gates: every gate-* or weekly-* recipe the fixture tier defers, and every weekly-* recipe. Recipes the
-    classifier defers that are not gates (the dump-ref-*, stage-*, route-trace-* tools) are not the rotation's."""
+def f_group(fam: str) -> str:
+    """The group of an F family's gates in `due` and `check`, apart from a recipe-profile family of the same name: one group's fresh
+    gates never stand for another's stale ones."""
+    return f"{fam} (F family)"
+
+
+def rotation_gates(rows: dict[str, Row], family: Callable[[str], str], f_gates: dict[str, str]) -> list[Gate]:
+    """The rotation's gates: every gate-* or weekly-* recipe the fixture tier defers, every weekly-* recipe and every gate of an F
+    family (`f_gates`: recipe -> class-table family, recipes.f_family_gates), which is the group it is listed under. Recipes the
+    classifier defers that are not gates (the dump-ref-*, stage-*, route-trace-* tools) are not the rotation's. A gate the class
+    tables name that the classifier does not is a named error: the tables or the justfile moved."""
+    missing = sorted(n for n in f_gates if n not in rows)
+    if missing:
+        raise RotationError(f"the class tables name {len(missing)} F-family gate(s) the classifier does not list: {' '.join(missing[:6])}")
     out = []
     for name in sorted(rows):
         row = rows[name]
@@ -155,10 +171,11 @@ def rotation_gates(rows: dict[str, Row], family: Callable[[str], str]) -> list[G
         if not (weekly or name.startswith(recipes.GATE_PREFIX) or name in ROTATION_CHECKS):
             continue
         deferred = row.cls == "D" and row.kind in DEFERRED_KINDS
-        if not (deferred or weekly):
+        if not (deferred or weekly or name in f_gates):
             continue
         m = NEEDS_ENV.search(row.why) if row.kind == "needs-env" else None
-        out.append(Gate(name, row.kind if deferred else "weekly", weekly, family(name), m.group(1) if m else ""))
+        kind = row.kind if deferred else "weekly" if weekly else F_KIND
+        out.append(Gate(name, kind, weekly, f_group(f_gates[name]) if name in f_gates else family(name), m.group(1) if m else ""))
     return out
 
 
@@ -382,7 +399,7 @@ def times_path_of() -> str:
     return os.environ.get("BLOOMERY_GATE_TIMES") or os.path.expanduser("~/.cache/bloomery/gate-times.tsv")
 
 
-def load_gates(args: argparse.Namespace, rs: dict[str, recipes.Recipe] | None = None) -> list[Gate]:
+def load_gates(args: argparse.Namespace, rs: dict[str, recipes.Recipe] | None = None, f_gates: dict[str, str] | None = None) -> list[Gate]:
     if args.classes:
         try:
             with open(args.classes, encoding="utf-8") as fh:
@@ -394,7 +411,9 @@ def load_gates(args: argparse.Namespace, rs: dict[str, recipes.Recipe] | None = 
     rows = parse_classes(text)
     if rs is None:
         rs = recipes.load_justfile(os.path.join(ROOT, "justfile"))
-    return rotation_gates(rows, lambda n: family_of(rs, n))
+    if f_gates is None:
+        f_gates = recipes.f_family_gates(recipes.class_tables(ROOT))
+    return rotation_gates(rows, lambda n: family_of(rs, n), f_gates)
 
 
 def load_ledger(path: str) -> tuple[dict[str, dt.datetime], int]:
@@ -409,11 +428,12 @@ def load_ledger(path: str) -> tuple[dict[str, dt.datetime], int]:
     return last, bad
 
 
-def cmd_due(args: argparse.Namespace, now: dt.datetime | None = None, key_of: Callable | None = None, rs: dict | None = None) -> int:
+def cmd_due(args: argparse.Namespace, now: dt.datetime | None = None, key_of: Callable | None = None, rs: dict | None = None,
+            f_gates: dict[str, str] | None = None) -> int:
     now = now or dt.datetime.now().astimezone()
     if rs is None:
         rs = recipes.load_justfile(os.path.join(recipes.ROOT, "justfile"))
-    gates = load_gates(args, rs)
+    gates = load_gates(args, rs, f_gates)
     ledger_path = ledger_path_of(args.ledger)
     times_path = times_path_of()
     last, _ = load_ledger(ledger_path)
@@ -455,9 +475,9 @@ def check_families(gates: list[Gate], last: dict[str, dt.datetime], now: dt.date
     return out
 
 
-def cmd_check(args: argparse.Namespace, now: dt.datetime | None = None, rs: dict | None = None) -> int:
+def cmd_check(args: argparse.Namespace, now: dt.datetime | None = None, rs: dict | None = None, f_gates: dict[str, str] | None = None) -> int:
     now = now or dt.datetime.now().astimezone()
-    gates = load_gates(args, rs)
+    gates = load_gates(args, rs, f_gates)
     last, _ = load_ledger(ledger_path_of(args.ledger))
     red = 0
     for fam, gs, newest, ok in check_families(gates, last, now, args.days):
@@ -511,7 +531,7 @@ def self_test() -> int:
         ]) + "\n"
         rows = parse_classes(classes)
         fam = {"gate-fresh": "fa", "gate-oldkey": "fa", "gate-never": "fb", "gate-recent": "fb", "gate-edge": "fc", "gate-env": "fc", "weekly-w": "fa"}
-        gates = rotation_gates(rows, lambda n: fam[n])
+        gates = rotation_gates(rows, lambda n: fam[n], {})
         names = [g.name for g in gates]
         expect(names == ["gate-edge", "gate-env", "gate-fresh", "gate-never", "gate-oldkey", "gate-recent", "weekly-w"],
                f"rotation_gates: a deferred kind or a weekly, and no landing gate, fixture-only or variant gate, or tool recipe: {names}")
@@ -662,7 +682,7 @@ def self_test() -> int:
             out_path = os.path.join(tmp, "due.list")
             args = argparse.Namespace(days=7.0, ledger=led, tier="real", classes=cls_path, with_weekly=True, out=out_path)
             with contextlib.redirect_stderr(io.StringIO()):
-                rc = cmd_due(args, now, keys({"gate-fresh": "skip"}), rs2)
+                rc = cmd_due(args, now, keys({"gate-fresh": "skip"}), rs2, {})
             written = open(out_path, encoding="utf-8").read()
             expect(rc == 0 and written.splitlines()[3] == "# the 1 weekly-* recipes first, then the due gates" and "weekly-w" in written
                    and "gate-oldkey" in written and "gate-fresh" not in written, f"cmd_due: the list file written (rc {rc}): {written}")
@@ -682,7 +702,7 @@ def self_test() -> int:
             out_mac = os.path.join(tmp, "due-mac.list")
             args_mac = argparse.Namespace(days=7.0, ledger=led, tier="real", classes=cls_path, with_weekly=True, out=out_mac)
             with contextlib.redirect_stderr(io.StringIO()):
-                rc = cmd_due(args_mac, now, keys({"gate-fresh": "skip"}), rs_mac)
+                rc = cmd_due(args_mac, now, keys({"gate-fresh": "skip"}), rs_mac, {})
             items_mac = bare(open(out_mac, encoding="utf-8").read())
             expect(rc == 0 and items_mac.count("gate-macgguf") == 1 and items_mac[0] == "weekly-w",
                    f"weekly union: due --with-weekly names the CUDA GGUF gate once, after the weekly recipes: {items_mac}")
@@ -691,20 +711,78 @@ def self_test() -> int:
             out_off = os.path.join(tmp, "due-off.list")
             args_off = argparse.Namespace(days=7.0, ledger=led, tier="real", classes=cls_path, with_weekly=False, out=out_off)
             with contextlib.redirect_stderr(io.StringIO()):
-                rc = cmd_due(args_off, now, keys({"gate-fresh": "skip"}), rs_mac)
+                rc = cmd_due(args_off, now, keys({"gate-fresh": "skip"}), rs_mac, {})
             expect(rc == 0 and "gate-macgguf" not in open(out_off, encoding="utf-8").read(),
                    "weekly union: without --with-weekly the CUDA GGUF gate stays off the due list")
             argsc = argparse.Namespace(days=7.0, ledger=led, classes=cls_path)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
-                rc = cmd_check(argsc, now, rs2)
+                rc = cmd_check(argsc, now, rs2, {})
             expect(rc == 1 and "RED  fa:" in buf.getvalue() and "ok   fb:" in buf.getvalue() and "RED  fc:" in buf.getvalue(),
                    f"cmd_check: rc 1 naming the families with no row newer than 7 d: {rc} {buf.getvalue()}")
             argsc.days = 9.0
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
-                rc = cmd_check(argsc, now, rs2)
+                rc = cmd_check(argsc, now, rs2, {})
             expect(rc == 0 and "RED" not in buf.getvalue(), f"cmd_check: rc 0 when every family has a row newer than N days: {rc} {buf.getvalue()}")
+
+            # The F families. A landing runs an F family's gate only on its family's change, so the rotation schedules it, from the class
+            # tables' set (`f_gates` stands for recipes.f_family_gates): gate-fx-old green 8 d ago and gate-fx-new never (family fx), gate-fz
+            # green 6 d ago (fz), gate-fy-real an F gate the landing defers too (fy), gate-other a landing gate of no F family and gate-prof a deferred
+            # gate of the recipe-profile family fx, green 1 d ago.
+            f_classes = "\n".join("\t".join(r) for r in [
+                ("gate-fx-old", "F", "balanced", "3090,a6000", "gate-fx-old: gpu-gate.sh any"),
+                ("gate-fx-new", "F", "balanced", "3090,a6000", "gate-fx-new: gpu-gate.sh any"),
+                ("gate-fy-real", "D", "real-only", "-", "gate-fy-real: real-only call"),
+                ("gate-fz", "X", "solo", "3090,a6000", "gate-fz: [group('solo')]"),
+                ("gate-other", "F", "balanced", "3090,a6000", "gate-other: gpu-gate.sh any"),
+                ("gate-prof", "D", "real-only", "-", "gate-prof: real-only call"),
+            ]) + "\n"
+            f_gates = {"gate-fx-old": "fx", "gate-fx-new": "fx", "gate-fy-real": "fy", "gate-fz": "fz"}
+            f_rows = parse_classes(f_classes)
+            fg = rotation_gates(f_rows, lambda n: "profile", f_gates)
+            expect([g.name for g in fg] == sorted([*f_gates, "gate-prof"]) and "gate-other" not in [g.name for g in fg],
+                   f"rotation_gates: every F-family gate of the class tables, the deferred gate and no other landing gate: {[g.name for g in fg]}")
+            expect({g.name: (g.kind, g.family) for g in fg} == {"gate-fx-old": ("family", "fx (F family)"), "gate-fx-new": ("family", "fx (F family)"),
+                                                                 "gate-fy-real": ("real-only", "fy (F family)"), "gate-fz": ("family", "fz (F family)"),
+                                                                 "gate-prof": ("real-only", "profile")},
+                   f"rotation_gates: an F gate the landing runs is kind family, a deferred one keeps its kind, both grouped by the class-table family: {[(g.name, g.kind, g.family) for g in fg]}")
+            expect(sorted(g.name for g in rotation_gates(f_rows, lambda n: "profile", {})) == ["gate-fy-real", "gate-prof"],
+                   "rotation_gates: with no F-family set only the deferred gates are the rotation's (what a landing's F gates were before)")
+            expect(raises(lambda: rotation_gates(f_rows, lambda n: "profile", {**f_gates, "gate-gone": "fx"}), "gate-gone"),
+                   "rotation_gates: an F-family gate the classifier does not list is a named error")
+
+            def f_ledger(name: str, rows_: list[tuple[str, str, float]]) -> str:
+                path_ = os.path.join(tmp, name)
+                with open(path_, "w", encoding="utf-8") as fh_:
+                    for key_, rec_, d_ in rows_:
+                        fh_.write(f"{k(key_)}\t{rec_}\t{rec_}\tabc123456789\t{ago(d_)}\t/x\n")
+                return path_
+
+            f_cls_path = os.path.join(tmp, "f-classes.tsv")
+            with open(f_cls_path, "w", encoding="utf-8") as fh:
+                fh.write(f_classes)
+            rs_f = {n: rec(n, f"BLOOMERY_MODEL={'fx' if n == 'gate-prof' else 'profile'} ./tools/box.sh 'x'") for n in f_rows}
+            led_old = f_ledger("f-old.tsv", [("1", "gate-fx-old", 8), ("2", "gate-fz", 6), ("4", "gate-prof", 1)])
+            out_f = os.path.join(tmp, "f-due.list")
+            args_f = argparse.Namespace(days=7.0, ledger=led_old, tier="real", classes=f_cls_path, with_weekly=False, out=out_f)
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = cmd_due(args_f, now, keys({}), rs_f, f_gates)
+            items_f = bare(open(out_f, encoding="utf-8").read())
+            expect(rc == 0 and sorted(items_f) == ["gate-fx-new", "gate-fx-old", "gate-fy-real"],
+                   f"cmd_due: an F gate last green 8 d ago is due, one 6 d ago is not, a landing gate of no F family never is: {items_f}")
+            argsf = argparse.Namespace(days=7.0, ledger=led_old, classes=f_cls_path)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = cmd_check(argsf, now, rs_f, f_gates)
+            expect(rc == 1 and "RED  fx (F family):" in buf.getvalue() and "RED  fy (F family):" in buf.getvalue()
+                   and "ok   fz (F family):" in buf.getvalue() and "ok   fx: 1 gate(s)" in buf.getvalue(),
+                   f"cmd_check: rc 1 for an F family whose newest row is 8 d old or missing though a profile family of its name is fresh, ok for the 6 d one: {rc} {buf.getvalue()}")
+            argsf.ledger = f_ledger("f-fresh.tsv", [("1", "gate-fx-old", 6), ("2", "gate-fz", 6), ("3", "gate-fy-real", 3), ("4", "gate-prof", 1)])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = cmd_check(argsf, now, rs_f, f_gates)
+            expect(rc == 0 and "RED" not in buf.getvalue(), f"cmd_check: rc 0 once every F family has a row newer than 7 d: {rc} {buf.getvalue()}")
         finally:
             if old_times is None:
                 os.environ.pop("BLOOMERY_GATE_TIMES", None)

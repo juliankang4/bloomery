@@ -27,8 +27,9 @@ glob of both tables matches a file in the tree; the `by-hand` rows are exactly t
 tools/ref/needs-env.sh, in their own text or through a dependency. One line per finding, rc 1 when there is one. A
 table that does not load is a named error, rc 2.
 
-Nothing reads the tables yet: the class stage of `just affected` comes later, and until it does this tool only
-reports. The justfile's recipe names are read through tools/recipes.py, the one parser.
+The class stage of `just affected` and the release list read the tables (tools/recipes.py `class_tables`), and so does the rotation
+(tools/rotation.py, for the F families' gates); this tool checks them. The justfile's recipe names are read through tools/recipes.py,
+the one parser.
 """
 
 from __future__ import annotations
