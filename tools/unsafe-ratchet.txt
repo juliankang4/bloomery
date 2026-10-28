@@ -661,7 +661,13 @@ gguf 7 2 0
 # route's window (scratch.rs `cells_view`, every window's one owner, and wide38.rs `Down38::window`). Each block
 # and fn has its SAFETY line or Safety section.
 # The gate-up entry shares product_stages; each of its four pointer calls has its own SAFETY block.
-gpu 2781 361 10
+# PIN(2026-10-28): gpu 2781 -> 2790 blocks, 361 -> 370 fns, new code, not old code relaxed: the BF16
+# words' activation source of the dense MMA tile (f32tile.rs `Bf16WordCols` with its fetch, land and landed
+# check, `MmaCols::landed_fits`, the column stage of the exact tile through `TileRows`), the wide norm writing
+# BF16 `xn` (hc_gated.rs `hc_gated_norm_4w_bf16`, the `NormedOut` stores) and the mix glue over either form
+# of `xn` (`mix_glue`, `hc_gated_mix_4_bf16`), counted by tools/check-unsafe.sh. Each new block and fn has
+# its SAFETY line or Safety section.
+gpu 2790 370 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

@@ -4,7 +4,7 @@
 
 use super::act32::ColsForm;
 use super::f32tile::{
-    Bf16Cols, Bf16Rows, ByteRows, HcUpMixArgs, MMA_THREADS, MmaCols, MmaRows, OutForm,
+    Bf16Cols, Bf16Rows, ByteRows, F32Rows, HcUpMixArgs, MMA_THREADS, MmaCols, MmaRows, OutForm,
     STAGE_FLOATS, STAGES as MMA_STAGES, TileLaunch, TileRows, bf16_mma_body,
     bf16_mma_norm_gate_body, form_col, mma_fits, refuse_or, store_refused,
 };
@@ -774,13 +774,14 @@ struct Mxfp8Cols<'a> {
     e: &'a [u32],
 }
 
-impl MmaCols for Mxfp8Cols<'_> {
+impl<'a> MmaCols for Mxfp8Cols<'a> {
     type Piece = ();
+    type Exact = F32Rows<'a>;
     const SCALED: bool = true;
 
     #[inline(always)]
-    fn exact(&self) -> &[f32] {
-        self.pairs.exact
+    fn exact(&self) -> F32Rows<'a> {
+        self.pairs.exact()
     }
 
     #[inline(always)]
@@ -1882,7 +1883,7 @@ mod native {
             lo.len() >= m * 320,
             lo_words.len() >= m * 160,
             lo_refused.len() >= m,
-            xn.len() >= m * 4 * hidden,
+            2 * xn.len() >= m * 4 * hidden,
             g.len() >= m * 4 * hidden,
             mixed.len() >= m * hidden,
             4 * qs.len() >= m * hidden,
@@ -1899,7 +1900,7 @@ mod native {
         lo: &[f32],
         lo_words: &[u32],
         lo_refused: &[u32],
-        xn: &[f32],
+        xn: &[u32],
         hidden: u32,
         m: u32,
         fault: crate::fault::FaultSink,

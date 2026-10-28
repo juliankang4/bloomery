@@ -69,9 +69,9 @@ pub use f32tile::LINE as F32_TILE_LINE;
 pub use f32tile::Mxfp8NormGateArgs;
 pub(crate) use f32tile::mxfp8_w8a8_reads;
 pub(crate) use f32tile::{
-    Bf16Cols, Bf16Out, Bf16Rows, F32Cols, F32Rows, F32T_THREADS_U32, HcUpMixArgs, MMA_CELLS,
-    MMA_COLS, MMA_ROWS, MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH, MmaCols,
-    MmaRows, MmaTile, NARROW_ROWS, NARROW_WORDS, OutForm, STAGE_FLOATS, STAGES, TileRows,
+    Bf16Cols, Bf16Out, Bf16Rows, Bf16WordCols, F32Cols, F32Rows, F32T_THREADS_U32, HcUpMixArgs,
+    MMA_CELLS, MMA_COLS, MMA_ROWS, MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH,
+    MmaCols, MmaRows, MmaTile, NARROW_ROWS, NARROW_WORDS, OutForm, STAGE_FLOATS, STAGES, TileRows,
     bf16_mma_body, bf16_mma_launch, bf16_mma_narrow, bf16_mma_tile, f32_tile_body, form_col,
     land_values, mma_launch, mma_tile_origin, store_refused, tile_launch,
 };
