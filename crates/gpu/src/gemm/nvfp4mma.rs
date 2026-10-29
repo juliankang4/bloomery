@@ -4,15 +4,18 @@
 
 use super::act32::ColsForm;
 use super::f32tile::{
-    Bf16Cols, Bf16Rows, ByteRows, F32Rows, HcUpMixArgs, MMA_THREADS, MmaCols, MmaRows, OutForm,
-    STAGE_FLOATS, STAGES as MMA_STAGES, TileLaunch, TileRows, bf16_mma_body,
-    bf16_mma_norm_gate_body, form_col, mma_fits, refuse_or, store_refused,
+    Bf16Cols, Bf16Rows, ByteRows, F32Rows, HcUpMixArgs, MMA_BOX_BYTES, MMA_THREADS, MmaCols,
+    MmaRows, OutForm, STAGE_FLOATS, STAGES as MMA_STAGES, TileLaunch, TileRows,
+    bf16_mma_norm_gate_body, form_col, mma_fits, mma_tile_store, refuse_or, store_refused,
+    tma_mma_tile,
 };
 use super::{GemmAct32, GemmRoute};
 use crate::GpuError;
 use crate::linear::norm_gate::NormGateTail;
 use crate::q8f32::{E4m3Weight, Mxfp8Bytes};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::barrier::Barrier;
+use cuda_device::tma::TmaDescriptor;
 use cuda_device::vector::F32x4;
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, ptx_asm, thread, warp,
@@ -123,6 +126,16 @@ const fn act_shared_bytes(k: u32) -> u32 {
     (k / 4 + k / 32 + 2) * 4
 }
 const _: () = assert!(act_shared_bytes(crate::tensor::Q8ACT_MAX_K as u32) == 24776);
+
+/// Bytes of [`native::mxfp8_w8a8_gemm`]'s stages in its dynamic shared
+/// memory; the stage barriers follow them.
+const TMA_STAGE_BYTES: usize = MMA_STAGES * STAGE_FLOATS * size_of::<f32>();
+/// Dynamic shared bytes of [`native::mxfp8_w8a8_gemm`]: the stages and
+/// their `full` and `empty` barriers ([`tma_mma_tile`]).
+const TMA_SHARED_BYTES: u32 = (TMA_STAGE_BYTES + 2 * MMA_STAGES * size_of::<Barrier>()) as u32;
+// `#[launch_contract(dynamic_shared = ...)]` takes a literal: the kernel's
+// declaration spells the byte count out, and this is the two agreeing.
+const _: () = assert!(TMA_SHARED_BYTES == 49_200 && TMA_STAGE_BYTES.is_multiple_of(8));
 
 /// # Safety
 /// The input spans contain four values at `base`. SwiGLU inputs are
@@ -731,6 +744,13 @@ impl MmaRows for Mxfp8Rows<'_> {
         // SAFETY: a row of K values holds K / 128 scale words, the 64-unit
         // span at / 64's among them (this fn's contract).
         unsafe { *self.e.get_unchecked(at / 64) }
+    }
+
+    #[cfg(bloomery_nvfp4_mma)]
+    #[inline(always)]
+    unsafe fn span_fits(self, at: usize) -> bool {
+        // SAFETY: this fn's contract.
+        ue8m0_fits(unsafe { self.scale_word(at) })
     }
 
     #[inline(always)]
@@ -1774,7 +1794,8 @@ mod native {
     /// Dense MXFP8 prompt product, W8A8 on block-scaled tensor cores: the
     /// weight's planes `qs` and `e` as stored against the activations' MXFP8
     /// form (`xq`, `xe` and `refused`, [`mxfp8_cols`]), with the f32 columns
-    /// `x` the replay reads.
+    /// `x` the replay reads. The stages' codes arrive by TMA through `w_map`
+    /// and `x_map`, the maps of `qs` and `xq` ([`mxfp8_tma_map`]).
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -1784,6 +1805,7 @@ mod native {
     #[launch_contract(
         domain = 1,
         block = (256, 1, 1),
+        dynamic_shared = 49200,
         requires = (
             rows >= 1,
             n >= 1,
@@ -1807,10 +1829,15 @@ mod native {
         k: u32,
         n: u32,
         mut y: DisjointSlice<f32>,
+        #[grid_constant] w_map: &TmaDescriptor,
+        #[grid_constant] x_map: &TmaDescriptor,
     ) {
-        static mut STAGE: SharedArray<f32, { MMA_STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
-        // SAFETY: this block's aligned shared allocation, accessed without a reference.
-        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        // The stages, 1024-byte aligned for the boxes' swizzle, then the
+        // stage barriers ([`TMA_SHARED_BYTES`]).
+        let (sh, bars) = (
+            cuda_device::DynamicSharedArray::<f32, 1024>::get(),
+            cuda_device::DynamicSharedArray::<Barrier, 1024>::offset(TMA_STAGE_BYTES),
+        );
         let cols = Mxfp8Cols {
             pairs: Bf16Cols {
                 words: xq,
@@ -1819,10 +1846,17 @@ mod native {
             },
             e: xe,
         };
+        let w = Mxfp8Rows { qs, e };
         // SAFETY: the checked launch supplies 256 converged threads, the grid,
-        // K a multiple of 128, 16-byte aligned planes and activation words and
-        // the spans in the contract.
-        unsafe { bf16_mma_body(Mxfp8Rows { qs, e }, cols, rows, k, n, &mut y, sh) };
+        // K a multiple of 128, the spans in the contract and the maps of qs
+        // and xq; sh and bars are this block's.
+        let Some(tile) =
+            (unsafe { tma_mma_tile((w, w_map), (cols, x_map), (rows, k / 2, n), sh, bars) })
+        else {
+            return;
+        };
+        // SAFETY: the tile's operands, spans and staging allocation.
+        unsafe { mma_tile_store(tile, w, cols, (rows, k, n), &mut y, sh) };
     }
 
     /// [`mxfp8_w8a8_gemm`] as a gate projection with the shared sigmoid norm
@@ -1987,6 +2021,66 @@ pub(super) struct SwigluArgs<'a> {
     pub(super) rule: crate::kquant::Act,
     pub(super) cols: u32,
     pub(super) act: &'a mut GemmAct32,
+}
+
+/// The TMA map [`tma_mma_tile`] copies an MXFP8 operand's stage boxes
+/// through: `lines` rows of `k` E4M3 bytes at `codes`, UINT8 `[lines][k]`,
+/// boxes of 64 bytes by 128 lines with the 64-byte swizzle, lines past the
+/// last read as zeros. TMA takes a 16-byte aligned base and a row stride a
+/// multiple of 16 below 2^40; another is a named `Shape` error.
+fn mxfp8_tma_map(
+    what: &'static str,
+    codes: &DeviceBuffer<u32>,
+    k: u32,
+    lines: u32,
+) -> Result<TmaDescriptor, GpuError> {
+    use cuda_core::sys;
+    let base = codes.cu_deviceptr();
+    if !base.is_multiple_of(16)
+        || !k.is_multiple_of(16)
+        || codes.len() * 4 < k as usize * lines as usize
+    {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "TMA codes at {base:#x}: {lines} lines of {k} bytes in {} words",
+                codes.len()
+            ),
+        ));
+    }
+    let dims = [u64::from(k), u64::from(lines)];
+    let strides = [u64::from(k)];
+    let tile = [64u32, 128];
+    let unit = [1u32, 1];
+    let mut map = std::mem::MaybeUninit::<sys::CUtensorMap>::uninit();
+    // SAFETY: every array outlives the call and holds the rank-2 entries it
+    // reads; the base is a live device allocation of lines·k bytes, checked
+    // above, and `map` is written by the call.
+    let rc = unsafe {
+        sys::cuTensorMapEncodeTiled(
+            map.as_mut_ptr(),
+            sys::CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            2,
+            base as *mut std::ffi::c_void,
+            dims.as_ptr(),
+            strides.as_ptr(),
+            tile.as_ptr(),
+            unit.as_ptr(),
+            sys::CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
+            sys::CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_64B,
+            sys::CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            sys::CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        )
+    };
+    crate::graph::cu(rc, what)?;
+    const {
+        assert!(size_of::<TmaDescriptor>() == size_of::<sys::CUtensorMap>());
+        assert!(align_of::<sys::CUtensorMap>() >= align_of::<TmaDescriptor>());
+        assert!(MMA_BOX_BYTES == 64 * 128);
+    };
+    // SAFETY: the successful call initialized the map's 128 opaque bytes,
+    // which the descriptor holds as they are.
+    Ok(unsafe { map.as_ptr().cast::<TmaDescriptor>().read() })
 }
 
 /// [`Kernels::mxfp8_w8a8_norm_gate`]'s arguments: the weight `w` over the
@@ -2319,13 +2413,21 @@ impl Kernels {
         t: &TileLaunch,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, 0);
+        let what = "Gemm32Kernels::enqueue_mxfp8_w8a8";
+        let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, TMA_SHARED_BYTES);
         let prep = self.module.prepare_mxfp8_w8a8_gemm(cfg)?;
         let (qs, e) = (w.qs.buf(), w.e.buf());
         let (xq, xe, refused) = (&form.words, &form.scales, &form.refused);
-        self.module.mxfp8_w8a8_gemm(
-            stream, &prep, qs, e, x, xq, xe, refused, t.rows, t.k, t.n, y,
-        )?;
+        let w_map = mxfp8_tma_map(what, qs, t.k, t.rows)?;
+        let x_map = mxfp8_tma_map(what, xq, t.k, t.n)?;
+        // SAFETY: the maps encode qs and xq, live and unmoved for the launch
+        // as every buffer it takes; a captured launch keeps them as it keeps
+        // their addresses.
+        unsafe {
+            self.module.mxfp8_w8a8_gemm(
+                stream, &prep, qs, e, x, xq, xe, refused, t.rows, t.k, t.n, y, w_map, x_map,
+            )?;
+        }
         Ok(())
     }
 
