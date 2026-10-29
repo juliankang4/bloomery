@@ -6732,6 +6732,42 @@ mod tests {
         }
     }
 
+    /// Ambiguous lengths and broken chunk boundaries are refused before another request can run.
+    #[test]
+    fn malformed_request_framing_closes_the_connection() {
+        use crate::http::read_test_response as response;
+        use std::io::{BufReader, Write};
+        use std::net::{Shutdown, TcpStream};
+
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let mut accepted = Vec::new();
+        for (headers, body) in [
+            ("Content-Length: 2\r\ncontent-length: 3\r\n", "{}"),
+            ("Content-Length: 2, 3\r\n", "{}"),
+            ("Transfer-Encoding: chunked\r\n", "2\r\n{}JUNK\r\n0\r\n\r\n"),
+            ("Transfer-Encoding: chunked\r\n", "2\r\n{}\n0\r\n\r\n"),
+            ("Transfer-Encoding: chunked\r\n", "0\r\nTrailer: value\r\n"),
+            ("Transfer-Encoding: chunked\r\n", "0\r\n\r"),
+        ] {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            write!(stream, "POST /tokenize HTTP/1.1\r\n{headers}\r\n{body}").unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut reader = BufReader::new(stream);
+            let (status, head, _) = response(&mut reader);
+            if status != 400 || !head.contains("Connection: close") {
+                accepted.push(format!("{headers:?} {body:?}: {head}"));
+            }
+            let mut byte = [0];
+            assert_eq!(reader.read(&mut byte).expect("the refused connection closes"), 0,
+                "no next request after malformed framing");
+        }
+        assert!(accepted.is_empty(), "malformed framing accepted: {accepted:?}");
+    }
+
     /// `POST /shutdown` needs the key even from a loopback peer: without one
     /// it is the 401 and the server keeps serving; with one it is the 200
     /// and the stop, as without keys.
