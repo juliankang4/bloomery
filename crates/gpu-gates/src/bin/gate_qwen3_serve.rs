@@ -2,7 +2,10 @@
 //! `generate_qwen3moe`, on each model file given, one process at a time on
 //! the card the runner pins.
 //!
-//!     gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir>
+//!     gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir> [--only-mixed]
+//!
+//! `--only-mixed` runs the two-slot greedy and seeded sampled requests alone
+//! and together, holding their ids and the shared round shape on one server.
 //!
 //! Before any file, touching no card, it holds
 //! `unplaced_card_is_the_largest`: on fake censuses of this workstation's
@@ -564,7 +567,7 @@ mod gate {
     use crate::q3place;
 
     const USAGE: &str = "usage: gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir> \
-                         [--images | --only-images]";
+                         [--images | --only-images | --only-mixed]";
 
     /// The tokens each request makes.
     const N: usize = 64;
@@ -673,6 +676,7 @@ mod gate {
     }
 
     struct Args {
+        only_mixed: bool,
         models: Vec<PathBuf>,
         dir: PathBuf,
         /// `--images`: the image clauses ([`images`]) after each file's own.
@@ -683,9 +687,11 @@ mod gate {
 
     fn parse_args() -> Result<Args, GateError> {
         let (mut models, mut dir, mut images, mut only_images) = (Vec::new(), None, false, false);
+        let mut only_mixed = false;
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             match flag.as_str() {
+                "--only-mixed" => only_mixed = true,
                 "--images" => images = true,
                 "--only-images" => only_images = true,
                 "--model" | "--dir" => {
@@ -703,6 +709,7 @@ mod gate {
         }
         match (models.is_empty(), dir) {
             (false, Some(dir)) => Ok(Args {
+                only_mixed,
                 models,
                 dir,
                 images: images || only_images,
@@ -1948,11 +1955,18 @@ mod gate {
         ids: &[u32],
         n: usize,
     ) -> Result<(JoinHandle<()>, StreamedRx), GateError> {
+        streamed_body(
+            addr,
+            json!({
+                "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
+                "cache_prompt": false, "ignore_eos": true, "stream": true,
+            }),
+        )
+    }
+
+    /// A streamed request with its own sampler and logits requirements.
+    fn streamed_body(addr: &str, body: Value) -> Result<(JoinHandle<()>, StreamedRx), GateError> {
         let (tx, rx) = mpsc::channel();
-        let body = json!({
-            "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
-            "cache_prompt": false, "ignore_eos": true, "stream": true,
-        });
         let url = format!("http://{addr}/completion");
         let (h, _) = spawn_helper("slots-request", Placement::Float, move || {
             let run = (|| -> Result<Streamed, String> {
@@ -2390,6 +2404,7 @@ mod gate {
         seat: qwen_seat::Family,
         dir: &Path,
         ok: &mut bool,
+        mixed: bool,
     ) -> Result<(), GateError> {
         type Arm<'a> = (
             &'a str,
@@ -2407,17 +2422,22 @@ mod gate {
             true,
         );
         let mut arms = vec![whole];
-        if routed(seat) {
+        if routed(seat) && !mixed {
             arms.push(placed);
-        } else {
+        } else if !routed(seat) && !mixed {
             not_for_dense(
                 "placed_slots_rounds_*",
                 "no host tier: a budgeted placement is the floor refusal",
             );
         }
         for (dir_name, prefix, flags, env, one_pass) in arms {
+            let prefix = if mixed { "mixed_" } else { prefix };
             let named = |c: &str| format!("{prefix}{c}");
-            let d = dir.join(dir_name);
+            let d = dir.join(if mixed {
+                "slots-rounds-mixed"
+            } else {
+                dir_name
+            });
             std::fs::create_dir_all(&d)?;
             let err_log = d.join("server.err");
             let mut cmd = stats_cmd()?;
@@ -2436,6 +2456,9 @@ mod gate {
                 m,
             ];
             args.extend_from_slice(flags);
+            if mixed {
+                args.extend_from_slice(&["--ctx-size", "4096", "--cache-ram", "0"]);
+            }
             let mut s = Served::spawn_cmd(cmd, &args, &d)?;
             let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
             let url = |p: &str| format!("http://{addr}{p}");
@@ -2470,9 +2493,23 @@ mod gate {
             );
             let a_ids = rendered(&url, messages())?;
             let b_ids = tokenized(&url, PROSE)?;
+            let request = |ids: &[u32], sampled: bool| {
+                if mixed {
+                    streamed_body(
+                        &addr,
+                        json!({
+                            "prompt": ids, "n_predict": SLOTS_PREDICT,
+                            "temperature": if sampled { 0.8 } else { 0.0 }, "seed": 42,
+                            "return_tokens": true, "cache_prompt": false, "stream": true,
+                        }),
+                    )
+                } else {
+                    streamed(&addr, ids, SLOTS_PREDICT)
+                }
+            };
             let mut alone = Vec::new();
-            for ids in [&a_ids, &b_ids] {
-                let (h, rx) = streamed(&addr, ids, SLOTS_PREDICT)?;
+            for (j, ids) in [&a_ids, &b_ids].into_iter().enumerate() {
+                let (h, rx) = request(ids, j == 1)?;
                 h.join()
                     .map_err(|_| format!("{dir_name}: an alone request's thread panicked"))?;
                 let ran = rx.recv().map_err(|_| {
@@ -2485,8 +2522,8 @@ mod gate {
             // and a `next`), so the window opens empty; taken anyway, so the
             // together run's records are exactly the ones after this point.
             let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
-            let first = streamed(&addr, &a_ids, SLOTS_PREDICT)?;
-            let second = streamed(&addr, &b_ids, SLOTS_PREDICT)?;
+            let first = request(&a_ids, false)?;
+            let second = request(&b_ids, true)?;
             let mut together = Vec::new();
             for ((h, rx), what) in [(first, "first"), (second, "second")] {
                 h.join()
@@ -4521,6 +4558,10 @@ mod gate {
             std::fs::create_dir_all(&dir)?;
             println!("== {}", model.display());
             let seat = seat_of(model)?;
+            if a.only_mixed {
+                slots_rounds_run_one_pass(model, seat, &dir, &mut ok, true)?;
+                continue;
+            }
             if a.only_images {
                 images(model, &dir, &mut ok)?;
                 continue;
@@ -4610,7 +4651,8 @@ mod gate {
             slots_count_their_checkpoints(model, seat, &dir, &mut ok)?;
             slot_ctx_too_small_is_refused(model, &dir, &mut ok)?;
             slots_late_request_together_alone(model, &dir, &mut ok)?;
-            slots_rounds_run_one_pass(model, seat, &dir, &mut ok)?;
+            slots_rounds_run_one_pass(model, seat, &dir, &mut ok, false)?;
+            slots_rounds_run_one_pass(model, seat, &dir, &mut ok, true)?;
             if seat == qwen_seat::Family::Qwen3moe {
                 // The qwen3moe arm alone: the placed prompt past the GEMM
                 // walk.
