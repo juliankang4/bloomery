@@ -11,6 +11,7 @@ crates/gpu-gates/src/bin/gate_gemma_embedding2_serve.rs 1 the gate's concurrent 
 crates/gpu-gates/src/serve_client.rs 2 a serve gate's two concurrent requests (together), from the gate main, never pinned
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs 2 the decide seat's backbone worker thread, which owns the card, spawned by the serve main, never pinned; the worker test's job thread, from a libtest thread that is never pinned
 crates/serve/src/api.rs 4 the HTTP server's threads and the signal handlers' reader thread, spawned by the serve main or its accept loop, never pinned
+crates/serve/src/responses.rs 1 background response workers, spawned by an unpinned HTTP connection thread
 crates/serve/src/embeddings.rs 2 two tests' requests that wait for a held lock (the model's, the cache's), from the test main, never pinned
 crates/serve/src/decide.rs 2 two tests' threads that run a decision server to its end (`serving`'s, which sends what `run` returns, and the early-listener takeover test's), from a libtest thread that is never pinned
 crates/decision/src/pool.rs 1 the head's resident workers, one per CPU, started on first use by the decision bins, gates and server, never pinned

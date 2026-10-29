@@ -48,8 +48,9 @@ use std::net::TcpStream;
 use serde_json::{Map, Value, json};
 
 use super::{
-    ApiError, ChatPlan, JSON, RETRY_AFTER_SECS, State, body, chat_input, chat_plan, engine_error,
-    error_body, get_i, invalid, json_type, run_gen, run_whole, send_json, tool_markup_error,
+    ApiError, ChatPlan, Client, JSON, RETRY_AFTER_SECS, State, body, chat_input, chat_plan,
+    engine_error, error_body, get_i, invalid, json_type, run_gen, run_whole, send_json,
+    tool_markup_error,
 };
 use crate::dsml::{Message, ToolCall};
 use crate::genloop::{Event, GenError, Outcome, StopKind, Timings};
@@ -836,7 +837,8 @@ fn stream(
             })?;
             blocks.push(ids, &d).iter().try_for_each(|v| event(s, v))
         };
-        run_gen(state, &prompt_ids, prompt, &p, peer, &mut sink).map(|r| r.map(|(o, _)| o))
+        run_gen(state, &prompt_ids, prompt, &p, Client::of(peer), &mut sink)
+            .map(|r| r.map(|(o, _)| o))
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),
