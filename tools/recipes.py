@@ -13136,6 +13136,12 @@ def ref_paths_self_test(expect) -> None:
             write(first, kvs)
             rc, out, err = run("qwen4exp", "fixture_budget", BLOOMERY_TIER="fixture")
             expect(rc == 65 and out == "" and why in err, f"ref-paths: a file that {why}: {rc} {out!r} {err!r}")
+        for budgets in ((10, 20), (20, 10)):
+            write(first, [("bloomery.fixture.version", 4, 1)] +
+                  [("bloomery.fixture.card_budget", 10, budget) for budget in budgets])
+            rc, out, err = run("qwen4exp", "fixture_budget", BLOOMERY_TIER="fixture")
+            expect(rc == 65 and out == "" and "duplicate metadata key 'bloomery.fixture.card_budget'" in err,
+                   f"ref-paths: duplicate GGUF budgets {budgets}: {rc} {out!r} {err!r}")
         with open(first, "wb") as fh:
             fh.write(b"not a gguf at all")
         rc, out, err = run("qwen4exp", "fixture_budget", BLOOMERY_TIER="fixture")
@@ -13154,8 +13160,8 @@ def ref_paths_self_test(expect) -> None:
             fh.write('{"metadata": {}, "weight_map": {}}')
         cut_first = os.path.join(cut_dir, "model-00001-of-00002.safetensors")
 
-        def write_cut(path: str, meta: dict) -> None:
-            header = json.dumps({"__metadata__": meta}).encode()
+        def write_cut(path: str, meta: dict | str) -> None:
+            header = (json.dumps({"__metadata__": meta}) if isinstance(meta, dict) else meta).encode()
             header += b" " * (-len(header) % 8)
             with open(path, "wb") as fh:
                 fh.write(len(header).to_bytes(8, "little") + header)
@@ -13185,6 +13191,21 @@ def ref_paths_self_test(expect) -> None:
             write_cut(cut_first, meta)
             rc, out, err = run("minimax-m3", "fixture_budget", BLOOMERY_TIER="fixture")
             expect(rc == 65 and out == "" and why in err, f"ref-paths: a folder whose first shard {why} ({meta}): {rc} {out!r} {err!r}")
+        for first_budget, second_budget in (("10", "20"), ("20", "10")):
+            for budget_key in ('"bloomery.fixture.card_budget"', r'"bloomery.fixture.card_\u0062udget"'):
+                write_cut(cut_first, '{"__metadata__":{"bloomery.fixture.version":"1",'
+                          f'"bloomery.fixture.card_budget" : "{first_budget}", {budget_key} : "{second_budget}"' + '}}')
+                rc, out, err = run("minimax-m3", "fixture_budget", BLOOMERY_TIER="fixture")
+                expect(rc == 65 and out == "" and "duplicate key 'bloomery.fixture.card_budget'" in err,
+                       f"ref-paths: duplicate safetensors budgets {first_budget}, {second_budget} ({budget_key}): {rc} {out!r} {err!r}")
+        for header, key in (
+            ('{"__metadata__":' + json.dumps(cut_whole) + ',"__metadata__":' + json.dumps(cut_whole) + '}', "__metadata__"),
+            ('{"__metadata__":' + json.dumps(cut_whole) + ',"extra":[{"k":1,"k":2}]}', "k"),
+        ):
+            write_cut(cut_first, header)
+            rc, out, err = run("minimax-m3", "fixture_budget", BLOOMERY_TIER="fixture")
+            expect(rc == 65 and out == "" and f"duplicate key {key!r}" in err,
+                   f"ref-paths: duplicate safetensors key {key}: {rc} {out!r} {err!r}")
         for blob in (b"short", (1 << 30).to_bytes(8, "little") + b"{}", (2).to_bytes(8, "little") + b"[]", (2).to_bytes(8, "little") + b"{{"):
             with open(cut_first, "wb") as fh:
                 fh.write(blob)

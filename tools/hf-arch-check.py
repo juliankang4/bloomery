@@ -2022,6 +2022,10 @@ def self_test():
                 and body35_types(pair(1), lists)[0] is not None)
 
     check("a type added to a body35 list is followed from the source, not mirrored", followed)
+    for first, second in ((0, 8), (8, 0)):
+        check(f"token_embd.weight in two shards ({type_name(first)}, then {type_name(second)}) is refused",
+              lambda: "in two shards" in (body35_types([[("token_embd.weight", first, [], 0)],
+                                                         [("token_embd.weight", second, [], 0)]])[0] or ""))
 
     def unnamed_field():
         text = read_source(BODY35_LAYERS_RS)
