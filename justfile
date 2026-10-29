@@ -1775,6 +1775,15 @@ gate-gpu-qwen4exp-nvfp4:
 gate-gpu-qwen4exp-mtp:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_mtp'
 
+# Qwen3.8's MTP input boundary on a checkpoint folder (BLOOMERY_QWEN38_FOLDER names a Qwen3.8-Flash-Next folder with its MTP layer,
+# such as FP4-Local): MTP reads only target hidden rows the last layer completed, in both prompt walks, and refuses the rows of a
+# tapped call that failed past its launch; the draft's own row runs only at the refreshed walk's next position and is refused after
+# a state adoption, reset, store walk, slot exchange or cut; the drafted greedy ids equal the plain ones. The whole model on one card:
+# without BLOOMERY_QWEN38_FOLDER a batch defers it by name (needs-env).
+[group('v41-load')]
+gate-gpu-qwen4exp-mtp-input:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen4exp-mtp-input BLOOMERY_QWEN38_FOLDER && export BLOOMERY_GATE_V41_LOAD=1 && BLOOMERY_REF_MODEL="$BLOOMERY_QWEN38_FOLDER" bash tools/gate.sh --gpu --oxide -p bloomery-gpu-gates --release --features gpu,checkpoint --bin gate_qwen4exp_mtp -- --ignored hw_mtp_input_validity --nocapture'
+
 # 그룹 int8 텐서코어 GEMM(bloomery_gpu::gemm): 실파일 Qwen3 gate(Q4_K)·down(Q4_K, Q6_K) 스택과 V4.1 routed gate(Q3_K)
 # 하나, 같은 형상의 합성 스택(+ Q5_K), T ∈ {1,15,16,17,64,511,512,4096} × 라우팅 넷을 f64 참조의 유도 밴드에 대고 잰다.
 # fault·거부·그래프 재생 포함. ARGS는 `--case <부분문자열>` 필터. `--bench-kernels`는 판정 대신 런치 값을 잰다

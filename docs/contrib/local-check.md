@@ -178,7 +178,11 @@ leases and query responses; it does not measure physical GPU occupancy.
 `gate-gpu-lib`, `gate-gpu-gemma4a`, `gate-gpu-gemma-embedding2-e2e`,
 `gate-gpu-ds41-lib`, `gate-gpu-vision-hw` and `gate-gpu-glm5next-tp` compile their
 hardware-enabled CUDA library-test passes outside the card lock using
-`tools/gate.sh --gpu --oxide`. Its native `--lib` Cargo call uses a capture-only
+`tools/gate.sh --gpu --oxide`. `gate-gpu-qwen4exp-mtp-input` uses the same path
+for a binary test target with `--bin gate_qwen4exp_mtp` and the model-load lock.
+It binds the runner's model identity to `BLOOMERY_QWEN38_FOLDER`, so a fixture batch
+still takes the load lock for that checkpoint.
+The native `--lib` or `--bin` Cargo call uses a capture-only
 target runner: compilation never executes the test. Cargo owns the executable,
 arguments, package working directory and runtime environment (including native
 library paths); a private temporary capture retains that context and is removed
@@ -209,8 +213,9 @@ Batch placement recognizes `gate.sh --gpu` as a call to the same GPU lock owner,
 including its `any` and box-selected card forms. A plain CPU `gate.sh` call stays
 card-free; the classifier does not follow the runner's conditional implementation.
 
-`bash tools/gpu-gate.sh --self-test --part 4` checks the library path against an
-ordinary GPU bin with real lock files and subprocesses: compilation while the card
+`bash tools/gpu-gate.sh --self-test --part 4` checks library and binary tests,
+including the checkpoint input recipe, against the card and model-load locks. It checks
+contention with an ordinary GPU bin using real lock files and subprocesses: compilation while the card
 is held, no test child before release, other-card isolation, the serial pass,
 failure/refusal/timeout statuses and cancellation cleanup. The test consumer reads
 package-relative data and uses Cargo's manifest environment; on Linux `cc` builds a
