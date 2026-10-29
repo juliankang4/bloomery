@@ -128,8 +128,8 @@ use super::scratch::{
     Io, KvPlanes, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams, stamps_at,
 };
 use super::scratch38::{
-    Arena38, LANES, PASS_ROWS, Store38, Taps38, VERIFY_ROWS, WideRecord, dims, final_res, no_carry,
-    store_rule_bytes,
+    Arena38, LANES, PASS_ROWS, Ple38, Store38, Taps38, VERIFY_ROWS, WideRecord, dims, final_res,
+    no_carry, store_rule_bytes,
 };
 use super::slot_pass::SlotIn;
 use super::swap38::{self, DEADLINE, LIVE_DELAY};
@@ -164,6 +164,7 @@ use crate::model::{
     CardBytes, ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, SlotRange, SlotRowOrder,
     SlotRows, Slots,
 };
+use crate::ple::PleKernels;
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{BY_NAME_COLS, ByName};
@@ -1001,6 +1002,50 @@ impl PleHost {
             }
         }
         Ok(())
+    }
+
+    /// The named rows of the first `n` positions in an arena's `e`: decoded
+    /// here and copied ([`PleHost::decode`], [`PleHost::upload`]), or, for
+    /// NVFP4 planes read from the NVMe tier, refused here and copied as read
+    /// to the arena's planes, which the card decodes into `e`
+    /// ([`PleKernels::enqueue_rows_nvfp4`], the host decode's values).
+    fn land(
+        &mut self,
+        stream: &CudaStream,
+        k: &PleKernels,
+        arena: &mut Ple38,
+        n: usize,
+    ) -> Result<(), GpuError> {
+        let planes = match (&mut self.nvme, &self.decode) {
+            (Some(read), PleRows::Nvfp4(fp4)) if read.planes == 2 => Some((read, fp4)),
+            _ => None,
+        };
+        let Some((read, fp4)) = planes else {
+            self.decode()?;
+            return self.upload(stream, &mut arena.e, n);
+        };
+        read.finish()?;
+        let filled = read.rows.filled();
+        if filled.len() != self.named * self.row_bytes || self.named * self.width != n * geo::HIDDEN
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the PLE reader copied {} B for {} rows of {} B, {n} positions",
+                    filled.len(),
+                    self.named,
+                    self.row_bytes
+                ),
+            ));
+        }
+        let groups = filled.len() / 9;
+        k.enqueue_rows_nvfp4(
+            stream,
+            (fp4, filled),
+            &mut arena.planes,
+            groups,
+            &mut arena.e,
+        )
     }
 
     /// The decoded rows of the first `n` positions copied to an arena's
@@ -3928,9 +3973,8 @@ impl Body38 {
             plant,
             ..
         } = self;
-        let mut rows_in = |e: &mut DeviceBuffer<f32>| -> Result<(), GpuError> {
-            ple.decode()?;
-            ple.upload(gpu.stream(), e, m)
+        let mut rows_in = |arena: &mut Ple38| -> Result<(), GpuError> {
+            ple.land(gpu.stream(), &k.ple, arena, m)
         };
         let mut prog = Gemm38 {
             p: WideParts {

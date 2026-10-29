@@ -199,7 +199,9 @@ const LIST_ROWS: u32 = 40_960;
 // rows (qwen4exp_meta's KV_AT): 27,648 B a position, and the 12 rings' 33,792 B join the fixed terms.
 // Rooms 37,484,237,780 and 11,882,206,164 over 27,648 give 1,355,766 and 429,767; the pin is one
 // fewer.
-const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_355_765), ("3090", 429_766)];
+// PIN(2026-10-29): the PLE site's NVFP4 planes add 5,898,240 B to the target scratch at 4,096
+// positions: the planner on this tree holds 1,355,553 and 429,553; the pin is one fewer.
+const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_355_552), ("3090", 429_552)];
 
 /// The plan with the shared draft (`place::PlanInputs::plan_mtp`): on each
 /// card at 4,096 and 32,768 positions the target's plan is `plan`'s field
@@ -538,8 +540,12 @@ fn hw_qwen4exp_mtp_plan() {
 // layers (was 11). The selecting layers' raw key rings leave the card's kv 12,549,120 B at 4,096
 // (qwen4exp_meta's KV_AT); the tier keeps its 7,236 experts, its bytes and rounding [derived: the
 // planner on this tree over the pinned headers printed this row].
+// PIN(2026-10-29): the A6000 244 on the first 24 layers (was 26), both cards 395 on the first 12
+// layers (was 14). The PLE site's NVFP4 planes add 5,898,240 B to the stage's scratch at 4,096
+// positions; the tier keeps its 7,236 experts, its bytes and rounding [derived: the planner on this
+// tree over the pinned headers printed this row].
 const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
-    (244, 26, 243, 395, 14, 7_236, 22_677_401_600, 145_903_616);
+    (244, 24, 243, 395, 12, 7_236, 22_677_401_600, 145_903_616);
 
 /// Plan (b′) of the Qwen3.8 file with the shared draft (`place::machine_bp`
 /// with `MtpInputs::card_bytes` as the A6000's reserve, `plan_mtp_with`

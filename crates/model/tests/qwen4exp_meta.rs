@@ -234,7 +234,10 @@ const KV_AT: [(u64, u64); 2] = [(4096, 591_647_360), (32_768, 1_318_310_528)];
 // rows (KV_AT): 25,600 B a position (the cache's 25,344 and the rope table's 256), and the 12 rings'
 // 33,792 B join the fixed terms. Rooms 40,319,098,240 and 14,717,066,624 over 25,600 give 1,574,964
 // and 574,885; the pin is one fewer [the box's planner on this tree held 1,574,964 and 574,885].
-const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_574_963), ("3090", 574_884)];
+// PIN(2026-10-29): the PLE site's NVFP4 planes add 1,440 B a ubatch position to the scratch,
+// 5,898,240 B at 4,096 (CARD_SCRATCH): the planner on this tree holds 1,574,734 and 574,654; the pin
+// is one fewer.
+const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_574_733), ("3090", 574_653)];
 // PIN(2026-09-28): the card's scratch, the m = 1 scratch and the ubatch walk's at 4,096
 // positions [derived: 64 MiB + place::ubatch_scratch_bytes(4096) = 67,108,864 + 4,096 ·
 // 668,277 + 32 MiB].
@@ -246,7 +249,9 @@ const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_574_963), ("3090", 574_884)]
 // PIN(2026-10-28): the ubatch arena holds no query rows, no separate β and α rows and no one-row
 // indexer queries, 27,008 B fewer per ubatch position [derived: 2,739,900,416 − 4,096 · 27,008 and
 // 430,567,936 − 512 · 27,008].
-const CARD_SCRATCH: [(u64, u64); 2] = [(4096, 2_629_275_648), (512, 416_739_840)];
+// PIN(2026-10-29): the PLE site's NVFP4 planes, 1,440 B more per ubatch position [derived:
+// 2,629,275,648 + 4,096 · 1,440 and 416,739,840 + 512 · 1,440; the planner on this tree printed both].
+const CARD_SCRATCH: [(u64, u64); 2] = [(4096, 2_635_173_888), (512, 417_477_120)];
 
 // PIN(2026-09-29): the card scratch of a card-experts machine
 // (`place::machine_for_experts` under `Experts::Card`): the host rows' plus
@@ -258,7 +263,8 @@ const CARD_SCRATCH: [(u64, u64); 2] = [(4096, 2_629_275_648), (512, 416_739_840)
 // PIN(2026-10-24): the wide HC scratch adds the same 644 B per ubatch position.
 // PIN(2026-10-25): and the ubatch arena's flash rows leave the same 24,576 B per ubatch position.
 // PIN(2026-10-28): and its query, β·α and one-row indexer rows the same 27,008 B.
-const CARD_ROUTE_SCRATCH: [(u64, u64); 2] = [(4096, 3_020_115_968), (512, 509_207_040)];
+// PIN(2026-10-29): and the PLE site's NVFP4 planes the same 1,440 B.
+const CARD_ROUTE_SCRATCH: [(u64, u64); 2] = [(4096, 3_026_014_208), (512, 509_944_320)];
 
 /// The card scratch [`CARD_SCRATCH`] pins at ubatch `u` (a host-routed plan).
 fn scratch_at(u: u64) -> u64 {
@@ -762,6 +768,10 @@ type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
 // and their granules, 2 to 86 experts a row [derived: the planner on this tree over the pinned Q4
 // headers printed each row's expert and rounding bytes; the counts are the one split of those expert
 // bytes over the file's per-layer expert sizes, which gives every old row from its old bytes].
+// PIN(2026-10-29): the U 4,096 rows re-pinned for the PLE site's NVFP4 planes, 5,898,240 B more card
+// scratch (CARD_ROUTE_SCRATCH): 1 to 3 experts off each, their granules with them [derived: the
+// planner on this tree over the pinned Q4 headers printed each row's expert and rounding bytes; the
+// counts are the one split of those bytes over the file's per-layer expert sizes].
 const CARD_PLANS: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -769,10 +779,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         4_096,
         264,
-        20,
+        19,
         263,
-        39_624_806_400,
-        595_911_168,
+        39_621_734_400,
+        594_788_864,
     ),
     (
         "A6000",
@@ -791,10 +801,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         246,
-        1,
+        0,
         245,
-        36_857_344_000,
-        517_538_304,
+        36_854_272_000,
+        514_318_848,
     ),
     (
         "A6000",
@@ -813,10 +823,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         4_096,
         260,
-        11,
+        10,
         259,
-        38_995_456_000,
-        491_258_368,
+        38_992_384_000,
+        488_038_912,
     ),
     (
         "A6000",
@@ -835,10 +845,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         239,
-        39,
+        38,
         238,
-        35_923_046_400,
-        659_112_448,
+        35_919_974_400,
+        655_892_992,
     ),
     (
         "A6000",
@@ -857,10 +867,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         4_096,
         94,
-        24,
+        23,
         93,
-        14_064_742_400,
-        556_040_704,
+        14_061_670_400,
+        552_821_248,
     ),
     (
         "3090",
@@ -879,10 +889,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         76,
-        12,
+        11,
         75,
-        11_320_217_600,
-        456_827_392,
+        11_317_145_600,
+        453_607_936,
     ),
     (
         "3090",
@@ -901,10 +911,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         4_096,
         89,
-        22,
+        21,
         88,
-        13_306_470_400,
-        578_212_352,
+        13_303_398_400,
+        574_992_896,
     ),
     (
         "3090",
@@ -923,10 +933,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         70,
-        4,
+        1,
         69,
-        10_392_576_000,
-        591_745_536,
+        10_382_438_400,
+        595_591_680,
     ),
     (
         "3090",
@@ -1256,6 +1266,11 @@ const CARD_ROUNDING_Q3: u64 = 398_764_544;
 // GGUF headers and tensor tables at revision 766911a6, the tensor data left out) printed each row's
 // expert and rounding bytes; the counts are the one split of those bytes over the file's per-layer
 // expert sizes, which gives every old row from its old bytes].
+// PIN(2026-10-29): the U 4,096 rows re-pinned for the PLE site's NVFP4 planes, as CARD_PLANS: 1 to 3
+// experts a row [derived: the planner on this tree over the Q3 file's headers (its three shards'
+// GGUF headers and tensor tables at revision 766911a6, the tensor data left out) printed each row's
+// expert and rounding bytes; the counts are the one split of those bytes over the file's per-layer
+// expert sizes].
 const CARD_PLANS_Q3: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -1263,10 +1278,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         4_096,
         365,
-        41,
+        40,
         364,
-        39_779_225_600,
-        597_547_520,
+        39_777_049_600,
+        593_432_064,
     ),
     (
         "A6000",
@@ -1285,10 +1300,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         340,
-        18,
+        15,
         339,
-        37_002_598_400,
-        530_436_608,
+        36_996_070_400,
+        530_673_152,
     ),
     (
         "A6000",
@@ -1307,10 +1322,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         4_096,
         358,
-        41,
+        40,
         357,
-        39_016_012_800,
-        626_757_120,
+        39_013_836_800,
+        622_641_664,
     ),
     (
         "A6000",
@@ -1329,10 +1344,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         332,
-        46,
+        45,
         331,
-        36_192_102_400,
-        546_112_000,
+        36_189_926_400,
+        544_093_696,
     ),
     (
         "A6000",
@@ -1351,10 +1366,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         4_096,
         131,
-        22,
+        21,
         130,
-        14_223_948_800,
-        548_695_552,
+        14_221_772_800,
+        546_677_248,
     ),
     (
         "3090",
@@ -1373,10 +1388,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         104,
-        44,
+        42,
         103,
-        11_328_819_200,
-        602_184_192,
+        11_324_467_200,
+        598_147_584,
     ),
     (
         "3090",
@@ -1395,10 +1410,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         4_096,
         124,
-        22,
+        21,
         123,
-        13_460_736_000,
-        577_905_152,
+        13_458_560_000,
+        575_886_848,
     ),
     (
         "3090",
@@ -1417,10 +1432,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         97,
-        31,
+        30,
         96,
-        10_537_318_400,
-        598_864_384,
+        10_534_323_200,
+        595_568_128,
     ),
     (
         "3090",
@@ -1719,7 +1734,11 @@ type BpRow = (u64, usize, u64, u64, usize, u64, u64, u64);
 // layers (was 31). The selecting layers' raw key rings leave the card's kv 12,549,120 B at 4,096
 // (KV_AT); the tier keeps its 7,236 experts, its bytes and rounding [derived: the planner on this tree
 // over the pinned headers printed this row].
-const BP_PLAIN: BpRow = (262, 45, 261, 413, 33, 7_236, 22_677_401_600, 145_903_616);
+// PIN(2026-10-29): the A6000 262 on the first 44 layers (was 45), both cards 413 on the first 32
+// layers (was 33). The PLE site's NVFP4 planes add 5,898,240 B to the stage's scratch at 4,096
+// positions; the tier keeps its 7,236 experts, its bytes and rounding [derived: the planner on this
+// tree over the pinned headers printed this row].
+const BP_PLAIN: BpRow = (262, 44, 261, 413, 32, 7_236, 22_677_401_600, 145_903_616);
 
 /// Plan (b′) of the Qwen3.8 file without the draft (`place::machine_bp`,
 /// `plan_with` under `Experts::Card`): the A6000's counts and card bytes

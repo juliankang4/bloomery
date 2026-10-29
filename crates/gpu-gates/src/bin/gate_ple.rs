@@ -38,7 +38,12 @@
 //!    is clean before and after.
 //! 8. `refuse`: the launchers refuse, by name, a conv of another tap count or
 //!    dilation, no stream, no token, a ring or key shorter than the call's.
-//! 9. `shape`: both entries compile with no local depot.
+//! 9. `rows`: `ple_rows_nvfp4` over a 4,096-position ubatch of NVFP4 planes
+//!    (every UE4M3 scale byte, random codes), at a unit and at a small tensor
+//!    scale, is `gguf::quant::Nvfp4Rows::decode_planes` bit for bit; an
+//!    undefined scale byte and a value past f32's range are refused by name
+//!    before the launch, `e` as it was.
+//! 10. `shape`: every entry compiles with no local depot.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -56,7 +61,7 @@ mod gate {
     use bloomery_gpu_gates::rounding::bf16_round;
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, no_local_depot, verdict};
     use cuda_core::DeviceBuffer;
-    use gguf::quant::bf16_bits_to_f32;
+    use gguf::quant::{Nvfp4Rows, bf16_bits_to_f32};
 
     /// Streams: Qwen3.8's `hyper_connection.count`.
     const HC: usize = 4;
@@ -350,7 +355,15 @@ mod gate {
             tally(pass);
         }
         tally(refuse(&cx)?);
-        tally(no_local_depot(&["ple_gate", "ple_conv", "ple_conv_bf16"])?);
+        for pass in rows_clauses(&cx)? {
+            tally(pass);
+        }
+        tally(no_local_depot(&[
+            "ple_gate",
+            "ple_conv",
+            "ple_conv_bf16",
+            "ple_rows_nvfp4",
+        ])?);
         let pass = failed == 0;
         println!(
             "gate_ple: {clauses} clauses, {failed} failed — {}",
@@ -876,6 +889,58 @@ mod gate {
                 &bad.out,
             ));
         }
+        Ok(out)
+    }
+
+    // ---------------------------------------------------------- 9. rows
+
+    /// Clause 9.
+    fn rows_clauses(cx: &Cx<'_>) -> Result<Vec<bool>, GateError> {
+        let s = cx.gpu.stream();
+        let groups = 4096 * ROW / 16;
+        let mut r = Lcg(0x0005_eed9);
+        let mut planes: Vec<u8> = (0..9 * groups).map(|_| (r.unit() * 256.0) as u8).collect();
+        for (g, b) in planes[8 * groups..].iter_mut().enumerate() {
+            *b = (g % 0x7F) as u8;
+        }
+        let mut dev = DeviceBuffer::<u8>::zeroed(s, 9 * groups)?;
+        let mut e = DeviceBuffer::<f32>::zeroed(s, 16 * groups)?;
+        let mut out = Vec::new();
+        for scale in [1.0f32, f32::from_bits(0x380B_6DB7)] {
+            let rows = Nvfp4Rows::new(scale);
+            let (codes, scales) = planes.split_at(8 * groups);
+            let mut want = vec![0.0f32; 16 * groups];
+            rows.decode_planes(codes, scales, &mut want)?;
+            cx.k.enqueue_rows_nvfp4(s, (&rows, &planes), &mut dev, groups, &mut e)?;
+            let got = e.to_host_vec(s)?;
+            let pass = bits_equal(&got, &want);
+            println!(
+                "rows scale={scale:e} groups={groups} bits={pass} {}",
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+        let before = e.to_host_vec(s)?;
+        let mut refused = |planes: &[u8], scale: f32, why: &str| -> Result<bool, GateError> {
+            let rows = Nvfp4Rows::new(scale);
+            let e_msg =
+                cx.k.enqueue_rows_nvfp4(s, (&rows, planes), &mut dev, groups, &mut e)
+                    .err()
+                    .map(|e| e.to_string());
+            let kept = bits_equal(&e.to_host_vec(s)?, &before);
+            let pass = e_msg.as_deref().is_some_and(|m| m.contains(why)) && kept;
+            println!(
+                "rows refuse {why:?}: {e_msg:?} e_kept={kept} {}",
+                verdict(pass)
+            );
+            Ok(pass)
+        };
+        planes[8 * groups + 1234] = 0x7F;
+        out.push(refused(&planes, 1.0, "block 1234")?);
+        planes[8 * groups + 1234] = 0x38;
+        planes[8 * 77..8 * 78].fill(0x77);
+        planes[8 * groups + 77] = 0x7E;
+        out.push(refused(&planes, f32::MAX / 4.0, "leaves f32's range")?);
         Ok(out)
     }
 
