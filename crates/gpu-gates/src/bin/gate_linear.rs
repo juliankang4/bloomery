@@ -3364,9 +3364,14 @@ mod gate {
     }
 
     /// The prompt clause's band on `‖ours − rule‖ / ‖rule‖` for `o` and the
-    /// state: the BF16 rounding of q, k, the state and the solved rows the
-    /// tensor cores take.
-    const PROMPT_BAND: f64 = 2e-2;
+    /// state: each operand the tensor cores take is a BF16 high part and its
+    /// BF16 residual, so what is left is the f32 sum order of the chunked form.
+    // PIN(2026-10-29): measured on GB10 at 5.4e-6 (16 rows), 6.6e-6 (1,000 and
+    // 4,096) and 2.2e-5 (4,096, keys near one direction) for `o` and 3.9e-6 to
+    // 2.2e-5 for the lane; one product without its residual terms is ~2⁻⁹ ≈
+    // 2e-3 relative [derived], so 2e-4, 9× the worst measured, keeps the
+    // residuals under test.
+    const PROMPT_BAND: f64 = 2e-4;
 
     /// Clause 16: `enqueue_delta_prompt` against the one-lane rule.
     fn prompt_clauses(cx: &Ctx<'_>) -> Result<Vec<bool>, GateError> {
