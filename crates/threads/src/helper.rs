@@ -171,6 +171,7 @@ pub fn caller_sibling() -> Option<usize> {
 /// The other logical cpu of `cpu`'s core
 /// (`/sys/devices/system/cpu/cpu<c>/topology/thread_siblings_list`); `None`
 /// for a core without SMT.
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn sibling_of(cpu: usize) -> Option<usize> {
     let list = std::fs::read_to_string(format!(
@@ -178,6 +179,13 @@ pub fn sibling_of(cpu: usize) -> Option<usize> {
     ))
     .ok()?;
     cpu_list(&list).find(|&c| c != cpu)
+}
+
+/// No sysfs SMT sibling is available on macOS.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn sibling_of(_cpu: usize) -> Option<usize> {
+    None
 }
 
 /// The cpus of the calling thread's mask.
@@ -225,6 +233,7 @@ fn pin_to(cpu: usize) -> bool {
 
 /// The cpus of a sysfs cpu list (`0,32`, `0-1`, `0-3,8`); a malformed entry
 /// ends the list.
+#[cfg(target_os = "linux")]
 fn cpu_list(text: &str) -> impl Iterator<Item = usize> + '_ {
     text.trim()
         .split(',')

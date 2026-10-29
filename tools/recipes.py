@@ -15110,8 +15110,10 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     # its lib tests run in `just lab-metal`.
     pure_now = sorted(n for n, w in real.items() if not w)
     # PIN(2026-10-21): bloomery-record joined: the record core lifted out of gpu-gates
+    # PIN(2026-10-29): qdot joined: its threads dependency's sysfs sibling lookup is Linux-only;
+    # `cargo test -p bloomery-qdot` passes natively on macOS, replacing its threads rejection below.
     expect(
-        pure_now == ["bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-gguf", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-record", "bloomery-refset", "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
+        pure_now == ["bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-gguf", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-record", "bloomery-refset", "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
         f"pure: the real tree's pure crates are {pure_now} — a new member of the set is proven by `just mac-test` before this list takes it",
     )
     # the host chain's Linux-only items are the one owner's now, behind its own cfg, so a crate that holds
@@ -15119,7 +15121,7 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     expect(not real.get("bloomery-gguf"), f"pure: gguf is rejected: {real.get('bloomery-gguf')}")
     expect(any("a Linux-only libc item" in w for ws in real.values() for w in ws), "pure: the rule names no Linux-only libc item in the tree")
     expect(any("bloomery-gpu -> cuda-" in w for w in real.get("bloomery-gpu", [])), f"pure: bloomery-gpu's reason {real.get('bloomery-gpu')}")
-    expect(any("crates/threads/src/" in w for w in real.get("bloomery-qdot", [])), f"pure: qdot's reason {real.get('bloomery-qdot')}")
+    expect(not real.get("bloomery-qdot"), f"pure: qdot is rejected: {real.get('bloomery-qdot')}")
     # host nightly on the real tree: the crates the set runs are the device-free ones and the admitted app; every gpu crate is left out
     # by its chain; every check script is a unit or an excluded one; the tables hold no stale entry
     lock_now = load_lock(tree.root)
