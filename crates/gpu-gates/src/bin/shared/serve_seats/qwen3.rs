@@ -2292,6 +2292,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         (ids.len() == 1).then(|| ids[0])
     };
     let vision = vision_of(&a, arch, (&path, &split), &token, &one)?;
+    // Keep the stage context and bundle resident before planning, as the CLI does.
+    let stage = a
+        .place
+        .unwrap_or(Place::A)
+        .on(&gpu_census::census()?)?
+        .card_specs()?[0];
+    Gpu::hold_card(stage.name, stage.device)?;
     // The side model is read and seated before the plans, each of which holds its bytes when it
     // sits on the stage card; it takes the card the encoder's seat takes.
     let side = side.read()?;
@@ -2434,8 +2441,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // set the count).
     parallel_line(slots, slot_ctx, from, pass);
     if a.plan_only {
-        // The records the load would print first are out; nothing was
-        // opened on a card.
+        // The records the load would print first are out; no model was
+        // opened on a card (the stage card was held above).
         load.print_plan(&levers, vision.as_ref())?;
         std::process::exit(0);
     }
