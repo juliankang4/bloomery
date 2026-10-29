@@ -70,7 +70,8 @@
 //! [`Rule::min_timings`] readings taken since, and the gate decides on their
 //! median. A chain draft's probe past an open gate refreshes the means of
 //! the positions past it, because no other pass reaches them; its costs
-//! start over only if the refreshed profile and reading would move the gate.
+//! start over only if the refreshed profile would move the gate at either
+//! the held median or the new reading.
 //! One fast reading cannot
 //! move the gate and one slow one cannot hold a width out of it, and one
 //! probe after a load step replaces a median read under the old load. A
@@ -1229,7 +1230,7 @@ impl<D, C: Clock> Choosing<D, C> {
         }
         let k = f.width;
         let ms = positive(self.costs[k].what, ms)?;
-        if f.probe && self.moves_on(k, ms) {
+        if f.probe && (self.moves_on(k, ms) || self.decision().is_some_and(|w| w != self.width)) {
             // The median read before gives way to readings from this one on.
             self.start_over(k);
         }
