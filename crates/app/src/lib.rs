@@ -766,7 +766,9 @@ where
         let floats = wanted
             .checked_mul(n_vocab)
             .ok_or_else(|| SessionError::Refused("round logits size overflow".into()))?;
-        self.round.resize(floats, 0.0);
+        if self.round.len() < floats {
+            self.round.resize(floats, 0.0);
+        }
         let mut ids = vec![0; total];
         for cut in &cuts {
             let held: usize = rows[..cut.start].iter().map(|(_, t)| t.len()).sum();
@@ -798,7 +800,7 @@ where
             ids,
             passes: cuts.len(),
             logits: (wanted > 0).then(|| RoundLogits {
-                all: &self.round,
+                all: &self.round[..floats],
                 offsets,
                 n_vocab,
             }),
