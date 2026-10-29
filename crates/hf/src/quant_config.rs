@@ -258,7 +258,7 @@ struct Modelopt {
     /// The top-level algorithm's format; `None` for MIXED_PRECISION.
     all: Option<Format>,
     /// `quantized_layers`: a module and its format.
-    layers: Vec<(String, Format)>,
+    layers: BTreeMap<String, Format>,
     exclude: Vec<String>,
 }
 
@@ -426,11 +426,16 @@ impl Config {
             return (formats, None);
         }
         if let Some(m) = &self.modelopt {
-            let layer = m
-                .layers
-                .iter()
-                .filter(|(k, _)| within(module, k))
-                .max_by_key(|(k, _)| k.len());
+            let mut ancestor = module;
+            let layer = loop {
+                if let Some(entry) = m.layers.get_key_value(ancestor) {
+                    break Some(entry);
+                }
+                let Some((parent, _)) = ancestor.rsplit_once('.') else {
+                    break None;
+                };
+                ancestor = parent;
+            };
             if let Some((k, f)) = layer {
                 return (vec![*f], Some(k));
             }
@@ -595,7 +600,7 @@ impl Modelopt {
             "MIXED_PRECISION" => None,
             _ => Some(modelopt_format("the checkpoint", algo, q)?),
         };
-        let mut layers = Vec::new();
+        let mut layers = BTreeMap::new();
         if let Some(l) = q.get("quantized_layers") {
             let l = l
                 .as_object()
@@ -612,7 +617,7 @@ impl Modelopt {
                     &[LAYER],
                 )
                 .map_err(bad)?;
-                layers.push((module.clone(), format));
+                layers.insert(module.clone(), format);
             }
         }
         let exclude = q
@@ -1220,13 +1225,6 @@ fn literal_patterns<'a>(
         ))),
         None => Ok(()),
     }
-}
-
-/// Whether `module` is `key` or inside it.
-fn within(module: &str, key: &str) -> bool {
-    module
-        .strip_prefix(key)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 /// fnmatch's `*` (any run) and `?` (one character) over the whole of `s`.
@@ -1939,6 +1937,38 @@ mod tests {
             stack.scale.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
             want
         );
+    }
+
+    /// Declarations match complete module ancestors, with the nearest ancestor winning.
+    #[test]
+    fn modelopt_declarations_use_the_nearest_module_ancestor() {
+        let c = Config::parse(
+            &serde_json::json!({}),
+            Some(&serde_json::json!({
+                "quantization": { "quant_algo": "MIXED_PRECISION", "quantized_layers": {
+                    "model": { "quant_algo": "FP8" },
+                    "model.layers.3": { "quant_algo": "NVFP4", "group_size": 16 },
+                    "model.layers.3.mlp": { "quant_algo": "FP8" }
+                } }
+            })),
+        )
+        .unwrap();
+        for (module, format, declaration) in [
+            ("model.layers.3", Format::Nvfp4, "model.layers.3"),
+            ("model.layers.3.attn.q", Format::Nvfp4, "model.layers.3"),
+            (
+                "model.layers.3.mlp.experts.511.gate_proj",
+                Format::Fp8Tensor,
+                "model.layers.3.mlp",
+            ),
+            ("model.layers.30.mlp", Format::Fp8Tensor, "model"),
+        ] {
+            assert_eq!(
+                c.declared(module, || None),
+                (vec![format], Some(declaration))
+            );
+        }
+        assert_eq!(c.declared("model2.layers.3", || None), (vec![], None));
     }
 
     /// Every tensor of a table gets one format or a refusal naming it: each format's layout is
