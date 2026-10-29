@@ -52,7 +52,7 @@ pub enum CallPiece {
 struct Told {
     index: usize,
     name: String,
-    /// The arguments text sent so far.
+    /// The whole-state scan's sent prefix; append-only advances leave it unchanged.
     sent: String,
 }
 
@@ -109,6 +109,22 @@ impl Streamer {
             }
             (_, Some(t)) => return Err(diverged(&t.name, t.index)),
             (None, None) => {}
+        }
+        Ok(())
+    }
+
+    /// An append-only scan's new arguments, with its close when complete.
+    pub(crate) fn advance(&mut self, p: &Progress, closed: bool) -> Result<(), MarkupError> {
+        if let Some(t) = &self.told {
+            if t.index != p.index || t.name != p.name {
+                return Err(diverged(&t.name, t.index));
+            }
+            self.extend(p.index, &p.name, "", &p.args)?;
+        } else {
+            self.step(&[], Some(p))?;
+        }
+        if closed {
+            self.told = None;
         }
         Ok(())
     }
@@ -174,24 +190,26 @@ impl Args {
         Args("{".to_owned())
     }
 
-    fn key(&mut self, key: &str) {
-        if self.0.len() > 1 {
-            self.0.push(',');
+    /// Appends the field prefix for `key` to the open object `out`: a comma
+    /// after an earlier field, the key, the colon.
+    pub(crate) fn key(out: &mut String, key: &str) {
+        if out.len() > 1 {
+            out.push(',');
         }
-        self.0.push_str(&string(key));
-        self.0.push(':');
+        out.push_str(&string(key));
+        out.push(':');
     }
 
     /// A parameter whose value is `json`, complete JSON text.
     pub(crate) fn field(&mut self, key: &str, json: &str) {
-        self.key(key);
+        Self::key(&mut self.0, key);
         self.0.push_str(json);
     }
 
     /// The text parameter `key` with `released` of its value so far; the
     /// string stays open.
     pub(crate) fn text_so_far(mut self, key: &str, released: &str) -> String {
-        self.key(key);
+        Self::key(&mut self.0, key);
         self.0.push('"');
         self.0.push_str(&string_body(released));
         self.0
@@ -329,5 +347,41 @@ mod tests {
         let mut a = Args::new();
         a.field("n", "3");
         assert_eq!(a.text_so_far("k", "v\n"), r#"{"n":3,"k":"v\n"#);
+    }
+    #[test]
+    fn advances_do_not_accumulate_argument_history() {
+        let mut s = Streamer::default();
+        s.advance(&progress(0, "{"), false).unwrap();
+        assert_eq!(s.take(), [open(0), args(0, "{")]);
+        for fragment in ["", "\"text\":", "\"hello\""] {
+            s.advance(&progress(0, fragment), false).unwrap();
+            assert_eq!(
+                s.told.as_ref().unwrap().sent,
+                "{",
+                "advances retain only the opening prefix"
+            );
+            assert_eq!(
+                s.take(),
+                if fragment.is_empty() {
+                    vec![]
+                } else {
+                    vec![args(0, fragment)]
+                }
+            );
+        }
+        let renamed = Progress {
+            name: "g".to_owned(),
+            ..progress(0, "")
+        };
+        assert_eq!(s.advance(&renamed, false).unwrap_err(), diverged("f", 0));
+        assert_eq!(
+            s.advance(&progress(1, ""), false).unwrap_err(),
+            diverged("f", 0)
+        );
+        s.advance(&progress(0, "}"), true).unwrap();
+        assert!(s.told.is_none(), "closed calls release their state");
+        assert_eq!(s.take(), [args(0, "}")]);
+        s.advance(&progress(1, "{}"), true).unwrap();
+        assert_eq!(s.take(), [open(1), args(1, "{}")]);
     }
 }

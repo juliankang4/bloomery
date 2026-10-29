@@ -48,9 +48,9 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::callstream::{self, Args, Progress, released};
+use crate::callstream::{self, Progress, released};
 use crate::constrain::{Fun, Part, Refusal, Style, call, value};
-use crate::dsml::{Scanned, ToolCall};
+use crate::dsml::{self, MarkupError, Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
 
 // The format's markup is its description's (the models crate's `function_xml`, not this crate's `models` module),
@@ -343,6 +343,7 @@ pub struct QwenScan {
     /// Text not yet decided.
     buf: String,
     calls: usize,
+    read: CallRead,
 }
 
 impl QwenScan {
@@ -357,27 +358,52 @@ impl QwenScan {
             after_call: false,
             buf: String::new(),
             calls: 0,
+            read: CallRead::default(),
         }
     }
 
     /// Feeds text; returns the content that may be sent and the calls that
     /// closed.
     pub fn push(&mut self, piece: &str) -> Result<Scanned, QwenXmlError> {
+        let mut out = self.push_stream(piece)?;
+        out.advances = None;
+        out.open = self.progress();
+        Ok(out)
+    }
+
+    fn progress(&self) -> Option<Progress> {
+        self.read.name.as_ref().map(|name| Progress {
+            index: self.calls,
+            name: name.clone(),
+            args: self.read.args.clone(),
+        })
+    }
+
+    /// [`QwenScan::push`] that reports the call text as `advances`, each
+    /// piece's new arguments, instead of the open call's whole text.
+    pub(crate) fn push_stream(&mut self, piece: &str) -> Result<Scanned, QwenXmlError> {
         self.buf.push_str(piece);
         let mut out = Scanned::default();
+        let advances = out.advances.insert(Vec::new());
         loop {
             if self.inside {
-                let Some((name, arguments, used)) =
-                    parse_call(&self.buf, self.calls, &self.kinds, self.framing, false)?
-                else {
-                    out.open =
-                        partial_call(&self.buf, &self.kinds, self.framing).map(|(name, args)| {
-                            Progress {
-                                index: self.calls,
-                                name,
-                                args,
-                            }
-                        });
+                let closed = self
+                    .read
+                    .advance(&self.buf, self.calls, &self.kinds, self.framing)?;
+                if let Some(name) = &self.read.name
+                    && (self.read.sent < self.read.args.len() || closed.is_some())
+                {
+                    advances.push((
+                        Progress {
+                            index: self.calls,
+                            name: name.clone(),
+                            args: self.read.args[self.read.sent..].to_owned(),
+                        },
+                        closed.is_some(),
+                    ));
+                    self.read.sent = self.read.args.len();
+                }
+                let Some((name, arguments, used)) = closed else {
                     return Ok(out);
                 };
                 out.calls.push(ToolCall {
@@ -386,6 +412,7 @@ impl QwenScan {
                     arguments,
                 });
                 self.calls += 1;
+                self.read = CallRead::default();
                 self.buf.drain(..used);
                 self.inside = false;
                 self.after_call = true;
@@ -415,6 +442,26 @@ impl QwenScan {
                 return Ok(out);
             }
         }
+    }
+
+    /// [`QwenScan::finish`] for the parser's end ([`crate::dsml::ChatParser::try_finish_at`]):
+    /// a call the limit `cut` and the parser `kept` is the call read so far, and since
+    /// its arguments already went out as advances, its stream only closes.
+    pub(crate) fn finish_at(
+        &mut self,
+        cut: bool,
+        kept: Option<&Progress>,
+    ) -> Result<Scanned, MarkupError> {
+        let mut scanned = dsml::ended(self.finish(), QwenXmlError::unclosed, cut, kept)?;
+        if let Some(p) = kept.filter(|_| cut) {
+            let close = Progress {
+                index: p.index,
+                name: p.name.clone(),
+                args: String::new(),
+            };
+            scanned.advances = Some(vec![(close, true)]);
+        }
+        Ok(scanned)
     }
 
     /// Releases what is held at the end of the stream; a call still open is
@@ -633,59 +680,118 @@ fn parse_call(
     )))
 }
 
-/// The call at the start of `s`, the text after `<tool_call>` whose close has
-/// not come, as far as `s` reads it: its name once `<function=NAME>` is whole
-/// and the request's tools name it, and the arguments [`parse_call`] will
-/// close with, as a prefix — each complete parameter, and the text of a
-/// parameter whose schema reads a string whose end has not come, up to the
-/// tail that could still become a tag that ends it. A fault ends the reading
-/// where it stands: [`parse_call`] names it.
-fn partial_call(s: &str, kinds: &ParamKinds, framing: Framing) -> Option<(String, String)> {
-    let rest = s.trim_start().strip_prefix(FUNCTION_OPEN)?;
-    let name_end = rest.find('>')?;
-    let name = &rest[..name_end];
-    if name.is_empty() || name.contains(['<', '\n', '"']) || !kinds.names(name) {
-        return None;
-    }
-    let mut args = Args::new();
-    let mut tail = &rest[name_end + 1..];
-    loop {
-        tail = tail.trim_start();
-        let Some(p) = tail.strip_prefix(PARAM_OPEN) else {
-            break;
-        };
-        let Some(key_end) = p.find('>') else { break };
-        let key = &p[..key_end];
-        if key.is_empty() || key.contains(['<', '\n', '"']) {
-            break;
-        }
-        let Some(v) = p[key_end + 1..].strip_prefix(framing.value_open()) else {
-            break;
-        };
-        let kind = kinds.kind(name, key);
-        let close = framing.value_close();
-        let Some(val_end) = v.find(close) else {
-            if kind == Some(&Kind::String) {
-                let text = released(v, &[close, CALL_CLOSE]);
-                return Some((name.to_owned(), args.text_so_far(key, text)));
+/// The cursor and argument text of the active call. Only a value's undecided
+/// delimiter suffix is searched again when more text arrives.
+#[derive(Clone, Debug, Default)]
+struct CallRead {
+    at: usize,
+    name: Option<String>,
+    args: String,
+    value: Option<(String, usize, usize)>,
+    sent: usize,
+}
+
+impl CallRead {
+    fn advance(
+        &mut self,
+        s: &str,
+        index: usize,
+        kinds: &ParamKinds,
+        framing: Framing,
+    ) -> Result<Option<(String, String, usize)>, QwenXmlError> {
+        if self.name.is_none() {
+            let rest = s.trim_start();
+            let Some(body) = rest.strip_prefix(FUNCTION_OPEN) else {
+                return parse_call(s, index, kinds, framing, false);
+            };
+            let Some(end) = body.find('>') else {
+                return Ok(None);
+            };
+            let name = &body[..end];
+            if name.is_empty() || name.contains(['<', '\n', '"']) || !kinds.names(name) {
+                return parse_call(s, index, kinds, framing, false);
             }
-            break;
-        };
-        let raw = &v[..val_end];
-        match kind {
-            Some(Kind::String) => args.field(key, &callstream::string(raw)),
-            Some(Kind::Bool) => match boolean(raw) {
-                Some(word) => args.field(key, word),
-                None => break,
-            },
-            Some(Kind::Json(_)) if serde_json::from_str::<Value>(raw).is_ok() => {
-                args.field(key, raw);
-            }
-            _ => break,
+            self.name = Some(name.to_owned());
+            self.args.push('{');
+            self.at = s.len() - body.len() + end + 1;
         }
-        tail = &v[val_end + close.len()..];
+        loop {
+            if let Some((key, start, searched)) = &mut self.value {
+                let close = framing.value_close();
+                let tail = &s[*searched..];
+                let end = tail.find(close).map(|n| *searched + n);
+                let text = kinds.kind(self.name.as_deref().unwrap_or_default(), key)
+                    == Some(&Kind::String);
+                if text {
+                    let upto = end
+                        .unwrap_or_else(|| *searched + released(tail, &[close, CALL_CLOSE]).len());
+                    self.args
+                        .push_str(&callstream::string_body(&s[*searched..upto]));
+                    *searched = upto;
+                } else if end.is_none() {
+                    *searched = s.len() - partial_suffix(tail, close);
+                }
+                let Some(end) = end else { return Ok(None) };
+                if text {
+                    self.args.push('"');
+                } else {
+                    callstream::Args::key(&mut self.args, key);
+                    let raw = &s[*start..end];
+                    match kinds.kind(self.name.as_deref().unwrap_or_default(), key) {
+                        Some(Kind::Bool) => match boolean(raw) {
+                            Some(word) => self.args.push_str(word),
+                            None => return parse_call(s, index, kinds, framing, false),
+                        },
+                        Some(Kind::Json(_)) if serde_json::from_str::<Value>(raw).is_ok() => {
+                            self.args.push_str(raw)
+                        }
+                        _ => return parse_call(s, index, kinds, framing, false),
+                    }
+                }
+                self.at = end + close.len();
+                self.value = None;
+            }
+            let rest = s[self.at..].trim_start();
+            let Some(p) = rest.strip_prefix(PARAM_OPEN) else {
+                if held(PARAM_OPEN, rest)
+                    || held(FUNCTION_CLOSE, rest)
+                    || rest
+                        .strip_prefix(FUNCTION_CLOSE)
+                        .is_some_and(|tail| held(CALL_CLOSE, tail.trim_start()))
+                {
+                    return Ok(None);
+                }
+                let closed = parse_call(s, index, kinds, framing, false)?;
+                if let Some((_, args, _)) = &closed {
+                    self.args.clone_from(args);
+                }
+                return Ok(closed);
+            };
+            let Some(end) = p.find('>') else {
+                return Ok(None);
+            };
+            let key = &p[..end];
+            if key.is_empty()
+                || key.contains(['<', '\n', '"'])
+                || kinds
+                    .kind(self.name.as_deref().unwrap_or_default(), key)
+                    .is_none()
+            {
+                return parse_call(s, index, kinds, framing, false);
+            }
+            let Some(v) = p[end + 1..].strip_prefix(framing.value_open()) else {
+                return parse_call(s, index, kinds, framing, false);
+            };
+            let text =
+                kinds.kind(self.name.as_deref().unwrap_or_default(), key) == Some(&Kind::String);
+            if text {
+                callstream::Args::key(&mut self.args, key);
+                self.args.push('"');
+            }
+            let start = s.len() - v.len();
+            self.value = Some((key.to_owned(), start, start));
+        }
     }
-    Some((name.to_owned(), args.so_far()))
 }
 
 /// The call this markup spells, as the parts structured output forces: the
