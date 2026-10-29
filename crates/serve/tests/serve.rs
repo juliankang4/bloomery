@@ -7,9 +7,12 @@
 //! yields `a`, `b`, `c`, EOS.
 
 mod common;
+#[path = "common/process.rs"]
+mod process;
 mod slots;
 
 use common::{assert_keys, call, fixture_keys, get, post, start};
+use process::Reaped;
 use serde_json::{Value, json};
 
 fn chat_body(extra: Value) -> Value {
@@ -1220,18 +1223,6 @@ fn hw_queued_requests_get_the_slot_in_arrival_order() {
     }
     let want: Vec<String> = (0..=QUEUED).map(|i| i.to_string()).collect();
     assert_eq!(log.prompts(), want, "the slot must pass in arrival order");
-}
-
-/// A spawned server, killed and reaped if the test panics before it exits.
-struct Reaped(std::process::Child);
-
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
 }
 
 /// Starts `bloomery-serve --mock-fail-at k` on a free port; returns the child,
