@@ -393,6 +393,14 @@ fn malformed() -> Vec<(&'static str, &'static str, QwenXmlError)> {
             },
         ),
         (
+            "an empty boolean value with no line of its own",
+            "</think><tool_call>\n<function=save_note>\n<parameter=pinned>\n</parameter>\n</function>\n</tool_call>",
+            QwenXmlError::Unterminated {
+                index: 0,
+                text: "<tool_call>\n<function=save_note>\n<parameter=pinned>\n</parameter>\n</function>\n</tool_call>".to_owned(),
+            },
+        ),
+        (
             "an untyped parameter that is not JSON",
             "</think><tool_call>\n<function=lookup>\n<parameter=n>\nforty two\n</parameter>\n</function>\n</tool_call>",
             QwenXmlError::NotJson {

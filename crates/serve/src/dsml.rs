@@ -174,6 +174,10 @@ pub struct Scanned {
     /// The call the scan has opened and not closed, once its name is read
     /// ([`Progress`]).
     pub open: Option<Progress>,
+    /// For a scan that streams by its own cursor, the call text it read this
+    /// step, in order: each piece's new arguments and whether it closed the
+    /// call. `None` for a scan whose `calls` and `open` are the whole state.
+    pub(crate) advances: Option<Vec<(Progress, bool)>>,
 }
 
 /// Streaming DSML scanner over the text after the think span.
@@ -854,10 +858,9 @@ impl ChatParser {
             Some(Scan::Dsml(d)) => Some(d.push(&split.content)),
             Some(Scan::Kv(k)) => Some(k.push(&split.content)?),
             Some(Scan::Hermes(h)) => Some(h.push(&split.content)?),
-            Some(Scan::Qwen(q)) => Some(q.push(&split.content)?),
+            Some(Scan::Qwen(q)) => Some(q.push_stream(&split.content)?),
             Some(Scan::Muse(m)) => Some(m.push(&split.content)),
         };
-        self.open = scanned.as_ref().and_then(|s| s.open.clone());
         self.stream(scanned.as_ref())?;
         Ok(self.emit(split, scanned))
     }
@@ -895,7 +898,7 @@ impl ChatParser {
             }
             Some(Scan::Kv(k)) => Some(ended(k.finish(), KvError::unclosed, cut, kept)?),
             Some(Scan::Hermes(h)) => Some(ended(h.finish(), HermesError::unclosed, cut, kept)?),
-            Some(Scan::Qwen(q)) => Some(ended(q.finish(), QwenXmlError::unclosed, cut, kept)?),
+            Some(Scan::Qwen(q)) => Some(q.finish_at(cut, kept)?),
             // The scan closes a message the stream ends inside as its call on its own.
             Some(Scan::Muse(m)) => Some(m.finish()),
         };
@@ -903,12 +906,33 @@ impl ChatParser {
         Ok(self.emit(split, scanned))
     }
 
-    /// Hands a scan step to the stream's pieces.
+    /// Hands a scan step to the open call and the stream's pieces.
     fn stream(&mut self, scanned: Option<&Scanned>) -> Result<(), MarkupError> {
-        match (&mut self.streamer, scanned) {
-            (Some(st), Some(s)) => st.step(&s.calls, s.open.as_ref()),
-            _ => Ok(()),
+        let Some(s) = scanned else {
+            self.open = None;
+            return Ok(());
+        };
+        let Some(advances) = &s.advances else {
+            self.open.clone_from(&s.open);
+            return match &mut self.streamer {
+                Some(st) => st.step(&s.calls, s.open.as_ref()),
+                None => Ok(()),
+            };
+        };
+        for (p, closed) in advances {
+            if let Some(st) = &mut self.streamer {
+                st.advance(p, *closed)?;
+            }
+            self.open = match self.open.take() {
+                _ if *closed => None,
+                Some(mut open) if open.index == p.index => {
+                    open.args.push_str(&p.args);
+                    Some(open)
+                }
+                _ => Some(p.clone()),
+            };
         }
+        Ok(())
     }
 
     /// The message so far.
@@ -951,7 +975,7 @@ impl ChatParser {
 /// inside a call it reads as the template's so far (`unclosed`: the text of that call, from the
 /// scan's own error), the answer holds what was read of that call instead of its error: the `kept`
 /// call (its name read) with the arguments so far, else the text it consumed as content.
-fn ended<E: Into<MarkupError>>(
+pub(crate) fn ended<E: Into<MarkupError>>(
     released: Result<Scanned, E>,
     unclosed: fn(&E) -> Option<String>,
     cut: bool,
