@@ -746,20 +746,23 @@ where
                 logits.len()
             )));
         }
-        let n_vocab = if logits.iter().any(|&want| want) {
-            self.model.n_vocab()?
-        } else {
-            0
-        };
-        let mut offsets = Vec::new();
+        let reads = logits.iter().any(|&want| want);
+        let n_vocab = if reads { self.model.n_vocab()? } else { 0 };
+        let total = rows
+            .iter()
+            .try_fold(0usize, |n, (_, ids)| n.checked_add(ids.len()))
+            .ok_or_else(|| SessionError::Refused("round row count overflow".into()))?;
+        // A round that requests no logits builds no offsets and reads no row.
+        let mut offsets = Vec::with_capacity(if reads { total } else { 0 });
         let mut wanted = 0usize;
-        for ((_, tokens), &want) in rows.iter().zip(logits) {
-            for _ in *tokens {
-                offsets.push(want.then_some(wanted));
-                wanted += usize::from(want);
+        if reads {
+            for ((_, tokens), &want) in rows.iter().zip(logits) {
+                for _ in *tokens {
+                    offsets.push(want.then_some(wanted));
+                    wanted += usize::from(want);
+                }
             }
         }
-        let total = offsets.len();
         let floats = wanted
             .checked_mul(n_vocab)
             .ok_or_else(|| SessionError::Refused("round logits size overflow".into()))?;
@@ -776,16 +779,18 @@ where
                     out.ids.len()
                 )));
             }
-            let mut fetched = false;
-            let slots = chunk
-                .iter()
-                .flat_map(|(slot, toks)| std::iter::repeat_n(*slot, toks.len()));
-            for (r, slot) in slots.enumerate() {
-                round_row(slot, offsets[held + r], n_vocab, &mut self.round, |row| {
-                    self.model.slots_row_into(r, &mut self.pass, fetched, row)?;
-                    fetched = true;
-                    Ok(())
-                })?;
+            if reads {
+                let mut fetched = false;
+                let slots = chunk
+                    .iter()
+                    .flat_map(|(slot, toks)| std::iter::repeat_n(*slot, toks.len()));
+                for (r, slot) in slots.enumerate() {
+                    round_row(slot, offsets[held + r], n_vocab, &mut self.round, |row| {
+                        self.model.slots_row_into(r, &mut self.pass, fetched, row)?;
+                        fetched = true;
+                        Ok(())
+                    })?;
+                }
             }
             ids[held..held + n].copy_from_slice(&out.ids);
         }
@@ -1140,6 +1145,40 @@ mod tests {
         assert!(
             error.to_string().contains("slot 1's logit 2 is NaN"),
             "{error}"
+        );
+        let (n_vocab, rounds) = (151_936, 32);
+        let stage = vec![1.0f32; 2 * n_vocab];
+        let mut both = vec![0.0; 2 * n_vocab];
+        let mut selected = vec![0.0; n_vocab];
+        let began = std::time::Instant::now();
+        for _ in 0..rounds {
+            for r in 0..2 {
+                let dst = &mut both[r * n_vocab..(r + 1) * n_vocab];
+                for (out, &v) in dst.iter_mut().zip(stage.iter().skip(r).step_by(2)) {
+                    *out = v;
+                }
+                assert!(!std::hint::black_box(&*dst).iter().any(|v| v.is_nan()));
+            }
+            std::hint::black_box(&both);
+        }
+        let all_us = began.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+        let began = std::time::Instant::now();
+        for _ in 0..rounds {
+            for (slot, offset) in [None, Some(0)].into_iter().enumerate() {
+                super::round_row(slot, offset, n_vocab, &mut selected, |dst| {
+                    for (out, &v) in dst.iter_mut().zip(stage.iter().skip(slot).step_by(2)) {
+                        *out = v;
+                    }
+                    Ok(())
+                })
+                .expect("a requested row");
+            }
+            std::hint::black_box(&selected);
+        }
+        let selected_us = began.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+        assert_eq!(selected, both[n_vocab..]);
+        eprintln!(
+            "mixed-logits vocab={n_vocab} rounds={rounds} all_host_us={all_us:.3} selected_host_us={selected_us:.3}"
         );
     }
 
