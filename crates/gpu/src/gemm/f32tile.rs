@@ -73,6 +73,14 @@ use cuda_device::shared::cvta_generic_to_shared_u32;
 use cuda_device::vector::{F32x2, F32x4, U32x4};
 use cuda_device::wmma::{ldmatrix_x4_shared_u32, mma_m16n8k16_f32_bf16};
 use cuda_device::{DisjointSlice, thread, warp};
+#[cfg(bloomery_nvfp4_mma)]
+use cuda_device::{
+    barrier::{
+        Barrier, fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_expect_tx,
+        mbarrier_init, mbarrier_try_wait_parity,
+    },
+    tma::{TmaDescriptor, cp_async_bulk_tensor_2d_g2s},
+};
 
 /// Columns and rows one block covers.
 pub(super) const TILE_COLS: usize = 32;
@@ -599,6 +607,19 @@ pub(crate) trait MmaRows: TileRows {
     #[inline(always)]
     unsafe fn scale_word(self, _at: usize) -> u32 {
         0
+    }
+
+    /// For a weight whose staged units are its stored bytes ([`tma_mma_tile`]),
+    /// whether the 64 units of a row from unit `at` (a multiple of 64) pass
+    /// the check [`Self::land`] makes when it lands their first piece.
+    ///
+    /// # Safety
+    ///
+    /// The units lie inside the weight's rows.
+    #[cfg(bloomery_nvfp4_mma)]
+    #[inline(always)]
+    unsafe fn span_fits(self, _at: usize) -> bool {
+        true
     }
 
     /// One tensor-core step on a row fragment `a` and a column fragment `b`
@@ -1185,6 +1206,85 @@ impl MmaTile {
     }
 }
 
+/// One 16-unit step of a published stage's products into a warp's 64 by 32
+/// accumulators `acc` ([`bf16_mma_tile`]'s): `stage` the stage's shared
+/// address, `(s, step)` the stage and step, the warp's origin `(wr, wc)` in
+/// the tile, the lanes' ldmatrix pieces and a scaled step's scale words.
+macro_rules! mma_step {
+    ($W:ty, $acc:ident, $stage:expr, ($s:expr, $step:expr), ($wr:expr, $wc:expr), ($a_lane:expr, $b_lane:expr), ($sa:expr, $sb:expr)) => {{
+        let half = 8 * $step;
+        // A scaled step's block, 2s + step, is this byte of the pair's words.
+        let shift = (8 * (2 * ($s % 2) + $step)) as u32;
+        // Both column fragments first; then one row fragment at a time, so
+        // the warp holds twelve fragment words, not twenty.
+        let mut b = [[0u32; 4]; 2];
+        for nj in 0..2 {
+            thread::__unroll_config::<0>();
+            let at = MMA_COLS_AT + ($wc + 16 * nj) * MMA_LINE_WORDS + ($b_lane ^ half);
+            // SAFETY: the warp is converged; each lane's 16-byte row lies in
+            // this published stage's column lines.
+            b[nj] = unsafe { ldmatrix_x4_shared_u32($stage + (4 * at) as u32) };
+        }
+        for mi in 0..4 {
+            thread::__unroll_config::<0>();
+            let at = ($wr + 16 * mi) * MMA_LINE_WORDS + ($a_lane ^ half);
+            // SAFETY: as above, in the stage's row lines.
+            let a = unsafe { ldmatrix_x4_shared_u32($stage + (4 * at) as u32) };
+            for j in 0..4 {
+                thread::__unroll_config::<0>();
+                let b = [b[j / 2][2 * (j % 2)], b[j / 2][2 * (j % 2) + 1]];
+                let (sa, sb) = ($sa[mi / 2] >> shift, $sb >> shift);
+                // SAFETY: the whole warp is converged; A is row-major and B
+                // column-major in the step's fragment layout, and lanes mi % 2
+                // (A) and j (B) of each quad hold their scales.
+                $acc[mi][j] = unsafe { <$W>::mma($acc[mi][j], a, b, sa, sb, mi % 2, j) };
+            }
+        }
+    }};
+}
+
+/// A scaled tile's block scales for the stage pair from stage `s`, from the
+/// quad lane each MMA's selectors name ([`MmaRows::mma`]): lane q of a quad
+/// holds in `sa[p]` the scale word of row g + 8(q % 2) of 16-row tile
+/// 2p + q / 2 of the warp at `origin`, and in `sb` that of column g of
+/// 8-column tile q. One word a row or column holds the four blocks of the
+/// pair. Zero for an unscaled tile.
+///
+/// # Safety
+///
+/// Stage s starts a stage pair inside K; w and x are the tile's operands of
+/// `dims` (rows, K units, n).
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn mma_scale_words<W: MmaRows, X: MmaCols>(
+    w: W,
+    x: X,
+    origin: (usize, usize),
+    (rows, kk, n): (usize, usize, usize),
+    lane: usize,
+    s: usize,
+) -> ([u32; 2], u32) {
+    let mut sa = [0u32; 2];
+    let mut sb = 0u32;
+    if W::SCALED {
+        let (g, q) = (lane / MMA_ROW_LANES, lane % MMA_ROW_LANES);
+        for p in 0..2 {
+            thread::__unroll_config::<0>();
+            let r = (origin.0 + 16 * (2 * p + q / 2) + g + 8 * (q % 2)).min(rows - 1);
+            // SAFETY: stage s starts a stage pair of the clamped row, inside
+            // the operands.
+            sa[p] = unsafe { w.scale_word(r * kk + s * MMA_LINE) };
+        }
+        let c = (origin.1 + 8 * q + g).min(n - 1);
+        // SAFETY: as the rows', of the clamped live column.
+        sb = unsafe { x.scale_word(c * kk + s * MMA_LINE) };
+    }
+    (sa, sb)
+}
+
 /// BF16 tensor-core fragments of the stored weight's decoded rows, and
 /// whether the tile replays. Activations and decoded weights round once to
 /// BF16; accumulation is F32, each output's 16-value MMA steps in increasing K.
@@ -1266,28 +1366,9 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, X: MmaCols>(
     // of row g + 8(q % 2) of 16-row tile 2p + q / 2, and in `sb` that of
     // column g of 8-column tile q. One word a row or column holds the four
     // blocks of a stage pair, loaded after the products of the pair before it.
-    let g = lane / MMA_ROW_LANES;
-    let q = lane % MMA_ROW_LANES;
-    let mut sa = [0u32; 2];
-    let mut sb = 0u32;
-    macro_rules! scale_words {
-        ($s:expr) => {{
-            if W::SCALED {
-                for p in 0..2 {
-                    thread::__unroll_config::<0>();
-                    let r = (row0 + wr + 16 * (2 * p + q / 2) + g + 8 * (q % 2)).min(rows - 1);
-                    // SAFETY: stage $s < stages starts a stage pair of the
-                    // clamped row, inside the operands.
-                    sa[p] = unsafe { w.scale_word(r * kk + $s * MMA_LINE) };
-                }
-                let c = (col0 + wc + 8 * q + g).min(n - 1);
-                // SAFETY: stage $s < stages starts a stage pair of the
-                // clamped live column, inside the activations.
-                sb = unsafe { x.scale_word(c * kk + $s * MMA_LINE) };
-            }
-        }};
-    }
-    scale_words!(0);
+    let origin = (row0 + wr, col0 + wc);
+    // SAFETY: stage 0 starts a stage pair inside K.
+    let (mut sa, mut sb) = unsafe { mma_scale_words(w, x, origin, (rows, kk, n), lane, 0) };
 
     // Bit i (2 + i) is set once this thread stages a value of its weight
     // (activation) line i that fails mma_fits.
@@ -1356,34 +1437,7 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, X: MmaCols>(
                     // SAFETY: commits this pass's copies as one group, empty near the end.
                     unsafe { cp_async_commit_group() };
                 }
-                let half = 8 * step;
-                // A scaled step's block, 2s + step, is this byte of the pair's words.
-                let shift = (8 * (2 * (s % 2) + step)) as u32;
-                // Both column fragments first; then one row fragment at a time,
-                // so the warp holds twelve fragment words, not twenty.
-                let mut b = [[0u32; 4]; 2];
-                for nj in 0..2 {
-                    thread::__unroll_config::<0>();
-                    let at = MMA_COLS_AT + (wc + 16 * nj) * MMA_LINE_WORDS + (b_lane ^ half);
-                    // SAFETY: the warp is converged; each lane's 16-byte row lies
-                    // in this published stage's column lines.
-                    b[nj] = unsafe { ldmatrix_x4_shared_u32(stage + (4 * at) as u32) };
-                }
-                for mi in 0..4 {
-                    thread::__unroll_config::<0>();
-                    let at = (wr + 16 * mi) * MMA_LINE_WORDS + (a_lane ^ half);
-                    // SAFETY: as above, in the stage's row lines.
-                    let a = unsafe { ldmatrix_x4_shared_u32(stage + (4 * at) as u32) };
-                    for j in 0..4 {
-                        thread::__unroll_config::<0>();
-                        let b = [b[j / 2][2 * (j % 2)], b[j / 2][2 * (j % 2) + 1]];
-                        let (sa, sb) = (sa[mi / 2] >> shift, sb >> shift);
-                        // SAFETY: the whole warp is converged; A is row-major and
-                        // B column-major in the step's fragment layout, and lanes
-                        // mi % 2 (A) and j (B) of each quad hold their scales.
-                        acc[mi][j] = unsafe { W::mma(acc[mi][j], a, b, sa, sb, mi % 2, j) };
-                    }
-                }
+                mma_step!(W, acc, stage, (s, step), (wr, wc), (a_lane, b_lane), (sa, sb));
                 if step == 1 {
                     for i in 0..2 {
                         thread::__unroll_config::<0>();
@@ -1409,7 +1463,8 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, X: MmaCols>(
                 }
             }
             if s % 2 == 1 && s + 1 < stages {
-                scale_words!(s + 1);
+                // SAFETY: stage s + 1 < stages starts a stage pair inside K.
+                (sa, sb) = unsafe { mma_scale_words(w, x, origin, (rows, kk, n), lane, s + 1) };
             }
         }};
     }
@@ -1425,6 +1480,189 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, X: MmaCols>(
             stage_pass!(s, s + 2 < stages);
         }
     }
+    Some(MmaTile {
+        values: acc,
+        row0,
+        col0,
+        warp,
+        lane,
+        lines: bad,
+        bad: 0,
+    })
+}
+
+/// Bytes of one operand's TMA box: 128 lines of one stage's 64 bytes.
+#[cfg(bloomery_nvfp4_mma)]
+pub(crate) const MMA_BOX_BYTES: u32 = (MMA_ROWS * MMA_LINE * 2) as u32;
+
+/// [`bf16_mma_tile`] for operands whose staged units are their stored bytes
+/// (MXFP8 codes), each stage's two 128-line boxes brought by TMA from
+/// `w_map` and `x_map` (UINT8 `[lines][K bytes]`, box 64 by 128 bytes,
+/// 64-byte swizzle, which is [`mma_piece_at`]'s layout). Lines past the last
+/// row or column arrive as zeros; their cells are never stored.
+///
+/// Thread 0 issues the copies: stages 0 and 1 first, stage s + 2 when stage
+/// s starts, into the buffer of stage s - 1 once every warp has released it.
+/// `bars` are [`STAGES`] `full` barriers (one arrival and the boxes' bytes)
+/// then [`STAGES`] `empty` barriers (one arrival a warp); stage s waits the
+/// parity of its round s / STAGES. No block barrier runs in the loop; one
+/// after it hands the stages to the epilogue. Scale words stay global reads,
+/// and each thread checks the spans of its two copy lines
+/// ([`MmaRows::span_fits`]) as [`MmaRows::land`] does for a fetched piece,
+/// so the tile's `lines` are [`bf16_mma_tile`]'s.
+///
+/// # Safety
+///
+/// [`bf16_mma_tile`]'s contract for scaled operands, `w_map` and `x_map`
+/// encoding w's rows and x's n columns of K bytes, sh 1024-byte aligned and
+/// bars 2·STAGES uninitialized barriers of this block.
+#[cfg(bloomery_nvfp4_mma)]
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+#[allow(
+    clippy::question_mark,
+    reason = "the kernel's early return on the raster; a `?` would move its PTX"
+)]
+pub(crate) unsafe fn tma_mma_tile<W: MmaRows, X: MmaCols>(
+    (w, w_map): (W, &TmaDescriptor),
+    (x, x_map): (X, &TmaDescriptor),
+    (rows, k, n): (u32, u32, u32),
+    sh: *mut f32,
+    bars: *mut Barrier,
+) -> Option<MmaTile> {
+    const { assert!(W::SCALED && X::SCALED) };
+    let (rows, kk, n) = (rows as usize, k as usize, n as usize);
+    let Some((row0, col0)) = mma_tile_origin::<W>(rows, n) else {
+        return None;
+    };
+    let tid = thread::threadIdx_x() as usize;
+    let lane = warp::lane_id() as usize;
+    let warp = tid / 32;
+    let (wr, wc) = mma_warp_at(warp);
+    let stages = kk / MMA_LINE;
+    let words = sh.cast::<u32>();
+    // SAFETY: sh is this block's shared allocation (this fn's contract).
+    let shared = unsafe { cvta_generic_to_shared_u32(words.cast_const().cast::<u8>()) };
+    let (full, empty) = (bars, bars.wrapping_add(STAGES));
+    if tid == 0 {
+        for b in 0..STAGES {
+            // SAFETY: the block's own barriers, before any other use.
+            unsafe {
+                mbarrier_init(full.add(b), 1);
+                mbarrier_init(empty.add(b), MMA_THREADS / 32);
+            }
+        }
+        // SAFETY: makes the initialized barriers visible to the TMA unit.
+        unsafe { fence_proxy_async_shared_cta() };
+    }
+    thread::sync_threads();
+    // Thread 0's copies of stage $s into its buffer, completing on its full
+    // barrier.
+    macro_rules! issue {
+        ($s:expr) => {{
+            let s = $s;
+            let bar = full.wrapping_add(s % STAGES);
+            let stage = words.wrapping_add((s % STAGES) * STAGE_FLOATS);
+            let cols = stage.wrapping_add(MMA_COLS_AT);
+            let at = (2 * MMA_LINE * s) as i32;
+            // SAFETY: the stage's full barrier and buffer in sh, released by
+            // every warp, the maps of this fn's contract, and boxes inside the
+            // 2 * MMA_BOX_BYTES the arrival expects. A launch without a cluster
+            // is a cluster of this one block, so its shared addresses are the
+            // copies' cluster addresses.
+            unsafe {
+                let _ = mbarrier_arrive_expect_tx(bar, 1, 2 * MMA_BOX_BYTES);
+                cp_async_bulk_tensor_2d_g2s(stage.cast(), w_map, at, row0 as i32, bar);
+                cp_async_bulk_tensor_2d_g2s(cols.cast(), x_map, at, col0 as i32, bar);
+            }
+        }};
+    }
+    if tid == 0 {
+        issue!(0);
+        issue!(1);
+    }
+
+    let origin = (row0 + wr, col0 + wc);
+    // SAFETY: stage 0 starts a stage pair inside K.
+    let (mut sa, mut sb) = unsafe { mma_scale_words(w, x, origin, (rows, kk, n), lane, 0) };
+    // This thread's copy lines, as bf16_mma_tile's: bit i (2 + i) is set
+    // once weight (activation) line i holds a value that fails mma_fits.
+    let (slot, line) = (tid % MMA_PIECES, tid / MMA_PIECES);
+    let w_lines = [
+        (row0 + line).min(rows - 1) * kk,
+        (row0 + line + MMA_PASS_LINES).min(rows - 1) * kk,
+    ];
+    let mut bad = 0u32;
+    for i in 0..2 {
+        thread::__unroll_config::<0>();
+        let c = (col0 + line + i * MMA_PASS_LINES).min(n - 1);
+        // SAFETY: c < n is a live column.
+        bad |= u32::from(unsafe { x.refused(c) }) << (2 + i);
+    }
+
+    let mut acc = [[[0.0f32; 4]; 4]; 4];
+    let a_lane = mma_piece_at(lane % 16, lane / 16);
+    let b_lane = mma_piece_at(lane % 8 + 8 * (lane / 16), (lane / 8) % 2);
+    for s in 0..stages {
+        let buf = s % STAGES;
+        if tid == 0 && s + 2 < stages {
+            let next = s + 2;
+            if next >= STAGES {
+                let parity = ((next / STAGES - 1) % 2) as u32;
+                // SAFETY: the block's initialized barrier; every warp releases
+                // stage s - 1 after its products.
+                while !unsafe { mbarrier_try_wait_parity(empty.add(next % STAGES), parity) } {}
+                // The warps read the buffer through the generic proxy and the
+                // copies write it through the async one: the proxy fence
+                // orders the reads the barrier brought here before them.
+                // SAFETY: a fence, no memory named.
+                unsafe { fence_proxy_async_shared_cta() };
+            }
+            issue!(next);
+        }
+        warp::sync_mask(u32::MAX);
+        // SAFETY: the block's initialized barrier; thread 0 issued stage s.
+        while !unsafe { mbarrier_try_wait_parity(full.add(buf), ((s / STAGES) % 2) as u32) } {}
+        // Lanes leave the wait on different polls; the `.aligned` ldmatrix and
+        // mma below need the whole warp converged.
+        warp::sync_mask(u32::MAX);
+        let stage = shared + (4 * buf * STAGE_FLOATS) as u32;
+        for step in 0..2 {
+            thread::__unroll_config::<0>();
+            mma_step!(
+                W,
+                acc,
+                stage,
+                (s, step),
+                (wr, wc),
+                (a_lane, b_lane),
+                (sa, sb)
+            );
+        }
+        warp::sync_mask(u32::MAX);
+        if lane == 0 {
+            // SAFETY: the block's initialized barrier; the warp's reads of
+            // the stage are done.
+            let _ = unsafe { mbarrier_arrive(empty.add(buf)) };
+        }
+        if s % 2 == 0 && slot == 0 {
+            for i in 0..2 {
+                thread::__unroll_config::<0>();
+                // SAFETY: stage s starts a 64-unit span of the clamped row.
+                bad |= u32::from(!unsafe { w.span_fits(w_lines[i] + s * MMA_LINE) }) << i;
+            }
+        }
+        if s % 2 == 1 && s + 1 < stages {
+            // SAFETY: stage s + 1 < stages starts a stage pair inside K.
+            (sa, sb) = unsafe { mma_scale_words(w, x, origin, (rows, kk, n), lane, s + 1) };
+        }
+    }
+    // Every copy completed (each stage's full wait); after this no warp reads
+    // a stage, so the epilogue may reuse them.
+    thread::sync_threads();
     Some(MmaTile {
         values: acc,
         row0,
@@ -1454,9 +1692,29 @@ pub(crate) unsafe fn bf16_mma_body<W: MmaRows, X: MmaCols>(
 ) {
     let units = if W::SCALED { k / 2 } else { k };
     // SAFETY: the wrapper's spans and launch satisfy the tile's contract.
-    let Some(mut tile) = (unsafe { bf16_mma_tile(w, x, rows, units, n, sh) }) else {
+    let Some(tile) = (unsafe { bf16_mma_tile(w, x, rows, units, n, sh) }) else {
         return;
     };
+    // SAFETY: the tile's operands, spans and staging allocation.
+    unsafe { mma_tile_store(tile, w, x, (rows, k, n), y, sh) };
+}
+
+/// [`bf16_mma_body`]'s store of a finished tile: its cells, those of an
+/// exceptional row or column replayed on the exact owner.
+///
+/// # Safety
+/// All 256 threads call converged with the tile's operands, checked spans
+/// and staging allocation, after a barrier that retired the stages' readers.
+#[inline(always)]
+pub(crate) unsafe fn mma_tile_store<W: MmaRows, X: MmaCols>(
+    mut tile: MmaTile,
+    w: W,
+    x: X,
+    (rows, k, n): (u32, u32, u32),
+    y: &mut DisjointSlice<f32>,
+    sh: *mut f32,
+) {
+    let units = if W::SCALED { k / 2 } else { k };
     let (rows, k, n) = (rows as usize, k as usize, n as usize);
     // SAFETY: all threads share the original staging allocation and K.
     if unsafe { tile.needs_replay(sh, units as usize) } {

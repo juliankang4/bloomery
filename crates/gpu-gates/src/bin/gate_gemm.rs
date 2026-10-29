@@ -8749,7 +8749,7 @@ mod gate {
                 // A value the tensor cores cannot take sends its column to
                 // the exact owner; a scale byte out of 10..=165 its row.
                 // Every other cell keeps its W8A8 bits.
-                let exact = |x: &DeviceBuffer<f32>, e: &DeviceTensor<u32>| {
+                let exact_of = |x: &DeviceBuffer<f32>, e: &DeviceTensor<u32>| {
                     let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n])?;
                     g32.enqueue_e4m3_tile(stream, mxfp8(&qs, e), x, n, &mut y)?;
                     Ok::<_, GateError>(y.to_host_vec(stream)?)
@@ -8763,7 +8763,7 @@ mod gate {
                     let dirty = DeviceBuffer::from_host(stream, &dirty)?;
                     enqueue(stream, &dirty, &e, &mut y)?;
                     let got = y.to_host_vec(stream)?;
-                    let exact = exact(&dirty, &e)?;
+                    let exact = exact_of(&dirty, &e)?;
                     let cells = (0..rows * n).all(|at| {
                         same(got[at], if at / rows == c { exact[at] } else { eager[at] })
                     });
@@ -8782,7 +8782,7 @@ mod gate {
                 let edges = DeviceTensor::upload(stream, &edges, rows, per_row)?;
                 enqueue(stream, &x, &edges, &mut y)?;
                 let got = y.to_host_vec(stream)?;
-                let exact = exact(&x, &edges)?;
+                let exact = exact_of(&x, &edges)?;
                 let line = |r: usize| (0..n).map(move |c| c * rows + r);
                 let replayed = line(0).chain(line(1)).all(|at| same(got[at], exact[at]));
                 let kept = [2, 3]
@@ -8798,6 +8798,32 @@ mod gate {
                     verdict(pass)
                 );
                 ok &= pass;
+                // One refused scale byte alone, in the last block of its word:
+                // row 8 (a thread's first copy line), row 64 (a second copy
+                // line) at the last word, row 5 at the last word. Only that row
+                // replays.
+                for (r, word) in [(8, 0), (64, per_row - 1), (5, per_row - 1)] {
+                    if r >= rows {
+                        continue;
+                    }
+                    let mut one = eh.clone();
+                    one[r * per_row + word] = (one[r * per_row + word] & 0x00ff_ffff) | (9 << 24);
+                    let one = DeviceTensor::upload(stream, &one, rows, per_row)?;
+                    enqueue(stream, &x, &one, &mut y)?;
+                    let got = y.to_host_vec(stream)?;
+                    let want = exact_of(&x, &one)?;
+                    let replayed = line(r).all(|at| same(got[at], want[at]));
+                    let others = (0..rows * n)
+                        .filter(|at| at % rows != r)
+                        .all(|at| same(got[at], eager[at]));
+                    let pass = replayed && others;
+                    println!(
+                        "gemm32 case=mxfp8_w8a8_one_refusal rows={rows} K={k} n={n} row={r} word={word} \
+                         replayed={replayed} others_kept={others} {}",
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
             }
             // The form is read only for the rows and the columns it was made
             // from, until the next quantizer launch; a weight's planes
