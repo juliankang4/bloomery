@@ -172,7 +172,7 @@ use crate::tensor::{WindowMut, to_host};
 use crate::weights::{Weights, tensor_scales};
 use crate::{Branch, DeviceTensor, Gpu, GpuError, StagedRows, launch_u32, ple, qsa};
 use bloomery_levers::{ChurnHosting, HostCfg};
-use cuda_core::{CudaStream, DeviceBuffer};
+use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, sys};
 use engram::hash::{History, Window};
 use engram::prefetch::{FillMode, HelperOptions, Prefetcher, caller_sibling};
 use engram::rows::{PageAdvice, RunTable, SplitTable};
@@ -361,6 +361,17 @@ fn checkpoint_lens_of(stores: &[Store38]) -> Vec<usize> {
         .filter(|s| matches!(s, Store38::Rec { .. }))
         .count();
     checkpoint_lens(gdn, stores.len() - gdn)
+}
+
+/// The layer whose walk writes each store of [`checkpoint_lens`]'s order,
+/// over layers that are delta (`true`) or selecting (`false`) in `delta`:
+/// each delta layer's three stores its own, the PLE ring the PLE `site`'s,
+/// then each selecting layer's key ring its own.
+fn checkpoint_owners(delta: impl Iterator<Item = bool> + Clone, site: usize) -> Vec<usize> {
+    let layers = delta.enumerate();
+    let rec = layers.clone().filter(|&(_, d)| d).flat_map(|(l, _)| [l; 3]);
+    let keys = layers.filter(|&(_, d)| !d).map(|(l, _)| l);
+    rec.chain([site]).chain(keys).collect()
 }
 
 /// The commit's replay table over the delta layers among `stores`, each
@@ -1530,6 +1541,12 @@ pub struct Body38 {
     /// to the point reads ([`Body38::draft_rejoins`]).
     point_rows: Vec<(u32, Vec<f32>)>,
     marks: bool,
+    /// A prompt call's checkpoint at the end of a ubatch, opened before the
+    /// ubatch walks ([`Body38::open_end_mark`]) and sealed at the mark
+    /// ([`Body38::take_mark`]).
+    end_mark: Option<checkpoint::Pending>,
+    /// Where an open end mark's copies run, made at its first use.
+    marker: Option<EndMarker>,
     /// What a sequence state of this load belongs to.
     who: Identity,
 }
@@ -2266,6 +2283,8 @@ impl Body38 {
             ple_points: Vec::new(),
             point_rows: Vec::new(),
             marks: false,
+            end_mark: None,
+            marker: None,
             who,
         };
         body.sp.write(stream, 0, 0)?;
@@ -2991,13 +3010,9 @@ impl Body38 {
         Ok(())
     }
 
-    /// A checkpoint at `pos`, where the stores stand, after any waiting cut:
-    /// the recurrent stores copied to a host slot with the PLE history beside
-    /// them and, on a load with the draft, the target's final hidden row at
-    /// `pos - 1` when an arena still holds it ([`Body38::point_rows`]), or
-    /// nothing where one stands. Refused by name while a verify waits or the
-    /// stores hold another position. Waits for the copies.
-    fn take_mark(&mut self, stream: &CudaStream, pos: u32) -> Result<(), GpuError> {
+    /// [`Body38::take_mark`]'s refusals and its waiting cut: the stores and
+    /// the PLE history at `pos`, and no verify waiting.
+    fn mark_checks(&mut self, stream: &CudaStream, pos: u32) -> Result<(), GpuError> {
         self.stores_at(pos)?;
         if let Some(p) = &self.pending {
             return Err(GpuError::shape(
@@ -3019,6 +3034,23 @@ impl Body38 {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    /// A checkpoint at `pos`, where the stores stand, after any waiting cut:
+    /// the recurrent stores copied to a host slot with the PLE history beside
+    /// them and, on a load with the draft, the target's final hidden row at
+    /// `pos - 1` when an arena still holds it ([`Body38::point_rows`]), or
+    /// nothing where one stands. Refused by name while a verify waits or the
+    /// stores hold another position. Waits for the copies.
+    fn take_mark(&mut self, stream: &CudaStream, pos: u32) -> Result<(), GpuError> {
+        if let Err(e) = self.mark_checks(stream, pos) {
+            let _ = self.drop_end_mark(stream);
+            return Err(e);
+        }
+        if let Some(open) = self.end_mark.take() {
+            return self.seal_end_mark(stream, pos, open);
+        }
         let lane = self.lane.lane();
         let mut c = Copied::of(&mut self.stores, &mut self.ple_ring, lane, None, None)?;
         let take = self.ckpt.take(stream, pos, &mut c.list());
@@ -3029,17 +3061,7 @@ impl Body38 {
                     self.ple_points.retain(|&(p, _)| p != e);
                     self.point_rows.retain(|&(p, _)| p != e);
                 }
-                let i = self.ple_points.partition_point(|&(p, _)| p < pos);
-                self.ple_points.insert(i, (pos, self.ple.hist.clone()));
-                let point_row = match (&self.mtp, pos.checked_sub(1)) {
-                    (Some(_), Some(before)) => self.hidden_row(stream, before)?,
-                    _ => None,
-                };
-                if let Some(row) = point_row {
-                    let i = self.point_rows.partition_point(|&(p, _)| p < pos);
-                    self.point_rows.insert(i, (pos, row));
-                }
-                Ok(())
+                self.point_taken(stream, pos)
             }
             Ok(Take::Held | Take::Empty) => Ok(()),
             Err(e) => {
@@ -3048,6 +3070,142 @@ impl Body38 {
                 Err(e)
             }
         }
+    }
+
+    /// A point's host side once its stores' copy holds `pos`: the PLE
+    /// history beside it and, on a load with the draft, the target's final
+    /// hidden row at `pos - 1` when an arena still holds it. Blocking.
+    fn point_taken(&mut self, stream: &CudaStream, pos: u32) -> Result<(), GpuError> {
+        let i = self.ple_points.partition_point(|&(p, _)| p < pos);
+        self.ple_points.insert(i, (pos, self.ple.hist.clone()));
+        let point_row = match (&self.mtp, pos.checked_sub(1)) {
+            (Some(_), Some(before)) => self.hidden_row(stream, before)?,
+            _ => None,
+        };
+        if let Some(row) = point_row {
+            let i = self.point_rows.partition_point(|&(p, _)| p < pos);
+            self.point_rows.insert(i, (pos, row));
+        }
+        Ok(())
+    }
+
+    /// The checkpoint at `to`, where a ubatch walking from `pos` ends, opened
+    /// before it walks ([`Checkpoints::open_take`], after any waiting cut):
+    /// the walk records each layer's done event ([`WideParts::done`]) and
+    /// [`Body38::copy_end_mark`] puts each store's copy behind the layer
+    /// that writes it, so it runs under the walk's later layers. Nothing opens
+    /// where no copy is due or a verify waits ([`Body38::take_mark`] takes
+    /// that mark as before).
+    fn open_end_mark(&mut self, stream: &CudaStream, pos: u32, to: u32) -> Result<(), GpuError> {
+        self.stores_at(pos)?;
+        if self.pending.is_some() || self.end_mark.is_some() {
+            return Ok(());
+        }
+        if self.stores.len() != self.plans.len() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} stores for {} layers",
+                    self.stores.len(),
+                    self.plans.len()
+                ),
+            ));
+        }
+        self.settle(stream)?;
+        let lane = self.lane.lane();
+        let mut c = Copied::of(&mut self.stores, &mut self.ple_ring, lane, None, None)?;
+        let open = self.ckpt.open_take(stream, to, &mut c.list());
+        drop(c);
+        let Some(open) = open? else {
+            return Ok(());
+        };
+        if self.marker.is_none() {
+            match EndMarker::new(stream, self.plans.len()) {
+                Ok(m) => self.marker = Some(m),
+                Err(e) => {
+                    self.ckpt.abandon(stream, open)?;
+                    return Err(e);
+                }
+            }
+        }
+        self.end_mark = Some(open);
+        Ok(())
+    }
+
+    /// An open end mark's copies, enqueued once its ubatch's walk is: each
+    /// store on the marker's stream behind the done event of the layer that
+    /// writes it ([`checkpoint_owners`]): each delta layer's lane, conv ring
+    /// and carry behind the layer's, the PLE ring behind its site's, each
+    /// selecting layer's key ring behind the layer's. Nothing without an
+    /// open mark.
+    fn copy_end_mark(&mut self) -> Result<(), GpuError> {
+        let (Some(open), Some(m)) = (self.end_mark.as_mut(), self.marker.as_ref()) else {
+            return Ok(());
+        };
+        let site = (self.plans.iter().position(|p| p.ple.is_some())).ok_or(GpuError::state(
+            WHAT,
+            "the PLE site the ring's copy waits for",
+        ))?;
+        let delta = (self.stores.iter()).map(|s| matches!(s, Store38::Rec { .. }));
+        let owners = checkpoint_owners(delta, site);
+        let lane = self.lane.lane();
+        let mut c = Copied::of(&mut self.stores, &mut self.ple_ring, lane, None, None)?;
+        for (i, store) in c.list().into_iter().enumerate() {
+            let l = *(owners.get(i))
+                .ok_or(GpuError::state(WHAT, "the layer a store's copy waits for"))?;
+            if i == 0 || owners[i - 1] != l {
+                let done = m.done.get(l).ok_or(GpuError::state(
+                    WHAT,
+                    "the done event of the layer a store's copy waits for",
+                ))?;
+                m.copy.wait(done)?;
+            }
+            self.ckpt.copy(&m.copy, open, i, store)?;
+        }
+        Ok(())
+    }
+
+    /// The end mark `open` at `pos` sealed ([`Checkpoints::seal`]) once its
+    /// walk is waited for and found sound, and its point's host side
+    /// ([`Body38::point_taken`]); points a later take evicted lose theirs.
+    /// A mark of another position is given back and refused by name.
+    fn seal_end_mark(
+        &mut self,
+        stream: &CudaStream,
+        pos: u32,
+        open: checkpoint::Pending,
+    ) -> Result<(), GpuError> {
+        let copy = self.marker.as_ref().map_or(stream, |m| &*m.copy);
+        if open.at() != pos {
+            let at = open.at();
+            self.ckpt.abandon(copy, open)?;
+            return Err(GpuError::shape(
+                WHAT,
+                format!("the end mark opened at {at} sealed at {pos}"),
+            ));
+        }
+        if let Err(e) = self.ckpt.seal(copy, open) {
+            self.ple_points.clear();
+            self.point_rows.clear();
+            return Err(e);
+        }
+        let kept = self.ckpt.positions();
+        self.ple_points.retain(|(p, _)| kept.contains(p));
+        self.point_rows.retain(|(p, _)| kept.contains(p));
+        if kept.contains(&pos) {
+            self.point_taken(stream, pos)?;
+        }
+        Ok(())
+    }
+
+    /// An open end mark given back ([`Checkpoints::abandon`]): its ubatch
+    /// failed before the mark, or the mark was refused.
+    fn drop_end_mark(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        let Some(open) = self.end_mark.take() else {
+            return Ok(());
+        };
+        let copy = self.marker.as_ref().map_or(stream, |m| &*m.copy);
+        self.ckpt.abandon(copy, open)
     }
 
     /// The target's final hidden row at `pos` ([`Hidden::Target`]'s
@@ -3971,8 +4129,14 @@ impl Body38 {
             eps,
             ctx,
             plant,
+            end_mark,
+            marker,
             ..
         } = self;
+        let done = marker
+            .as_ref()
+            .filter(|_| end_mark.is_some())
+            .map(|m| m.done.as_slice());
         let mut rows_in = |arena: &mut Ple38| -> Result<(), GpuError> {
             ple.land(gpu.stream(), &k.ple, arena, m)
         };
@@ -4002,6 +4166,7 @@ impl Body38 {
                 stream,
                 media: media.as_mut(),
                 ple_rows: late.then_some(&mut rows_in as &mut PleRowsIn<'_>),
+                done,
             },
         };
         let cap = prog.p.x.rows;
@@ -4587,16 +4752,23 @@ impl GpuModel<Body38> {
             {
                 let (gpu, _, body) = self.body_parts(WHAT_P)?;
                 match path {
-                    Prompt38::Gemm => body.plan_gemm(gpu.stream(), chunk, pos)?,
+                    Prompt38::Gemm => {
+                        body.plan_gemm(gpu.stream(), chunk, pos)?;
+                        if marked {
+                            let to = launch_u32(WHAT_P, "positions", pos as usize + m)?;
+                            body.open_end_mark(gpu.stream(), pos, to)?;
+                        }
+                    }
                     _ => body.plan_pass(gpu.stream(), chunk, pos)?,
                 }
             }
-            next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
+            let walked = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
                 let out = headed.then_some(head);
                 match path {
                     Prompt38::Gemm => {
                         body.walk_gemm(gpu, w, m, pos, out, read)?;
                         body.stream.walk_done();
+                        body.copy_end_mark()?;
                     }
                     _ => body.walk_pass(gpu, w, m, pos, out, read > usize::from(headed))?,
                 }
@@ -4606,9 +4778,21 @@ impl GpuModel<Body38> {
                     return Err(GpuError::fault(WHAT_P, f));
                 }
                 Ok(headed)
-            })?;
-            if let Some(f) = sink.as_deref_mut() {
-                f(self, walk, pos, m)?;
+            });
+            let r = walked.and_then(|n| {
+                next = n;
+                match sink.as_deref_mut() {
+                    Some(f) => f(self, walk, pos, m),
+                    None => Ok(()),
+                }
+            });
+            if let Err(e) = r {
+                // The unit failed before its mark: an end mark it opened is
+                // given back, the unit's error reported.
+                if let Ok((gpu, _, body)) = self.body_parts(WHAT_P) {
+                    let _ = body.drop_end_mark(gpu.stream());
+                }
+                return Err(e);
             }
             if marked {
                 self.mark_here(WHAT_P)?;
@@ -5834,6 +6018,26 @@ impl Body38 {
     }
 }
 
+/// Where an end mark's copies run ([`Body38::copy_end_mark`]): a stream of
+/// their own and an event a layer the walk records ([`WideParts::done`]).
+struct EndMarker {
+    copy: Arc<CudaStream>,
+    done: Vec<CudaEvent>,
+}
+
+impl EndMarker {
+    fn new(stream: &CudaStream, layers: usize) -> Result<EndMarker, GpuError> {
+        let ctx = stream.context();
+        let flags = Some(sys::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING);
+        Ok(EndMarker {
+            copy: ctx.new_stream()?,
+            done: (0..layers)
+                .map(|_| ctx.new_event(flags))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
 /// The stores a checkpoint copies, lent for one call ([`Copied::of`]), and
 /// a sequence state's positional rows beside them.
 struct Copied<'a> {
@@ -6463,7 +6667,8 @@ const _: () = assert!(VERIFY_ROWS <= PASS_ROWS);
 mod tests {
     use super::{
         Arc, Device, E4m3Rows, GgmlType, GpuError, Nvfp4Rows, PleHost, Split, checkpoint_budget38,
-        checkpoint_bytes, checkpoint_lens, checkpoint_price38, dequant_row, geo, ple_takes,
+        checkpoint_bytes, checkpoint_lens, checkpoint_owners, checkpoint_price38, dequant_row, geo,
+        ple_takes,
     };
     use engram::hash::{EosWindow, Window};
 
@@ -6497,6 +6702,21 @@ mod tests {
                 "ctx {ctx}"
             );
         }
+    }
+
+    /// An end mark's copy of each store waits for the layer that writes it:
+    /// a delta layer's three stores for that layer, the PLE ring for its
+    /// site, each selecting layer's key ring for that selecting layer (not
+    /// the site, which an earlier selecting layer's ring would pass while a
+    /// later layer still appends its keys).
+    #[test]
+    fn an_end_marks_store_waits_for_the_layer_that_writes_it() {
+        let delta = [true, true, true, false, true, true, true, false];
+        let owners = checkpoint_owners(delta.iter().copied(), 1);
+        assert_eq!(owners.len(), checkpoint_lens(6, 2).len());
+        let mut want: Vec<usize> = [0, 1, 2, 4, 5, 6].iter().flat_map(|&l| [l; 3]).collect();
+        want.extend([1, 3, 7]);
+        assert_eq!(owners, want);
     }
 
     /// The call's check is the hash's: a text id passes; the image

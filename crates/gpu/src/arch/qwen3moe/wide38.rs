@@ -1822,6 +1822,10 @@ pub(super) struct WideParts<'a> {
     /// the arena's `e` before any unit reads it, the walk's layers before
     /// it enqueued.
     pub(super) ple_rows: Option<&'a mut PleRowsIn<'a>>,
+    /// One event a layer, each recorded once the layer's last unit's back is
+    /// enqueued: what a checkpoint's copy of the layer's stores waits for
+    /// (`Body38`'s end mark).
+    pub(super) done: Option<&'a [CudaEvent]>,
 }
 
 /// [`WideParts::ple_rows`]: the walk's PLE rows landed in the arena's `e`
@@ -3255,6 +3259,16 @@ impl<'a> LayerProgram for UnitWalk<'_, 'a> {
         {
             p.stream.owe_return(l);
         }
+        let r = r.and_then(|()| match p.done {
+            Some(done) if at.unit + 1 == units => match done.get(l) {
+                Some(event) => Ok(event.record(p.c.gpu.stream())?),
+                None => Err(GpuError::shape(
+                    WHAT,
+                    format!("layer {l}'s done event of {}", done.len()),
+                )),
+            },
+            _ => Ok(()),
+        });
         port.part_end(at, enq);
         r
     }
