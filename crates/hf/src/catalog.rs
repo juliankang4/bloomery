@@ -614,9 +614,14 @@ impl Fit {
 }
 
 /// The files of `row` in the repo's listing `entries`: the GGUF set its quant tag names, or the
-/// checkpoint its index holds. `None` when the listing lacks the set; a repo the listing makes
-/// ambiguous or incomplete is refused by name ([`HfError`]).
-pub fn row_files(row: &Row, entries: &[Entry]) -> Result<Option<Vec<Entry>>, HfError> {
+/// checkpoint's manifest when `index` is its verified cached index, otherwise the candidates
+/// (all listed shards and top-level configs), an upper bound. `None` when the listing lacks
+/// the set; a repo the listing makes ambiguous or incomplete is refused by name ([`HfError`]).
+pub fn row_files(
+    row: &Row,
+    entries: &[Entry],
+    index: Option<&Path>,
+) -> Result<Option<Vec<Entry>>, HfError> {
     match row.kind {
         Kind::Gguf => {
             let sets = crate::gguf_sets(row.repo, entries)?;
@@ -626,7 +631,10 @@ pub fn row_files(row: &Row, entries: &[Entry]) -> Result<Option<Vec<Entry>>, HfE
                 Err(e) => Err(e),
             }
         }
-        Kind::Folder => Ok(crate::checkpoint_files(entries)),
+        Kind::Folder => match index {
+            Some(index) => crate::checkpoint_manifest(row.repo, entries, index).map(Some),
+            None => Ok(crate::checkpoint_files(entries)),
+        },
     }
 }
 
@@ -642,8 +650,13 @@ pub fn is_cached(file: &Entry, cached: &[Entry]) -> bool {
 /// What the repo's listing `entries` and the cache's verified files `cached` say of `row`'s files:
 /// the bytes of [`row_files`] the cache does not hold ([`is_cached`]), or [`Avail::NotInRepo`]
 /// when the listing lacks the set.
-pub fn availability(row: &Row, entries: &[Entry], cached: &[Entry]) -> Result<Avail, HfError> {
-    let Some(files) = row_files(row, entries)? else {
+pub fn availability(
+    row: &Row,
+    entries: &[Entry],
+    cached: &[Entry],
+    index: Option<&Path>,
+) -> Result<Avail, HfError> {
+    let Some(files) = row_files(row, entries, index)? else {
         return Ok(Avail::NotInRepo);
     };
     let download_bytes = files
@@ -657,8 +670,8 @@ pub fn availability(row: &Row, entries: &[Entry], cached: &[Entry]) -> Result<Av
 /// [`availability`] when no listing could be read: the verified `cached` files are all there is,
 /// so a row whose set they hold whole is present with nothing to fetch and every other row is
 /// [`Avail::OfflineUncached`].
-pub fn availability_offline(row: &Row, cached: &[Entry]) -> Avail {
-    match availability(row, cached, cached) {
+pub fn availability_offline(row: &Row, cached: &[Entry], index: Option<&Path>) -> Avail {
+    match availability(row, cached, cached, index) {
         Ok(avail @ Avail::Present { .. }) => avail,
         Ok(Avail::NotInRepo | Avail::OfflineUncached) | Err(_) => Avail::OfflineUncached,
     }
@@ -1448,33 +1461,33 @@ mod tests {
             entry("README.md", 5, "cc"),
         ];
         assert_eq!(
-            availability(row, &listed, &[]).expect("listed"),
+            availability(row, &listed, &[], None).expect("listed"),
             Avail::Present {
                 download_bytes: 100
             }
         );
         let cached = [entry("Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", 100, "aa")];
         assert_eq!(
-            availability(row, &listed, &cached).expect("cached"),
+            availability(row, &listed, &cached, None).expect("cached"),
             Avail::Present { download_bytes: 0 }
         );
         let moved = [entry("Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", 100, "zz")];
         assert_eq!(
-            availability(row, &listed, &moved).expect("a moved file"),
+            availability(row, &listed, &moved, None).expect("a moved file"),
             Avail::Present {
                 download_bytes: 100
             },
             "a cached file whose digest is not the listing's is fetched again"
         );
         assert_eq!(
-            availability(row, &listed[1..], &[]).expect("no such set"),
+            availability(row, &listed[1..], &[], None).expect("no such set"),
             Avail::NotInRepo
         );
         assert_eq!(
-            availability_offline(row, &cached),
+            availability_offline(row, &cached, None),
             Avail::Present { download_bytes: 0 }
         );
-        assert_eq!(availability_offline(row, &[]), Avail::OfflineUncached);
+        assert_eq!(availability_offline(row, &[], None), Avail::OfflineUncached);
 
         let folder = row_of("qwen3.8-flash-next", "nvfp4");
         let checkpoint = [
@@ -1485,15 +1498,70 @@ mod tests {
             entry("sub/other.json", 4, "o"),
         ];
         assert_eq!(
-            availability(folder, &checkpoint, &checkpoint[..2]).expect("folder"),
+            availability(folder, &checkpoint, &checkpoint[..2], None).expect("folder"),
             Avail::Present {
                 download_bytes: 2003
             }
         );
         assert_eq!(
-            availability(folder, &listed, &[]).expect("a repo with no index"),
+            availability(folder, &listed, &[], None).expect("a repo with no index"),
             Avail::NotInRepo
         );
+    }
+
+    #[test]
+    fn availability_uses_the_cached_checkpoint_manifest() {
+        let dir = crate::fetch::tests::scratch("catalog-manifest");
+        let index = dir.join(safetensors::Folder::INDEX);
+        std::fs::write(
+            &index,
+            r#"{"weight_map":{"a":"weights/a.safetensors","b":"weights/b.safetensors"}}"#,
+        )
+        .unwrap();
+        let row = row_of("qwen3.8-flash-next", "nvfp4");
+        let listed = [
+            entry(safetensors::Folder::INDEX, 80, "i"),
+            entry("weights/a.safetensors", 100, "a"),
+            entry("weights/b.safetensors", 200, "b"),
+            entry("config.json", 2, "c"),
+            entry("chat_template.jinja", 10, "t"),
+            entry("consolidated.safetensors", 900, "unused"),
+            entry("extra/unused.safetensors", 800, "unused2"),
+        ];
+        let cached = &listed[..5];
+        assert_eq!(
+            availability(row, &listed, cached, Some(&index)).unwrap(),
+            Avail::Present { download_bytes: 0 }
+        );
+        assert_eq!(
+            row_files(row, &listed, Some(&index)).unwrap().unwrap(),
+            cached
+        );
+        assert_eq!(
+            availability(row, &listed, cached, None).unwrap(),
+            Avail::Present {
+                download_bytes: 1700
+            }
+        );
+        assert_eq!(
+            availability(row, &listed, &cached[..4], Some(&index)).unwrap(),
+            Avail::Present { download_bytes: 10 }
+        );
+        assert_eq!(
+            availability_offline(row, cached, Some(&index)),
+            Avail::Present { download_bytes: 0 }
+        );
+        let err = availability(row, &listed[..2], cached, Some(&index)).unwrap_err();
+        assert!(matches!(err, HfError::NoFile { .. }), "{err}");
+        assert_eq!(
+            availability_offline(row, &cached[..2], Some(&index)),
+            Avail::OfflineUncached
+        );
+        std::fs::write(&index, "not JSON").unwrap();
+        assert!(matches!(
+            availability(row, &listed, cached, Some(&index)),
+            Err(HfError::Listing { .. })
+        ));
     }
 
     /// The next smaller variant is the largest verified automatic row under the row's bytes that

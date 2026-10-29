@@ -443,28 +443,48 @@ fn tag_of(name: &str) -> String {
     base[at..].to_ascii_uppercase()
 }
 
-/// The safetensors checkpoint `entries` hold at the repo's top level: its index
-/// (`model.safetensors.index.json`), every `.safetensors` file, and the configs, tokenizer and
-/// chat template beside them (`.json`, `.jinja`), in the listing's order. `None` for a repo with
-/// no index there.
+/// Checkpoint candidates for a download estimate: all safetensors files and top-level JSON
+/// configs and Jinja templates. `None` without a top-level index. A resolve reads the index
+/// to select and require its shards; this listing alone does not prove completeness.
 pub fn checkpoint_files(entries: &[Entry]) -> Option<Vec<Entry>> {
-    let top = |e: &&Entry| !e.path.contains('/');
     entries
         .iter()
-        .filter(top)
         .any(|e| e.path == safetensors::Folder::INDEX)
         .then(|| {
             entries
                 .iter()
-                .filter(top)
-                .filter(|e| {
-                    [".safetensors", ".json", ".jinja"]
-                        .iter()
-                        .any(|x| e.path.ends_with(x))
-                })
+                .filter(|e| e.path.ends_with(".safetensors") || checkpoint_config(e))
                 .cloned()
                 .collect()
         })
+}
+
+fn checkpoint_config(entry: &Entry) -> bool {
+    !entry.path.contains('/') && (entry.path.ends_with(".json") || entry.path.ends_with(".jinja"))
+}
+
+/// The checkpoint's index, shards named by its `weight_map` and top-level JSON configs and
+/// Jinja templates, in listing order. Every shard must be a relative path present in `entries`.
+pub(crate) fn checkpoint_manifest(
+    repo: &str,
+    entries: &[Entry],
+    index: &Path,
+) -> Result<Vec<Entry>, HfError> {
+    let map = safetensors::Folder::weight_map(index).map_err(|e| match e {
+        safetensors::Error::Io(_, err) => HfError::io(index, err),
+        e => HfError::Listing {
+            repo: repo.to_owned(),
+            why: e.to_string(),
+        },
+    })?;
+    let shards: std::collections::BTreeSet<&str> = map.values().map(String::as_str).collect();
+    let paths: Vec<&str> = shards.iter().copied().collect();
+    exact(repo, entries, &paths)?;
+    Ok(entries
+        .iter()
+        .filter(|e| shards.contains(e.path.as_str()) || checkpoint_config(e))
+        .cloned()
+        .collect())
 }
 
 /// The GGUF model sets of `entries`, in the listing's order of their first

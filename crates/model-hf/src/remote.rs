@@ -490,9 +490,10 @@ pub fn whole_file(
     fs::write(dest, bytes).map_err(|e| io_err(dest, "write", e))
 }
 
-/// A checkpoint folder's `files` (entries of `repo`'s listing at revision `rev`, its top-level
-/// files: [`hf::checkpoint_files`]) as a header-only copy in `dir`: each shard's header read by
-/// range into a sparse file of the listed size ([`sparse_safetensors`]), every other file whole.
+/// A checkpoint folder's `files` (entries of `repo`'s listing at revision `rev`, the shards
+/// of any folder and the top-level configs: [`hf::checkpoint_files`]) as a header-only copy in
+/// `dir`: each shard's header read by range into a sparse file of the listed size
+/// ([`sparse_safetensors`]), every other file whole.
 /// The files are read up to [`PARALLEL`] at a time, and where `rev` is a commit a file an earlier
 /// read left whole in `dir` is kept. Calls `progress` after each file, in the order of `files`.
 /// `dir`, which a folder reader opens as the folder.
@@ -510,7 +511,11 @@ pub fn sparse_checkpoint(
         files.len(),
         &|i| {
             let e = &files[i];
-            let dest = dir.join(e.name());
+            let dest = hf::cache_path(dir, "", &e.path)?;
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| io_err(parent, "create the shard folder", err))?;
+            }
             if reuse && left_whole(&dest, e.size) {
                 return Ok(());
             }
@@ -1113,6 +1118,80 @@ mod tests {
         match sparse_safetensors(&d.join("s"), "s", 4, &mut slice_reader(&[0; 4])) {
             Err(RemoteError::PastEnd { size, .. }) => assert_eq!(size, 4),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sparse_checkpoint_keeps_subfolders_and_refuses_escaping_paths() {
+        let d = scratch("st-folders");
+        let hub = d.join("hub");
+        let source = hub.join("a/b/resolve/main");
+        let a = safetensors_bytes(
+            r#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#,
+            8,
+        );
+        let b = safetensors_bytes(
+            r#"{"b":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#,
+            8,
+        );
+        let index =
+            br#"{"weight_map":{"a":"first/model.safetensors","b":"second/model.safetensors"}}"#;
+        let mut entries = Vec::new();
+        for (name, bytes) in [
+            (safetensors::Folder::INDEX, index.as_slice()),
+            ("config.json", b"{}".as_slice()),
+            ("first/model.safetensors", a.as_slice()),
+            ("second/model.safetensors", b.as_slice()),
+        ] {
+            let path = source.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+            entries.push(Entry {
+                path: name.into(),
+                size: bytes.len() as u64,
+                check: hf::Check::Sha256,
+                digest: String::new(),
+            });
+        }
+        let client = Client {
+            base: format!("file://{}", hub.display()),
+            token: None,
+            root: d.join("cache"),
+            curl: "curl".into(),
+            offline: false,
+            revision: "main".into(),
+        };
+        let dest = d.join("headers");
+        let mut seen = Vec::new();
+        sparse_checkpoint(&client, "a/b", "main", &entries, &dest, &mut |e| {
+            seen.push(e.path.clone());
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>()
+        );
+        let folder = safetensors::Folder::open(&dest).expect("index paths open both shards");
+        assert_eq!(folder.names().collect::<Vec<_>>(), ["a", "b"]);
+        assert!(!dest.join("model.safetensors").exists());
+        assert_eq!(fs::read(dest.join("config.json")).unwrap(), b"{}");
+        for bad in [
+            "../escape.safetensors",
+            "/escape.safetensors",
+            "a//b",
+            "a/./b",
+            r"a\b",
+        ] {
+            let entry = Entry {
+                path: bad.into(),
+                ..entries[0].clone()
+            };
+            let err = sparse_checkpoint(&client, "a/b", "main", &[entry], &dest, &mut |_| {})
+                .expect_err("invalid listed path");
+            assert!(
+                matches!(err, RemoteError::Hf(HfError::Path { .. })),
+                "{err}"
+            );
         }
     }
 
