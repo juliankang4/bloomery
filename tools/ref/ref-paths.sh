@@ -238,6 +238,15 @@ def refuse(code, why):
     sys.exit(code)
 
 
+def unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
 def safetensors_meta(path):
     """The `__metadata__` of a safetensors shard, the fixture keys of a folder fixture's first shard."""
     try:
@@ -254,7 +263,7 @@ def safetensors_meta(path):
     if len(text) != n:
         refuse(65, f"{path} is not a readable safetensors header: {len(text)} of {n} bytes")
     try:
-        header = json.loads(text)
+        header = json.loads(text, object_pairs_hook=unique_pairs)
     except ValueError as e:
         refuse(65, f"{path} is not a readable safetensors header: {e}")
     if not isinstance(header, dict) or not isinstance(header.get("__metadata__"), dict):

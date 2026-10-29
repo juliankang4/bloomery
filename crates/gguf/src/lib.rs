@@ -8,7 +8,8 @@
 //!
 //! Two entry points share one header parser: `Gguf::open*` (strict — every
 //! tensor must be sized by this engine's `GgmlType`, or by the caller's
-//! [`PrivateType`] table in [`Gguf::open_private`], and sit inside the file;
+//! [`PrivateType`] table in [`Gguf::open_private`], and sit inside the file
+//! without overlapping another tensor;
 //! bloomery's own value types open through a [`Split`] alone)
 //! and [`inventory_of`] (header-only — unknown type ids are carried as
 //! numbers with ggml's size table, so files with types the engine cannot
@@ -32,6 +33,8 @@
 //!   * alignment: `general.alignment` KV (u32) or 32; the data base is the
 //!     end of the tensor-info section rounded up to that alignment
 //!     (ggml.c:31436-31447).
+//!
+//! Metadata keys and tensor names must be unique, including in header-only inventories.
 //!
 //! Errors, not panics: every file-derived value is bounds-checked — a
 //! truncated or hostile file yields [`LoadError`].
@@ -144,6 +147,21 @@ pub enum LoadError {
     Truncated { at: u64, need: u64, len: u64 },
     #[error("metadata value type tag {0} is not a GGUF value type (0-12)")]
     BadValueType(u32),
+    #[error("duplicate metadata key {key:?} at offset {second}; first declared at offset {first}")]
+    DuplicateMetadata {
+        key: String,
+        first: u64,
+        second: u64,
+    },
+    #[error(
+        "tensor {first:?} range {first_range:?} overlaps tensor {second:?} range {second_range:?} (relative to data base)"
+    )]
+    OverlappingTensors {
+        first: String,
+        first_range: Range<u64>,
+        second: String,
+        second_range: Range<u64>,
+    },
     /// An array whose element tag is 9: ggml reads arrays of scalars and of
     /// strings only, and aborts on an array of arrays.
     #[error("metadata {key:?} is an array of arrays; GGUF arrays hold scalars or strings")]
@@ -189,6 +207,7 @@ pub enum LoadError {
     },
     #[error("{path}: split.count says a split, but the name does not end in {suffix:?}")]
     SplitName { path: String, suffix: String },
+    /// A tensor name repeated at two shard paths or two descriptor offsets in one file.
     #[error("tensor {name:?} appears twice: in {first} and in {second}")]
     DuplicateTensor {
         name: String,
@@ -1449,7 +1468,7 @@ impl Value {
     }
 }
 
-/// The alignment the first `general.alignment` sets: a u32, as ggml reads
+/// The alignment `general.alignment` sets: a u32, as ggml reads
 /// it, and not 0, which no offset can be rounded to; 32 when absent.
 fn alignment_of(meta: &[(String, Value)]) -> Result<u64, LoadError> {
     match meta
@@ -1489,8 +1508,8 @@ fn check_private(private: &[PrivateType]) -> Result<(), LoadError> {
 /// by this engine's `GgmlType` (bloomery's own value types only when `own`)
 /// or by its entry in `private`, its first dim must be
 /// block-aligned and its bytes must fit a u64; then every tensor must sit
-/// inside the `len`-byte file — the placement invariant the coverage gate
-/// re-checks per tensor. A q8_1 or q8_K tensor is refused: they are ggml's
+/// inside the `len`-byte file without sharing bytes — the placement invariant
+/// the coverage gate re-checks per tensor. A q8_1 or q8_K tensor is refused: they are ggml's
 /// activation forms, which no quantizer writes to a file, though their rows size them.
 fn strict_tensors(
     raw: Vec<RawTensorInfo>,
@@ -1553,6 +1572,18 @@ fn strict_tensors(
             return Err(out_of_bounds());
         }
     }
+    let mut ranges: Vec<_> = strict.iter().collect();
+    ranges.sort_unstable_by_key(|t| t.offset);
+    for (first, second) in ranges.iter().zip(ranges.iter().skip(1)) {
+        if second.offset < first.offset + first.nbytes {
+            return Err(LoadError::OverlappingTensors {
+                first: first.name.clone(),
+                first_range: first.offset..first.offset + first.nbytes,
+                second: second.name.clone(),
+                second_range: second.offset..second.offset + second.nbytes,
+            });
+        }
+    }
     Ok(strict)
 }
 
@@ -1589,8 +1620,17 @@ fn parse_header(b: &[u8], len: u64) -> Result<Header, LoadError> {
 
     let mut meta = Vec::new();
     let mut offsets = Vec::new();
+    let mut keys = HashMap::new();
     for _ in 0..n_kv {
+        let key_at = rd.pos as u64;
         let key = rd.string()?;
+        if let Some(first) = keys.insert(key.clone(), key_at) {
+            return Err(LoadError::DuplicateMetadata {
+                key,
+                first,
+                second: key_at,
+            });
+        }
         let tag = rd.u32()?;
         // The value starts at the reader's position; `read_value` moves past it.
         let at = rd.pos as u64;
@@ -1600,8 +1640,17 @@ fn parse_header(b: &[u8], len: u64) -> Result<Header, LoadError> {
     }
 
     let mut tensors = Vec::new();
+    let mut names = HashMap::new();
     for _ in 0..n_tensors {
+        let name_at = rd.pos;
         let name = rd.string()?;
+        if let Some(first) = names.insert(name.clone(), name_at) {
+            return Err(LoadError::DuplicateTensor {
+                name,
+                first: format!("offset {first}"),
+                second: format!("offset {name_at}"),
+            });
+        }
         let n_dims = rd.u32()?;
         if !(1..=4).contains(&n_dims) {
             return Err(LoadError::BadDims { name, n: n_dims });
@@ -1763,53 +1812,88 @@ mod split_tests {
     #[test]
     fn duplicate_header_keys_are_refused() {
         for values in [[1, 2], [2, 1]] {
-            let layout = crate::write::Layout::new(&[
-                kv("qwen4exp.block_count", Value::U32(values[0])),
-                kv("qwen4exp.block_counX", Value::U32(values[1])),
-            ], vec![]).unwrap();
+            let layout = crate::write::Layout::new(
+                &[
+                    kv("test.block_count", Value::U32(values[0])),
+                    kv("test.block_counX", Value::U32(values[1])),
+                ],
+                vec![],
+            )
+            .unwrap();
             let mut bytes = layout.header_bytes().to_vec();
-            let second = bytes.windows(20).position(|w| w == b"qwen4exp.block_counX").unwrap();
-            bytes[second + 19] = b't';
+            let key = b"test.block_counX";
+            let second = bytes.windows(key.len()).position(|w| w == key).unwrap();
+            bytes[second + key.len() - 1] = b't';
             let Err(e) = super::parse_header(&bytes, layout.file_len()) else {
                 panic!("metadata key uniqueness must not depend on declaration order")
             };
             let text = e.to_string();
-            assert!(text.contains("qwen4exp.block_count") && text.contains("duplicate") && text.contains("offset"), "{text}");
+            assert!(
+                text.contains("test.block_count")
+                    && text.contains("duplicate")
+                    && text.contains("offset"),
+                "{text}"
+            );
         }
-        let layout = crate::write::Layout::new(&[], ["gate", "up__"].into_iter().map(|name| TensorDecl {
-            name: name.into(), dims: vec![4], type_id: 0, nbytes: 16,
-        }).collect()).unwrap();
+        let layout = gate_and_up();
         let mut bytes = layout.header_bytes().to_vec();
         let second = bytes.windows(4).position(|w| w == b"up__").unwrap();
         bytes[second..second + 4].copy_from_slice(b"gate");
         let Err(e) = super::parse_header(&bytes, layout.file_len()) else {
             panic!("a repeated tensor name must be refused before building the name table")
         };
-        assert!(e.to_string().contains("gate") && e.to_string().contains("twice"), "{e}");
+        assert!(
+            e.to_string().contains("gate") && e.to_string().contains("twice"),
+            "{e}"
+        );
     }
 
     #[test]
     fn overlapping_tensor_ranges_are_refused() {
-        for offsets in [[0, 0], [0, 8], [8, 0]] {
-            let layout = crate::write::Layout::new(&[], ["gate", "up"].into_iter().map(|name| TensorDecl {
-                name: name.into(), dims: vec![4], type_id: 0, nbytes: 16,
-            }).collect()).unwrap();
+        let layout = gate_and_up();
+        let strict_at = |offsets: [u64; 2]| {
             let mut h = super::parse_header(layout.header_bytes(), layout.file_len()).unwrap();
-            for (t, off) in h.tensors.iter_mut().zip(offsets) { t.offset = off; }
-            let Err(e) = super::strict_tensors(h.tensors, h.data_base, layout.file_len(), &[], false) else {
+            for (t, off) in h.tensors.iter_mut().zip(offsets) {
+                t.offset = off;
+            }
+            super::strict_tensors(h.tensors, h.data_base, layout.file_len(), &[], false)
+        };
+        for offsets in [[0, 0], [0, 8], [8, 0]] {
+            let Err(e) = strict_at(offsets) else {
                 panic!("overlapping tensor data must be refused in either declaration order")
             };
             let text = e.to_string();
-            assert!(text.contains("gate") && text.contains("up") && text.contains("overlap") && text.contains(".."), "{text}");
+            assert!(
+                text.contains("gate")
+                    && text.contains("up__")
+                    && text.contains("overlap")
+                    && text.contains(".."),
+                "{text}"
+            );
         }
         for offsets in [[0, 16], [32, 0]] {
-            let layout = crate::write::Layout::new(&[], ["gate", "up"].into_iter().map(|name| TensorDecl {
-                name: name.into(), dims: vec![4], type_id: 0, nbytes: 16,
-            }).collect()).unwrap();
-            let mut h = super::parse_header(layout.header_bytes(), layout.file_len()).unwrap();
-            for (t, off) in h.tensors.iter_mut().zip(offsets) { t.offset = off; }
-            assert!(super::strict_tensors(h.tensors, h.data_base, layout.file_len(), &[], false).is_ok(), "adjacent and disjoint tensors must still open");
+            assert!(
+                strict_at(offsets).is_ok(),
+                "adjacent and disjoint tensors must still open"
+            );
         }
+    }
+
+    /// A header of two 16-byte f32 tensors, `gate` and `up__`.
+    fn gate_and_up() -> crate::write::Layout {
+        crate::write::Layout::new(
+            &[],
+            ["gate", "up__"]
+                .into_iter()
+                .map(|name| TensorDecl {
+                    name: name.into(),
+                    dims: vec![4],
+                    type_id: 0,
+                    nbytes: 16,
+                })
+                .collect(),
+        )
+        .unwrap()
     }
 
     /// A metadata pair as the synthetic shards carry it.

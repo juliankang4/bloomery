@@ -232,8 +232,8 @@ fn write_raw(path: &Path, kvs: &[(&str, u32, Vec<u8>)]) {
     std::fs::write(path, out).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
-/// A key the file gives twice is refused (the file would state two values),
-/// and so is a nested array, which the reader refuses before a line is
+/// A key the file gives twice is refused by the GGUF reader (the file would
+/// state two values), and so is a nested array, which the reader refuses before a line is
 /// formed; both by the key.
 #[test]
 fn a_key_given_twice_and_a_nested_array_are_refused() -> Result<(), RefError> {
@@ -251,7 +251,7 @@ fn a_key_given_twice_and_a_nested_array_are_refused() -> Result<(), RefError> {
     let e = e.to_string();
     assert!(
         e.contains(&path.display().to_string())
-            && e.contains("bloomery.fixture.seed is given twice"),
+            && e.contains("duplicate metadata key \"bloomery.fixture.seed\""),
         "{e}"
     );
 
@@ -1487,14 +1487,23 @@ fn a_cut_folders_line_refuses_what_it_cannot_state() -> Result<(), RefError> {
         assert!(refused(why).contains("bloomery.fixture.bad"), "{why}");
     }
 
-    let twice = CUT_META
-        .iter()
-        .map(|(k, v)| format!("{}:{}", json_str(k), json_str(v)))
-        .chain([format!("{}:\"2\"", json_str("bloomery.fixture.version"))])
-        .collect::<Vec<_>>()
-        .join(",");
-    write_shard_text(&shard, &twice);
-    assert!(refused("twice").contains("given twice"));
+    for key in [
+        json_str("bloomery.fixture.version"),
+        r#""bloomery.fixture.\u0076ersion""#.to_string(),
+    ] {
+        let twice = CUT_META
+            .iter()
+            .map(|(k, v)| format!("{} : {}", json_str(k), json_str(v)))
+            .chain([format!("{key} : \"2\"")])
+            .collect::<Vec<_>>()
+            .join(",");
+        write_shard_text(&shard, &twice);
+        let e = refused("twice");
+        assert!(
+            e.contains("duplicate key \"bloomery.fixture.version\""),
+            "{e}"
+        );
+    }
 
     write_shard_text(&shard, r#""bloomery.fixture.version":1"#);
     assert!(refused("a number").contains("bloomery.fixture.version"));

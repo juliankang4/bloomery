@@ -166,10 +166,16 @@ def header(path, size=None):
         meta = {}
         for _ in range(n_kv):
             k = string().decode("utf-8", "replace")
+            if k in meta:
+                raise Refusal(65, f"{path}: duplicate metadata key {k!r}")
             meta[k] = value(u32())
         tensors = []
+        names = set()
         for _ in range(n_tensors):
             name = string().decode("utf-8", "replace")
+            if name in names:
+                raise Refusal(65, f"{path}: duplicate tensor name {name!r}")
+            names.add(name)
             nd = u32()
             dims = [u64() for _ in range(nd)]
             tensors.append((name, u32(), dims, u64()))
@@ -219,10 +225,15 @@ def tensors_of(first):
         raise Refusal(65, f"{first}: {arch}.leading_dense_block_count {dense!r} is not an integer")
     shards = shard_paths(first, meta)
     out = []
+    seen = {}
     for i, p in enumerate(shards):
         m, ts, start, size, align = header(p)
         if len(shards) > 1 and m.get("split.no") != i:
             raise Refusal(65, f"{p}: split.no {m.get('split.no')}, expected {i}")
+        for name, *_ in ts:
+            if name in seen:
+                raise Refusal(65, f"{p}: tensor {name} is also in {seen[name]}")
+            seen[name] = p
         rows = sorted((off, name, nbytes(p, name, ty, dims)) for name, ty, dims, off in ts)
         for j, (off, name, n) in enumerate(rows):
             if off % align:

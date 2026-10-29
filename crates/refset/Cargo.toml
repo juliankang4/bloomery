@@ -17,9 +17,9 @@ workspace = true
 
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
-# The `# fixture` line of a checkpoint folder's first shard reads its safetensors header's `__metadata__`.
-serde_json = "=1.0.151"
+bloomery-safetensors = { path = "../safetensors" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+serde_json = "=1.0.151"
 sha2 = { workspace = true }

@@ -617,11 +617,14 @@ def body35_lists(lists=None):
 
 def body35_types(tensors_by_shard, lists=None):
     """The decide seat's backbone body against the tensors of the headers read: (refusal or None, tensors checked).
-    The refusal names the first tensor, in file order, whose type is outside the list its site reads."""
+    The refusal names a tensor declared in two shards, or the first tensor, in file order, whose type is outside the
+    list its site reads."""
     lists = body35_lists(lists)
     seen = {}
     for tensors in tensors_by_shard:
         for name, ty, _, _ in tensors:
+            if name in seen:
+                return f"{name} is declared in two shards", 0
             seen[name] = ty
     head = BODY35_HEAD_TENSOR if (BODY35_HEAD_TENSOR in seen or BODY35_EMBED_TENSOR not in seen) \
         else BODY35_EMBED_TENSOR

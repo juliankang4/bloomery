@@ -3,7 +3,8 @@
 //! The layout: an 8-byte little-endian header length, the JSON header (name → `dtype`, `shape`,
 //! `data_offsets` relative to the end of the header, plus an optional `__metadata__`), then the
 //! data. The header is validated whole on open: every entry's dtype is known, its byte range
-//! matches its shape and lies in the data section, and no two ranges overlap. A tensor is read
+//! matches its shape and lies in the data section, and no two ranges overlap. JSON object keys
+//! are unique at every level, including the folder index. A tensor is read
 //! three ways: widened to f32 ([`Safetensors::tensor`], BF16, F16 and F32), as its stored bits
 //! ([`Safetensors::raw`], [`Safetensors::bf16`]), or as integers ([`Safetensors::i64s`]). The
 //! packed and 8-bit dtypes quantized checkpoints store (U8, I8, U16, U32, I32, F8_E4M3, F8_E5M2,
@@ -42,6 +43,75 @@ pub enum Error {
 
 fn bad(what: String) -> Error {
     Error::Format(what)
+}
+
+/// Parses `text`, the JSON `what` names, and refuses a repeated object key at any level.
+pub fn parse_unique(what: &str, text: &str) -> Result<Value, Error> {
+    struct NoRepeat;
+
+    impl<'de> serde::Deserialize<'de> for NoRepeat {
+        fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = NoRepeat;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("JSON with unique object keys")
+                }
+
+                fn visit_bool<E>(self, _: bool) -> Result<NoRepeat, E> {
+                    Ok(NoRepeat)
+                }
+
+                fn visit_i64<E>(self, _: i64) -> Result<NoRepeat, E> {
+                    Ok(NoRepeat)
+                }
+
+                fn visit_u64<E>(self, _: u64) -> Result<NoRepeat, E> {
+                    Ok(NoRepeat)
+                }
+
+                fn visit_f64<E>(self, _: f64) -> Result<NoRepeat, E> {
+                    Ok(NoRepeat)
+                }
+
+                fn visit_str<E>(self, _: &str) -> Result<NoRepeat, E> {
+                    Ok(NoRepeat)
+                }
+
+                fn visit_unit<E>(self) -> Result<NoRepeat, E> {
+                    Ok(NoRepeat)
+                }
+
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut seq: A,
+                ) -> Result<NoRepeat, A::Error> {
+                    while seq.next_element::<NoRepeat>()?.is_some() {}
+                    Ok(NoRepeat)
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<NoRepeat, A::Error> {
+                    let mut seen = std::collections::HashSet::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        if !seen.insert(key.clone()) {
+                            return Err(serde::de::Error::custom(format!("duplicate key {key:?}")));
+                        }
+                        map.next_value::<NoRepeat>()?;
+                    }
+                    Ok(NoRepeat)
+                }
+            }
+            de.deserialize_any(Visitor)
+        }
+    }
+
+    let not_json = |e: serde_json::Error| bad(format!("{what} is not JSON: {e}"));
+    serde_json::from_str::<NoRepeat>(text).map_err(not_json)?;
+    serde_json::from_str(text).map_err(not_json)
 }
 
 /// A stored element type this reader holds.
@@ -204,9 +274,7 @@ impl Safetensors {
             })?;
         let text = std::str::from_utf8(&bytes[8..data])
             .map_err(|_| bad("the header is not UTF-8".into()))?;
-        let Value::Object(pairs) = serde_json::from_str::<Value>(text)
-            .map_err(|e| bad(format!("the header is not JSON: {e}")))?
-        else {
+        let Value::Object(pairs) = parse_unique("the header", text)? else {
             return Err(bad("the header is not a JSON object".into()));
         };
         let mut entries = BTreeMap::new();
@@ -407,8 +475,7 @@ impl Folder {
         let path = dir.join(Folder::INDEX);
         let text =
             std::fs::read_to_string(&path).map_err(|e| Error::Io(path.display().to_string(), e))?;
-        let index: Value = serde_json::from_str(&text)
-            .map_err(|e| bad(format!("{}: not JSON: {e}", path.display())))?;
+        let index = parse_unique(&path.display().to_string(), &text)?;
         let Some(Value::Object(map)) = index.get("weight_map") else {
             return Err(bad(format!("{}: no weight_map object", path.display())));
         };
@@ -833,47 +900,90 @@ mod tests {
 
     #[test]
     fn duplicate_header_keys_are_refused() {
+        let unique = r#"{"a":[true,false,null,-1,0,4,1.5,18446744073709551616,1.234567890123456789,1e100,"s",{"b":{}}]}"#;
+        assert_eq!(
+            parse_unique("text", unique).unwrap(),
+            serde_json::from_str::<Value>(unique).unwrap(),
+            "JSON with unique keys must parse to the value serde_json gives it"
+        );
+        for (text, why) in [
+            (r#"{"a":1,"a":2}"#, "text is not JSON: duplicate key \"a\""),
+            ("{", "text is not JSON: EOF"),
+        ] {
+            assert!(
+                matches!(parse_unique("text", text), Err(Error::Format(e)) if e.starts_with(why)),
+                "the parser's refusal is the crate's Format error naming its input: {text}"
+            );
+        }
         let a = r#"{"dtype":"F32","shape":[1],"data_offsets":[0,4]}"#;
         let b = r#"{"dtype":"F32","shape":[1],"data_offsets":[4,8]}"#;
-        for (first, second) in [(a, b), (b, a)] {
-            let text = format!(r#"{{"model.layers.0.weight":{first},"model.layers.0.weight":{second}}}"#);
-            let mut file = (text.len() as u64).to_le_bytes().to_vec();
-            file.extend_from_slice(text.as_bytes());
-            file.extend_from_slice(&[0; 8]);
-            assert!(matches!(Safetensors::parse(file), Err(Error::Format(e))
-                if e.contains("duplicate key") && e.contains("model.layers.0.weight")),
-                "both declaration orders must refuse the repeated tensor name");
-        }
+        let tensor_twice = |first: &str, second: &str| {
+            format!(r#"{{"model.layers.0.weight":{first},"model.layers.0.weight":{second}}}"#)
+        };
         for (text, key) in [
-            (r#"{"x":{"dtype":"F32","dtype":"U32","shape":[1],"data_offsets":[0,4]}}"#, "dtype"),
-            (r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4],"data_offsets":[4,8]}}"#, "data_offsets"),
-            (r#"{"__metadata__":{"source":"a","source":"b"}}"#, "source"),
+            (tensor_twice(a, b), "model.layers.0.weight"),
+            (tensor_twice(b, a), "model.layers.0.weight"),
+            (
+                r#"{"x":{"dtype":"F32","dtype":"U32","shape":[1],"data_offsets":[0,4]}}"#.into(),
+                "dtype",
+            ),
+            (
+                r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4],"data_offsets":[4,8]}}"#
+                    .into(),
+                "data_offsets",
+            ),
+            (
+                r#"{"__metadata__":{"source":"a","source":"b"}}"#.into(),
+                "source",
+            ),
+            (
+                r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4],"extra":[{"k":1,"k":2}]}}"#
+                    .into(),
+                "k",
+            ),
         ] {
             let mut file = (text.len() as u64).to_le_bytes().to_vec();
             file.extend_from_slice(text.as_bytes());
             file.extend_from_slice(&[0; 8]);
-            assert!(matches!(Safetensors::parse(file), Err(Error::Format(e))
-                if e.contains("duplicate key") && e.contains(key)),
-                "nested objects must preserve key uniqueness too: {key}");
+            assert!(
+                matches!(Safetensors::parse(file), Err(Error::Format(e))
+                if e.contains(&format!("duplicate key {key:?}"))),
+                "a repeated key must be refused in either order and at every level: {key}"
+            );
         }
     }
 
     #[test]
     fn duplicate_index_keys_are_refused() {
         let d = Dir::new("duplicate-index");
-        for (first, second) in [("a.safetensors", "b.safetensors"), ("b.safetensors", "a.safetensors")] {
-            for shard in [first, second] {
-                d.file(shard, &write(&[("model.layers.0.weight", "F32", &[1], &[0; 4])]));
-            }
-            for text in [
-                format!(r#"{{"weight_map":{{"model.layers.0.weight":"{first}","model.layers.0.weight":"{second}"}}}}"#),
-                format!(r#"{{"weight_map":{{"model.layers.0.weight":"{first}"}},"weight_map":{{"model.layers.0.weight":"{second}"}}}}"#),
-            ] {
-                d.file(Folder::INDEX, text.as_bytes());
-                let Err(e) = Folder::open(&d.0) else { panic!("a duplicate index key must be refused") };
-                assert!(e.to_string().contains("duplicate key"), "{e}");
-                assert!(e.to_string().contains("model.layers.0.weight") || e.to_string().contains("weight_map"), "{e}");
-            }
+        for shard in ["a.safetensors", "b.safetensors"] {
+            d.file(
+                shard,
+                &write(&[("model.layers.0.weight", "F32", &[1], &[0; 4])]),
+            );
+        }
+        for (text, key) in [
+            (
+                r#"{"weight_map":{"model.layers.0.weight":"a.safetensors","model.layers.0.weight":"b.safetensors"}}"#,
+                "model.layers.0.weight",
+            ),
+            (
+                r#"{"weight_map":{"model.layers.0.weight":"b.safetensors","model.layers.0.weight":"a.safetensors"}}"#,
+                "model.layers.0.weight",
+            ),
+            (
+                r#"{"weight_map":{"model.layers.0.weight":"a.safetensors"},"weight_map":{"model.layers.0.weight":"b.safetensors"}}"#,
+                "weight_map",
+            ),
+        ] {
+            d.file(Folder::INDEX, text.as_bytes());
+            let Err(e) = Folder::open(&d.0) else {
+                panic!("a duplicate index key must be refused: {key}")
+            };
+            assert!(
+                e.to_string().contains(&format!("duplicate key {key:?}")),
+                "{e}"
+            );
         }
     }
 
