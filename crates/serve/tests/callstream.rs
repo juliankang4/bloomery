@@ -436,3 +436,89 @@ fn hw_a_call_closed_under_another_name_is_a_named_error() {
         }
     }
 }
+
+thread_local! {
+    static ALLOCATED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+struct CountAlloc;
+
+// SAFETY: every allocation is delegated unchanged to the system allocator.
+unsafe impl std::alloc::GlobalAlloc for CountAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        ALLOCATED.with(|n| {
+            if let Some(bytes) = n.get() {
+                n.set(Some(bytes + layout.size()));
+            }
+        });
+        // SAFETY: the caller supplies the allocator's layout contract.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: this pointer and layout came from the same system allocator.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static COUNT_ALLOC: CountAlloc = CountAlloc;
+
+/// A file-sized string streams with allocation work bounded by its length,
+/// preserving escapes and delimiters under small, character-aligned chunks.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_qwen_long_string_stream_is_linear() {
+    let content = "quoted \" \\ tab\t 서울 </parameter x>\n".repeat(3000);
+    for framing in [Framing::Lines, Framing::Compact] {
+        let (open, close) = match framing {
+            Framing::Lines => ("\n", "\n</parameter>\n"),
+            Framing::Compact => ("", "</parameter>"),
+        };
+        let mut p = ChatParser::with_tools(
+            "",
+            ReasoningFormat::None,
+            Some(Tools::QwenXml(
+                framing,
+                ParamKinds::of_tools(Some(&tools())),
+            )),
+        )
+        .streaming_calls();
+        let prefix = format!("<tool_call><function=write><parameter=content>{open}");
+        let suffix = format!("{close}</function></tool_call>");
+        let mut arguments = String::new();
+        let began = std::time::Instant::now();
+        ALLOCATED.with(|n| n.set(Some(0)));
+        p.try_push(&prefix).expect("call opens");
+        for line in content.split_inclusive('\n') {
+            p.try_push(line).expect("string advances");
+            for piece in p.take_pieces() {
+                if let CallPiece::Args { text, .. } = piece {
+                    arguments.push_str(&text);
+                }
+            }
+        }
+        p.try_push(&suffix).expect("call closes");
+        for piece in p.take_pieces() {
+            if let CallPiece::Args { text, .. } = piece {
+                arguments.push_str(&text);
+            }
+        }
+        p.try_finish().expect("stream ends");
+        let bytes = ALLOCATED.with(|n| n.replace(None).expect("counting"));
+        eprintln!(
+            "long-string {framing:?}: bytes={} allocated={bytes} host_us={}",
+            content.len(),
+            began.elapsed().as_micros()
+        );
+        assert_eq!(arguments, p.message().calls[0].arguments);
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).unwrap()["content"],
+            content
+        );
+        assert!(
+            bytes < content.len() * 128,
+            "{framing:?}: {bytes} allocated for {} argument bytes",
+            content.len()
+        );
+    }
+}
