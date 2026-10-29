@@ -277,7 +277,7 @@ fn kind_of(ty: &Value) -> Option<Kind> {
 }
 
 /// Streaming scanner over the text after the think span.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct KvScan {
     markers: &'static Markers,
     types: ArgTypes,

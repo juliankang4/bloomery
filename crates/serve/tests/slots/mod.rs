@@ -302,7 +302,8 @@ fn hw_a_cut_of_an_idle_conversation_saves_it_on_several_slots() {
 }
 
 /// Past the queue's depth a request is a 503 with `Retry-After` at once, never
-/// queued; the requests in the slot and the queue are served.
+/// queued, as is a request of several choices that only partly fit: none of
+/// its choices queues. The requests in the slot and the queue are served.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_a_request_past_the_queue_depth_is_503() {
@@ -318,22 +319,31 @@ fn hw_a_request_past_the_queue_depth_is_503() {
         log.len_reached(1, BOUND),
         "the first prompt never reached the engine"
     );
+    // The answer to a request, or `None` when it waits past `BOUND`.
+    let at_once = |path: &'static str, body: Value| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(post(addr, path, &body));
+        });
+        rx.recv_timeout(BOUND).ok()
+    };
+    let two = json!({"prompt": "abcab", "max_tokens": 2, "temperature": 0, "n": 2});
+    let partial = at_once("/v1/completions", two);
     let queued = {
         let body = body.clone();
         std::thread::spawn(move || post(addr, "/completion", &body))
     };
     wait_deferred(addr, 1, BOUND);
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(post(addr, "/completion", &body));
-    });
-    let past = rx.recv_timeout(BOUND);
+    let past = at_once("/completion", body);
     log.release();
+    let partial = partial.expect("the choices past the depth waited instead of a 503");
+    assert_error(&partial, 503, "unavailable_error", "the queue's depth");
     let past = past.expect("the request past the depth waited instead of a 503");
     assert_error(&past, 503, "unavailable_error", "the queue's depth");
     assert_eq!(past.header("Retry-After"), Some("1"), "{:?}", past.headers);
     assert_eq!(first.join().expect("first").status, 200);
     assert_eq!(queued.join().expect("queued").status, 200);
+    assert_eq!(log.prompts().len(), 2, "{:?}", log.prompts());
     assert_eq!(
         metric(&get(addr, "/metrics").body, "requests_deferred"),
         0.0

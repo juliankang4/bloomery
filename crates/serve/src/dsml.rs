@@ -177,7 +177,7 @@ pub struct Scanned {
 }
 
 /// Streaming DSML scanner over the text after the think span.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DsmlScan {
     tags: &'static Tags,
     /// Inside a block: the text consumed since it opened or since its last call,
@@ -631,7 +631,7 @@ pub enum Tools {
     MuseSpark,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Scan {
     Dsml(DsmlScan),
     Kv(KvScan),
@@ -676,7 +676,7 @@ impl PartialEq<KvError> for MarkupError {
 /// piece for piece. With tools, the think span is tracked in either format so
 /// tool-call markup inside it is never parsed; with `None` the span's text, its
 /// `</think>` included, stays in `content`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ChatParser {
     format: ReasoningFormat,
     /// The tags the span is split on, and that [`ReasoningFormat::None`]

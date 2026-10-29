@@ -14,7 +14,8 @@
 //! takes no decode round until its prompt ends. Without another busy slot, or
 //! on an engine that names none, a prompt runs in one go.
 //!
-//! A request's events reach its HTTP thread over a channel of its own. Its
+//! A request's events reach its HTTP thread over a channel of its own (the
+//! choices of one request share theirs, each event tagged with its choice). Its
 //! counters, its `/slots` view and its slot's release are booked before its
 //! last event is sent, so the response a client reads finds the slot free
 //! and the counters final. A client gone ends its request at the next event,
@@ -141,8 +142,26 @@ pub(crate) struct Submit {
     /// The sampler the request draws with, `None` for a greedy one
     /// ([`crate::genloop::sampler_of`]).
     pub sampler: Option<Sampler>,
-    pub events: mpsc::Sender<Msg>,
+    pub events: Events,
     pub client: Arc<crate::api::Client>,
+}
+
+/// A request's side of its HTTP thread's channel. The choices of one request
+/// share the channel, each message tagged with its choice.
+pub(crate) struct Events {
+    tx: mpsc::Sender<(usize, Msg)>,
+    choice: usize,
+}
+
+impl Events {
+    pub(crate) fn new(tx: mpsc::Sender<(usize, Msg)>, choice: usize) -> Events {
+        Events { tx, choice }
+    }
+
+    /// Fails, as a gone client, once the HTTP thread dropped its end.
+    pub(crate) fn send(&self, m: Msg) -> io::Result<()> {
+        self.tx.send((self.choice, m)).map_err(|_| client_gone())
+    }
 }
 
 /// What the engine thread tells a request's HTTP thread.
@@ -334,7 +353,7 @@ struct Dead;
 struct Active {
     slot: usize,
     job: Gen,
-    events: mpsc::Sender<Msg>,
+    events: Events,
     /// The engine call the request needs next, taken from its generation
     /// by a pump that ran ahead of the call ([`Worker::hold_need`]).
     need: Option<Need>,
@@ -495,13 +514,13 @@ fn call_alone(slot: &mut Slot, a: &mut Active, need: Need) -> Result<(), EngineE
 }
 
 /// The sink a request's generation writes to: its channel.
-fn sink_of(events: &mpsc::Sender<Msg>) -> impl FnMut(Event<'_>) -> io::Result<()> + '_ {
+fn sink_of(events: &Events) -> impl FnMut(Event<'_>) -> io::Result<()> + '_ {
     |ev| {
         let m = match ev {
             Event::Prompt(t) => Msg::Prompt(t.clone()),
             Event::Text(text, t) => Msg::Text(text.to_owned(), t.clone()),
         };
-        events.send(m).map_err(|_| client_gone())
+        events.send(m)
     }
 }
 

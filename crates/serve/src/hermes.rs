@@ -83,7 +83,7 @@ impl HermesError {
 }
 
 /// Streaming scanner over the text after the think span.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct HermesScan {
     /// Inside a call (its `<tool_call>` consumed).
     inside: bool,

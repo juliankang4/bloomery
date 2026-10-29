@@ -1119,7 +1119,7 @@ fn stream(
             }
             frames.send(s, events)
         };
-        run_gen(state, &input, prompt, &p, peer, &mut sink).map(|(o, _)| o)
+        run_gen(state, &input, prompt, &p, peer, &mut sink).map(|r| r.map(|(o, _)| o))
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),

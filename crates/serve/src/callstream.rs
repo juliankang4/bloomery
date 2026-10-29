@@ -48,7 +48,7 @@ pub enum CallPiece {
 }
 
 /// A call announced and not closed: what has gone out of it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Told {
     index: usize,
     name: String,
@@ -58,7 +58,7 @@ struct Told {
 
 /// The pieces a parser's scans owe the stream: the call being read, and what
 /// went out of it.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Streamer {
     told: Option<Told>,
     pieces: Vec<CallPiece>,

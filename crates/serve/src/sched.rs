@@ -233,15 +233,23 @@ impl<R, A> Board<R, A> {
         self.slots.iter().filter(|s| s.state == Use::Free).count()
     }
 
-    /// Queues a request, unless the requests that would then wait past the
-    /// free slots exceed the depth.
-    pub(crate) fn enqueue(&mut self, held: Held, payload: R) -> Result<(), Refusal> {
+    /// Whether `k` more requests may queue now: not past a failed engine, and
+    /// not when the requests that would then wait past the free slots exceed
+    /// the depth. A request of several choices asks for all of them at once,
+    /// so it queues whole or not at all.
+    pub(crate) fn admits(&self, k: usize) -> Result<(), Refusal> {
         if let Some(reason) = &self.dead {
             return Err(Refusal::Dead(reason.clone()));
         }
-        if self.waiting.len() >= self.depth + self.free() {
+        if self.waiting.len() + k > self.depth + self.free() {
             return Err(Refusal::Full { depth: self.depth });
         }
+        Ok(())
+    }
+
+    /// Queues a request when [`Board::admits`] one more.
+    pub(crate) fn enqueue(&mut self, held: Held, payload: R) -> Result<(), Refusal> {
+        self.admits(1)?;
         self.tickets.draw();
         self.waiting.push_back(Waiter { held, payload });
         Ok(())
@@ -793,6 +801,16 @@ mod tests {
         assert_eq!(
             none.enqueue(Held::from(vec![1]), 1),
             Err(Refusal::Full { depth: 0 })
+        );
+        let mut several = board(2, 1);
+        several
+            .enqueue(Held::from(vec![0]), 0)
+            .expect("a free slot");
+        assert_eq!(several.admits(2), Ok(()), "one free slot and one place");
+        assert_eq!(
+            several.admits(3),
+            Err(Refusal::Full { depth: 1 }),
+            "three choices past one free slot and one place are refused whole"
         );
     }
 
