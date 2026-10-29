@@ -210,11 +210,10 @@ mod swiglu {
                     // SAFETY: the checked column's Q8 planes; this lane owns its word.
                     unsafe { *q.get_unchecked_mut(col * words + at) = word };
                     if lane & 7 == 0 {
-                        // SAFETY: the octet owns this block's scale and code sum.
-                        unsafe {
-                            *d.get_unchecked_mut(col * blocks + block) = dv;
-                            *sums.get_unchecked_mut(col * blocks + block) = sum;
-                        }
+                        // SAFETY: the octet owns this checked column's block scale.
+                        unsafe { *d.get_unchecked_mut(col * blocks + block) = dv };
+                        // SAFETY: the octet owns this checked column's block code sum.
+                        unsafe { *sums.get_unchecked_mut(col * blocks + block) = sum };
                     }
                 }
                 largest = if refused {
@@ -239,11 +238,9 @@ mod swiglu {
             }
         }
         thread::sync_threads();
-        // SAFETY: the first warp published its maximum in the first reduction word.
-        let first = f32::from_bits(unsafe { *cache.add(words + blocks) });
-        // SAFETY: the second warp published its maximum in the second reduction word.
-        let second = f32::from_bits(unsafe { *cache.add(words + blocks + 1) });
-        let largest = first.max(second);
+        // SAFETY: the two warps published these adjacent reduction words after the cached prefix.
+        let maxima = unsafe { cache.add(words + blocks).cast::<[u32; 2]>().read() };
+        let largest = f32::from_bits(maxima[0]).max(f32::from_bits(maxima[1]));
         let gs = if !largest.is_finite() {
             f32::NAN
         } else if largest > 0.0 {
