@@ -119,12 +119,18 @@
 //! query norm, the plain walk and `q38`'s out gate in turn.
 //!
 //! The `_q8` entries ([`FlashGqaPrefill::enqueue_q8`] and its eight-head
-//! `_256` kin; no packed q8 entry exists) run the same walks over the Q8_0
-//! cache the quantizing appends write (`rope_neox`'s two-plane layout: a
+//! `_256` kin, Qwen3.8's gated pack-of-four walk
+//! `gqa_prefill_flash_256_p4_gated_q8`, and the listed walks
+//! `gqa_prefill_flash_256_p12_sel_q8` and `_p12_sel_gated_q8`, which
+//! [`FlashGqaPrefill::enqueue_256_p12_sel`] and its gated form launch on a
+//! q8_0 cache; no other packed q8 entry exists) run the same walks over the
+//! Q8_0 cache the quantizing appends write (`rope_neox`'s two-plane layout: a
 //! codes plane of `head/4` u32 a row, a scales plane of `head/32` u16, a
 //! pair of planes a side). The `_256_p4`, `_256_p2` and `_256_q8` entries
-//! are the instances of one body, `prefill_256_p`, over [`F16Kv`] and
-//! [`Q8Kv`]; `gqa_prefill_flash` and `gqa_prefill_flash_q8` are the instances
+//! and the gated `_p4` pair are the instances of one body, `prefill_256_p`,
+//! over [`F16Kv`] and [`Q8Kv`]; the listed entries are the instances of
+//! `prefill_256_sel`, whose q8 staging is the same two steps at each listed
+//! row; `gqa_prefill_flash` and `gqa_prefill_flash_q8` are the instances
 //! of the other, `prefill_128`, over the same two formats. The
 //! tensor cores need the f16 tile the walk reads, so a q8 tile's staging
 //! becomes two steps: `cp.async` carries each tile's
@@ -143,7 +149,7 @@
 //! key tile's under the value product); the dequants add the two barriers
 //! the in-place widening needs. A q8 256 block's dynamic shared memory grows
 //! by the two scales tiles (100,352 bytes, still inside the card's opt-in
-//! window); the 128 entry's are static. The query staging, the scores, the
+//! window; a listed block's 75,776); the 128 entry's are static. The query staging, the scores, the
 //! softmax and the value products are the f16 walk's — the q8 read's
 //! dequantized values are not the f16 cache's bits, and the owning gates
 //! hold these entries against the dequantized cache with the f16 rounding
@@ -163,8 +169,8 @@
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{f32x2_to_f16x2_bits, half_bits_to_f32};
 use crate::flash_gqa::{
-    F16Kv, GROUP, GROUP_7, GqaListArgs, HEAD, KvSrc, PACK_2, PACK_4, PACK_12, Q8Kv, SEL_NAN4,
-    check_listed_256, q8_word_values, real_head,
+    CachePlanes, F16Kv, GROUP, GROUP_7, GqaListArgs, HEAD, KvSrc, PACK_2, PACK_4, PACK_12, Q8Kv,
+    SEL_NAN4, check_listed_256, q8_word_values, real_head,
 };
 use crate::rope_neox::{ROT_256 as ROPE_256, q8_plane_lens, query_scale_256, query_value_256};
 use crate::route_core::sigmoid;
@@ -765,6 +771,38 @@ macro_rules! zero_row {
     }};
 }
 
+/// A 256-dim q8 tile's in-place widening, `$tile` with its scales `$scales`,
+/// for every prefill walk at `HEAD_256`: warp `$wid` widens its own rows
+/// (`dequant_row` reads before its warp sync and writes after), a row whose
+/// key `$key` fails `$live` four zero words, then a barrier publishes the
+/// tile. `$live` is the walk's own bound (the dense walk's count and first
+/// key, the listed walk's list length).
+macro_rules! widen_256 {
+    (($tile:expr, $scales:expr), ($wid:expr, $lane:expr), $kb:expr, $key:ident => $live:expr) => {{
+        for r in 0..Q8_WID_ROWS_256 {
+            let row = $wid * Q8_WID_ROWS_256 + r;
+            let base = row * ROW_WORDS_256;
+            let $key = $kb * KEY_TILE_U32 + (row as u32);
+            if $live {
+                // SAFETY: the row is this warp's alone, its raw words and
+                // scales published by the barrier before this expansion.
+                dequant_row!(
+                    2,
+                    $tile,
+                    base,
+                    $scales.wrapping_add(row * 8),
+                    row & 7,
+                    $lane
+                );
+            } else {
+                // SAFETY: the row is this warp's alone in the tile.
+                zero_row!(2, $tile, base, row & 7, $lane);
+            }
+        }
+        thread::sync_threads();
+    }};
+}
+
 /// The online softmax of the module doc's step 2 over one key tile's scores,
 /// written once for every prefill body and expanded in each, as
 /// `dequant_row!` is: the body's locals are the arguments. A warp whose tile
@@ -1040,6 +1078,15 @@ pub(crate) use prefill_pack_store;
 /// One 256-value-head scales tile of the q8 staging: `KEY_TILE` rows of
 /// `HEAD_256/32` u16.
 const Q8_SCALE_TILE_256: usize = KEY_TILE * (HEAD_256 / 32);
+/// The 256-value-head q8 staging: code 16-byte chunks a staged row takes, a
+/// thread's count of a tile's, the tile keys one pass of the block's chunks
+/// covers, and the rows of a tile each warp widens.
+const Q8_ROW_CCHUNKS_256: usize = HEAD_256 / 16;
+const Q8_TILE_CCHUNKS_256: usize = KEY_TILE * Q8_ROW_CCHUNKS_256 / THREADS_256;
+const Q8_PASS_KEYS_256: usize = THREADS_256 / Q8_ROW_CCHUNKS_256;
+const Q8_WID_ROWS_256: usize = KEY_TILE / WARPS_256;
+const _: () = assert!(Q8_TILE_CCHUNKS_256 * THREADS_256 == KEY_TILE * Q8_ROW_CCHUNKS_256);
+const _: () = assert!(Q8_WID_ROWS_256 * WARPS_256 == KEY_TILE);
 /// The q8 bytes of dynamic shared memory a 256-value-head block adds to the
 /// f16 window: its two scales tiles.
 const Q8_SCALES_256: usize = 2 * Q8_SCALE_TILE_256;
@@ -1121,13 +1168,6 @@ unsafe fn prefill_256_p<
     let pps = SLICE_POS;
     // PACK = 1 takes its own position indexing, without dividing by qpp.
     let qpp = PACK / Q_ROW_STEP_256;
-    // The q8 staging: code 16-byte chunks a staged row takes, a thread's
-    // count of a tile's, and the rows of a tile each warp widens.
-    const ROW_CCHUNKS: usize = HEAD_256 / 16;
-    const TILE_CCHUNKS: usize = KEY_TILE * ROW_CCHUNKS / THREADS_256;
-    const _: () = assert!(TILE_CCHUNKS * THREADS_256 == KEY_TILE * ROW_CCHUNKS);
-    const WID_ROWS: usize = KEY_TILE / WARPS_256;
-    const _: () = assert!(WID_ROWS * WARPS_256 == KEY_TILE);
 
     let b = thread::blockIdx_x() as usize;
     let nkv = n_kv as usize;
@@ -1383,11 +1423,11 @@ unsafe fn prefill_256_p<
             let (tile, sk, qs, ds, kb): (*mut u32, *mut u16, *const u32, *const u32, u32) =
                 ($tile, $sk, $qs, $ds, $kb);
             let sk32 = sk.cast::<u32>();
-            for i in 0..TILE_CCHUNKS {
+            for i in 0..Q8_TILE_CCHUNKS_256 {
                 cuda_device::thread::__unroll_config::<0>();
                 let e = tid + THREADS_256 * i;
-                let row = e / ROW_CCHUNKS;
-                let col = e - row * ROW_CCHUNKS;
+                let row = e / Q8_ROW_CCHUNKS_256;
+                let col = e - row * Q8_ROW_CCHUNKS_256;
                 // SAFETY: row < KEY_TILE and words 4·col .. + 4 are one whole
                 // chunk of the row's low half: the 16 destination bytes are
                 // inside the tile and 16-byte aligned.
@@ -1454,29 +1494,6 @@ unsafe fn prefill_256_p<
             }
         };
     }
-    // A q8 tile's in-place widening, `$tile` with its scales `$scales`:
-    // warp `wid` widens its own rows (`dequant_row` reads before its warp
-    // sync and writes after), a key at or past `hi` (or below `lo` with
-    // LOWER) four zero words, then a barrier publishes the tile.
-    macro_rules! widen {
-        ($tile:expr, $scales:expr, $kb:expr) => {{
-            let rows0 = wid * WID_ROWS;
-            for r in 0..WID_ROWS {
-                let row = rows0 + r;
-                let base = row * ROW_WORDS_256;
-                let key = $kb * KEY_TILE_U32 + (row as u32);
-                if key < hi && (!LOWER || key >= lo) {
-                    // SAFETY: the row is this warp's alone, its raw words and
-                    // scales published by the barrier before this expansion.
-                    dequant_row!(2, $tile, base, $scales.wrapping_add(row * 8), row & 7, lane);
-                } else {
-                    // SAFETY: the row is this warp's alone in the tile.
-                    zero_row!(2, $tile, base, row & 7, lane);
-                }
-            }
-            thread::sync_threads();
-        }};
-    }
     if kb_first < tiles {
         if KEY_TILE_U32 * (kb_first + 1) <= hi && (!LOWER || KEY_TILE_U32 * kb_first >= lo) {
             stage_side!(K, kb_first, true);
@@ -1532,7 +1549,7 @@ unsafe fn prefill_256_p<
         // A q8 key tile landed as raw codes and scales: widened in place
         // before the scores read it.
         if S::Q8 {
-            widen!(kt, sk, kb);
+            widen_256!((kt, sk), (wid, lane), kb, key => key < hi && (!LOWER || key >= lo));
         }
         if end <= hi && (!LOWER || KEY_TILE_U32 * kb >= lo) {
             stage_side!(V, kb, true);
@@ -1627,7 +1644,7 @@ unsafe fn prefill_256_p<
         thread::sync_threads();
         // A q8 value tile likewise, before the value product reads it.
         if S::Q8 {
-            widen!(vt, sv, kb);
+            widen_256!((vt, sv), (wid, lane), kb, key => key < hi && (!LOWER || key >= lo));
         }
         if kb + 1 < tiles {
             if end + KEY_TILE_U32 <= hi {
@@ -1704,6 +1721,13 @@ const DYN_BYTES_SEL_U32: u32 = DYN_BYTES_SEL as u32;
 const _: () = assert!(DYN_BYTES_SEL_U32 as usize == DYN_BYTES_SEL);
 // `#[launch_contract(dynamic_shared = ...)]` takes a literal.
 const _: () = assert!(DYN_BYTES_SEL == 73_728);
+/// A q8 listed block's dynamic shared window: [`DYN_BYTES_SEL`] and the two
+/// scales tiles after it, as [`DYN_BYTES_256_Q8`] adds them to the dense
+/// walk's.
+const DYN_BYTES_SEL_Q8: usize = DYN_BYTES_SEL + Q8_SCALES_256 * 2;
+const DYN_BYTES_SEL_Q8_U32: u32 = DYN_BYTES_SEL_Q8 as u32;
+const _: () = assert!(DYN_BYTES_SEL_Q8_U32 as usize == DYN_BYTES_SEL_Q8);
+const _: () = assert!(DYN_BYTES_SEL_Q8 == 75_776);
 // The pack's twelve heads and four zero rows fill one m16 fragment, the warps
 // split a tile's eight n8 key tiles in pairs and its dims in n16 pairs.
 const _: () = assert!(PACK_12 < SLICE_ROWS && SEL_Q_PASSES * Q_ROW_STEP_256 == SLICE_ROWS);
@@ -1711,19 +1735,25 @@ const _: () = assert!(SEL_QUARTERS * 2 == KEY_NT && SEL_DIM_PAIRS == 2);
 
 /// The listed walk of the section above: block `b` is row `t = b % m` and key
 /// head `kh = b / m`, query heads `kh·12 ..`, read at `q[(t·n_head + kh·12 +
-/// j)·256 ..]` and written at the same index of `y`. A count of zero or past
-/// `width` raises [`FaultSite::KeyCount`], reads no key and writes NaN; a list
-/// entry at or past `ctx` raises [`FaultSite::PoolSelect`] and stages the f16
-/// NaN pattern in both tiles, so its row is NaN. Keys at or past the count
-/// are staged as zeros and masked, as the dense walk's keys past its largest
-/// count. Every guard around a shuffle or a barrier is block-uniform (the
-/// block's one count).
+/// j)·256 ..]` and written at the same index of `y`, over a cache in the
+/// format `S`. A count of zero or past `width` raises [`FaultSite::KeyCount`],
+/// reads no key and writes NaN; a list entry at or past `ctx` raises
+/// [`FaultSite::PoolSelect`] and stages NaN in both tiles (the f16 NaN
+/// pattern, or a q8 row's NaN scales, which widen to NaN), so its row is NaN.
+/// Keys at or past the count are staged as zeros and masked, as the dense
+/// walk's keys past its largest count. The formats differ only in a tile's
+/// staging, as in [`prefill_256_p`]: the f16 rows land by `cp.async` in the
+/// permuted layout; a q8 tile's listed rows land as raw code words in the low
+/// halves of its rows and scales in its scales tile, widened in place
+/// (`dequant_row`, `zero_row`) before the tile is read. Every guard around a
+/// shuffle or a barrier is block-uniform (the block's one count).
 ///
 /// SAFETY: the entry's launch contract (`n_sel` holds `m` counts, `list` `m ·
-/// width` entries, `q` and `y` `m · n_kv · 12` heads, the planes `n_kv · ctx`
-/// rows of 256 values, 16-byte aligned, `q` 8-byte aligned), a block of
+/// width` entries, `q` and `y` `m · n_kv · 12` heads, `src`'s planes `n_kv ·
+/// ctx` rows of 256 values, 16-byte aligned, `q` 8-byte aligned), a block of
 /// [`THREADS_256`] threads and [`DYN_BYTES_SEL`] bytes of dynamic shared
-/// memory starting at the block's shared base.
+/// memory for an f16 cache, [`DYN_BYTES_SEL_Q8`] for a q8 one, starting at
+/// the block's shared base.
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
@@ -1733,11 +1763,10 @@ const _: () = assert!(SEL_QUARTERS * 2 == KEY_NT && SEL_DIM_PAIRS == 2);
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn prefill_256_sel<G: OutGate, Q: QueryRows>(
+unsafe fn prefill_256_sel<S: KvSrc, G: OutGate, Q: QueryRows>(
     q: &[f32],
     qrows: Q,
-    kc: &[u16],
-    vc: &[u16],
+    src: S,
     list: &[u32],
     n_sel: &[u32],
     scale: f32,
@@ -1778,6 +1807,10 @@ unsafe fn prefill_256_sel<G: OutGate, Q: QueryRows>(
         DynamicSharedArray::<u32, 16>::offset(TILE_WORDS_256 * 4),
         DynamicSharedArray::<f32, 16>::offset(2 * TILE_WORDS_256 * 4),
     );
+    // A q8 cache's two scales tiles, past the scores: 16-byte aligned (their
+    // offset DYN_BYTES_SEL is), so the 16-byte scale copies land aligned.
+    let sk = DynamicSharedArray::<u16, 16>::offset(DYN_BYTES_SEL);
+    let sv = DynamicSharedArray::<u16, 16>::offset(DYN_BYTES_SEL + Q8_SCALE_TILE_256 * 2);
 
     // SAFETY: t < m <= n_sel.len() (launch contract).
     let count = unsafe { *n_sel.get_unchecked(t) };
@@ -1882,14 +1915,43 @@ unsafe fn prefill_256_sel<G: OutGate, Q: QueryRows>(
 
     // Thread `tid` copies 16-byte column `tid % ROW_CHUNKS_256` of tile keys
     // `tid / ROW_CHUNKS_256 + PASS_KEYS_256·i`, from the cache rows the list
-    // names for them.
+    // names for them; on a q8 cache, code chunk `tid % Q8_ROW_CCHUNKS_256` of
+    // keys `tid / Q8_ROW_CCHUNKS_256 + Q8_PASS_KEYS_256·i` (`i <
+    // Q8_TILE_CCHUNKS_256`) and, below `KEY_TILE`, key `tid`'s scales (slot
+    // `Q8_TILE_CCHUNKS_256` of the rows).
+    let [k_rows, k_scales, v_rows, v_scales] = src.words();
     let col = tid % ROW_CHUNKS_256;
     let plane = kh * ctx as usize * ROW_WORDS_256 + 4 * col;
-    let k_src = kc.as_ptr().cast::<u32>().wrapping_add(plane);
-    let v_src = vc.as_ptr().cast::<u32>().wrapping_add(plane);
+    let k_src = k_rows.wrapping_add(plane);
+    let v_src = v_rows.wrapping_add(plane);
     let key_of_pass0 = tid / ROW_CHUNKS_256;
+    // The q8 planes' first rows of this key head, codes at this thread's
+    // chunk and scales a side (the scales' u32 half-words: a row's
+    // HEAD_256/32 u16).
+    let rowq = kh * ctx as usize;
+    let qcol = tid % Q8_ROW_CCHUNKS_256;
+    let kq_src = k_rows.wrapping_add(rowq * (HEAD_256 / 4) + 4 * qcol);
+    let kd_src = k_scales.wrapping_add(rowq * (HEAD_256 / 32) / 2);
+    let vq_src = v_rows.wrapping_add(rowq * (HEAD_256 / 4) + 4 * qcol);
+    let vd_src = v_scales.wrapping_add(rowq * (HEAD_256 / 32) / 2);
     let list_row = list.as_ptr().wrapping_add(t * width as usize);
     let tiles = c.div_ceil(KEY_TILE_U32);
+    // The tile key of this thread's slot `i` of the rows, or `KEY_TILE` for a
+    // slot it does not copy.
+    macro_rules! slot_key {
+        ($i:expr) => {{
+            let i: usize = $i;
+            if !S::Q8 {
+                key_of_pass0 + i * PASS_KEYS_256
+            } else if i < Q8_TILE_CCHUNKS_256 {
+                tid / Q8_ROW_CCHUNKS_256 + i * Q8_PASS_KEYS_256
+            } else if i == Q8_TILE_CCHUNKS_256 && tid < KEY_TILE {
+                tid
+            } else {
+                KEY_TILE
+            }
+        }};
+    }
     // The cache rows of tile `kb`'s keys this thread copies; a key at or past
     // the count reads no entry.
     macro_rules! listed_rows {
@@ -1898,8 +1960,9 @@ unsafe fn prefill_256_sel<G: OutGate, Q: QueryRows>(
             let mut r = [0u32; CHUNKS_256];
             for i in 0..CHUNKS_256 {
                 cuda_device::thread::__unroll_config::<0>();
-                let j = kb * KEY_TILE_U32 + (key_of_pass0 + i * PASS_KEYS_256) as u32;
-                if j < c {
+                let key = slot_key!(i);
+                let j = kb * KEY_TILE_U32 + key as u32;
+                if key < KEY_TILE && j < c {
                     // SAFETY: j < c <= width and t < m, so t·width + j <
                     // m·width <= list.len() (launch contract).
                     r[i] = unsafe { *list_row.add(j as usize) };
@@ -1945,10 +2008,91 @@ unsafe fn prefill_256_sel<G: OutGate, Q: QueryRows>(
             unsafe { cp_async_commit_group() };
         }};
     }
+    // Stage tile `kb` of one side's q8 planes from the rows `r` (the dense
+    // walk's `stage_q8` at a listed row): the code words as 16-byte
+    // `cp.async` copies into the low half of the f16 tile's rows, the scales
+    // as one 16-byte copy a row; a listed row at or past the cache raises
+    // `pool_select`, its codes zero and its scales the f16 NaN pattern, so it
+    // widens to NaN; a key at or past the count zeroed and never read. One
+    // group a stage.
+    macro_rules! stage_listed_q8 {
+        ($tile:expr, $sk:expr, $qs:expr, $ds:expr, $kb:expr, $r:expr) => {{
+            let (tile, sk, qs, ds, kb, r): (
+                *mut u32,
+                *mut u16,
+                *const u32,
+                *const u32,
+                u32,
+                [u32; CHUNKS_256],
+            ) = ($tile, $sk, $qs, $ds, $kb, $r);
+            for i in 0..Q8_TILE_CCHUNKS_256 {
+                cuda_device::thread::__unroll_config::<0>();
+                let row = slot_key!(i);
+                // SAFETY: row < KEY_TILE and words 4·qcol .. + 4 are one
+                // whole chunk of the row's low half: the 16 destination bytes
+                // are inside the tile and 16-byte aligned.
+                let d = unsafe { tile.add(row * ROW_WORDS_256 + 4 * qcol) };
+                let j = kb * KEY_TILE_U32 + row as u32;
+                if j < c && r[i] < ctx {
+                    // SAFETY: the row is below ctx, so it lies inside this
+                    // key head's codes plane (launch contract); rows are
+                    // HEAD_256/4 words and the plane starts 16-byte aligned
+                    // (host-checked), so the source is 16-byte aligned.
+                    unsafe { cp_async_cg_16(d, qs.wrapping_add(r[i] as usize * (HEAD_256 / 4))) };
+                } else {
+                    if j < c {
+                        fault.raise(FaultSite::PoolSelect);
+                    }
+                    // SAFETY: `d` is 16 bytes inside the tile, 16-byte
+                    // aligned, this thread's chunk alone, and no warp reads
+                    // the tile before the barrier after this stage's wait.
+                    unsafe { *d.cast::<U32x4>() = U32x4::splat(0) };
+                }
+            }
+            if tid < KEY_TILE {
+                // SAFETY: the row's HEAD_256/32 u16 are one aligned 16-byte
+                // chunk of the scales tile, this thread's row alone.
+                let d = unsafe { sk.cast::<u32>().add(4 * tid) };
+                let j = kb * KEY_TILE_U32 + tid as u32;
+                let row = r[Q8_TILE_CCHUNKS_256];
+                if j < c && row < ctx {
+                    // SAFETY: the row is below ctx: its scales are inside the
+                    // plane (launch contract), one 16-byte aligned chunk of
+                    // HEAD_256/32 u16.
+                    unsafe { cp_async_cg_16(d, ds.wrapping_add(row as usize * 4)) };
+                } else {
+                    let fill = if j < c { SEL_NAN4 as u32 } else { 0 };
+                    // SAFETY: this thread's chunk alone, read only by the
+                    // widening after this stage's wait.
+                    unsafe { *d.cast::<U32x4>() = U32x4::splat(fill) };
+                }
+            }
+            // SAFETY: closes this thread's copies above as one group.
+            unsafe { cp_async_commit_group() };
+        }};
+    }
+    // Stage tile `kb` of the key (`K`) or value (`V`) side in the cache's
+    // format from the rows `r`.
+    macro_rules! stage_side {
+        (K, $kb:expr, $r:expr) => {
+            if S::Q8 {
+                stage_listed_q8!(kt, sk, kq_src, kd_src, $kb, $r);
+            } else {
+                stage_listed!(kt, k_src, $kb, $r);
+            }
+        };
+        (V, $kb:expr, $r:expr) => {
+            if S::Q8 {
+                stage_listed_q8!(vt, sv, vq_src, vd_src, $kb, $r);
+            } else {
+                stage_listed!(vt, v_src, $kb, $r);
+            }
+        };
+    }
     let mut rows_cur = [0u32; CHUNKS_256];
     if tiles > 0 {
         rows_cur = listed_rows!(0);
-        stage_listed!(kt, k_src, 0, rows_cur);
+        stage_side!(K, 0, rows_cur);
     }
 
     // This lane's `ldmatrix` addresses: the key tile's in the first sixteen
@@ -2009,7 +2153,12 @@ unsafe fn prefill_256_sel<G: OutGate, Q: QueryRows>(
         // then publishes every thread's copies.
         unsafe { cp_async_wait_group(0) };
         thread::sync_threads();
-        stage_listed!(vt, v_src, kb, rows_cur);
+        // A q8 key tile landed as raw codes and scales: widened in place
+        // before the scores read it.
+        if S::Q8 {
+            widen_256!((kt, sk), (wid, lane), kb, key => key < c);
+        }
+        stage_side!(V, kb, rows_cur);
         let rows_next = if kb + 1 < tiles {
             listed_rows!(kb + 1)
         } else {
@@ -2044,7 +2193,7 @@ unsafe fn prefill_256_sel<G: OutGate, Q: QueryRows>(
         // Every warp is done reading the key tile: the next one lands under
         // the softmax and the value product.
         if kb + 1 < tiles {
-            stage_listed!(kt, k_src, kb + 1, rows_next);
+            stage_side!(K, kb + 1, rows_next);
         }
 
         // S = S_lo + S_hi for every key of the tile, in every warp.
@@ -2094,6 +2243,10 @@ unsafe fn prefill_256_sel<G: OutGate, Q: QueryRows>(
             unsafe { cp_async_wait_group(0) };
         }
         thread::sync_threads();
+        // A q8 value tile likewise, before the value product reads it.
+        if S::Q8 {
+            widen_256!((vt, sv), (wid, lane), kb, key => key < c);
+        }
 
         // ---- O += P̂·V over the warp's dims.
         for kk2 in 0..PV_STEPS {
@@ -3451,7 +3604,80 @@ mod flash_gqa_prefill_kernels {
         // memory.
         unsafe {
             prefill_256_sel(
-                q, Stored, kc, vc, list, n_sel, scale, n_kv, ctx, width, m, fault, Ungated, y,
+                q,
+                Stored,
+                F16Kv { k: kc, v: vc },
+                list,
+                n_sel,
+                scale,
+                n_kv,
+                ctx,
+                width,
+                m,
+                fault,
+                Ungated,
+                y,
+            )
+        };
+    }
+
+    /// [`gqa_prefill_flash_256_p12_sel`] over the Q8_0 cache
+    /// ([`prefill_256_sel`] over [`Q8Kv`], the module doc's `_q8` staging).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        dynamic_shared = 75776,
+        requires = (
+            n_sel.len() >= m,
+            list.len() >= m * width,
+            q.len() >= m * n_kv * 12 * 256,
+            kq.len() >= n_kv * ctx * 64,
+            kd.len() >= n_kv * ctx * 8,
+            vq.len() >= n_kv * ctx * 64,
+            vd.len() >= n_kv * ctx * 8,
+            y.len() >= m * n_kv * 12 * 256
+        )
+    )]
+    pub fn gqa_prefill_flash_256_p12_sel_q8(
+        q: &[f32],
+        kq: &[u32],
+        kd: &[u16],
+        vq: &[u32],
+        vd: &[u16],
+        list: &[u32],
+        n_sel: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        width: u32,
+        m: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        // SAFETY: the launch contract is `prefill_256_sel`'s over the four
+        // Q8_0 planes, and the block is THREADS_256 threads with
+        // DYN_BYTES_SEL_Q8 bytes of dynamic shared memory.
+        unsafe {
+            prefill_256_sel(
+                q,
+                Stored,
+                Q8Kv { kq, kd, vq, vd },
+                list,
+                n_sel,
+                scale,
+                n_kv,
+                ctx,
+                width,
+                m,
+                fault,
+                Ungated,
+                y,
             )
         };
     }
@@ -3592,8 +3818,163 @@ mod flash_gqa_prefill_kernels {
             prefill_256_sel(
                 qg,
                 rows,
-                kc,
-                vc,
+                F16Kv { k: kc, v: vc },
+                list,
+                n_sel,
+                scale,
+                n_kv,
+                ctx,
+                width,
+                m,
+                fault,
+                SigmoidGate { qg, fault },
+                y,
+            )
+        };
+    }
+
+    /// [`gqa_prefill_flash_256_p4_gated`] over the Q8_0 cache
+    /// ([`prefill_256_p`] over [`Q8Kv`]): the staging the module doc's `_q8`
+    /// paragraph names, the query norm, the walk and the out gate the f16
+    /// entry's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        dynamic_shared = 100352,
+        requires = (
+            n_keys_buf.len() >= t_rows,
+            pos.len() >= t_rows,
+            qg.len() >= t_rows * n_kv * packs * 4 * 512,
+            gain.len() >= 256,
+            table.len() >= ctx * 64,
+            kq.len() >= n_kv * ctx * 64,
+            kd.len() >= n_kv * ctx * 8,
+            vq.len() >= n_kv * ctx * 64,
+            vd.len() >= n_kv * ctx * 8,
+            y.len() >= t_rows * n_kv * packs * 4 * 256
+        )
+    )]
+    pub fn gqa_prefill_flash_256_p4_gated_q8(
+        qg: &[f32],
+        gain: &[f32],
+        table: &[f32],
+        pos: &[u32],
+        eps: f32,
+        kq: &[u32],
+        kd: &[u16],
+        vq: &[u32],
+        vd: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        t_rows: u32,
+        packs: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        let rows = NormedRows {
+            qg,
+            gain,
+            table,
+            pos,
+            eps,
+            ctx,
+            fault,
+        };
+        // SAFETY: the launch contract is `gqa_prefill_flash_256_p4_gated`'s
+        // over the four Q8_0 planes, and the block is THREADS_256 threads with
+        // DYN_BYTES_256_Q8 bytes of dynamic shared memory.
+        unsafe {
+            prefill_256_p::<PACK_4, { SLICE_ROWS / PACK_4 }, false, _, _, _>(
+                qg,
+                rows,
+                Q8Kv { kq, kd, vq, vd },
+                n_keys_buf,
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                t_rows,
+                packs as usize,
+                fault,
+                SigmoidGate { qg, fault },
+                y,
+            )
+        };
+    }
+
+    /// [`gqa_prefill_flash_256_p12_sel_gated`] over the Q8_0 cache
+    /// ([`prefill_256_sel`] over [`Q8Kv`]): the listed rows staged as the q8
+    /// tiles of [`gqa_prefill_flash_256_p4_gated_q8`], every other step the
+    /// f16 entry's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        dynamic_shared = 75776,
+        requires = (
+            n_sel.len() >= m,
+            pos.len() >= m,
+            list.len() >= m * width,
+            qg.len() >= m * n_kv * 12 * 512,
+            gain.len() >= 256,
+            table.len() >= ctx * 64,
+            kq.len() >= n_kv * ctx * 64,
+            kd.len() >= n_kv * ctx * 8,
+            vq.len() >= n_kv * ctx * 64,
+            vd.len() >= n_kv * ctx * 8,
+            y.len() >= m * n_kv * 12 * 256
+        )
+    )]
+    pub fn gqa_prefill_flash_256_p12_sel_gated_q8(
+        qg: &[f32],
+        gain: &[f32],
+        table: &[f32],
+        pos: &[u32],
+        eps: f32,
+        kq: &[u32],
+        kd: &[u16],
+        vq: &[u32],
+        vd: &[u16],
+        list: &[u32],
+        n_sel: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        width: u32,
+        m: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        let rows = NormedRows {
+            qg,
+            gain,
+            table,
+            pos,
+            eps,
+            ctx,
+            fault,
+        };
+        // SAFETY: the launch contract is `gqa_prefill_flash_256_p12_sel_gated`'s
+        // over the four Q8_0 planes, and the block is THREADS_256 threads with
+        // DYN_BYTES_SEL_Q8 bytes of dynamic shared memory.
+        unsafe {
+            prefill_256_sel(
+                qg,
+                rows,
+                Q8Kv { kq, kd, vq, vd },
                 list,
                 n_sel,
                 scale,
@@ -4093,13 +4474,20 @@ pub struct GqaPrefillArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
-/// Validate a packed f16 prefill launch and return packs per key head.
+/// Validate a packed prefill launch over either cache format ([`CachePlanes`])
+/// and return packs per key head: nonzero `n_kv`, `ctx` and `t`, a group that
+/// is a nonzero multiple of `pack`, `q`, `n_keys`, `y` and every cache plane
+/// long enough, `q` 8-byte and every plane 16-byte aligned, and a key walk to
+/// `ctx + tile` that fits u32; each refused by name.
 pub(crate) fn checked_packed(
     what: &'static str,
-    a: &GqaPrefillArgs<'_>,
+    q: &DeviceBuffer<f32>,
+    kv: CachePlanes<'_>,
+    n_keys: &DeviceBuffer<u32>,
+    y: &DeviceBuffer<f32>,
+    (n_head, n_kv, ctx, t): (usize, usize, usize, usize),
     (head, tile, pack): (usize, usize, usize),
 ) -> Result<usize, GpuError> {
-    let (n_head, n_kv, ctx, t) = (a.n_head, a.n_kv, a.ctx, a.t);
     if n_kv == 0 || ctx == 0 || t == 0 {
         return Err(GpuError::shape(
             what,
@@ -4115,35 +4503,18 @@ pub(crate) fn checked_packed(
             ),
         ));
     }
-    let packs = n_head / (n_kv * pack);
-    let lens = [
-        ("q", a.q.len(), t * n_head * head),
-        ("kc", a.kc.len(), n_kv * ctx * head),
-        ("vc", a.vc.len(), n_kv * ctx * head),
-        ("n_keys", a.n_keys.len(), t),
-        ("y", a.y.len(), t * n_head * head),
-    ];
-    if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
-        return Err(GpuError::shape(
-            what,
-            format!("{name}.len() {got} < {need}"),
-        ));
-    }
+    short(
+        what,
+        &[
+            ("q", q.len(), t * n_head * head),
+            ("n_keys", n_keys.len(), t),
+            ("y", y.len(), t * n_head * head),
+        ],
+    )?;
+    kv.check_lens(what, head, n_kv, ctx)?;
     // A window at another offset is a misaligned access on the card.
-    let starts = [
-        ("q", a.q.cu_deviceptr(), 8u64),
-        ("kc", a.kc.cu_deviceptr(), 16),
-        ("vc", a.vc.cu_deviceptr(), 16),
-    ];
-    if let Some((name, at, align)) = starts
-        .iter()
-        .find(|(_, at, align)| !at.is_multiple_of(*align))
-    {
-        return Err(GpuError::shape(
-            what,
-            format!("{name} at {at:#x} is not {align}-byte aligned"),
-        ));
-    }
+    crate::tensor::check_alignment::<u64, _>(what, "q", q)?;
+    kv.check_aligned(what)?;
     // The walk counts keys in u32 up to one tile past the largest count.
     if ctx > u32::MAX as usize - tile {
         return Err(GpuError::shape(
@@ -4151,7 +4522,7 @@ pub(crate) fn checked_packed(
             format!("ctx = {ctx}: the key walk counts to ctx + {tile} in u32"),
         ));
     }
-    Ok(packs)
+    Ok(n_head / (n_kv * pack))
 }
 
 /// [`GqaPrefillArgs`]' q8_0 form: the same query rows, counts and output,
@@ -4573,17 +4944,75 @@ impl FlashGqaPrefill {
         self.enqueue_packed(what, stream, args, PACK_4, None, Some(query))
     }
 
+    /// [`FlashGqaPrefill::enqueue_256_p4_gated`] over the Q8_0 cache
+    /// (`gqa_prefill_flash_256_p4_gated_q8`): the planes [`q8_plane_lens`] at
+    /// [`HEAD_256`], one launch with 100,352 bytes of dynamic shared memory,
+    /// the f16 launch's refusals by name before it, the planes' lengths and
+    /// 16-byte alignment checked. Asynchronous, allocation-free, capturable.
+    pub(crate) fn enqueue_256_p4_gated_q8(
+        &self,
+        stream: &CudaStream,
+        args: GqaPrefillQ8Args<'_>,
+        query: QueryNorm<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "flash_gqa_prefill::enqueue_256_p4_gated_q8";
+        let GqaPrefillQ8Args {
+            q,
+            kq,
+            kd,
+            vq,
+            vd,
+            n_keys,
+            scale,
+            n_head,
+            n_kv,
+            ctx,
+            t,
+            fault,
+            y,
+        } = args;
+        query.holds(what, q, (t, n_head, ctx))?;
+        let packs = checked_packed(
+            what,
+            q,
+            CachePlanes::Q8 { kq, kd, vq, vd },
+            n_keys,
+            &*y,
+            (n_head, n_kv, ctx, t),
+            (HEAD_256, KEY_TILE, PACK_4),
+        )?;
+        let QueryNorm {
+            gain,
+            table,
+            pos,
+            eps,
+        } = query;
+        let grid = launch_u32(what, "grid", t.div_ceil(Q_ROWS_256 / PACK_4) * n_kv * packs)?;
+        let packs = launch_u32(what, "packs", packs)?;
+        let n_kv = launch_u32(what, "n_kv", n_kv)?;
+        let ctx = launch_u32(what, "ctx", ctx)?;
+        let t = launch_u32(what, "t", t)?;
+        let cfg = LaunchConfig1D::new(grid, THREADS_256_U32, DYN_BYTES_256_Q8_U32);
+        let prep = self.module.prepare_gqa_prefill_flash_256_p4_gated_q8(cfg)?;
+        self.module.gqa_prefill_flash_256_p4_gated_q8(
+            stream, &prep, q, gain, table, pos, eps, kq, kd, vq, vd, n_keys, scale, n_kv, ctx, t,
+            packs, fault, y,
+        )?;
+        Ok(())
+    }
+
     /// [`FlashGqaPrefill::enqueue_256_p4`]'s attention for `m` rows over the
     /// keys their lists name (`gqa_prefill_flash_256_p12_sel`, the listed
     /// section): key `j` of row `t` is cache row `list[t·width + j]` for `j <
     /// n_sel[t]`. One launch of `m · n_kv` blocks of 256 threads with 73,728
-    /// bytes of dynamic shared memory. Refused by name before any launch: a
-    /// group that is not [`PACK_12`] heads a key head, a size of zero, a short
-    /// buffer (`check_listed_256`), `q` not 8-byte or `kc`/`vc` not 16-byte
-    /// aligned, a width whose walk passes u32. A count of zero or past the
-    /// width raises [`FaultSite::KeyCount`] and a list entry at or past `ctx`
-    /// raises [`FaultSite::PoolSelect`]; either row is NaN. Asynchronous,
-    /// allocation-free, capturable.
+    /// bytes of dynamic shared memory; on a q8_0 cache
+    /// (`gqa_prefill_flash_256_p12_sel_q8`) 75,776. Refused by name before any
+    /// launch: a group that is not [`PACK_12`] heads a key head, a size of
+    /// zero, a short buffer (`check_listed_256`), `q` not 8-byte or a plane
+    /// not 16-byte aligned, a width whose walk passes u32. A count of zero or
+    /// past the width raises [`FaultSite::KeyCount`] and a list entry at or
+    /// past `ctx` raises [`FaultSite::PoolSelect`]; either row is NaN.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_256_p12_sel(
         &self,
         stream: &CudaStream,
@@ -4617,8 +5046,8 @@ impl FlashGqaPrefill {
     }
 
     /// The listed entries' one launcher: the checks of
-    /// [`FlashGqaPrefill::enqueue_256_p12_sel`], then its entry, the gated
-    /// one when `query` is given.
+    /// [`FlashGqaPrefill::enqueue_256_p12_sel`], then its entry over the
+    /// cache's format, the gated one when `query` is given.
     fn enqueue_listed(
         &self,
         what: &'static str,
@@ -4630,8 +5059,7 @@ impl FlashGqaPrefill {
         check_listed_256(what, &args, n_head)?;
         let GqaListArgs {
             q,
-            kc,
-            vc,
+            kv,
             list,
             n_sel,
             width,
@@ -4644,8 +5072,7 @@ impl FlashGqaPrefill {
         } = args;
         // A window at another offset is a misaligned access on the card.
         crate::tensor::check_alignment::<u64, _>(what, "q", q)?;
-        crate::tensor::check_alignment::<U32x4, _>(what, "kc", kc)?;
-        crate::tensor::check_alignment::<U32x4, _>(what, "vc", vc)?;
+        kv.check_aligned(what)?;
         // The walk counts list positions in u32 up to one tile past the width.
         if width > u32::MAX as usize - KEY_TILE {
             return Err(GpuError::shape(
@@ -4658,26 +5085,54 @@ impl FlashGqaPrefill {
         let ctx = launch_u32(what, "ctx", ctx)?;
         let width = launch_u32(what, "width", width)?;
         let m = launch_u32(what, "m", m)?;
-        let cfg = LaunchConfig1D::new(grid, THREADS_256_U32, DYN_BYTES_SEL_U32);
-        match query {
-            None => {
-                let prep = self.module.prepare_gqa_prefill_flash_256_p12_sel(cfg)?;
+        let f16 = LaunchConfig1D::new(grid, THREADS_256_U32, DYN_BYTES_SEL_U32);
+        let q8 = LaunchConfig1D::new(grid, THREADS_256_U32, DYN_BYTES_SEL_Q8_U32);
+        match (query, kv) {
+            (None, CachePlanes::F16 { kc, vc }) => {
+                let prep = self.module.prepare_gqa_prefill_flash_256_p12_sel(f16)?;
                 self.module.gqa_prefill_flash_256_p12_sel(
                     stream, &prep, q, kc, vc, list, n_sel, scale, n_kv, ctx, width, m, fault, y,
                 )?;
             }
-            Some(QueryNorm {
-                gain,
-                table,
-                pos,
-                eps,
-            }) => {
+            (None, CachePlanes::Q8 { kq, kd, vq, vd }) => {
+                let prep = self.module.prepare_gqa_prefill_flash_256_p12_sel_q8(q8)?;
+                self.module.gqa_prefill_flash_256_p12_sel_q8(
+                    stream, &prep, q, kq, kd, vq, vd, list, n_sel, scale, n_kv, ctx, width, m,
+                    fault, y,
+                )?;
+            }
+            (
+                Some(QueryNorm {
+                    gain,
+                    table,
+                    pos,
+                    eps,
+                }),
+                CachePlanes::F16 { kc, vc },
+            ) => {
                 let prep = self
                     .module
-                    .prepare_gqa_prefill_flash_256_p12_sel_gated(cfg)?;
+                    .prepare_gqa_prefill_flash_256_p12_sel_gated(f16)?;
                 self.module.gqa_prefill_flash_256_p12_sel_gated(
                     stream, &prep, q, gain, table, pos, eps, kc, vc, list, n_sel, scale, n_kv, ctx,
                     width, m, fault, y,
+                )?;
+            }
+            (
+                Some(QueryNorm {
+                    gain,
+                    table,
+                    pos,
+                    eps,
+                }),
+                CachePlanes::Q8 { kq, kd, vq, vd },
+            ) => {
+                let prep = self
+                    .module
+                    .prepare_gqa_prefill_flash_256_p12_sel_gated_q8(q8)?;
+                self.module.gqa_prefill_flash_256_p12_sel_gated_q8(
+                    stream, &prep, q, gain, table, pos, eps, kq, kd, vq, vd, list, n_sel, scale,
+                    n_kv, ctx, width, m, fault, y,
                 )?;
             }
         }
@@ -4756,7 +5211,18 @@ impl FlashGqaPrefill {
         k_first: Option<&DeviceBuffer<u32>>,
         query: Option<QueryNorm<'_>>,
     ) -> Result<(), GpuError> {
-        let packs = checked_packed(what, &args, (HEAD_256, KEY_TILE, pack))?;
+        let packs = checked_packed(
+            what,
+            args.q,
+            CachePlanes::F16 {
+                kc: args.kc,
+                vc: args.vc,
+            },
+            args.n_keys,
+            &*args.y,
+            (args.n_head, args.n_kv, args.ctx, args.t),
+            (HEAD_256, KEY_TILE, pack),
+        )?;
         let GqaPrefillArgs {
             q,
             kc,
@@ -5581,11 +6047,11 @@ mod tests {
     /// One case of the gated entries: the `[q | gate]` rows, the query norm's
     /// inputs, the cache and its counts, and the lists (every key below the
     /// row's count).
+    #[derive(Clone, Copy)]
     struct Gated<'a> {
         qg: &'a DeviceBuffer<f32>,
         query: QueryNorm<'a>,
-        kc: &'a DeviceBuffer<u16>,
-        vc: &'a DeviceBuffer<u16>,
+        kv: CachePlanes<'a>,
         n_keys: &'a DeviceBuffer<u32>,
         list: &'a DeviceBuffer<u32>,
         ctx: usize,
@@ -5605,8 +6071,7 @@ mod tests {
         if listed {
             let args = GqaListArgs {
                 q,
-                kc: c.kc,
-                vc: c.vc,
+                kv: c.kv,
                 list: c.list,
                 n_sel: c.n_keys,
                 width: c.ctx,
@@ -5622,24 +6087,120 @@ mod tests {
                 None => k.enqueue_256_p12_sel(s, args, G_HEAD),
             }
         } else {
-            let args = GqaPrefillArgs {
-                q,
-                kc: c.kc,
-                vc: c.vc,
-                n_keys: c.n_keys,
-                scale: 0.0625,
-                n_head: G_HEAD,
-                n_kv: G_KV,
-                ctx: c.ctx,
-                t: m,
-                fault,
-                y,
-            };
-            match query {
-                Some(qr) => k.enqueue_256_p4_gated(s, args, qr),
-                None => k.enqueue_256_p4(s, args),
+            match (c.kv, query) {
+                (CachePlanes::F16 { kc, vc }, query) => {
+                    let args = GqaPrefillArgs {
+                        q,
+                        kc,
+                        vc,
+                        n_keys: c.n_keys,
+                        scale: 0.0625,
+                        n_head: G_HEAD,
+                        n_kv: G_KV,
+                        ctx: c.ctx,
+                        t: m,
+                        fault,
+                        y,
+                    };
+                    match query {
+                        Some(qr) => k.enqueue_256_p4_gated(s, args, qr),
+                        None => k.enqueue_256_p4(s, args),
+                    }
+                }
+                (CachePlanes::Q8 { kq, kd, vq, vd }, Some(qr)) => k.enqueue_256_p4_gated_q8(
+                    s,
+                    GqaPrefillQ8Args {
+                        q,
+                        kq,
+                        kd,
+                        vq,
+                        vd,
+                        n_keys: c.n_keys,
+                        scale: 0.0625,
+                        n_head: G_HEAD,
+                        n_kv: G_KV,
+                        ctx: c.ctx,
+                        t: m,
+                        fault,
+                        y,
+                    },
+                    qr,
+                ),
+                (CachePlanes::Q8 { .. }, None) => panic!("no ungated pack-of-four q8 entry"),
             }
         }
+    }
+
+    /// The gated tests' inputs at `M` rows over a cache of `CTX` rows: the
+    /// planes' f32 values (multiples of 1/512 in [−1, 1), exact in f16), the
+    /// `[q | gate]` rows (raw queries in [−2, 2), gates in [−8, 8)), the
+    /// query norm's gain and table, the counts across the cache, each row's
+    /// list (every key below its count) and the positions.
+    struct GatedInputs {
+        k: Vec<f32>,
+        v: Vec<f32>,
+        rows: Vec<f32>,
+        gain: DeviceBuffer<f32>,
+        table: DeviceBuffer<f32>,
+        nk: DeviceBuffer<u32>,
+        list: DeviceBuffer<u32>,
+        pos: Vec<u32>,
+    }
+
+    impl GatedInputs {
+        fn new(s: &CudaStream, m: usize, ctx: usize) -> GatedInputs {
+            let up = |v: &[f32]| DeviceBuffer::from_host(s, v).expect("an upload");
+            let plane = |mul: usize| -> Vec<f32> {
+                (0..G_KV * ctx * HEAD_256)
+                    .map(|i| ((i * mul) % 1024) as f32 / 512.0 - 1.0)
+                    .collect()
+            };
+            let mut rows = vec![0.0f32; m * G_ROW * 2];
+            for r in 0..m * G_HEAD {
+                for d in 0..HEAD_256 {
+                    let at = r * 2 * HEAD_256 + d;
+                    rows[at] = ((r * 53 + d * 29) % 1000) as f32 / 250.0 - 2.0;
+                    rows[at + HEAD_256] = ((r * 31 + d * 17) % 1024) as f32 / 64.0 - 8.0;
+                }
+            }
+            let gain: Vec<f32> = (0..HEAD_256).map(|d| 0.5 + (d % 7) as f32 / 7.0).collect();
+            let table: Vec<f32> = (0..ctx * ROPE_256)
+                .map(|i| ((i * 43) % 1000) as f32 / 500.0 - 1.0)
+                .collect();
+            let counts: Vec<u32> = (0..m).map(|t| (1 + (t * 71) % ctx) as u32).collect();
+            let list: Vec<u32> = (0..m).flat_map(|_| 0..ctx as u32).collect();
+            GatedInputs {
+                k: plane(37),
+                v: plane(91),
+                rows,
+                gain: up(&gain),
+                table: up(&table),
+                nk: DeviceBuffer::from_host(s, &counts).expect("counts"),
+                list: DeviceBuffer::from_host(s, &list).expect("lists"),
+                pos: (0..m).map(|t| ((t * 7) % ctx) as u32).collect(),
+            }
+        }
+    }
+
+    /// `vals` (f32, a whole number of 32-value blocks) as the q8_0 planes the
+    /// quantizing append writes (`quantize_q8_0`, packed by
+    /// `weights::q8_0_planes`), and as the f16 bits of its dequantized values
+    /// (`code · d`, exact in f32): the q8 cache and its f16 twin.
+    fn q8_and_twin(vals: &[f32]) -> ((Vec<u32>, Vec<u16>), Vec<u16>) {
+        let blocks: Vec<_> = vals
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|b| model::quant::quantize_q8_0(b))
+            .collect();
+        let twin = blocks
+            .iter()
+            .flat_map(|b| {
+                let d = half_bits_to_f32(b.d);
+                b.q.iter().map(move |&c| f32_to_f16_bits(f32::from(c) * d))
+            })
+            .collect();
+        (crate::weights::q8_0_planes(&blocks), twin)
     }
 
     /// The gated launch through the pack-of-four entry or (`listed`) the
@@ -5751,53 +6312,32 @@ mod tests {
         let s = gpu.stream();
         let k = FlashGqaPrefill::load(gpu.context()).expect("the prefill module");
         let up = |v: &[f32]| DeviceBuffer::from_host(s, v).expect("an upload");
-        // Multiples of 1/512 in [−1, 1): exact in f16.
-        let plane = |mul: usize| -> DeviceBuffer<u16> {
-            let p: Vec<u16> = (0..G_KV * CTX * HEAD_256)
-                .map(|i| f32_to_f16_bits(((i * mul) % 1024) as f32 / 512.0 - 1.0))
-                .collect();
+        let f16 = |v: &[f32]| -> DeviceBuffer<u16> {
+            let p: Vec<u16> = v.iter().map(|&x| f32_to_f16_bits(x)).collect();
             DeviceBuffer::from_host(s, &p).expect("a plane")
         };
-        let (kc, vc) = (plane(37), plane(91));
-        let mut rows = vec![0.0f32; M * G_ROW * 2];
-        for r in 0..M * G_HEAD {
-            for d in 0..HEAD_256 {
-                let at = r * 2 * HEAD_256 + d;
-                rows[at] = ((r * 53 + d * 29) % 1000) as f32 / 250.0 - 2.0;
-                rows[at + HEAD_256] = ((r * 31 + d * 17) % 1024) as f32 / 64.0 - 8.0;
-            }
-        }
-        let gain: Vec<f32> = (0..HEAD_256).map(|d| 0.5 + (d % 7) as f32 / 7.0).collect();
-        let table: Vec<f32> = (0..CTX * ROPE_256)
-            .map(|i| ((i * 43) % 1000) as f32 / 500.0 - 1.0)
-            .collect();
-        let (gain, table) = (up(&gain), up(&table));
-        let counts: Vec<u32> = (0..M).map(|t| (1 + (t * 71) % CTX) as u32).collect();
-        let nk = DeviceBuffer::from_host(s, &counts).expect("counts");
-        let list: Vec<u32> = (0..M).flat_map(|_| 0..CTX as u32).collect();
-        let list = DeviceBuffer::from_host(s, &list).expect("lists");
-        let mut pos: Vec<u32> = (0..M).map(|t| ((t * 7) % CTX) as u32).collect();
-        let clean_pos = DeviceBuffer::from_host(s, &pos).expect("positions");
-        pos[9] = CTX as u32;
-        let bad_pos = DeviceBuffer::from_host(s, &pos).expect("positions");
-        let clean = up(&rows);
+        let mut i = GatedInputs::new(s, M, CTX);
+        let (kc, vc) = (f16(&i.k), f16(&i.v));
+        let clean_pos = DeviceBuffer::from_host(s, &i.pos).expect("positions");
+        i.pos[9] = CTX as u32;
+        let bad_pos = DeviceBuffer::from_host(s, &i.pos).expect("positions");
+        let clean = up(&i.rows);
         // Row 5's head 3, value 7.
         let bad_at = (5 * G_HEAD + 3) * HEAD_256 + 7;
-        rows[(5 * G_HEAD + 3) * 2 * HEAD_256 + HEAD_256 + 7] = f32::NAN;
-        let nan_gate = up(&rows);
+        i.rows[(5 * G_HEAD + 3) * 2 * HEAD_256 + HEAD_256 + 7] = f32::NAN;
+        let nan_gate = up(&i.rows);
         let sink = gpu.layer_sink(LAYER).expect("a sink");
         let base = Gated {
             qg: &clean,
             query: QueryNorm {
-                gain: &gain,
-                table: &table,
+                gain: &i.gain,
+                table: &i.table,
                 pos: &clean_pos,
                 eps: G_EPS,
             },
-            kc: &kc,
-            vc: &vc,
-            n_keys: &nk,
-            list: &list,
+            kv: CachePlanes::F16 { kc: &kc, vc: &vc },
+            n_keys: &i.nk,
+            list: &i.list,
             ctx: CTX,
         };
         let nan_case = Gated {
@@ -5897,6 +6437,128 @@ mod tests {
                     "listed={listed}: short {name}: {e}"
                 );
             }
+        }
+    }
+
+    /// The gated entries over a q8_0 cache (`enqueue_256_p4_gated_q8`, and
+    /// `enqueue_256_p12_sel_gated` on [`CachePlanes::Q8`]) and the ungated
+    /// listed one (`enqueue_256_p12_sel` there), at the f16 test's 40 rows
+    /// and counts: the cache's Q8_0 form built by `quantize_q8_0` over the
+    /// f16 test's plane values, each entry bit for bit its f16 entry on the
+    /// f16 cache of the dequantized values (the module doc's `_q8` rule: the
+    /// tiles stage `code · d` rounded to f16, every step after the staging is
+    /// the f16 walk's); a listed entry at the cache's height raises
+    /// `pool_select` at the launch's layer, that row NaN and every other bit
+    /// the clean run's; a codes plane one row short refused by name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_q8_gated_entries_are_the_f16_entries_on_the_dequantized_cache() {
+        const LAYER: usize = 13;
+        const M: usize = 40;
+        const CTX: usize = 300;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let s = gpu.stream();
+        let k = FlashGqaPrefill::load(gpu.context()).expect("the prefill module");
+        let i = GatedInputs::new(s, M, CTX);
+        let ((kq, kd), k16) = q8_and_twin(&i.k);
+        let ((vq, vd), v16) = q8_and_twin(&i.v);
+        let up32 = |v: &[u32]| DeviceBuffer::from_host(s, v).expect("a plane");
+        let up16 = |v: &[u16]| DeviceBuffer::from_host(s, v).expect("a plane");
+        let (kq, kd, vq, vd) = (up32(&kq), up16(&kd), up32(&vq), up16(&vd));
+        let (k16, v16) = (up16(&k16), up16(&v16));
+        let qg = DeviceBuffer::from_host(s, &i.rows).expect("rows");
+        let pos = DeviceBuffer::from_host(s, &i.pos).expect("positions");
+        let twin = Gated {
+            qg: &qg,
+            query: QueryNorm {
+                gain: &i.gain,
+                table: &i.table,
+                pos: &pos,
+                eps: G_EPS,
+            },
+            kv: CachePlanes::F16 { kc: &k16, vc: &v16 },
+            n_keys: &i.nk,
+            list: &i.list,
+            ctx: CTX,
+        };
+        let q8 = Gated {
+            kv: CachePlanes::Q8 {
+                kq: &kq,
+                kd: &kd,
+                vq: &vq,
+                vd: &vd,
+            },
+            ..twin
+        };
+        let sink = gpu.layer_sink(LAYER).expect("a sink");
+        let run = |c: &Gated<'_>, listed: bool, query: Option<QueryNorm<'_>>| {
+            let mut y = DeviceBuffer::<f32>::zeroed(s, M * G_ROW).expect("rows");
+            gated_launch(&gpu, &k, listed, c, (c.qg, query), sink, &mut y).expect("a flash launch");
+            s.synchronize().expect("the flash's sync");
+            let fault = gpu.take_fault().expect("the fault word");
+            (y.to_host_vec(s).expect("read back"), fault)
+        };
+        for (listed, query) in [
+            (false, Some(twin.query)),
+            (true, Some(twin.query)),
+            (true, None),
+        ] {
+            let (want, wf) = run(&twin, listed, query);
+            let (got, gf) = run(&q8, listed, query);
+            assert!(
+                wf.is_none() && gf.is_none(),
+                "listed={listed} gated={}: clean inputs raised {wf:?} {gf:?}",
+                query.is_some()
+            );
+            assert!(
+                want.iter().all(|v| v.is_finite()) && same(&want, &got),
+                "listed={listed} gated={}: not the f16 twin's bits",
+                query.is_some()
+            );
+        }
+        // Row 7's list names the cache's height at position 3.
+        let (clean, _) = run(&q8, true, Some(twin.query));
+        let mut list: Vec<u32> = (0..M).flat_map(|_| 0..CTX as u32).collect();
+        list[7 * CTX + 3] = CTX as u32;
+        let list = DeviceBuffer::from_host(s, &list).expect("lists");
+        let (got, f) = run(&Gated { list: &list, ..q8 }, true, Some(twin.query));
+        let f = f.expect("a listed row past the cache raises a fault");
+        assert!(
+            f.layer == LAYER as u32 && f.site() == Some(FaultSite::PoolSelect),
+            "a listed row past the cache raised {f:?}"
+        );
+        for (r, (a, b)) in got.chunks(G_ROW).zip(clean.chunks(G_ROW)).enumerate() {
+            if r == 7 {
+                assert!(a.iter().all(|v| v.is_nan()), "row 7: not NaN");
+            } else {
+                assert!(same(a, b), "row {r}: moved by row 7's bad entry");
+            }
+        }
+        // A codes plane one row short, refused by name by both entries.
+        let (words, _) = q8_plane_lens(HEAD_256, G_KV, CTX);
+        let kq_short = DeviceBuffer::<u32>::zeroed(s, words - HEAD_256 / 4).expect("a plane");
+        let short = Gated {
+            kv: CachePlanes::Q8 {
+                kq: &kq_short,
+                kd: &kd,
+                vq: &vq,
+                vd: &vd,
+            },
+            ..q8
+        };
+        let mut y = DeviceBuffer::<f32>::zeroed(s, M * G_ROW).expect("rows");
+        for listed in [false, true] {
+            let r = gated_launch(
+                &gpu,
+                &k,
+                listed,
+                &short,
+                (&qg, Some(twin.query)),
+                sink,
+                &mut y,
+            );
+            let e = r.expect_err("a short codes plane").to_string();
+            assert!(e.contains("kq.len()"), "listed={listed}: {e}");
         }
     }
 }

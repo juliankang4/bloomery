@@ -689,7 +689,15 @@ gguf 7 2 0
 # (linear/delta.rs) keeps its state transposed in registers, so the state staging, the projection round trip and the
 # packed solved rows go (17 blocks fewer); its reads move into `prepared_reads`, and `frag_mma` and `split_mma` (an
 # MMA with its A operand in registers, and its high/residual terms) are new unsafe fns, each with its Safety section.
-gpu 2795 381 10
+# PIN(2026-10-29): gpu 2795 -> 2806 blocks, new code, not old code relaxed: the q8_0 KV cache's flashes. flash_gqa.rs
+# (+1): the two walks' `stage_row` bodies (2 blocks) become `row`, an unsafe fn per walk that only finds the row, and
+# the two staging blocks (contiguous and listed) become three that read the cache's word through `KvSrc` (the
+# contiguous word, the walk's row and the listed word); the two new seg entries (`gqa_flash_seg_mma_256_p12_sel_q8`, `gqa_flash_seg_mma_256_p4_q8`) hold one block
+# each over the segment pass. flash_gqa_prefill.rs (+10): `prefill_256_sel`'s q8_0 stage (`stage_listed_q8`, the
+# code chunk's address, its copy and its zero fill, the scales chunk's address, its copy and its fill, and the group's
+# commit, 7 blocks, as `prefill_256_p`'s q8_0 stage) and the three new entries (`gqa_prefill_flash_256_p12_sel_q8`,
+# `_p12_sel_gated_q8`, `_p4_gated_q8`), one block each over their body. Each block has its SAFETY line.
+gpu 2806 381 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

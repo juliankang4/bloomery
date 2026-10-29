@@ -115,7 +115,12 @@
 //! through [`q8_word_values`] and `f32x2_to_f16x2_bits`. Their products carry
 //! the f16 rounding the f16 cache never had, so the owning gates hold each
 //! entry bit for bit to its f16 twin run on the f16 cache of those
-//! dequantized values. No scalar or packed (`_p4`, `_p2`) q8 pass exists.
+//! dequantized values. The pack-of-four tensor-core pass
+//! ([`FlashGqaKernels::enqueue_pass_256_p4_q8`], `seg_mma_p`) and the
+//! `_p12_sel` pass over a q8_0 cache (`seg_mma_ps`, through
+//! [`FlashGqaKernels::enqueue_pass_256_p12_sel`] on [`CachePlanes::Q8`]) are
+//! the same two instances of their bodies, held to their f16 twins the same
+//! way. No scalar q8 pass exists, nor a `_p2` or `_p16_blocks` one.
 //!
 //! A key at or past the segment's end stages zeros, so a refused block's NaN
 //! scale reaches a live result only as the f16 twin's NaN rows do — through a
@@ -1958,14 +1963,16 @@ unsafe fn seg_scalar_p<const HEAD: usize, const QW: usize, const PACK: usize>(
 /// `mma.m16n8k16` per `ldmatrix.x4` of the key), then add the slices in
 /// ascending order — the order the prefill flash adds its two warps' half
 /// scores in, so both compute a key's score to the same bits — and write
-/// `scale · S`. Both staged strides are `mma_row_words(HEAD)` words.
+/// `scale · S`. Both staged strides are `mma_row_words(HEAD)` words. The
+/// cache is in the format `S` ([`F16Kv`], or [`Q8Kv`] for the `_p4_q8` entry):
+/// only a tile's staged words differ ([`KvSrc::word`]).
 ///
 /// SAFETY: the entry's launch contract at `HEAD` and `packs · PACK` query
-/// heads per key head, a block of `PACK · 32` threads, and the four tiles this
-/// block's shared memory as the entry declared them: the query tile
-/// (`MMA_ROWS · mma_row_words(HEAD)` u32), the key tile (`KEY_TILE ·
-/// mma_row_words(HEAD)` u32), the value tile (`KEY_TILE · HEAD/4` u64) and the
-/// weight tile (`PACK · KEY_TILE` f32).
+/// heads per key head over `src`'s planes, a block of `PACK · 32` threads,
+/// and the four tiles this block's shared memory as the entry declared them:
+/// the query tile (`MMA_ROWS · mma_row_words(HEAD)` u32), the key tile
+/// (`KEY_TILE · mma_row_words(HEAD)` u32), the value tile (`KEY_TILE ·
+/// HEAD/4` u64) and the weight tile (`PACK · KEY_TILE` f32).
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
@@ -1980,10 +1987,10 @@ unsafe fn seg_mma_p<
     const QW: usize,
     const PACK: usize,
     const TILE_PACKS: usize,
+    S: KvSrc,
 >(
     q: &[f32],
-    kc: &[u16],
-    vc: &[u16],
+    src: S,
     n_keys_buf: &[u32],
     scale: f32,
     n_kv: u32,
@@ -2081,9 +2088,7 @@ unsafe fn seg_mma_p<
         }
     }
 
-    let plane = kh * ctx * HEAD;
-    let k64 = kc.as_ptr() as *const u64;
-    let v64 = vc.as_ptr() as *const u64;
+    let head = src.head::<HEAD>(kh, ctx);
     let key0 = (w % 4) * MMA_NTILE;
     let arow = lane % MMA_ROWS;
     let ahalf = lane / MMA_ROWS;
@@ -2101,12 +2106,9 @@ unsafe fn seg_mma_p<
             let key = e / row_qwords;
             let word = e - key * row_qwords;
             let (kw, vw) = if t0 + key < hi {
-                // SAFETY: as in seg_scalar — the row is inside key head kh's
-                // plane and the u64 read is aligned.
-                unsafe {
-                    let r = (plane + (t0 + key) * HEAD) / 4 + word;
-                    (*k64.add(r), *v64.add(r))
-                }
+                // SAFETY: head is key head kh's, t0 + key < hi <= the row's
+                // live count <= ctx and word < HEAD/4.
+                unsafe { S::word::<HEAD>(head, t0 + key, word) }
             } else {
                 (0u64, 0u64)
             };
@@ -2222,44 +2224,29 @@ unsafe fn seg_mma_p<
 
 /// How a listed segment pass finds the cache row of a row's key `j`: the
 /// walk [`seg_mma_ps`] takes a row's count bound from
-/// ([`KeyWalk::count_cap`]) and stages a tile through
-/// ([`KeyWalk::stage_row`]); every other step is [`seg_mma_p`]'s.
+/// ([`KeyWalk::count_cap`]) and a staged key's cache row from
+/// ([`KeyWalk::row`]); the row's words come from the cache format
+/// ([`KvSrc::word`]), and every other step is [`seg_mma_p`]'s.
 trait KeyWalk: Copy {
     /// The largest live count a row may carry: past it the row is refused
     /// ([`live_keys`]).
     fn count_cap(self) -> usize;
 
-    /// Word `word` (u64) of key `j` of row `t` for key head `kh`, in the key
-    /// and the value plane: `plane` is the key head's first value, the planes
-    /// `ctx` rows of `HEAD` f16 per key head.
+    /// The cache row of key `j` of row `t` for key head `kh`, below `ctx`;
+    /// `None`, with [`FaultSite::PoolSelect`] raised, for an entry at or past
+    /// the cache, whose key stages the f16 NaN pattern ([`SEL_NAN4`]) in both
+    /// planes, so the row's output is NaN, never a plausible value.
     ///
     /// # Safety
     /// `j` is below row `t`'s live count ([`live_keys`] at
     /// [`KeyWalk::count_cap`]), `t` a row of the launch, `kh` a key head of
-    /// it, `word < HEAD/4`, `plane` key head `kh`'s first value, and the
-    /// entry's launch contract holds.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the staging's state is the caller's registers, passed by value"
-    )]
-    unsafe fn stage_row<const HEAD: usize>(
-        self,
-        t: usize,
-        kh: usize,
-        j: usize,
-        word: usize,
-        plane: usize,
-        ctx: usize,
-        k64: *const u64,
-        v64: *const u64,
-    ) -> (u64, u64);
+    /// it, and the entry's launch contract holds.
+    unsafe fn row(self, t: usize, kh: usize, j: usize, ctx: usize) -> Option<usize>;
 }
 
 /// A `_p12_sel` row's keys: key `j` of row `t` is cache row
 /// `list[t·width + j]`, the count at most `width`, the same for every key
-/// head. An entry at or past the cache
-/// raises [`FaultSite::PoolSelect`] and stages the f16 NaN pattern in both
-/// planes, so the row's output is NaN, never a plausible value.
+/// head.
 #[derive(Clone, Copy)]
 struct Listed<'a> {
     list: &'a [u32],
@@ -2274,32 +2261,15 @@ impl KeyWalk for Listed<'_> {
     }
 
     #[inline(always)]
-    unsafe fn stage_row<const HEAD: usize>(
-        self,
-        t: usize,
-        _kh: usize,
-        j: usize,
-        word: usize,
-        plane: usize,
-        ctx: usize,
-        k64: *const u64,
-        v64: *const u64,
-    ) -> (u64, u64) {
+    unsafe fn row(self, t: usize, _kh: usize, j: usize, ctx: usize) -> Option<usize> {
         // SAFETY: j < count <= width and t < m, so t·width + j < m·width <=
         // list.len() by the launch contract.
         let row = unsafe { *self.list.get_unchecked(t * self.width + j) } as usize;
         if row >= ctx {
             self.fault.raise(FaultSite::PoolSelect);
-            return (SEL_NAN4, SEL_NAN4);
+            return None;
         }
-        // SAFETY: row < ctx, so the row is inside the key head's plane; a
-        // row is HEAD u16 = HEAD/4 u64 and the planes start 8-byte aligned
-        // (a device allocation), so the u64 read is aligned and inside both
-        // planes.
-        unsafe {
-            let r = (plane + row * HEAD) / 4 + word;
-            (*k64.add(r), *v64.add(r))
-        }
+        Some(row)
     }
 }
 
@@ -2311,8 +2281,8 @@ pub(crate) const SEL_NAN4: u64 = 0x7e00_7e00_7e00_7e00;
 /// position `j % BLOCK` of block `ids[(t·n_kv + kh)·blocks + j / BLOCK]`, so
 /// cache row `BLOCK · id + j % BLOCK`; the count is at most `blocks · BLOCK`
 /// and the list is the key head's own (one block selection for each key
-/// head). A block whose row is at or past the cache raises
-/// [`FaultSite::PoolSelect`] and stages the f16 NaN pattern, as [`Listed`].
+/// head). A block whose row is at or past the cache is refused as
+/// [`Listed`]'s entry is.
 #[derive(Clone, Copy)]
 struct BlockListed<'a, const BLOCK: usize> {
     ids: &'a [u32],
@@ -2328,17 +2298,7 @@ impl<const BLOCK: usize> KeyWalk for BlockListed<'_, BLOCK> {
     }
 
     #[inline(always)]
-    unsafe fn stage_row<const HEAD: usize>(
-        self,
-        t: usize,
-        kh: usize,
-        j: usize,
-        word: usize,
-        plane: usize,
-        ctx: usize,
-        k64: *const u64,
-        v64: *const u64,
-    ) -> (u64, u64) {
+    unsafe fn row(self, t: usize, kh: usize, j: usize, ctx: usize) -> Option<usize> {
         // SAFETY: j < count <= blocks·BLOCK, so j / BLOCK < blocks, and t < m,
         // kh < n_kv: (t·n_kv + kh)·blocks + j / BLOCK < m·n_kv·blocks <=
         // ids.len() by the launch contract.
@@ -2350,16 +2310,9 @@ impl<const BLOCK: usize> KeyWalk for BlockListed<'_, BLOCK> {
         let row = id * BLOCK + j % BLOCK;
         if row >= ctx {
             self.fault.raise(FaultSite::PoolSelect);
-            return (SEL_NAN4, SEL_NAN4);
+            return None;
         }
-        // SAFETY: row < ctx, so the row is inside the key head's plane; a row
-        // is HEAD u16 = HEAD/4 u64 and the planes start 8-byte aligned (a
-        // device allocation), so the u64 read is aligned and inside both
-        // planes.
-        unsafe {
-            let r = (plane + row * HEAD) / 4 + word;
-            (*k64.add(r), *v64.add(r))
-        }
+        Some(row)
     }
 }
 
@@ -2411,12 +2364,13 @@ macro_rules! listed_query_tile {
 }
 
 /// One segment of the listed passes: keys `lo .. hi` of row `t` for key head
-/// `kh`, read through `walk`, in [`KEY_TILE`]-key tiles ascending: the
-/// staging (a key at or past `hi` stages zeros), `S = Q·Kᵀ` on `mma.m16n8k16`
-/// (warps `0..4`, each 128-value slice in its own accumulator, the slices
-/// added in ascending order, then `scale · S`) and [`fold_tile_w_p`], into a
-/// fresh `(max, Σ exp, Σ exp·V)` bound to the three names given. A macro, as
-/// `listed_query_tile!` is.
+/// `kh`, their cache rows found through `walk` and their words read from
+/// `src` (the expanding body's cache format `S`, [`KvSrc::word`]), in
+/// [`KEY_TILE`]-key tiles ascending: the staging (a key at or past `hi` stages
+/// zeros), `S = Q·Kᵀ` on `mma.m16n8k16` (warps `0..4`, each 128-value slice
+/// in its own accumulator, the slices added in ascending order, then `scale ·
+/// S`) and [`fold_tile_w_p`], into a fresh `(max, Σ exp, Σ exp·V)` bound to
+/// the three names given. A macro, as `listed_query_tile!` is.
 macro_rules! listed_seg_tiles {
     (
         $walk:ident,
@@ -2424,7 +2378,7 @@ macro_rules! listed_seg_tiles {
         $kh:ident,
         $lo:expr,
         $hi:expr,
-        ($kc:ident, $vc:ident, $ctx:ident),
+        ($src:ident, $ctx:ident),
         $scale:ident,
         ($qt:ident, $kt:ident, $vs:ident, $ws:ident),
         ($tid:ident, $w:ident, $lane:ident),
@@ -2437,9 +2391,7 @@ macro_rules! listed_seg_tiles {
         // the last pass short when the block does not divide the tile.
         let tile_words = KEY_TILE * row_qwords;
         let stage_per = tile_words.div_ceil(threads);
-        let plane = $kh * $ctx * HEAD;
-        let k64 = $kc.as_ptr() as *const u64;
-        let v64 = $vc.as_ptr() as *const u64;
+        let head = $src.head::<HEAD>($kh, $ctx);
         let key0 = ($w % 4) * MMA_NTILE;
         let arow = $lane % MMA_ROWS;
         let ahalf = $lane / MMA_ROWS;
@@ -2459,10 +2411,13 @@ macro_rules! listed_seg_tiles {
                     let key = e / row_qwords;
                     let word = e - key * row_qwords;
                     let (kw, vw) = if t0 + key < hi {
-                        // SAFETY: t0 + key < hi <= the row's live count, t < m,
-                        // word < HEAD/4 and plane is key head kh's first value.
-                        unsafe {
-                            $walk.stage_row::<HEAD>($t, $kh, t0 + key, word, plane, $ctx, k64, v64)
+                        // SAFETY: t0 + key < hi <= the row's live count, t < m
+                        // and kh is a key head of the launch.
+                        match unsafe { $walk.row($t, $kh, t0 + key, $ctx) } {
+                            // SAFETY: head is key head kh's, row < ctx and
+                            // word < HEAD/4.
+                            Some(row) => unsafe { S::word::<HEAD>(head, row, word) },
+                            None => (SEL_NAN4, SEL_NAN4),
                         }
                     } else {
                         (0u64, 0u64)
@@ -2604,13 +2559,13 @@ macro_rules! listed_seg_tiles {
 /// body, and this one serves the `_p12_sel` and `_p16_blocks` entries. Every
 /// step is [`seg_mma_p`]'s except the row's count bound
 /// ([`KeyWalk::count_cap`]), the
-/// tile's staging load ([`KeyWalk::stage_row`]) and the pack's rows: `PACK`
+/// tile's staged rows ([`KeyWalk::row`]) and the pack's rows: `PACK`
 /// heads in rows `0..PACK`, `PAD` zero rows after them, the heads past row 7
 /// read back from the accumulator's `c[2]`, `c[3]` (rows `lane/4 + 8`).
 ///
-/// SAFETY: [`seg_mma_p`]'s, with key `j < count` of row `t` read through
-/// `walk` under [`KeyWalk::stage_row`]'s contract, a block of `PACK · 32`
-/// threads and a weight tile of `PACK · KEY_TILE` f32.
+/// SAFETY: [`seg_mma_p`]'s over `src`'s planes, with key `j < count` of row
+/// `t` found through `walk` under [`KeyWalk::row`]'s contract, a block of
+/// `PACK · 32` threads and a weight tile of `PACK · KEY_TILE` f32.
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
@@ -2622,6 +2577,7 @@ macro_rules! listed_seg_tiles {
 )]
 unsafe fn seg_mma_ps<
     W: KeyWalk,
+    S: KvSrc,
     const HEAD: usize,
     const QW: usize,
     const PACK: usize,
@@ -2629,8 +2585,7 @@ unsafe fn seg_mma_ps<
 >(
     walk: W,
     q: &[f32],
-    kc: &[u16],
-    vc: &[u16],
+    src: S,
     n_keys_buf: &[u32],
     scale: f32,
     n_kv: u32,
@@ -2689,7 +2644,7 @@ unsafe fn seg_mma_ps<
         kh,
         lo,
         hi,
-        (kc, vc, ctx),
+        (src, ctx),
         scale,
         (qt, kt, vs, ws),
         (tid, w, lane),
@@ -4897,10 +4852,83 @@ mod flash_gqa_kernels {
         // without a reference. The launch contract is `seg_mma_p`'s at
         // HEAD_256 and `packs · PACK_4` heads per key head.
         unsafe {
-            seg_mma_p::<HEAD_256, QW_256, PACK_4, { MMA_ROWS / PACK_4 }>(
+            seg_mma_p::<HEAD_256, QW_256, PACK_4, { MMA_ROWS / PACK_4 }, _>(
                 q,
-                kc,
-                vc,
+                F16Kv { k: kc, v: vc },
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                packs as usize,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QT),
+                SharedArray::as_raw_mut_ptr(&raw mut KT),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+            )
+        };
+    }
+
+    /// [`gqa_flash_seg_mma_256_p4`] over the Q8_0 cache (`seg_mma_p` over
+    /// [`Q8Kv`]): the tiles hold the dequantized f16, as
+    /// [`gqa_flash_seg_mma_256_q8`]'s do; every step after the staging is the
+    /// f16 entry's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            segs >= 1,
+            q.len() >= m * n_kv * packs * 4 * 256,
+            kq.len() >= n_kv * ctx * 64,
+            kd.len() >= n_kv * ctx * 8,
+            vq.len() >= n_kv * ctx * 64,
+            vd.len() >= n_kv * ctx * 8,
+            part_v.len() >= m * n_kv * packs * 4 * segs * 256,
+            part_ms.len() >= m * n_kv * packs * 4 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_mma_256_p4_q8(
+        q: &[f32],
+        kq: &[u32],
+        kd: &[u16],
+        vq: &[u32],
+        vd: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        packs: u32,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QT: SharedArray<u32, { MMA_ROWS * MMA_ROW_W_256 }> = SharedArray::UNINIT;
+        static mut KT: SharedArray<u32, { KEY_TILE * MMA_ROW_W_256 }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS_256 }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { PACK_4 * KEY_TILE }> = SharedArray::UNINIT;
+
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for HEAD_256 and PACK_4; the raw form reaches it
+        // without a reference. The launch contract is `seg_mma_p`'s at
+        // HEAD_256 and `packs · PACK_4` heads per key head over the four Q8_0
+        // planes.
+        unsafe {
+            seg_mma_p::<HEAD_256, QW_256, PACK_4, { MMA_ROWS / PACK_4 }, _>(
+                q,
+                Q8Kv { kq, kd, vq, vd },
                 n_keys_buf,
                 scale,
                 n_kv,
@@ -4983,11 +5011,93 @@ mod flash_gqa_kernels {
         // HEAD_256 and one pack of PACK_12 heads per key head, with the
         // list's.
         unsafe {
-            seg_mma_ps::<_, HEAD_256, QW_256, PACK_12, PAD_12>(
+            seg_mma_ps::<_, _, HEAD_256, QW_256, PACK_12, PAD_12>(
                 walk,
                 q,
-                kc,
-                vc,
+                F16Kv { k: kc, v: vc },
+                n_sel,
+                scale,
+                n_kv,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                1,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QT),
+                SharedArray::as_raw_mut_ptr(&raw mut KT),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+            )
+        };
+    }
+
+    /// [`gqa_flash_seg_mma_256_p12_sel`] over the Q8_0 cache (`seg_mma_ps`
+    /// over [`Q8Kv`]): the listed keys' tiles hold the dequantized f16, as
+    /// [`gqa_flash_seg_mma_256_q8`]'s do; the list, the counts, the faults and
+    /// every step after the staging are the f16 entry's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(384)]
+    #[launch_contract(
+        domain = 1,
+        block = (384, 1, 1),
+        requires = (
+            n_sel.len() >= m,
+            list.len() >= m * width,
+            segs >= 1,
+            q.len() >= m * n_kv * 12 * 256,
+            kq.len() >= n_kv * ctx * 64,
+            kd.len() >= n_kv * ctx * 8,
+            vq.len() >= n_kv * ctx * 64,
+            vd.len() >= n_kv * ctx * 8,
+            part_v.len() >= m * n_kv * 12 * segs * 256,
+            part_ms.len() >= m * n_kv * 12 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_mma_256_p12_sel_q8(
+        q: &[f32],
+        kq: &[u32],
+        kd: &[u16],
+        vq: &[u32],
+        vd: &[u16],
+        list: &[u32],
+        n_sel: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        width: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        fault: FaultSink,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QT: SharedArray<u32, { MMA_ROWS * MMA_ROW_W_256 }> = SharedArray::UNINIT;
+        static mut KT: SharedArray<u32, { KEY_TILE * MMA_ROW_W_256 }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS_256 }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { PACK_12 * KEY_TILE }> = SharedArray::UNINIT;
+
+        let walk = Listed {
+            list,
+            width: width as usize,
+            fault,
+        };
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for HEAD_256 and PACK_12; the raw form reaches it
+        // without a reference. The launch contract is `seg_mma_ps`'s at
+        // HEAD_256 and one pack of PACK_12 heads per key head over the four
+        // Q8_0 planes, with the list's.
+        unsafe {
+            seg_mma_ps::<_, _, HEAD_256, QW_256, PACK_12, PAD_12>(
+                walk,
+                q,
+                Q8Kv { kq, kd, vq, vd },
                 n_sel,
                 scale,
                 n_kv,
@@ -5071,11 +5181,10 @@ mod flash_gqa_kernels {
         // without a reference. The launch contract is `seg_mma_ps`'s at HEAD
         // and one pack of PACK_16 heads per key head, with the block lists'.
         unsafe {
-            seg_mma_ps::<_, HEAD, { HEAD / SLICE }, PACK_16, PAD_16>(
+            seg_mma_ps::<_, _, HEAD, { HEAD / SLICE }, PACK_16, PAD_16>(
                 walk,
                 q,
-                kc,
-                vc,
+                F16Kv { k: kc, v: vc },
                 n_keys,
                 scale,
                 n_kv,
@@ -5947,6 +6056,63 @@ impl PackedSeg {
     }
 }
 
+/// A packed pass's arguments with the cache in either format: [`GqaArgs`]'
+/// or [`GqaQ8Args`]'.
+struct PackedArgs<'a> {
+    q: &'a DeviceBuffer<f32>,
+    kv: CachePlanes<'a>,
+    n_keys: &'a DeviceBuffer<u32>,
+    scale: f32,
+    n_kv: usize,
+    ctx: usize,
+    m: usize,
+    part_v: &'a mut DeviceBuffer<f32>,
+    part_ms: &'a mut DeviceBuffer<f32>,
+    fault: FaultSink,
+    y: &'a mut DeviceBuffer<f32>,
+}
+
+impl<'a> From<GqaArgs<'a>> for PackedArgs<'a> {
+    fn from(a: GqaArgs<'a>) -> PackedArgs<'a> {
+        PackedArgs {
+            q: a.q,
+            kv: CachePlanes::F16 { kc: a.kc, vc: a.vc },
+            n_keys: a.n_keys,
+            scale: a.scale,
+            n_kv: a.n_kv,
+            ctx: a.ctx,
+            m: a.m,
+            part_v: a.part_v,
+            part_ms: a.part_ms,
+            fault: a.fault,
+            y: a.y,
+        }
+    }
+}
+
+impl<'a> From<GqaQ8Args<'a>> for PackedArgs<'a> {
+    fn from(a: GqaQ8Args<'a>) -> PackedArgs<'a> {
+        PackedArgs {
+            q: a.q,
+            kv: CachePlanes::Q8 {
+                kq: a.kq,
+                kd: a.kd,
+                vq: a.vq,
+                vd: a.vd,
+            },
+            n_keys: a.n_keys,
+            scale: a.scale,
+            n_kv: a.n_kv,
+            ctx: a.ctx,
+            m: a.m,
+            part_v: a.part_v,
+            part_ms: a.part_ms,
+            fault: a.fault,
+            y: a.y,
+        }
+    }
+}
+
 /// [`FlashGqaKernels::enqueue_pass`]'s arguments: `m` rows of `n_kv · PACK`
 /// query heads (roped, unscaled, token-major), the layer's two planes of
 /// `n_kv · ctx` rows, each row's live key count on the device (`m` of them),
@@ -6017,15 +6183,84 @@ pub struct GqaSelArgs<'a> {
     pub part_ms: &'a mut DeviceBuffer<f32>,
 }
 
+/// A layer's cache as a launch reads it: the f16 planes, or the q8_0
+/// cache's four ([`q8_plane_lens`]: per side the codes and the scales).
+#[derive(Clone, Copy)]
+pub enum CachePlanes<'a> {
+    F16 {
+        kc: &'a DeviceBuffer<u16>,
+        vc: &'a DeviceBuffer<u16>,
+    },
+    Q8 {
+        kq: &'a DeviceBuffer<u32>,
+        kd: &'a DeviceBuffer<u16>,
+        vq: &'a DeviceBuffer<u32>,
+        vd: &'a DeviceBuffer<u16>,
+    },
+}
+
+impl CachePlanes<'_> {
+    /// Every plane at least the length `n_kv · ctx` rows of `head` values
+    /// take in its format; a short plane is refused by name.
+    pub(crate) fn check_lens(
+        &self,
+        what: &'static str,
+        head: usize,
+        n_kv: usize,
+        ctx: usize,
+    ) -> Result<(), GpuError> {
+        match *self {
+            CachePlanes::F16 { kc, vc } => crate::short(
+                what,
+                &[
+                    ("kc", kc.len(), n_kv * ctx * head),
+                    ("vc", vc.len(), n_kv * ctx * head),
+                ],
+            ),
+            CachePlanes::Q8 { kq, kd, vq, vd } => {
+                let (words, scales) = q8_plane_lens(head, n_kv, ctx);
+                crate::short(
+                    what,
+                    &[
+                        ("kq", kq.len(), words),
+                        ("kd", kd.len(), scales),
+                        ("vq", vq.len(), words),
+                        ("vd", vd.len(), scales),
+                    ],
+                )
+            }
+        }
+    }
+
+    /// Every plane 16-byte aligned, as the 16-byte tile copies of the prefill
+    /// walks read them; a plane at another offset is refused by name.
+    pub(crate) fn check_aligned(&self, what: &'static str) -> Result<(), GpuError> {
+        use crate::tensor::check_alignment;
+        use cuda_device::vector::U32x4;
+        match *self {
+            CachePlanes::F16 { kc, vc } => {
+                check_alignment::<U32x4, _>(what, "kc", kc)?;
+                check_alignment::<U32x4, _>(what, "vc", vc)
+            }
+            CachePlanes::Q8 { kq, kd, vq, vd } => {
+                check_alignment::<U32x4, _>(what, "kq", kq)?;
+                check_alignment::<U32x4, _>(what, "kd", kd)?;
+                check_alignment::<U32x4, _>(what, "vq", vq)?;
+                check_alignment::<U32x4, _>(what, "vd", vd)
+            }
+        }
+    }
+}
+
 /// A listed flash's arguments ([`GqaSelArgs`]' and
 /// [`crate::flash_gqa_prefill::FlashGqaPrefill::enqueue_256_p12_sel`]'s):
-/// those of [`GqaArgs`] without the partials, with each row's list (`m ·
-/// width` cache rows, ascending) and its length (`n_sel`, `m` of them) in
-/// place of the live counts.
+/// those of [`GqaArgs`] without the partials, the cache in either format
+/// ([`CachePlanes`]), with each row's list (`m · width` cache rows,
+/// ascending) and its length (`n_sel`, `m` of them) in place of the live
+/// counts.
 pub struct GqaListArgs<'a> {
     pub q: &'a DeviceBuffer<f32>,
-    pub kc: &'a DeviceBuffer<u16>,
-    pub vc: &'a DeviceBuffer<u16>,
+    pub kv: CachePlanes<'a>,
     pub list: &'a DeviceBuffer<u32>,
     pub n_sel: &'a DeviceBuffer<u32>,
     pub width: usize,
@@ -6213,20 +6448,16 @@ pub(crate) fn check_listed_256(
             ),
         ));
     }
-    let lens = [
-        ("q", a.q.len(), m * n_head * HEAD_256),
-        ("kc", a.kc.len(), n_kv * ctx * HEAD_256),
-        ("vc", a.vc.len(), n_kv * ctx * HEAD_256),
-        ("list", a.list.len(), m * width),
-        ("n_sel", a.n_sel.len(), m),
-        ("y", a.y.len(), m * n_head * HEAD_256),
-    ];
-    if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
-        return Err(GpuError::shape(
-            what,
-            format!("{name}.len() {got} < {need}"),
-        ));
-    }
+    crate::short(what, &[("q", a.q.len(), m * n_head * HEAD_256)])?;
+    a.kv.check_lens(what, HEAD_256, n_kv, ctx)?;
+    crate::short(
+        what,
+        &[
+            ("list", a.list.len(), m * width),
+            ("n_sel", a.n_sel.len(), m),
+            ("y", a.y.len(), m * n_head * HEAD_256),
+        ],
+    )?;
     Ok(listed_segments(width))
 }
 
@@ -6590,7 +6821,33 @@ impl FlashGqaKernels {
         } else {
             PackedSeg::Scalar4
         };
-        self.pass_packed("flash_gqa::enqueue_256_p4", stream, args, n_head, seg)
+        self.pass_packed(
+            "flash_gqa::enqueue_256_p4",
+            stream,
+            args.into(),
+            n_head,
+            seg,
+        )
+    }
+
+    /// [`FlashGqaKernels::enqueue_pass_256_p4`]'s tensor-core pass over the
+    /// Q8_0 cache: the segment pass `gqa_flash_seg_mma_256_p4_q8` and
+    /// `gqa_flash_merge_256`, the planes [`q8_plane_lens`] at [`HEAD_256`].
+    /// Two launches, the refusals of `enqueue_pass_256_p4`. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_pass_256_p4_q8(
+        &self,
+        stream: &CudaStream,
+        args: GqaQ8Args<'_>,
+        n_head: usize,
+    ) -> Result<(), GpuError> {
+        self.pass_packed(
+            "flash_gqa::enqueue_256_p4_q8",
+            stream,
+            args.into(),
+            n_head,
+            PackedSeg::Mma4,
+        )
     }
 
     /// [`FlashGqaKernels::enqueue_pass_256_p4`]'s scalar pass in blocks of
@@ -6608,7 +6865,7 @@ impl FlashGqaKernels {
         self.pass_packed(
             "flash_gqa::enqueue_256_p2",
             stream,
-            args,
+            args.into(),
             n_head,
             PackedSeg::Scalar2,
         )
@@ -6616,19 +6873,19 @@ impl FlashGqaKernels {
 
     /// The packed passes' one body: the group refused unless a nonzero
     /// multiple of `seg`'s pack, the buffers checked, then `seg`'s segment
-    /// entry and the merge.
+    /// entry over the cache's format and the merge. A q8_0 cache has the
+    /// tensor-core pack of four alone.
     fn pass_packed(
         &self,
         what: &'static str,
         stream: &CudaStream,
-        args: GqaArgs<'_>,
+        args: PackedArgs<'_>,
         n_head: usize,
         seg: PackedSeg,
     ) -> Result<(), GpuError> {
-        let GqaArgs {
+        let PackedArgs {
             q,
-            kc,
-            vc,
+            kv,
             n_keys,
             scale,
             n_kv,
@@ -6657,21 +6914,17 @@ impl FlashGqaKernels {
         }
         let packs = n_head / (n_kv * pack);
         let segs = SEGMENTS;
-        let lens = [
-            ("q", q.len(), m * n_head * HEAD_256),
-            ("kc", kc.len(), n_kv * ctx * HEAD_256),
-            ("vc", vc.len(), n_kv * ctx * HEAD_256),
-            ("n_keys", n_keys.len(), m),
-            ("part_v", part_v.len(), partials_v_len_256(m, n_head)),
-            ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
-            ("y", y.len(), m * n_head * HEAD_256),
-        ];
-        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
-            return Err(GpuError::shape(
-                what,
-                format!("{name}.len() {got} < {need}"),
-            ));
-        }
+        crate::short(what, &[("q", q.len(), m * n_head * HEAD_256)])?;
+        kv.check_lens(what, HEAD_256, n_kv, ctx)?;
+        crate::short(
+            what,
+            &[
+                ("n_keys", n_keys.len(), m),
+                ("part_v", part_v.len(), partials_v_len_256(m, n_head)),
+                ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
+                ("y", y.len(), m * n_head * HEAD_256),
+            ],
+        )?;
         let grid = launch_u32(what, "grid", m * n_kv * packs * segs)?;
         let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
         let heads = launch_u32(what, "n_head", n_head)?;
@@ -6681,8 +6934,8 @@ impl FlashGqaKernels {
         let segs = launch_u32(what, "segs", segs)?;
         let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
         let m = launch_u32(what, "m", m)?;
-        match seg {
-            PackedSeg::Mma4 => {
+        match (seg, kv) {
+            (PackedSeg::Mma4, CachePlanes::F16 { kc, vc }) => {
                 let cfg = LaunchConfig1D::new(grid, THREADS_P4_U32, 0);
                 let prep = self.module.prepare_gqa_flash_seg_mma_256_p4(cfg)?;
                 self.module.gqa_flash_seg_mma_256_p4(
@@ -6690,7 +6943,15 @@ impl FlashGqaKernels {
                     part_v, part_ms,
                 )?;
             }
-            PackedSeg::Scalar4 => {
+            (PackedSeg::Mma4, CachePlanes::Q8 { kq, kd, vq, vd }) => {
+                let cfg = LaunchConfig1D::new(grid, THREADS_P4_U32, 0);
+                let prep = self.module.prepare_gqa_flash_seg_mma_256_p4_q8(cfg)?;
+                self.module.gqa_flash_seg_mma_256_p4_q8(
+                    stream, &prep, q, kq, kd, vq, vd, n_keys, scale, n_kv, ctx, segs, seg_keys, m,
+                    packs, part_v, part_ms,
+                )?;
+            }
+            (PackedSeg::Scalar4, CachePlanes::F16 { kc, vc }) => {
                 let cfg = LaunchConfig1D::new(grid, THREADS_P4_U32, 0);
                 let prep = self.module.prepare_gqa_flash_seg_256_p4(cfg)?;
                 self.module.gqa_flash_seg_256_p4(
@@ -6698,13 +6959,19 @@ impl FlashGqaKernels {
                     part_v, part_ms,
                 )?;
             }
-            PackedSeg::Scalar2 => {
+            (PackedSeg::Scalar2, CachePlanes::F16 { kc, vc }) => {
                 let cfg = LaunchConfig1D::new(grid, THREADS_P2_U32, 0);
                 let prep = self.module.prepare_gqa_flash_seg_256_p2(cfg)?;
                 self.module.gqa_flash_seg_256_p2(
                     stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, packs,
                     part_v, part_ms,
                 )?;
+            }
+            (PackedSeg::Scalar4 | PackedSeg::Scalar2, CachePlanes::Q8 { .. }) => {
+                return Err(GpuError::shape(
+                    what,
+                    "a q8_0 cache's packed pass is the tensor-core pack of four",
+                ));
             }
         }
         let prep = self
@@ -6826,7 +7093,9 @@ impl FlashGqaKernels {
     /// the cache raises [`FaultSite::PoolSelect`] and its row is NaN. With
     /// every list `0 .. n` each row stages `enqueue_pass_256_p4`'s keys at
     /// count `n`, and the gate holds the two passes to the same bits there.
-    /// Asynchronous, allocation-free, capturable.
+    /// A q8_0 cache ([`CachePlanes::Q8`]) runs `gqa_flash_seg_mma_256_p12_sel_q8`,
+    /// whose tiles stage the dequantized values (the module doc's `_q8`
+    /// paragraph). Asynchronous, allocation-free, capturable.
     pub fn enqueue_pass_256_p12_sel(
         &self,
         stream: &CudaStream,
@@ -6842,8 +7111,7 @@ impl FlashGqaKernels {
         let segs = check_listed_256(what, &attn, n_head)?;
         let GqaListArgs {
             q,
-            kc,
-            vc,
+            kv,
             list,
             n_sel,
             width,
@@ -6882,11 +7150,22 @@ impl FlashGqaKernels {
         let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
         let m = launch_u32(what, "m", m)?;
         let cfg = LaunchConfig1D::new(grid, THREADS_P12_U32, 0);
-        let prep = self.module.prepare_gqa_flash_seg_mma_256_p12_sel(cfg)?;
-        self.module.gqa_flash_seg_mma_256_p12_sel(
-            stream, &prep, q, kc, vc, list, n_sel, scale, n_kv, ctx, width, segs, seg_keys, m,
-            fault, part_v, part_ms,
-        )?;
+        match kv {
+            CachePlanes::F16 { kc, vc } => {
+                let prep = self.module.prepare_gqa_flash_seg_mma_256_p12_sel(cfg)?;
+                self.module.gqa_flash_seg_mma_256_p12_sel(
+                    stream, &prep, q, kc, vc, list, n_sel, scale, n_kv, ctx, width, segs, seg_keys,
+                    m, fault, part_v, part_ms,
+                )?;
+            }
+            CachePlanes::Q8 { kq, kd, vq, vd } => {
+                let prep = self.module.prepare_gqa_flash_seg_mma_256_p12_sel_q8(cfg)?;
+                self.module.gqa_flash_seg_mma_256_p12_sel_q8(
+                    stream, &prep, q, kq, kd, vq, vd, list, n_sel, scale, n_kv, ctx, width, segs,
+                    seg_keys, m, fault, part_v, part_ms,
+                )?;
+            }
+        }
         // The merge reads a row's count through the same rule at the list's
         // width: its `ctx` argument is the width.
         let prep = self

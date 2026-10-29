@@ -238,7 +238,9 @@ generate_ds41 gqa_flash_seg_k192_ring 12 8
 generate_ds41 gqa_flash_seg_mma 0 0
 generate_ds41 gqa_flash_seg_mma_256 0 0
 generate_ds41 gqa_flash_seg_mma_256_p12_sel 0 0
+generate_ds41 gqa_flash_seg_mma_256_p12_sel_q8 0 0
 generate_ds41 gqa_flash_seg_mma_256_p4 0 0
+generate_ds41 gqa_flash_seg_mma_256_p4_q8 0 0
 generate_ds41 gqa_flash_seg_mma_256_q8 0 0
 generate_ds41 gqa_flash_seg_mma_p16_blocks 0 0
 generate_ds41 gqa_flash_seg_mma_q8 0 0
@@ -252,8 +254,11 @@ generate_ds41 gqa_prefill_flash_256_p2 0 0
 generate_ds41 gqa_prefill_flash_256_p2_lower 0 0
 generate_ds41 gqa_prefill_flash_256_p12_sel 0 0
 generate_ds41 gqa_prefill_flash_256_p12_sel_gated 0 0
+generate_ds41 gqa_prefill_flash_256_p12_sel_gated_q8 0 0
+generate_ds41 gqa_prefill_flash_256_p12_sel_q8 0 0
 generate_ds41 gqa_prefill_flash_256_p4 0 0
 generate_ds41 gqa_prefill_flash_256_p4_gated 0 0
+generate_ds41 gqa_prefill_flash_256_p4_gated_q8 0 0
 generate_ds41 gqa_prefill_flash_256_q8 0 0
 generate_ds41 gqa_prefill_flash_512_p4 0 0
 generate_ds41 gqa_prefill_flash_q8 0 0
