@@ -22,8 +22,10 @@ bloomery-refset = { path = "../refset" }
 bloomery-hf = { path = "../hf", optional = true }
 # Host-only checkpoint weights, through `hf` for DSpark and `clef` for the decision head.
 bloomery-safetensors = { path = "../safetensors", optional = true }
-# Host only, through the `checkpoint` feature: the checkpoint maps, a Qwen3.8 checkpoint folder a server or
-# a gate opens (`serve_seats/qwen38_folder.rs`) and GLM-5.3-Flash's (`generate_glm5next`'s tensor-parallel read).
+# Host only, through the `hf` feature: the checkpoint maps, a Qwen3.8 checkpoint folder a server or
+# a gate opens (`serve_seats/qwen38_folder.rs`), GLM-5.3-Flash's (`generate_glm5next`'s tensor-parallel read)
+# and the architecture of a `--hf` repo's model read before its fetch (a GGUF shard's header by Range, a
+# checkpoint's config.json).
 bloomery-model-hf = { path = "../model-hf", optional = true }
 # Host only: the lever registry, which the binaries parse once at `main`.
 bloomery-levers = { path = "../levers" }
@@ -110,11 +112,13 @@ bloomery-gpu-vision = { path = "../gpu-vision", optional = true }
 bloomery-vision = { path = "../vision", optional = true }
 
 [features]
-# The hub: `--hf` fetches, plus DSpark configuration and checkpoint weights.
-hf = ["dep:bloomery-hf", "dep:bloomery-safetensors"]
+# DSpark draft configuration and mapped weights, without the model-file fetch and header readers.
+dspark-hf = ["dep:bloomery-hf", "dep:bloomery-safetensors"]
+# The hub: `--hf` fetches and reads the repo's model header before the download.
+hf = ["dspark-hf", "dep:bloomery-model-hf"]
 # A safetensors checkpoint folder read as stored: a server's or a gate's `-m <folder>`, and the folder a
 # `--hf` repo that holds a checkpoint resolves to.
-checkpoint = ["hf", "dep:bloomery-model-hf"]
+checkpoint = ["hf"]
 # GLM-5.3-Flash read from its Hugging Face checkpoint folder: `generate_glm5next --place tp`.
 glm5next-hf = ["glm5next", "checkpoint"]
 gpu = [
@@ -619,7 +623,7 @@ required-features = ["deepseek41", "hf"]
 
 [[bin]]
 name = "gate_qwen35_dspark"
-required-features = ["gpu", "hf"]
+required-features = ["gpu", "dspark-hf"]
 
 [[bin]]
 name = "gate_qwen35moe_attn"

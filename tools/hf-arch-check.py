@@ -16,7 +16,7 @@ one line per row:
     hf-arch <seat> <repo>:<quant> shard1=<path> arch=<arch> route=<ok|REFUSED: ...> embd=<type> exps=<types> types=<ok|printed|REFUSED: ...>
 
 and a summary `hf-arch rows=<n> ok=<n> red=<n>`. route=ok holds when the router's seat for the architecture is the row's
-seat (`Model::serves`; for the decide row one of `serve::decide::pick`'s paths) and the model reader takes the
+seat (`Model::serves_arch`; for the decide row one of `serve::decide::pick`'s paths) and the model reader takes the
 architecture (`model::arch::spec`). embd and exps are the ggml types of `token_embd.weight` and of the routed-expert
 tensors in the headers of the set's shards (a split set's later shards are range-read for theirs, within the same
 64 MiB), exps by role. types is judged for the decide seat alone, whose backbone body keeps one list per site kind
@@ -37,7 +37,7 @@ expires (`BOX_EXCEPTIONS`): while its expiry file on the box (`box-facts --grep`
 the two named sizes is `excepted: <reason>` and not a FAIL, counted on its own in `excepted=`, and the day the file holds the
 string it is a FAIL naming the exception.
 
---self-test greps the Rust sources the mirror copies (`Model::serves`, the qwen3 seat's program rule
+--self-test greps the Rust sources the mirror copies (`Model::serves_arch`, the qwen3 seat's program rule
 (`Family::pick`, `program_of`, the models crate's `Arch::name`), the decide rows' constants,
 `GgmlType::from_u32`) and fails, naming every name that is in one and not the other, or a source it cannot parse. The
 architecture strings of `Arch::from_name` and of the model reader are not mirrored: they are read from
@@ -103,7 +103,7 @@ ROW_BUDGET = 64 * MIB
 # The mirror of the serve router. Each block cites its Rust source; --self-test greps the source and
 # fails on any name in one and not the other.
 
-# crates/gpu-gates/src/bin/bloomery_serve.rs:Model::serves — the architecture strings each generative seat
+# crates/gpu-gates/src/bin/bloomery_serve.rs:Model::serves_arch — the architecture strings each generative seat
 # serves. The glm and nemotron seats read their names through Arch::from_name (SERVES_VIA_FROM_NAME); the qwen3 seat
 # serves a file by the program that runs its description (SERVES_BY_PROGRAM).
 SERVES = {
@@ -113,7 +113,7 @@ SERVES = {
 }
 SERVES_VIA_FROM_NAME = {"glm": ("Glm5next",), "solar2": ("SolarOpen2",), "minimaxm3": ("MiniMaxM3",), "nemotron": ("NemotronH", "NemotronHMoe"),
                         "raon1": ("Raon1",), "musespark": ("MuseSpark",), "flint": ("Flint",)}
-# crates/gpu-gates/src/qwen_seat.rs:Family::pick — the programs a program-served seat serves (Model::serves asks
+# crates/gpu-gates/src/qwen_seat.rs:Family::pick — the programs a program-served seat serves (Model::serves_arch asks
 # Family::of). crates/placement/src/accepts.rs:program_of — the program that runs each crates/models Arch variant, here
 # the variants of those programs; crates/models/src/lib.rs:Arch::name — the architecture string of each variant.
 # PIN(2026-10-26): the mirror of qwen_seat.rs DECISION_LAYOUTS and its doctoring case are gone with the const: the seat
@@ -1411,9 +1411,9 @@ def src_seat_words(serve, consts_decide):
 
 
 def src_serves(serve, arch_consts, words):
-    """Model::serves: ({seat word: [names]}, {seat word: [Arch variants]} it reads through Arch::from_name,
+    """Model::serves_arch: ({seat word: [names]}, {seat word: [Arch variants]} it reads through Arch::from_name,
     {seat word: True} for the seats that ask `qwen_seat::Family::of`, the program of the file's description)."""
-    lo, hi = serve.one_body("serves")
+    lo, hi = serve.one_body("serves_arch")
     direct, via, programmed = {}, {}, {}
     for pat, (a, b) in serve.match_arms(lo, hi, r"\bmatch\s+self\b"):
         m = re.fullmatch(r"\s*Model::(\w+)\s*", serve.m[pat[0]:pat[1]])
@@ -1437,7 +1437,7 @@ def src_serves(serve, arch_consts, words):
                 via[word] = tuple(alts)
             else:
                 raise serve.err(first[0], f"a matches! head this tool cannot read: {head!r}")
-        elif expr == "bloomery_gpu_gates::qwen_seat::Family::of(file).is_ok()":
+        elif expr == "file.map(bloomery_gpu_gates::qwen_seat::Family::of)?.is_ok()":
             programmed[word] = True
         else:
             alts = []
@@ -1990,7 +1990,7 @@ def self_test():
 
     check("a site call reading a field Sites35::CARD does not name is refused by name", unnamed_field)
     try:
-        mirror_vs_source(doctored(SERVE_RS, "Model::Qwen3 => bloomery_gpu_gates::qwen_seat::Family::of(file).is_ok(),",
+        mirror_vs_source(doctored(SERVE_RS, "Model::Qwen3 => file.map(bloomery_gpu_gates::qwen_seat::Family::of)?.is_ok(),",
                                   'Model::Qwen3 => arch.starts_with("qwen3"),'))
         check("a serves arm in a form this tool cannot read fails by file and line", False, "no failure")
     except SourceError as e:

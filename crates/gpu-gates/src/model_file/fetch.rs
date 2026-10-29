@@ -267,6 +267,49 @@ pub fn name(flags: &Flags) -> Result<(), GateError> {
     Ok(())
 }
 
+/// The `general.architecture` and the decision type (`<arch>.decision.type`) of the model the
+/// `--hf` repo `r` holds, read before any of its files is fetched, from the file a fetch
+/// ([`resolve`]) would open first: a set's first shard by its header, read by HTTP Range
+/// ([`model_hf::remote::shard_header`]), or a checkpoint's `config.json` as its folder's map
+/// reads it ([`model_hf::folder::architecture`]; a folder declares no decision type). Under
+/// `HF_HUB_OFFLINE` there is no listing to read it from.
+pub fn repo_architecture(r: &hf::RepoRef) -> Result<(String, Option<String>), GateError> {
+    let client = client()?;
+    if client.offline {
+        return Err(format!("--hf {r}: HF_HUB_OFFLINE is set, so there is no listing").into());
+    }
+    let entries = client.listing(&r.repo)?;
+    let sets = hf::gguf_sets(&r.repo, &entries)?;
+    if sets.is_empty()
+        && let Some(files) = hf::checkpoint_files(&entries)
+    {
+        let config = files
+            .iter()
+            .find(|e| e.path == "config.json")
+            .ok_or_else(|| format!("--hf {r}: the checkpoint has no config.json"))?;
+        let bytes = client.fetch_range(&r.repo, "main", &config.path, 0, config.size)?;
+        return Ok((model_hf::folder::architecture(&bytes)?.to_owned(), None));
+    }
+    let first = hf::pick(&r.repo, &sets, r.quant.as_deref())?
+        .files
+        .first()
+        .ok_or_else(|| format!("--hf {r}: the picked set has no file"))?;
+    let dest = std::env::temp_dir().join(format!("bloomery-header-{}.gguf", std::process::id()));
+    let header =
+        model_hf::remote::shard_header(&dest, &first.path, first.size, &mut |from, len| {
+            client
+                .fetch_range(&r.repo, "main", &first.path, from, len)
+                .map_err(Into::into)
+        })?;
+    let arch = header
+        .value(gguf::GENERAL_ARCHITECTURE)
+        .and_then(gguf::Value::as_str)
+        .ok_or_else(|| format!("--hf {r}: {} names no architecture", first.path))?;
+    let key = format!("{arch}.decision.type");
+    let decision = super::decision_type(&key, header.value(&key))?.map(str::to_owned);
+    Ok((arch.to_owned(), decision))
+}
+
 /// The image projector the `--hf` repo holds beside the process's model file, a set's first
 /// shard in the cache (`<root>/<owner>/<name>/<path in the repo>`, which gives the cache root and
 /// the model's path in the repo): the listing's `mmproj` sibling of the model
@@ -393,6 +436,14 @@ mod tests {
                 ..Default::default()
             };
             let result = match case.as_str() {
+                "architecture" => {
+                    let repo = hf::RepoRef::parse("fixture/gguf:Q4_K_M").unwrap();
+                    assert_eq!(
+                        model_file::repo_architecture(&repo).unwrap(),
+                        ("fixture".into(), Some("lev".into()))
+                    );
+                    return;
+                }
                 "name" => model_file::name(&flags),
                 "resolve" => {
                     model_file::resolve(&flags, None, hf::fetch::Sources::Gguf).map(|_| ())
@@ -463,6 +514,37 @@ mod tests {
         let tree = hub.join("api/models/fixture/checkpoint/tree");
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::write(tree.join("main"), format!("[{}]", listing.join(","))).unwrap();
+        let gguf = hub.join("fixture/gguf/resolve/main");
+        std::fs::create_dir_all(&gguf).unwrap();
+        let header = gguf::write::Layout::new(
+            &[
+                (
+                    gguf::GENERAL_ARCHITECTURE.into(),
+                    gguf::Value::String("fixture".into()),
+                ),
+                (
+                    "fixture.decision.type".into(),
+                    gguf::Value::String("lev".into()),
+                ),
+            ],
+            Vec::new(),
+        )
+        .unwrap()
+        .header_bytes()
+        .to_vec();
+        let file = gguf.join("model-Q4_K_M.gguf");
+        std::fs::write(&file, &header).unwrap();
+        let digest = hf::fetch::digest(&file, hf::Check::GitSha1, header.len() as u64).unwrap();
+        let tree = hub.join("api/models/fixture/gguf/tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(
+            tree.join("main"),
+            format!(
+                r#"[{{"type":"file","path":"model-Q4_K_M.gguf","size":{},"oid":"{digest}"}}]"#,
+                header.len()
+            ),
+        )
+        .unwrap();
         let bin = dir.join("bin");
         std::fs::create_dir(&bin).unwrap();
         let curl = bin.join("curl");
@@ -487,6 +569,7 @@ exec /usr/bin/curl "${{args[@]}}"
         .unwrap();
         std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
         for case in [
+            "architecture",
             "name",
             "resolve",
             "quant",
@@ -540,7 +623,13 @@ exec /usr/bin/curl "${{args[@]}}"
             );
             assert_eq!(
                 requests.len(),
-                if supported { 4 } else { 1 },
+                if case == "architecture" {
+                    2
+                } else if supported {
+                    4
+                } else {
+                    1
+                },
                 "{case}: {requests:?}"
             );
             assert_eq!(root.join("cache/fixture/checkpoint").exists(), supported);

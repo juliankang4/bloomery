@@ -1575,7 +1575,7 @@ gate-gpu-qwen3-dspark:
 # weights (a block of 8 rows over 3 and over 2,100 context rows, the window 2,048), the captured pass replaying to the
 # eager bits, and the loader's card bytes. Real file only (the draft belongs to the Q4_K_M target); the gate lock.
 gate-gpu-qwen35-dspark:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35-dspark && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,hf --release --bin gate_qwen35_dspark && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_dspark'
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35-dspark && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,dspark-hf --release --bin gate_qwen35_dspark && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_dspark'
 
 # The same bin on the MiniCPM-V 4.7 35B-A3B text model (a qwen35moe file with its own vocabulary and a declared, stripped next-token
 # layer; profile minicpmv47). ik refuses the file as it is and no ik set was dumped from it, so the gate takes its text path: the

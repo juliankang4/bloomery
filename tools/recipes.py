@@ -3439,7 +3439,7 @@ def cmd_why(args: argparse.Namespace) -> int:
 KEY_REACH_PINS = {
     "bloomery-hf": "a Hugging Face fetch or checkpoint configuration reader: its commits move only the gates whose targets run its code "
     "(model-hf, gpu-gates under the `hf` feature, and gpu-glm5next under its `hf` feature for gate-gpu-glm5next-tp's folder test)",
-    "bloomery-model-hf": "the fixture fetch and the checkpoint maps: gpu-gates links it under the `checkpoint` feature, for a Qwen3.8 checkpoint "
+    "bloomery-model-hf": "the fixture fetch and the checkpoint maps: gpu-gates links it under the `hf` feature, for a repo header and a Qwen3.8 checkpoint "
     "folder that bloomery-serve and gate_qwen4exp_nvfp4 open and for generate_glm5next (`glm5next-hf`), and gpu-glm5next under its `hf` "
     "feature, for gate-gpu-glm5next-tp's folder test",
 }
@@ -12898,7 +12898,7 @@ def orphan_self_test(expect, real: Side) -> None:
                 fh.write(text[: m.start()] + text[m.end() :])
             got = set(orphan_tests(real.tree, load_justfile(p))[0]) - base
             bind = [o for o in got if " bind::tests::" in o]
-            expect(len(bind) == n_bind and len(got) == n_bind + n_seats and all('cfg(feature = "deepseek41") at crates/gpu-gates/src/lib.rs:' in o and "gate-gpu-gates-lib (features hf)" in o for o in bind), f"orphan FAIL-first (a): {sorted(got)}")
+            expect(len(bind) == n_bind and len(got) == n_bind + n_seats and all('cfg(feature = "deepseek41") at crates/gpu-gates/src/lib.rs:' in o and "gate-gpu-gates-lib (features dspark-hf,hf)" in o for o in bind), f"orphan FAIL-first (a): {sorted(got)}")
         # (c) a filter that matches nothing of its module: the tests only that filter reached go red
         for pat in (r"--lib -- (bind::)'", r"--ignored (hw_ds41_oracle) "):
             m = re.search(pat, text)

@@ -190,6 +190,28 @@ pub fn sparse_shard(
     Ok(HeaderStat { header, reads })
 }
 
+/// The header of the GGUF file `file` (`size` bytes), read through `read` into a sparse file at
+/// `dest` ([`sparse_shard`]) and removed after. `dest` is created here, so a file or link already
+/// at that path is refused before any range is read, never written through.
+pub fn shard_header(
+    dest: &Path,
+    file: &str,
+    size: u64,
+    read: &mut ReadRange<'_>,
+) -> Result<gguf::Inventory, RemoteError> {
+    fs::File::create_new(dest).map_err(|e| io_err(dest, "create the header file", e))?;
+    let header = sparse_shard(dest, file, size, FIRST_RANGE, read).and_then(|_| {
+        gguf::inventory_of(dest).map_err(|source| RemoteError::Header {
+            file: file.to_string(),
+            source,
+        })
+    });
+    let removed = fs::remove_file(dest).map_err(|e| io_err(dest, "remove the header file", e));
+    let header = header?;
+    removed?;
+    Ok(header)
+}
+
 /// The sparse file at `dest` opens, and the listing's `size` is what its header says: the
 /// last tensor ends at most an alignment's padding before it.
 fn check_size(dest: &Path, file: &str, size: u64) -> Result<(), RemoteError> {
@@ -354,6 +376,36 @@ mod tests {
                 None => Err(format!("range {from}+{len} is past the end").into()),
             }
         }
+    }
+
+    /// The header read creates its file: a link already at the path is refused before any range
+    /// is read and its target keeps its bytes, and a free path gives the header and is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_shard_header_is_never_written_through_an_existing_path() {
+        let d = scratch("header");
+        let file = gguf_bytes(4, 1);
+        let log = RefCell::new(Vec::new());
+        let mut read = reader(&file, &log);
+        let target = d.join("target");
+        fs::write(&target, b"kept").unwrap();
+        let dest = d.join("header.gguf");
+        std::os::unix::fs::symlink(&target, &dest).unwrap();
+        let size = file.len() as u64;
+        let e = shard_header(&dest, "m.gguf", size, &mut read)
+            .map(drop)
+            .unwrap_err();
+        assert!(e.to_string().contains("create the header file"), "{e}");
+        assert!(log.borrow().is_empty());
+        assert_eq!(fs::read(&target).unwrap(), b"kept");
+        fs::remove_file(&dest).unwrap();
+        let header = shard_header(&dest, "m.gguf", size, &mut read).unwrap();
+        assert_eq!(
+            header.value(GENERAL_ARCHITECTURE).and_then(Value::as_str),
+            Some("llama")
+        );
+        assert!(!dest.exists());
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

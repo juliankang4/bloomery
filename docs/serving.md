@@ -162,8 +162,12 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   before `--hf` downloads anything and before the driver is asked: with `--model` or `--head`, the selected seat's
   `--help` and refusal of a flag, value or lever come first. A generative start with llama-server placement flags
   resolves their overrides and checks its levers, including `--levers`, after device discovery. Without `--model`
-  or `--head`, the model file picks the seat,
-  so only what every seat refuses ends the start there. The picked seat uses the same checks after the download.
+  or `--head`, the model file picks the seat. What every seat refuses ends the start there. What only some seats
+  refuse (`--prefill steps`, which only the glm and mimo2 seats take, or `--parallel 2` on Nemotron) makes the start
+  read the `--hf` repo's file list and its model's architecture (the first GGUF shard's header, or a checkpoint's
+  `config.json`, and no weights) and end with the refusal of the seat that serves that model, still before the
+  download. Under `HF_HUB_OFFLINE`, or with no network, that read is skipped. The picked seat uses the same checks
+  after the download.
 - **The model's name** (`/v1/models` `id`, the `model` of every answer, `/props` `model_alias`) is `--alias`, else the
   GGUF's `general.name`, else the seat's own default. llama-server's default is the model file's name; this server
   names the model as its file does, which stays the same when a file is renamed or split into shards. A file whose

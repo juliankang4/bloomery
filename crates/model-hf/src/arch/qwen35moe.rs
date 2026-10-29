@@ -1160,6 +1160,10 @@ impl FolderMap for Checkpoint {
         })
     }
 
+    fn architecture(&self) -> &'static str {
+        self.geometry.family.gguf()
+    }
+
     fn header(
         &self,
         planned: &[(&str, &[u64])],
