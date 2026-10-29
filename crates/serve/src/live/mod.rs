@@ -19,6 +19,9 @@
 //! and keeps serving.
 
 mod parts;
+#[cfg(test)]
+#[path = "../../tests/common/process.rs"]
+mod process;
 mod ring;
 mod term;
 mod view;
@@ -447,7 +450,7 @@ mod tests {
                 Ok(())
             });
         }
-        let mut child = cmd.spawn().unwrap();
+        let mut child = super::process::Reaped(cmd.spawn().unwrap());
 
         let (tx, rx) = mpsc::channel();
         let mut reader = master.try_clone().unwrap();
@@ -525,7 +528,14 @@ mod tests {
         let at = wait_for("shutdown (SIGINT)", at);
         let at = wait_for("settings at exit:", at);
         let end = wait_for("\n", at);
-        let status = child.wait().unwrap();
+        let until = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < until, "the child did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert!(status.success(), "{status:?}\n{seen}");
         let want = format!(
             " {:x} {:x} {:x} {:x} {:x?}",
