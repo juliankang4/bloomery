@@ -61,7 +61,7 @@ pub mod vocab;
 mod worker;
 
 pub use api::{
-    COMMIT, ChatPreparation, ChatRequest, EngineFailure, FATAL_LINGER, KEEP_ALIVE_IDLE,
+    COMMIT, ChatPreparation, ChatRequest, EngineFailure, FATAL_LINGER, KEEP_ALIVE_IDLE, Keys,
     MAX_CONNECTIONS, ServeError, Server, ServerConfig, VERSION, panic_text,
 };
 pub use engine::{

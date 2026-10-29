@@ -428,6 +428,71 @@ fn preflight_source_reference() {
     );
 }
 
+/// A misspelled key is refused by the seat, and its value, which may be a key, is never printed.
+#[test]
+fn a_config_file_key_no_seat_takes_is_refused_before_the_fetch() {
+    let path = std::env::temp_dir().join(format!("serve-config-{}.json", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"{"model": "qwen38", "hf": "o/r", "ctx-size": 65536, "api_key": "s3cret"}"#,
+    )
+    .unwrap();
+    let (dir, err, _) = startup_coded(
+        "config-unknown-key",
+        env!("CARGO_BIN_EXE_bloomery-serve"),
+        &["--config", path.to_str().unwrap()],
+        &[],
+    );
+    assert!(err.contains("unknown argument \"--api_key\""), "{err}");
+    assert!(!err.contains("s3cret"), "{err}");
+    clean_refusal(&dir, &err, true);
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A source override reaches the argument check after source resolution.
+#[test]
+fn a_config_files_model_source_yields_to_the_command_line() {
+    let path =
+        std::env::temp_dir().join(format!("serve-config-source-{}.json", std::process::id()));
+    for (entry, flags) in [
+        (r#""model-file": "/x.gguf""#, vec!["--hf", "o/r"]),
+        (r#""model": "glm:Q8_0""#, vec!["-m", "/x.gguf"]),
+        (r#""model-file": "/x.gguf""#, vec!["--model", "glm:Q8_0"]),
+    ] {
+        std::fs::write(&path, format!("{{{entry}, \"ctx-size\": \"abc\"}}")).unwrap();
+        let mut args = vec!["--config", path.to_str().unwrap()];
+        args.extend(flags);
+        checked_refusal("config-source", &args, &[], "--ctx-size \"abc\"");
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+/// The command line's `--embd-hf` and `--embd-no-mmproj` replace the file's `embd-model` and
+/// `embd-mmproj`: the start reaches the check of the repo name, not a model or projector named twice.
+#[test]
+fn a_config_files_embedding_model_and_projector_yield_to_the_command_line() {
+    let path = std::env::temp_dir().join(format!("serve-config-embd-{}.json", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"{"model": "qwen38", "hf": "o/r", "embd-model": "/e.gguf", "embd-mmproj": "/p.gguf"}"#,
+    )
+    .unwrap();
+    checked_refusal(
+        "config-embd",
+        &[
+            "--config",
+            path.to_str().unwrap(),
+            "--embd-hf",
+            "invalid",
+            "--embd-no-mmproj",
+        ],
+        &[],
+        "embedding flags (--embd-model/--embd-hf): --hf \"invalid\": a repo is <owner>/<name>",
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn preflight_ds41_draft() {
     checked_refusal(

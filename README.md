@@ -187,9 +187,9 @@ These seats serve a file or a checkpoint folder on disk (`-m PATH`):
 
 The server has one slot unless `--parallel N` asks for N, so a second request waits for the first. Unset,
 `--ctx-size` gives each slot the largest context its plan holds; a set `--ctx-size` is the total the slots share,
-and one slot takes it whole. A flag on the command line wins over its `LLAMA_ARG_*` variable and over the `BLOOMERY_*`
-lever it stands for. A request field the server does not know is ignored, as in llama-server, so a misspelled sampling field runs at
-its default. Which flags each seat takes, which setting wins and what a request's fields do:
+and one slot takes it whole. `--config FILE` reads the flags from one JSON file. A flag on the command line wins over
+the file's, and both win over the flag's `LLAMA_ARG_*` variable and the `BLOOMERY_*` lever it stands for. A request
+field the server does not know is ignored, as in llama-server, so a misspelled sampling field runs at its default. Which flags each seat takes, which setting wins and what a request's fields do:
 [`docs/serving.md`](docs/serving.md#settings).
 
 What each model needs in GPU memory, RAM and disk is in [`docs/models.md`](docs/models.md). In short: Qwen3-30B and

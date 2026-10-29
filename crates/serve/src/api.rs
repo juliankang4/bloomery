@@ -66,6 +66,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jinja::{ChatTemplate, TemplateError};
+use serde::de::{Deserialize, Deserializer, Error, IgnoredAny, MapAccess, Visitor};
 use serde_json::{Map, Value, json};
 
 use crate::callstream::CallPiece;
@@ -1669,16 +1670,37 @@ fn body(req: &Request) -> Result<Map<String, Value>, ApiError> {
     }
 }
 
+/// A JSON object with each key named once, discarding its values.
+pub struct Keys;
+impl<'de> Visitor<'de> for Keys {
+    type Value = Keys;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON object")
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Keys, A::Error> {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(k) = m.next_key::<String>()? {
+            m.next_value::<IgnoredAny>()?;
+            if seen.contains(&k) {
+                return Err(A::Error::custom(format!("{k} is named twice")));
+            }
+            seen.insert(k);
+        }
+        Ok(Keys)
+    }
+}
+impl<'de> Deserialize<'de> for Keys {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Keys, D::Error> {
+        d.deserialize_map(Keys)
+    }
+}
+
 /// The body of a route that reads [`logit_bias`]: [`body`], and a 400 for a
 /// `logit_bias` key named twice, which the parse into a map keeps only the
 /// last of.
 fn gen_body(req: &Request) -> Result<Map<String, Value>, ApiError> {
-    use serde::de::{Deserialize, Deserializer, Error, IgnoredAny, MapAccess, Visitor};
-
     /// The body's top level, which reads only its `logit_bias`.
     struct Top;
-    /// A `logit_bias` object, each key once.
-    struct Keys;
     impl<'de> Visitor<'de> for Top {
         type Value = ();
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1687,33 +1709,13 @@ fn gen_body(req: &Request) -> Result<Map<String, Value>, ApiError> {
         fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<(), A::Error> {
             while let Some(k) = m.next_key::<String>()? {
                 if k == "logit_bias" {
-                    m.next_value::<Keys>()?;
+                    m.next_value::<Keys>()
+                        .map_err(|e| A::Error::custom(format!("logit_bias: {e}")))?;
                 } else {
                     m.next_value::<IgnoredAny>()?;
                 }
             }
             Ok(())
-        }
-    }
-    impl<'de> Visitor<'de> for Keys {
-        type Value = Keys;
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("logit_bias as an object")
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Keys, A::Error> {
-            let mut seen = std::collections::HashSet::new();
-            while let Some(k) = m.next_key::<String>()? {
-                m.next_value::<IgnoredAny>()?;
-                if !seen.insert(k) {
-                    return Err(A::Error::custom("logit_bias names one key twice"));
-                }
-            }
-            Ok(Keys)
-        }
-    }
-    impl<'de> Deserialize<'de> for Keys {
-        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Keys, D::Error> {
-            d.deserialize_map(Keys)
         }
     }
 

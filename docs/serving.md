@@ -247,8 +247,9 @@ setting wins when two name the same thing, and what a request's fields do.
 
 `bloomery-serve` reads its own flags first: `--model <seat>`, the model (`-m`/`--model-file` or `--hf`), `--head`
 and `--head-config` (the decide seat), the embedding side model (`--embd-*`, the generative seats),
-llama-server's placement flags ([Placement](#placement); not on the decide seat), `--levers`, `--list-devices` and
-`--version`. The seat parses every other flag. Every generative seat takes this common set: `--host`, `--port`,
+llama-server's placement flags ([Placement](#placement); not on the decide seat), `--config`
+([The settings file](#the-settings-file)), `--levers`, `--list-devices` and `--version`. The seat parses every other
+flag. Every generative seat takes this common set: `--host`, `--port`,
 `--ctx` (`--ctx-size`, `-c`), `--parallel` (`-np`), `--place`, `--plan`, `--queue-depth`, `--chat-template-file`,
 `--api-key`, `--api-key-file`, `--alias` and `--slot-save-path`, and the qwen3 seat refuses the last two. The table
 gives what differs. A flag the seat named by `--model` does not take is refused by name with the seat's usage, before `--hf`
@@ -287,6 +288,50 @@ card bytes of each size.
 needs the model file (`--hf` downloads it first), the driver, and the cards' free bytes, and the qwen38 seat opens a
 CUDA context on its stage card first, as a load does. Run it on the machine that will serve.
 
+### The settings file
+
+`bloomery-serve --config FILE` reads a start's flags from one JSON object, so a long start line can live in a file
+that people and services share. Each key is a flag's name without its dashes, and its value is the flag's:
+
+```json
+{
+  "model-file": "/models/Qwen3.8-Flash-Next-FP4-Local",
+  "ctx-size": 65536,
+  "parallel": 2,
+  "host": "0.0.0.0",
+  "api-key-file": "/etc/bloomery/keys",
+  "no-mmproj": true
+}
+```
+
+`bloomery-serve --config FILE` with this file starts as `bloomery-serve -m /models/Qwen3.8-Flash-Next-FP4-Local
+--ctx-size 65536 --parallel 2 --host 0.0.0.0 --api-key-file /etc/bloomery/keys --no-mmproj` does.
+
+- **Values.** A string or a number is the flag's value. `true` gives a switch; a switch that is off is left out. A
+  list gives the flag once for each value (`"api-key": ["k1", "k2"]`). A path is read as on the command line, from
+  the directory the server starts in.
+- **Keys.** Every flag that sets something has a key, its long name: `ctx-size` for `-c`, `device` for `-dev`, `model`
+  for `--model`. A key the seat does not take is refused by the seat with the flag's name before anything is
+  fetched, as the flag would be.
+- **The command line replaces the file.** A flag on the command line, in any of its spellings, replaces the file's
+  entry for it: `-c 4096` replaces `"ctx-size"`. So does a flag that sets the same thing another way: `-m` or `--hf`
+  replaces `"model-file"`, `--embd-hf` replaces `"embd-model"`, `--no-mmproj` replaces `"mmproj"` and
+  `--embd-no-mmproj` replaces `"embd-mmproj"` (and the reverse of each), `-ncmoe` or `-ot` replaces `"cpu-moe"`, and
+  `--place` replaces `"device"`, `"split-mode"`, `"tensor-split"` and `"main-gpu"` while `-dev`, `-sm`, `-ts` or `-mg`
+  replaces `"place"`. A catalog variant (`"model": "glm:Q8_0"`) is also a model source; a bare seat word
+  (`"model": "glm"`) keeps its separate meaning.
+- **One line on stderr for each entry** says what it was read as, or which flag of the command line replaced it. The
+  line prints the value only for `ctx-size`, `ubatch-size`, `cache-ram`, `parallel`, `alias`, `host`, `port`,
+  `api-key-file`, `slot-save-path`, `chat-template-file` and the image flags; for any other key, `api-key` and a
+  misspelled `api_key` among them, it names the flag and leaves the value out.
+- **The file is read before `--help`**, because it can name the seat whose usage `--help` prints: `--help` beside a
+  file that cannot be read or is refused ends with that refusal.
+- **Refused by name**, with the file's path, before the model is read: a file that is not one JSON object, a key
+  named twice, a key written with its dashes, a key that asks the start to do something rather than set it (`plan`,
+  `levers`, `help`, `version`, `list-devices`, `records-schema`, `recommend`, `dry-run`, `json`, `config`), `false`,
+  `null`, an object or an empty list as a value, a value for a switch, `true` for a flag that takes a value, and
+  `--config` given twice.
+
 ### Which setting wins
 
 One value a setting, chosen in this order:
@@ -295,11 +340,14 @@ One value a setting, chosen in this order:
    stands for a `BLOOMERY_*` lever replaces the lever's value: `-ub` replaces `BLOOMERY_QWEN3_UBATCH`,
    `--cache-type-k` replaces `BLOOMERY_QWEN3_KV`, and the placement flags replace the levers they set
    ([Placement](#placement)).
-2. **llama-server's variables.** A `LLAMA_ARG_*` variable is read as its flag ([The environment](#the-environment)),
+2. **The settings file** (`--config`, [above](#the-settings-file)). A file's flag counts as the command line's against
+   the variables and levers below, and the line that says so names it as the command line's.
+3. **llama-server's variables.** A `LLAMA_ARG_*` variable is read as its flag ([The environment](#the-environment)),
    so it also replaces the lever: `LLAMA_ARG_UBATCH=48` beside `BLOOMERY_QWEN3_UBATCH=64` runs 48.
-3. **The levers.** A `BLOOMERY_*` variable that no flag or `LLAMA_ARG_*` variable names.
-4. **The seat's default.**
+4. **The levers.** A `BLOOMERY_*` variable that no flag or `LLAMA_ARG_*` variable names.
+5. **The seat's default.**
 
+A command-line `--api-key` or `--api-key-file` replaces the settings file's entire list for that same flag.
 Two cases are not ranked. The keys add: `LLAMA_API_KEY`, `--api-key` and `--api-key-file` together make one set. Two
 sources of one thing are refused by name, never picked between: the model named twice (`-m` beside `--hf`,
 `LLAMA_ARG_MODEL` beside `LLAMA_ARG_HF_REPO`, or `BLOOMERY_REF_MODEL` naming another file), `--place` beside a

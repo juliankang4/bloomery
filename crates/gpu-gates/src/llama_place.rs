@@ -815,6 +815,20 @@ pub(crate) fn spelled(arg: &str) -> String {
     }
 }
 
+/// Whether `a` and `b` set one placement, as llama-server matches the flags: two spellings of a
+/// placement flag, two flags of the routed experts' place, or `--place` and a flag that names cards.
+pub(crate) fn one_placement(a: &str, b: &str) -> bool {
+    let (a, b) = (spelled(a), spelled(b));
+    let (a, b) = (a.as_str(), b.as_str());
+    let in_one = |sets: &[&[&str]]| sets.iter().any(|set| set.contains(&a) && set.contains(&b));
+    let any = |sets: &[&[&str]], x: &str| sets.iter().any(|set| set.contains(&x));
+    let moe = [CPU_MOE, N_CPU_MOE, OVERRIDE_TENSOR];
+    in_one(&FLAGS)
+        || (any(&moe, a) && any(&moe, b))
+        || (a == "--place" && any(&NAMES_CARDS, b))
+        || (b == "--place" && any(&NAMES_CARDS, a))
+}
+
 /// The census in CUDA order, which is llama-server's device order.
 fn by_ordinal(census: &[DeviceInfo]) -> Vec<&DeviceInfo> {
     let mut all: Vec<&DeviceInfo> = census.iter().collect();
