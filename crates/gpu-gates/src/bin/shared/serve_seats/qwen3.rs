@@ -338,15 +338,6 @@ pub(crate) struct Args {
     template_file: TemplateFile,
 }
 
-/// The K/V planes' format this run loads: `--cache-type-k`'s word when given
-/// (refused by name on any other), else `set`, the `BLOOMERY_QWEN3_KV` lever's,
-/// else f16.
-fn cache_k(a: &Args, set: Option<&str>) -> Result<KvQ8, GateError> {
-    let word = a.cache_type_k.as_deref().or(set).unwrap_or("f16");
-    KvQ8::parse(word)
-        .ok_or_else(|| format!("--cache-type-k takes f16 or q8_0, not {word:?}").into())
-}
-
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
     let mut a = Args {
         host: "127.0.0.1".to_owned(),
@@ -2340,7 +2331,11 @@ pub(crate) fn check(
             let a = parse_args(args)?;
             a.template_file.check()?;
             a.vision.check_before_model(from_repo)?;
-            cache_k(&a, levers.and_then(Levers::qwen3_kv_set))?;
+            KvQ8::choose(
+                a.cache_type_k.as_deref(),
+                levers.and_then(Levers::qwen3_kv_set),
+                KvQ8::F16,
+            )?;
             if let Some(levers) = levers {
                 let word = served::word(levers)?;
                 WidthMode::of(levers.mtp_width())?;
@@ -2373,7 +2368,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     .run();
 
     arm_screen(levers.screen());
-    let kv = cache_k(&a, levers.qwen3_kv_set())?;
+    let kv = KvQ8::choose(a.cache_type_k.as_deref(), levers.qwen3_kv_set(), KvQ8::F16)?;
     let path = ref_model_path()?;
     // A directory is a checkpoint folder, opened once here: its located header plans as a
     // split's first shard does, and the header and part source go to the engine thread.

@@ -7,6 +7,7 @@
 /// The levers the Qwen3.8 server acts on.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::QWEN38_EXPERTS,
+    bloomery_levers::QWEN3_KV,
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::PIN_MAIN,
     bloomery_levers::HOST_LANES,

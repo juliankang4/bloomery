@@ -112,11 +112,11 @@ impl Store38 {
         Ok(())
     }
 
-    /// A zeroed selecting store of `ctx` positions over the planes `d` cuts
-    /// — f16 planes: the qwen38 family's stores carry no q8_0 form.
-    pub(super) fn qsa(stream: &CudaStream, d: &Dims) -> Result<Store38, GpuError> {
+    /// A zeroed selecting store of `ctx` positions over the planes `d` cuts,
+    /// its K/V planes in the load's cache format `kv` (the index keys f16).
+    pub(super) fn qsa(stream: &CudaStream, d: &Dims, kv: KvQ8) -> Result<Store38, GpuError> {
         Ok(Store38::Qsa {
-            kv: KvPlanes::new(stream, d, KvQ8::F16)?,
+            kv: KvPlanes::new(stream, d, kv)?,
             raw: DeviceBuffer::zeroed(stream, d.ctx * geo::IDX_DIM)?,
             pooled: DeviceBuffer::zeroed(stream, qsa::pools_for(d.ctx) * geo::IDX_DIM)?,
         })
@@ -140,14 +140,21 @@ pub(super) fn no_carry() -> GpuError {
 }
 
 /// The bytes `runtime::stores` counts for a delta store of [`LANES`] lanes
-/// and for a selecting store at `ctx` positions: what the load's
-/// allocations must equal.
-pub(super) fn store_rule_bytes(ctx: usize) -> (u64, u64) {
+/// and for a selecting store at `ctx` positions in the cache format `kv`:
+/// what the load's allocations must equal.
+pub(super) fn store_rule_bytes(ctx: usize, kv: KvQ8) -> (u64, u64) {
     (
         stores::recurrent_bytes(GDN.n_v, GDN.n_k, linear::HEAD, linear::CONV_TAPS)
             + stores::delta_lane_bytes(GDN.n_v, linear::HEAD, LANES)
             + stores::delta_carry_bytes(GDN.n_v, GDN.n_k, linear::HEAD),
-        stores::selecting_bytes(geo::N_KV, geo::HEAD, geo::IDX_DIM, geo::POOL, ctx),
+        stores::selecting_bytes(
+            geo::N_KV,
+            geo::HEAD,
+            kv == KvQ8::Q8,
+            geo::IDX_DIM,
+            geo::POOL,
+            ctx,
+        ),
     )
 }
 

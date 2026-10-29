@@ -249,6 +249,15 @@
 //!   for bit — a token's bits depend neither on the ubatch it lands in nor
 //!   on the route's run (D3K's 3,001 tokens run two at the load's ubatch
 //!   of 4,096).
+//! - (kv) the q8_0 cache (`BLOOMERY_QWEN3_KV=q8_0`, the seat's `--cache-type-k q8_0`): the
+//!   model loaded again with its K/V planes and the MTP-less load's every selecting store in
+//!   q8_0's two-plane layout. Its store bytes equal their derivation (each selecting layer's
+//!   K and V at 17/16 B a value, the rest as (s) derives them); (p) on it, graph = eager = pass
+//!   with every store bit for bit; and D3K's step after its prefill by ubatches (the gated
+//!   prompt flashes over the cache's q8 tiles, below and past the selection's onset, then the
+//!   selected decode flash) judged against ik's by (t)'s rule and bands: the cache's
+//!   quantization must not move the argmax past a named tie nor a layer output past
+//!   [`FREE_BAND`].
 //! - (r) refusals: `Prompt38::parse` takes `step`, `pass`, `gemm` and `auto`
 //!   and refuses any other name by name; the image placeholder
 //!   the header's image placeholder (`ple.image_token_id`) as a step, as a pass and as a ubatch is refused by name
@@ -347,7 +356,7 @@ mod gate {
     use crate::qwen38_open::{Open38, Opened38, PlanFacts};
 
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Seq38, SplitWalk, Store38Host,
+        Body38, KvQ8, LayerKind38, Prompt38, Qwen38Model, RouteTap, Seq38, SplitWalk, Store38Host,
         TargetRows, seq38_bytes,
     };
     use bloomery_gpu::head::Head;
@@ -772,11 +781,11 @@ mod gate {
     /// ([`PlanInputs::plan_with_slots`]).
     fn open_slots(experts: Experts, slots: usize) -> Result<Qwen38Model, GateError> {
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
-        Ok(open_at(experts, slots, ub, None)?.model)
+        Ok(open_at(experts, slots, ub, None, KvQ8::F16)?.model)
     }
 
     /// [`open_slots`] at a ubatch of `ub`, the host's room the reading's or
-    /// `room` given ([`PlanInputs::room`]); with the plan's facts, which the
+    /// `room` given ([`PlanInputs::room`]), the K/V planes in `kv`; with the plan's facts, which the
     /// plan line prints and the structure clause holds the body to (each
     /// layer's card experts are the plan's own, read before the body is
     /// built), among them the tier the plan reads the PLE table from.
@@ -785,6 +794,7 @@ mod gate {
         slots: usize,
         ub: usize,
         room: Option<u64>,
+        kv: KvQ8,
     ) -> Result<Opened38, GateError> {
         let file = open_split()?;
         let t = Instant::now();
@@ -799,6 +809,7 @@ mod gate {
             host: cfg().host,
             room,
             residency: Residency::Off,
+            kv,
         }
         .plan(file)?;
         let p = planned.facts();
@@ -914,6 +925,30 @@ mod gate {
     fn set_taps(m: &mut Qwen38Model, on: bool) -> Result<(), GateError> {
         m.set_layer_taps(on)?;
         Ok(())
+    }
+
+    /// [`store_bytes`] on a q8_0 cache: each selecting layer's K and V at
+    /// 17/16 B a value (`2 · 2 · 256` values a position) in place of f16's 2.
+    fn store_bytes_q8() -> usize {
+        let kv = |bytes_x16: usize| CTX * 2 * N_KV * HEAD * bytes_x16 / 16;
+        store_bytes() - n_qsa() * (kv(32) - kv(17))
+    }
+
+    /// (kv): the model loaded with a q8_0 cache (module doc).
+    fn kv_q8(toks: &[u32], ties: &mut usize) -> Result<bool, GateError> {
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
+        let mut m = open_at(Experts::Host, 1, ub, None, KvQ8::Q8)?.model;
+        let (got, want) = (m.body("kv_q8")?.store_bytes(), store_bytes_q8());
+        let mut ok = got == want;
+        println!(
+            "kv q8_0: store bytes {got} (want {want}, derived; f16's {}) {}",
+            store_bytes(),
+            verdict(ok)
+        );
+        ok &= paths(&mut m, toks)?.0;
+        ok &= step_set(&mut m, D3K, Prompt38::Gemm, (None, false), ties)?.0;
+        println!("kv q8_0 {}", verdict(ok));
+        Ok(ok)
     }
 
     /// `reset`, then every selecting store's planes set to [`PLANE_FILL`].
@@ -3982,7 +4017,7 @@ mod gate {
     /// against `host`, (ii) and (iii).
     fn card_leg(toks: &[u32], host: &Run, man: &RefManifest) -> Result<bool, GateError> {
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
-        let Opened38 { model: mut m, plan } = match open_at(Experts::Card, 1, ub, None) {
+        let Opened38 { model: mut m, plan } = match open_at(Experts::Card, 1, ub, None, KvQ8::F16) {
             Ok(o) => o,
             Err(e) => {
                 println!(
@@ -4043,6 +4078,7 @@ mod gate {
                     },
                     room: None,
                     residency: Residency::Off,
+                    kv: KvQ8::F16,
                 }
                 .plan(open_split()?)?
                 .open()
@@ -4402,7 +4438,7 @@ mod gate {
         m.prompt38(&ids[..k], Prompt38::Pass)?;
         m.prompt38(&ids[k..n], Prompt38::Pass)?;
         let state = m.seq_save()?;
-        let derived = seq38_bytes(n_gdn(), n_qsa(), n, false);
+        let derived = seq38_bytes(n_gdn(), n_qsa(), n, false, KvQ8::F16);
         let lane = m.seq_lane(2 * derived)?;
         let (on_lane, pending) = m.seq_save_async(&lane)?.map_err(GateError::from)?;
         pending.land()?;
@@ -4717,7 +4753,7 @@ mod gate {
             let rec = st::recurrent_bytes(V_HEADS, K_HEADS, HEAD_V, CONV)
                 + st::delta_lane_bytes(V_HEADS, HEAD_V, LANES)
                 + st::delta_carry_bytes(V_HEADS, K_HEADS, HEAD_V);
-            let sel = st::selecting_bytes(N_KV, HEAD, IDX_DIM, POOL, CTX);
+            let sel = st::selecting_bytes(N_KV, HEAD, false, IDX_DIM, POOL, CTX);
             let ple = st::ple_ring_bytes(PLE_TAPS, PLE_DILATION, STREAMS, HIDDEN);
             let rows = (1 + PASS_ROWS) * STREAMS * HIDDEN * 4;
             u64::try_from(n_gdn())? * (rec + 32)
@@ -4884,6 +4920,7 @@ mod gate {
             host: cfg().host,
             room: None,
             residency: Residency::Off,
+            kv: KvQ8::F16,
         }
         .plan(open_split()?)?
         .facts()
@@ -4892,13 +4929,13 @@ mod gate {
         let Opened38 {
             model: mut m,
             plan: host_plan,
-        } = open_at(Experts::Host, 1, ZUB, None)?;
+        } = open_at(Experts::Host, 1, ZUB, None, KvQ8::F16)?;
         let (want, host_faults) = z_runs(&mut m, toks, &prefill)?;
         drop(m);
         let Opened38 {
             model: mut m,
             plan: nvme_plan,
-        } = open_at(Experts::Host, 1, ZUB, Some(host_need - 1))?;
+        } = open_at(Experts::Host, 1, ZUB, Some(host_need - 1), KvQ8::F16)?;
         let (got, nvme_faults) = z_runs(&mut m, toks, &prefill)?;
         drop(m);
         let (host_tier, nvme_tier) = (host_plan.ple_tier, nvme_plan.ple_tier);
@@ -5788,6 +5825,9 @@ mod gate {
         steps) is replaced by D1K's passes = steps and windows over the selector region's \
         boundaries from a shared GEMM prefix; D3K's ik compare is the GEMM-fed one.";
 
+    /// (kv)'s clause line.
+    const KV_CLAUSE: &str = "(kv) the q8_0 cache: store bytes, graph = eager = pass, D3K's step";
+
     pub fn run() -> Result<(), GateError> {
         let mut ok = init()?;
         let mut m = open(Experts::Host)?;
@@ -5846,6 +5886,8 @@ mod gate {
         tier::sc("(r) refusals")?;
         ok &= refusals(&mut m)?;
         drop(m);
+        tier::sc(KV_CLAUSE)?;
+        ok &= kv_q8(&toks, &mut ties)?;
         tier::sc("(z) the PLE table on the NVMe tier = on the host")?;
         ok &= ple_nvme(&toks)?;
         tier::sc("(y) resident slots: the plan's bytes and the harness's contracts")?;

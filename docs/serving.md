@@ -157,8 +157,12 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   residency resolves `off`, and a `ctx experts-floor=unmet` line says why. A set value is the total the slots split, and
   one that does not fit is refused, never cut. PIN(2026-10-14): `generate::choose_ctx` over `ctx_ask::choose`),
   `--cache-type-k f16|q8_0` (the qwen3
-  seats; llama-server's spelling, also the `BLOOMERY_QWEN3_KV` lever — q8_0 halves the KV bytes a position, so the
-  auto context nearly doubles on the same card; `--cache-type-v` does not exist, both planes quantize together),
+  and qwen38 seats; llama-server's spelling, also the `BLOOMERY_QWEN3_KV` lever; q8_0 nearly doubles the auto
+  context on the same card for the qwen3 seat. On Qwen3.8 FP4-Local at 16,896 positions, the attention store is
+  773,279,360 B against f16's 967,921,280 B; the index keys stay f16, and the default context and slot count did
+  not change there. Unset is f16, except a Qwen3.8 checkpoint folder,
+  whose seat runs q8_0 (FP4-Local's Spark default; `--cache-type-k f16` keeps f16); `--cache-type-v` does not
+  exist, both planes quantize together),
   `-ub/--ubatch-size N` (the qwen3 seat and the decide seat, on a file with no routed expert, whose only load is the
   whole one: that many tokens a prompt ubatch, or a refusal by name with the bytes it needs and a smaller size as
   the remedy; unset, the load takes the largest of 4096, 2048, 1024 and 512 the card holds at the asked context and
@@ -245,7 +249,7 @@ downloads anything; `bloomery-serve --model <seat> --help` prints that usage.
 |---|---|---|---|---|---|
 | `ds41` | N | yes | no | yes | |
 | `glm` | N | yes | no | yes | `--prefill batch\|steps` |
-| `qwen38` | N | yes | 1 to 4096 | yes ² | |
+| `qwen38` | N | yes | 1 to 4096 | yes ² | `--cache-type-k f16\|q8_0` |
 | `qwen3` | N | no | a file with no routed expert ³ | yes | `--cache-type-k f16\|q8_0` |
 | `mimo2` | N | yes | no | no | `--prefill batch\|steps` |
 | `minimaxm3` | N | yes | no | no | |

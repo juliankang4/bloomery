@@ -111,6 +111,7 @@
 //! recurrent stores one call on, so a call at that position is refused by
 //! name until `reset`: a delta layer keeps no earlier state to cut back to.
 
+use super::body::KvQ8;
 use super::card38::{Card38, MapCheck, Walk38};
 use super::image::{
     MediaCarrier, MediaRows, imrope_sections, media_call, section_order, window_spans,
@@ -123,7 +124,9 @@ use super::program38::{
     Ctx38, Kernels38, PLE_ARRIVAL_NODES, Parts38, Pass38, RowsCopy, STEP_MEMOPS, Seqs38, SlotSeq38,
     Step38, Verify38, seq_launches, step_launches, verify_launches,
 };
-use super::scratch::{Io, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams, stamps_at};
+use super::scratch::{
+    Io, KvPlanes, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams, stamps_at,
+};
 use super::scratch38::{
     Arena38, LANES, PASS_ROWS, Store38, Taps38, VERIFY_ROWS, WideRecord, dims, final_res, no_carry,
     store_rule_bytes,
@@ -286,20 +289,21 @@ pub struct Slot38 {
 }
 
 /// The host bytes a sequence state of `positions` positions holds on a load
-/// of `gdn` delta and `qsa` selecting layers, with the draft's side when the
-/// load carries it ([`Seq38::bytes`]'s terms at plan time, for a seat's park
-/// budget): the positional rows and two recurrent copies
-/// ([`seq_positional_bytes`], [`checkpoint_bytes`]), the draft's store rows
-/// below the same positions, the step's and the pass's arena rows (the
-/// most a parked refresh reads), and the hidden row of the one point whose
+/// of `gdn` delta and `qsa` selecting layers, its K/V rows in the cache
+/// format `kv`, with the draft's side when the load carries it
+/// ([`Seq38::bytes`]'s terms at plan time, for a seat's park budget): the
+/// positional rows and two recurrent copies ([`seq_positional_bytes`],
+/// [`checkpoint_bytes`]), the draft's store rows below the same positions
+/// (in the same format), the step's and the pass's arena rows (the most a
+/// parked refresh reads), and the hidden row of the one point whose
 /// recurrent copy the shared part counts ([`POINT_ROW_BYTES`]).
 #[must_use]
-pub fn seq38_bytes(gdn: usize, qsa: usize, positions: usize, drafts: bool) -> u64 {
-    let shared = seq_positional_bytes(qsa, positions) + 2 * checkpoint_bytes(gdn);
+pub fn seq38_bytes(gdn: usize, qsa: usize, positions: usize, drafts: bool, kv: KvQ8) -> u64 {
+    let shared = seq_positional_bytes(qsa, positions, kv) + 2 * checkpoint_bytes(gdn);
     if !drafts {
         return shared;
     }
-    let store = 2 * (geo::N_KV * positions * geo::HEAD * size_of::<u16>()) as u64;
+    let store = kv_rows_bytes(positions, kv);
     let rows = ((1 + PASS_ROWS) * geo::STREAMS * geo::HIDDEN * size_of::<f32>()) as u64;
     shared + store + rows + POINT_ROW_BYTES
 }
@@ -394,15 +398,21 @@ pub fn checkpoint_budget38(gdn: usize, ctx: u64) -> Result<u64, GpuError> {
 }
 
 /// The positional bytes a sequence state of `positions` positions carries
-/// for `qsa` selecting layers: each one's K and V rows, raw indexer keys and
-/// the pooled keys of the pools the positions reach.
+/// for `qsa` selecting layers: each one's K and V rows in the cache format
+/// `kv`, raw indexer keys and the pooled keys of the pools the positions
+/// reach (f16 in either format).
 #[must_use]
-pub const fn seq_positional_bytes(qsa: usize, positions: usize) -> u64 {
+pub const fn seq_positional_bytes(qsa: usize, positions: usize, kv: KvQ8) -> u64 {
     let f16 = size_of::<u16>();
-    let layer = 2 * geo::N_KV * positions * geo::HEAD * f16
-        + positions * geo::IDX_DIM * f16
-        + positions.div_ceil(geo::POOL) * geo::IDX_DIM * f16;
-    (qsa * layer) as u64
+    let keys = positions * geo::IDX_DIM * f16 + positions.div_ceil(geo::POOL) * geo::IDX_DIM * f16;
+    qsa as u64 * (kv_rows_bytes(positions, kv) + keys as u64)
+}
+
+/// One attention store's K and V rows of `positions` positions in the cache
+/// format `kv` (`runtime::stores::kv_plane_bytes`).
+const fn kv_rows_bytes(positions: usize, kv: KvQ8) -> u64 {
+    let q8 = matches!(kv, KvQ8::Q8);
+    runtime::stores::kv_plane_bytes(geo::N_KV, geo::HEAD, q8, positions as u64)
 }
 
 /// How a prompt runs: captured steps, one a position — the decode step's
@@ -1115,8 +1125,10 @@ fn ple_takes(
 }
 
 /// A layer's store read back ([`Body38::stores_host`]): a delta layer's
-/// state, conv ring and carry, or a selecting layer's K/V planes (f16 bits)
-/// and its raw and pooled indexer keys.
+/// state, conv ring and carry, or a selecting layer's K/V planes and its raw
+/// and pooled indexer keys. A side's plane is its f16 bits, or on a q8_0
+/// cache its codes plane's 16-bit halves (each word's low half first) then
+/// its scales plane: bit equality reads either, a row's values only the f16.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Store38Host {
     Rec {
@@ -1892,14 +1904,16 @@ impl Body38 {
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
         let d = dims(router_dims, ctx);
+        // The plan's cache format is the one the stores take.
+        let kv = KvQ8::of(inputs.kv.is_q8());
         let stores = kinds
             .iter()
             .map(|k| match k {
                 Kind38::Gdn => Store38::rec(stream),
-                Kind38::Qsa => Store38::qsa(stream, &d),
+                Kind38::Qsa => Store38::qsa(stream, &d, kv),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (rec, sel) = store_rule_bytes(ctx);
+        let (rec, sel) = store_rule_bytes(ctx, kv);
         for (l, (st, k)) in stores.iter().zip(kinds).enumerate() {
             let want = match k {
                 Kind38::Gdn => rec,
@@ -2207,6 +2221,18 @@ impl Body38 {
                 super::plan38::Mixer38::Qsa(_) => LayerKind38::Qsa,
             })
             .collect()
+    }
+
+    /// The cache format the selecting stores hold: the load's one choice,
+    /// read back from the live planes (f16 on a load of none).
+    fn kv_format(&self) -> KvQ8 {
+        self.stores
+            .iter()
+            .find_map(|s| match s {
+                Store38::Qsa { kv, .. } => Some(kv.format()),
+                Store38::Rec { .. } => None,
+            })
+            .unwrap_or_default()
     }
 
     /// The captured step's launches ([`super::program38`]'s count), and how
@@ -2695,10 +2721,24 @@ impl Body38 {
                             .to_host_vec(stream)?,
                     },
                     Store38::Qsa { kv, raw, pooled } => {
-                        let (k, v) = kv.f16("qwen38::stores_host")?;
+                        let q8 = |codes: &DeviceBuffer<u32>, scales: &DeviceBuffer<u16>| {
+                            let mut halves: Vec<u16> = codes
+                                .to_host_vec(stream)?
+                                .into_iter()
+                                .flat_map(|w| [w as u16, (w >> 16) as u16])
+                                .collect();
+                            halves.extend(scales.to_host_vec(stream)?);
+                            Ok::<_, GpuError>(halves)
+                        };
+                        let (k, v) = match kv {
+                            KvPlanes::F16 { k, v } => {
+                                (k.to_host_vec(stream)?, v.to_host_vec(stream)?)
+                            }
+                            KvPlanes::Q8 { kq, kd, vq, vd } => (q8(kq, kd)?, q8(vq, vd)?),
+                        };
                         Store38Host::Qsa {
-                            k: k.to_host_vec(stream)?,
-                            v: v.to_host_vec(stream)?,
+                            k,
+                            v,
                             raw: raw.to_host_vec(stream)?,
                             pooled: pooled.to_host_vec(stream)?,
                         }
@@ -2712,16 +2752,29 @@ impl Body38 {
     /// Every selecting store's K/V planes and raw and pooled keys set to
     /// `bits`, an f16 pattern: a gate's stand-in for the rows `reset` leaves
     /// as they were, so a path that reads a row it did not write reads the
-    /// pattern, not a previous run's value. Synchronizes; gate use.
+    /// pattern, not a previous run's value. On a q8_0 cache the scales hold
+    /// `bits` and each codes word two copies of it. Synchronizes; gate use.
     pub fn fill_planes(&mut self, gpu: &Gpu, bits: u16) -> Result<(), GpuError> {
-        const WHAT: &str = "qwen38::fill_planes";
         let stream = gpu.stream();
+        let fill = |buf: &mut DeviceBuffer<u16>| buf.copy_from_host(stream, &vec![bits; buf.len()]);
+        let word = u32::from(bits) * 0x1_0001;
         for s in &mut self.stores {
             if let Store38::Qsa { kv, raw, pooled } = s {
-                let (k, v) = kv.f16_mut(WHAT)?;
-                for buf in [k, v, raw, pooled] {
-                    buf.copy_from_host(stream, &vec![bits; buf.len()])?;
+                match kv {
+                    KvPlanes::F16 { k, v } => {
+                        fill(k)?;
+                        fill(v)?;
+                    }
+                    KvPlanes::Q8 { kq, kd, vq, vd } => {
+                        for codes in [kq, vq] {
+                            codes.copy_from_host(stream, &vec![word; codes.len()])?;
+                        }
+                        fill(kd)?;
+                        fill(vd)?;
+                    }
                 }
+                fill(raw)?;
+                fill(pooled)?;
             }
         }
         Ok(())
@@ -5293,12 +5346,14 @@ impl Slots for Body38 {
         }
         let stream = gpu.stream();
         let d = dims(self.s.route.dims(), self.ctx);
+        // The load's one cache format, read back from the live planes.
+        let kv = self.kv_format();
         let stores = self
             .kinds()
             .into_iter()
             .map(|k| match k {
                 LayerKind38::Gdn => Store38::rec(stream),
-                LayerKind38::Qsa => Store38::qsa(stream, &d),
+                LayerKind38::Qsa => Store38::qsa(stream, &d, kv),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let ckpt = Checkpoints::sequence(
@@ -5689,7 +5744,8 @@ impl<'a> Copied<'a> {
     /// The stores of `stores` and `ple_ring` a checkpoint copies — each
     /// delta layer's state lane `lane`, its conv ring and carry, then the PLE ring
     /// — and, with `rows` (`(ctx, n)`), each selecting layer's rows of
-    /// positions below `n`: its K and V planes' (`[N_KV][ctx][HEAD]` each),
+    /// positions below `n`: its K/V planes' ([`KvPlanes::spans`](super::scratch::KvPlanes::spans), in
+    /// the cache's format),
     /// its raw keys' (`[ctx][IDX_DIM]`) and its pooled keys' of the pools
     /// those positions reach; then `draft`'s store rows of the same
     /// positions ([`Mtp38::store_spans`]).
@@ -5729,12 +5785,8 @@ impl<'a> Copied<'a> {
                 }
                 Store38::Qsa { kv, raw, pooled } => {
                     if let Some((ctx, n)) = rows {
-                        let (h, d) = (geo::HEAD, geo::IDX_DIM);
-                        let (k, v) = kv.f16_mut("qwen38::copied")?;
-                        c.spans
-                            .push(Spans::by_position(k, geo::N_KV, ctx * h, n, h)?);
-                        c.spans
-                            .push(Spans::by_position(v, geo::N_KV, ctx * h, n, h)?);
+                        let d = geo::IDX_DIM;
+                        c.spans.extend(kv.spans((geo::N_KV, ctx, geo::HEAD), n)?);
                         c.spans.push(Spans::by_position(raw, 1, 0, n, d)?);
                         c.spans
                             .push(Spans::by_pool(pooled, 1, 0, n, (geo::POOL, d))?);

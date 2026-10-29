@@ -2847,11 +2847,7 @@ impl Slots for Body35 {
                 .zip(&self.stores)
                 .map(|(p, live)| match (&p.mixer, live) {
                     (MixerPlan::Gqa(_), LayerStore::Kv(planes)) => {
-                        let kv = match planes {
-                            KvPlanes::F16 { .. } => KvQ8::F16,
-                            KvPlanes::Q8 { .. } => KvQ8::Q8,
-                        };
-                        Ok(LayerStore::Kv(KvPlanes::new(stream, &d, kv)?))
+                        Ok(LayerStore::Kv(KvPlanes::new(stream, &d, planes.format())?))
                     }
                     (MixerPlan::Delta(dp), LayerStore::Rec(_)) => Ok(LayerStore::Rec(
                         RecStore::new(stream, dp.shape.lens(PLAIN_LANES), PLAIN_LANES)?,
