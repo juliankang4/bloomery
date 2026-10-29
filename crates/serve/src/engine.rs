@@ -67,6 +67,7 @@
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -383,7 +384,11 @@ pub trait Engine: Send {
     /// [`Engine::slots`]), in row order: each row's `last` and whatever the
     /// engine's draft proposes after it evaluated together, the tokens the
     /// pass keeps appended to its `out` in position order and what it drafted
-    /// set in its `drafted`, as [`Engine::advance`] does for one. Afterwards
+    /// set in its `drafted`, as [`Engine::advance`] does for one, or for a
+    /// row with a [`SlotDraw`] as [`Engine::advance_sampled`] does: its ids
+    /// the ones its pass alone draws, so a sampled request of one seed takes
+    /// the same ids beside other slots as alone. The server sends a row with
+    /// a draw only to an engine that [`Engine::drafts_sampled`]. Afterwards
     /// the selected slot is unspecified: the server selects before its next
     /// per-slot call. The server calls this only with two rows or more (one
     /// row is an `advance`, which an engine may run another way than a round:
@@ -392,7 +397,7 @@ pub trait Engine: Send {
     fn advance_slots(&mut self, rows: &mut [SlotPass<'_>]) -> Result<(), EngineError> {
         for row in rows {
             self.select_slot(row.slot)?;
-            row.drafted = self.advance(row.last, row.out)?;
+            row.drafted = advance_row(self, row)?;
         }
         Ok(())
     }
@@ -624,15 +629,68 @@ pub struct SlotRow<'a> {
 }
 
 /// One row of [`Engine::advance_slots`]: the slot, the id its pass runs, the
-/// ids the pass keeps (appended), and what the pass drafted. `drafted` is the
-/// engine's answer, set by the call; the server checks the kept ids against
-/// the engine's rows as [`Engine::advance`]'s caller does.
+/// ids the pass keeps (appended), what the pass drafted, and the draw of a
+/// request that draws. `drafted` is the engine's answer, set by the call;
+/// the server checks the kept ids against the engine's rows as
+/// [`Engine::advance`]'s caller does.
 #[derive(Debug)]
 pub struct SlotPass<'a> {
     pub slot: usize,
     pub last: u32,
     pub out: &'a mut Vec<u32>,
     pub drafted: Drafted,
+    /// `None` for a greedy pass ([`Engine::advance`]'s); `Some` for a
+    /// request that draws, whose pass is [`Engine::advance_sampled`]'s.
+    pub draw: Option<SlotDraw<'a>>,
+}
+
+/// What a sampled row of [`Engine::advance_slots`] draws with: the ids its
+/// draws see (the prompt's tail then the generated ids so far), and the
+/// request's sampler, which the engine takes for the call and puts back,
+/// its state moved one draw a kept id. The server refuses a row whose
+/// sampler did not come back.
+pub struct SlotDraw<'a> {
+    pub history: &'a [u32],
+    pub sampler: &'a mut Option<Sampler>,
+}
+
+impl fmt::Debug for SlotDraw<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlotDraw")
+            .field("history", &self.history.len())
+            .field("sampler", &self.sampler.is_some())
+            .finish()
+    }
+}
+
+/// `row`'s pass on `engine`'s selected slot: [`Engine::advance`], or for a
+/// row that draws [`Engine::advance_sampled`] with its history and its
+/// sampler, which goes back into the row whatever the outcome. The pass a
+/// row of the default [`Engine::advance_slots`] runs.
+pub(crate) fn advance_row<E: Engine + ?Sized>(
+    engine: &mut E,
+    row: &mut SlotPass<'_>,
+) -> Result<Drafted, EngineError> {
+    let Some(draw) = row.draw.as_mut() else {
+        return engine.advance(row.last, row.out);
+    };
+    let sampler = draw.sampler.take().ok_or_else(|| {
+        EngineError(format!(
+            "slot {}: a sampled row without its sampler",
+            row.slot
+        ))
+    })?;
+    let (d, back, sampler) =
+        engine.advance_sampled(row.last, draw.history.to_vec(), sampler, row.out);
+    *draw.sampler = Some(sampler);
+    let d = d?;
+    if back != draw.history {
+        return Err(EngineError(format!(
+            "slot {}: a sampled pass handed back another history",
+            row.slot
+        )));
+    }
+    Ok(d)
 }
 
 /// What one [`Engine::advance`] drafted: the ids its draft proposed (0 for a

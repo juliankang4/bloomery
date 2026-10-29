@@ -6044,8 +6044,8 @@ mod tests {
     }
 
     /// A round of two slots whose rows split into one step and one drafted
-    /// pass — a request that needs its logits row (`ignore_eos` bans an id)
-    /// steps beside a greedy one that passes — runs the pass as the engine's
+    /// pass — a request that asks for probabilities steps beside a greedy
+    /// one that passes — runs the pass as the engine's
     /// `advance`, the call a request alone makes, not as a round of one row
     /// ([`crate::Engine::advance_slots`] is called with two rows or more). The
     /// long greedy request holds the engine thread in its prompt call until
@@ -6088,7 +6088,7 @@ mod tests {
         );
         let short = ask(
             json!({"prompt": "abacadae", "n_predict": 12, "temperature": 0,
-                   "ignore_eos": true, "cache_prompt": false}),
+                   "n_probs": 1, "cache_prompt": false}),
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         while !roundtrip(addr, "GET", "/metrics", "")

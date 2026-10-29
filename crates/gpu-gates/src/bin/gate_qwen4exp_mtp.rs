@@ -5192,6 +5192,7 @@ mod gate {
                     last: l0,
                     depth,
                     out: &mut o0,
+                    draw: None,
                 },
                 app::mtp::SlotWindow {
                     slot: 1,
@@ -5199,6 +5200,7 @@ mod gate {
                     last: l1,
                     depth,
                     out: &mut o1,
+                    draw: None,
                 },
             ];
             let (done, _) = app::mtp::pass_slots(s, &mut w)?;
@@ -5543,6 +5545,7 @@ mod gate {
                         last,
                         depth,
                         out,
+                        draw: None,
                     });
                 }
             }
@@ -5761,6 +5764,7 @@ mod gate {
                         last: first,
                         depth: 0,
                         out: &mut out0,
+                        draw: None,
                     },
                     app::mtp::SlotWindow {
                         slot: 1,
@@ -5768,6 +5772,7 @@ mod gate {
                         last: last1,
                         depth: 0,
                         out: &mut out1,
+                        draw: None,
                     },
                 ],
             )?;

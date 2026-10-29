@@ -908,6 +908,31 @@ where
         read
     }
 
+    /// Row `r`'s logits of the last call into `row` (`n_vocab` f32), when it
+    /// was a [`GpuModel::step_slots`] or a [`GpuModel::verify_slots`]: the
+    /// read a sampled window of a pass of several slots takes each row it
+    /// draws from by. A pass laid in one head is fetched into `stage` (grown
+    /// to the pass's rows once, then reused) unless `fetched` says this
+    /// pass's head is there already. Blocking read. Refused by name as
+    /// [`GpuModel::slots_logits_into`] refuses, and for a row past the pass.
+    pub fn slots_row_into(
+        &self,
+        r: usize,
+        stage: &mut Vec<f32>,
+        fetched: bool,
+        row: &mut [f32],
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "GpuModel::slots_row_into";
+        let (rows, _) = self.slots_shape(WHAT)?;
+        let mut read = PassRead {
+            layout: B::HEADS,
+            rows,
+            stage,
+            fetched,
+        };
+        self.pass_row(WHAT, &mut read, r, row)
+    }
+
     /// The rows of the last call and the logits each holds, when that call
     /// was a pass of several slots; refused by name as `what` otherwise.
     fn slots_shape(&self, what: &'static str) -> Result<(usize, usize), GpuError> {

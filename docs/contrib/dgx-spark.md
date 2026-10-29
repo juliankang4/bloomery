@@ -123,10 +123,10 @@ target/release/bloomery-serve -m <FP4-Local folder>
 
 With `BLOOMERY_MTP_DRAFT` unset, a folder target's MTP draft is the checkpoint's own MTP layer, loaded in its stored
 formats ([#682](https://github.com/midagedev/bloomery/pull/682); `draft_file`,
-`crates/refset/src/arch/qwen4exp/mtp.rs:33-38` at `c21e3b81`). An unset `BLOOMERY_DRAFT` drafts with it on one slot
-unless the load prints a `load draft=off` or `draft yield` record. The draft goes off under `--parallel` above 1,
+`crates/refset/src/arch/qwen4exp/mtp.rs:33-38` at `c21e3b81`). An unset `BLOOMERY_DRAFT` drafts with it
+on any slot count unless the load prints a `load draft=off` or `draft yield` record. The draft goes off under
 `--place gate` or `--mmproj`, with stores shorter than one window, on a plan that pages experts, and when its card
-bytes would leave a slot half the context positions or fewer. `BLOOMERY_DRAFT=mtp` keeps it on under `--parallel` above 1 and never
+bytes would leave a slot half the context positions or fewer. `BLOOMERY_DRAFT=mtp` never
 yields to the context (`crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs:28-31,162-171,236-238,246-264` at
 `c21e3b81`). With no `--ctx-size`, each slot asks the trained 262,144 positions and, where the GB10's one memory pool cannot
 hold that plan, takes the largest context under it, a multiple of 1,024, whose plan holds, so `--parallel 2` and

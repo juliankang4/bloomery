@@ -1464,13 +1464,13 @@ impl Engine for DraftMock {
         true
     }
 
-    /// The default's select and `advance` a row, logged as one call of its
-    /// row count.
+    /// The default's select and pass a row (`advance`, or `advance_sampled`
+    /// for a row that draws), logged as one call of its row count.
     fn advance_slots(&mut self, rows: &mut [SlotPass<'_>]) -> Result<(), EngineError> {
         self.record(MockCall::AdvanceSlots(rows.len()));
         for row in rows {
             self.select_slot(row.slot)?;
-            row.drafted = self.advance(row.last, row.out)?;
+            row.drafted = crate::engine::advance_row(self, row)?;
         }
         Ok(())
     }

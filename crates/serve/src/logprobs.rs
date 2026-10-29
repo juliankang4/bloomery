@@ -28,8 +28,8 @@
 //! the first the one `next(last, None)` returns ([`Engine::advance`]), so the
 //! steps take the ids the passes kept; a sampled pass draws exactly one id a
 //! kept row from the sampler a plain run draws from, so a drafted and a plain
-//! run of one seed take the same ids ([`Engine::advance_sampled`]). Beside
-//! another busy slot a sampled request already steps. The probabilities read
+//! run of one seed take the same ids ([`Engine::advance_sampled`]), beside
+//! another busy slot's pass too ([`Engine::advance_slots`]). The probabilities read
 //! the row and change nothing in it. The tests pin all four paths on the
 //! mocks, and that an asking run on the drafting mock makes no pass.
 //!

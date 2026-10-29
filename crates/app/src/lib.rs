@@ -439,6 +439,18 @@ impl<B: ChainBody> Session<B> {
         }
     }
 
+    /// Row `r` as a read left it in the session's row: refused by name when
+    /// it holds a NaN, as a step's row is.
+    fn read_row(&self, r: usize) -> Result<&[f32], SessionError> {
+        if let Some(i) = self.logits.iter().position(|v| v.is_nan()) {
+            return Err(SessionError::Refused(format!(
+                "row {r}'s logit {i} is NaN after position {}",
+                self.model.pos()
+            )));
+        }
+        Ok(&self.logits)
+    }
+
     /// The clear: the model back to the state it had right after its load
     /// and its captures, so a prompt run after it gives the tokens, logits
     /// and counters that prompt gives in a fresh process ([`GpuModel::reset`]
@@ -668,6 +680,21 @@ where
         let out = self.model.verify_slots(rows)?;
         self.slots_waiting = Some(rows.len());
         Ok(out)
+    }
+
+    /// Row `r` of the last pass of several slots, in the pass's row order
+    /// ([`GpuModel::slots_row_into`]), into the session's row, grown once and
+    /// reused: the row a sampled window draws from. `fetched` false on the
+    /// first row asked of a pass, whose head a pass laid in one head then
+    /// fetches into the session's copy, and true for the pass's later rows.
+    /// Refused by name as that refuses, and for a row holding a NaN, as a
+    /// step's row is.
+    pub fn slots_row(&mut self, r: usize, fetched: bool) -> Result<&[f32], SessionError> {
+        let n_vocab = self.model.n_vocab()?;
+        self.logits.resize(n_vocab, 0.0);
+        self.model
+            .slots_row_into(r, &mut self.pass, fetched, &mut self.logits)?;
+        self.read_row(r)
     }
 
     /// Keep each slot's first `kept[i]` rows of the pass waiting for its
@@ -938,13 +965,7 @@ impl<B: Prompt + Keep + Rows + Rollback> RowLogits for Session<B> {
                 f.fetched = true;
             }
         }
-        if let Some(i) = self.logits.iter().position(|v| v.is_nan()) {
-            return Err(SessionError::Refused(format!(
-                "row {r}'s logit {i} is NaN after position {}",
-                self.model.pos()
-            )));
-        }
-        Ok(&self.logits)
+        self.read_row(r)
     }
 }
 

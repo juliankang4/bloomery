@@ -1,7 +1,8 @@
 //! Gate: a sampled request on an engine that drafts sampled requests
 //! ([`serve::Engine::advance_sampled`]) takes the ids a plain run of the same
-//! seed takes, alone in its round, and steps where a pass would read what the
-//! loop has not settled: a think close it forces, another busy slot's rows. A
+//! seed takes, alone in its round or beside another busy slot's pass, and
+//! steps where a pass would read what the loop has not settled: a think close
+//! it forces. A
 //! request that bans an id (`ignore_eos`) draws in those passes too, greedy or
 //! sampled, from rows whose banned ids are at -inf. The drafted mock is
 //! [`DraftMock`]; its plain twin is the same mock
@@ -20,7 +21,7 @@ use serde_json::{Value, json};
 use serve::mock::{Hold, MockCall};
 use serve::{
     DraftMock, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplerRefused,
-    SamplingParams, Tokenizer,
+    SamplingParams, SlotPass, Tokenizer,
 };
 
 /// A prompt whose `a` has four followers, so the sampler branches at every
@@ -445,12 +446,16 @@ fn wait_deferred(addr: SocketAddr, n: f64) {
     }
 }
 
+// PIN(2026-10-29): `hw_beside_another_busy_slot_a_sampled_request_steps` became the test
+// below: a sampled request's pass rides the round's drafted call beside another busy slot.
+
 /// Two busy slots: a sampled request that only ever runs beside a greedy one
-/// takes plain steps in their shared rounds, no sampled pass, with the plain
-/// ids; the same request alone on the same server passes, with those ids.
+/// passes in their shared rounds, its sampled pass a row of the drafted call
+/// of both slots, with the plain ids; the same request alone on the same
+/// server passes, with those ids.
 #[test]
 #[ignore = "gate: just gate-serve"]
-fn hw_beside_another_busy_slot_a_sampled_request_steps() {
+fn hw_beside_another_busy_slot_a_sampled_request_passes() {
     let (dlog, plog) = (log(), log());
     let hold = Arc::new(Hold::default());
     let held = drafting(4096)
@@ -485,13 +490,16 @@ fn hw_beside_another_busy_slot_a_sampled_request_steps() {
     );
     let (va, vb) = (ra.json(), rb.json());
     assert!(draft_counts(&va).0 > 0, "the greedy request drafted: {va}");
-    assert_eq!(
-        draft_counts(&vb),
-        (0, 0),
-        "the sampled request stepped: {vb}"
+    assert!(
+        draft_counts(&vb).0 > 0,
+        "the sampled request drafted beside the greedy one: {vb}"
     );
     let calls = drain(&dlog);
-    assert_eq!(count(&calls, MockCall::Sampled), 0, "{calls:?}");
+    assert!(count(&calls, MockCall::Sampled) > 0, "{calls:?}");
+    assert!(
+        calls.iter().any(|c| matches!(c, MockCall::AdvanceSlots(2))),
+        "the two slots passed in one call: {calls:?}"
+    );
     let (want, _) = ids_of(plain, &short);
     assert_eq!(vb["tokens"], json!(want), "{vb}");
     let (alone, v) = ids_of(addr, &short);
@@ -501,15 +509,17 @@ fn hw_beside_another_busy_slot_a_sampled_request_steps() {
 }
 
 /// [`DraftMock`] whose sampled pass hands its history back with its last id
-/// changed, as long as it was lent.
-struct Alters(DraftMock);
+/// changed, as long as it was lent, once its first prompts have completed.
+struct Alters(DraftMock, usize);
 
 impl Engine for Alters {
     fn tokenizer(&self) -> Arc<dyn Tokenizer> {
         self.0.tokenizer()
     }
     fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
-        self.0.prefill(ids)
+        self.0.prefill(ids)?;
+        self.1 = self.1.saturating_sub(1);
+        Ok(())
     }
     fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
         self.0.next(last, out)
@@ -525,13 +535,24 @@ impl Engine for Alters {
         out: &mut Vec<u32>,
     ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
         let (d, mut history, sampler) = self.0.advance_sampled(last, history, sampler, out);
-        if let Some(id) = history.last_mut() {
+        if self.1 == 0
+            && let Some(id) = history.last_mut()
+        {
             *id += 1;
         }
         (d, history, sampler)
     }
     fn drafts_sampled(&self) -> bool {
         self.0.drafts_sampled()
+    }
+    fn slots(&self) -> usize {
+        self.0.slots()
+    }
+    fn select_slot(&mut self, slot: usize) -> Result<(), EngineError> {
+        self.0.select_slot(slot)
+    }
+    fn slot_drafts(&self) -> bool {
+        self.0.slot_drafts()
     }
     fn reset(&mut self) -> Result<(), EngineError> {
         self.0.reset()
@@ -544,18 +565,155 @@ impl Engine for Alters {
     }
 }
 
+/// The default round adapter rejects a same-length history edit and returns
+/// the sampler even on that refusal.
+#[test]
+fn a_round_rejects_a_changed_history_and_restores_its_sampler() {
+    let mut engine = Alters(drafting(4096).with_slots(2), 1);
+    engine.select_slot(1).expect("the second slot");
+    engine.prefill(&[1, 2, 3]).expect("a prompt");
+    let history = [1, 2, 3];
+    let mut sampler: Option<Sampler> = Some(Box::new(|_, _| 1));
+    let mut out = Vec::new();
+    let mut rows = [SlotPass {
+        slot: 1,
+        last: 3,
+        out: &mut out,
+        drafted: Drafted::default(),
+        draw: Some(serve::SlotDraw {
+            history: &history,
+            sampler: &mut sampler,
+        }),
+    }];
+    let e = engine
+        .advance_slots(&mut rows)
+        .expect_err("a history edit must fail");
+    assert_eq!(e.0, "slot 1: a sampled pass handed back another history");
+    assert!(sampler.is_some(), "the sampler comes back on refusal");
+}
+
 /// A sampled pass whose history comes back other than it was lent, at its
 /// length, fails the request by name: the next draw would read ids the
 /// request never took.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_a_history_handed_back_changed_is_a_named_error() {
-    let addr = start_sampling(Box::new(Alters(drafting(4096))), 1, penalised());
+    let check = |r: common::Reply| {
+        let v = r.json();
+        let msg = v["error"]["message"].as_str().expect("a named error");
+        assert!(msg.contains("handed back another"), "{msg}");
+    };
+    let addr = start_sampling(Box::new(Alters(drafting(4096), 1)), 1, penalised());
     let r = post(addr, "/completion", &sampled(BRANCHY, 8, 0.8, 1));
     assert_eq!(r.status, 500, "{}", r.body);
-    let msg = r.json()["error"]["message"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
-    assert!(msg.contains("handed back another"), "{msg}");
+    check(r);
+
+    let hold = Arc::new(Hold::default());
+    let held = drafting(4096).with_slots(2).holding(Arc::clone(&hold));
+    let addr = start_sampling(Box::new(Alters(held, 2)), 2, penalised());
+    let a = std::thread::spawn(move || post(addr, "/completion", &sampled(BRANCHY, 40, 0.8, 1)));
+    assert!(
+        hold.reached(1, BOUND),
+        "the first prompt never reached the engine"
+    );
+    let b = std::thread::spawn(move || post(addr, "/completion", &sampled(BRANCHY, 40, 0.8, 2)));
+    wait_deferred(addr, 1.0);
+    hold.open();
+    for t in [a, b] {
+        let r = t.join().expect("a request");
+        assert!(matches!(r.status, 500 | 503), "{}: {}", r.status, r.body);
+        check(r);
+    }
+}
+
+/// [`DraftMock`] of two slots whose round of passes keeps every sampled
+/// row's sampler.
+struct Keeps(DraftMock);
+
+impl Engine for Keeps {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        self.0.tokenizer()
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        self.0.prefill(ids)
+    }
+    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        self.0.next(last, out)
+    }
+    fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        self.0.advance(last, out)
+    }
+    fn advance_rows(&self) -> usize {
+        self.0.advance_rows()
+    }
+    fn advance_sampled(
+        &mut self,
+        last: u32,
+        history: Vec<u32>,
+        sampler: Sampler,
+        out: &mut Vec<u32>,
+    ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
+        self.0.advance_sampled(last, history, sampler, out)
+    }
+    fn drafts_sampled(&self) -> bool {
+        self.0.drafts_sampled()
+    }
+    fn slots(&self) -> usize {
+        self.0.slots()
+    }
+    fn select_slot(&mut self, slot: usize) -> Result<(), EngineError> {
+        self.0.select_slot(slot)
+    }
+    fn slot_drafts(&self) -> bool {
+        self.0.slot_drafts()
+    }
+    fn advance_slots(&mut self, rows: &mut [SlotPass<'_>]) -> Result<(), EngineError> {
+        self.0.advance_slots(rows)?;
+        for d in rows.iter_mut().filter_map(|r| r.draw.as_mut()) {
+            *d.sampler = None;
+        }
+        Ok(())
+    }
+    fn reset(&mut self) -> Result<(), EngineError> {
+        self.0.reset()
+    }
+    fn ctx_max(&self) -> usize {
+        self.0.ctx_max()
+    }
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+}
+
+/// A round of passes that keeps a sampled row's sampler fails its requests
+/// by name: the request's next draw would have no sampler.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_sampler_kept_by_a_round_is_a_named_error() {
+    let hold = Arc::new(Hold::default());
+    let held = drafting(4096).with_slots(2).holding(Arc::clone(&hold));
+    let addr = start_sampling(Box::new(Keeps(held)), 2, penalised());
+    let a = std::thread::spawn(move || post(addr, "/completion", &sampled(BRANCHY, 40, 0.8, 1)));
+    assert!(
+        hold.reached(1, BOUND),
+        "the first prompt never reached the engine"
+    );
+    let b = std::thread::spawn(move || post(addr, "/completion", &sampled(BRANCHY, 40, 0.8, 2)));
+    wait_deferred(addr, 1.0);
+    hold.open();
+    let msgs: Vec<String> = [a, b]
+        .map(|t| {
+            let r = t.join().expect("a request");
+            assert_eq!(r.status, 500, "{}", r.body);
+            r.json()["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .into();
+    assert!(
+        msgs.iter()
+            .all(|m| m.contains("kept the request's sampler")),
+        "{msgs:?}"
+    );
 }

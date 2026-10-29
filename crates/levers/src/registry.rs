@@ -518,10 +518,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               through a four-row window; `generate_glm5next` and the GLM seat of `bloomery-serve` on a \
               glm5next file: `mtp` serves the target file's NextN layer as the MTP draft through a \
               two-row window, and `lookup` and `dspark` are refused by name; the greedy ids are the \
-              plain run's. A server drafts a request that samples or bans an id while its slot \
-              runs alone on a seat that drafts sampled requests (the Qwen3.8 and GLM seats), \
-              each kept id its draw from its verified row, and serves it through plain steps \
-              otherwise, each step's logits row the target's. `off` is the plain path on a \
+              plain run's. A server drafts a request that samples or bans an id on a seat that \
+              drafts sampled requests (the Qwen3.8 and GLM seats), alone or beside other busy \
+              slots, each kept id its draw from its verified row, and serves it through plain \
+              steps otherwise, each step's logits row the target's. `off` is the plain path on a \
               qwen4exp file, the same-binary arm of the unset draft. Unset in \
               `generate_qwen3moe` on a qwen4exp file follows the placement \
               (`bloomery_levers::draft38_unset`): under `--place a` the MTP draft runs when a \
@@ -538,9 +538,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               with no file there, with stores too short for one window (`--ctx-size` under \
               5: the server takes a window only while its rows fit), and when the target's \
               `token_embd` or `output` is not Q8_0, the format the draft reads them in (a set \
-              `mtp` is refused there by name before the load), and under `--parallel` above 1, \
-              where a drafted server also walks each slot's draft over every row of a sampled or \
-              id-banning request (a set `mtp` drafts there), with the same record; it \
+              `mtp` is refused there by name before the load), with the same record; it \
               has no `--logits` (a request that reads the logits row steps plainly) and takes \
               no route trace. The GLM seat of `bloomery-serve` takes `mtp` and `off`; unset \
               (`bloomery_levers::glm_unset`, a `draft unset` record before the plan) it drafts \

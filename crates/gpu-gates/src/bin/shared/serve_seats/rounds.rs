@@ -9,10 +9,12 @@
 //! [`bind::step_rows_in_turn`]: bloomery_gpu_gates::bind::step_rows_in_turn
 //! [`bind::pass_rows_in_turn`]: bloomery_gpu_gates::bind::pass_rows_in_turn
 
-use app::mtp::{MtpBody, SlotWalks, SlotWindow};
+use app::mtp::{Draw, MtpBody, SlotWalks, SlotWindow};
 use bloomery_gpu::model::{SlotRows, slots_a_pass};
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::bind::{Seat, SlotPassRow, SlotStep, pass_rows_in_turn, step_rows_in_turn};
+use bloomery_gpu_gates::bind::{
+    RowDraw, Seat, SlotPassRow, SlotStep, pass_rows_in_turn, step_rows_in_turn,
+};
 use bloomery_gpu_gates::record;
 use runtime::{Target, Widths, Window};
 use serve::Drafted;
@@ -263,7 +265,17 @@ where
         }
         s.select_slot(r.slot)?;
         r.out.clear();
-        r.drafted = drafts.pass(s, r.slot, r.last, &mut r.out)?;
+        r.drafted = match r.draw.as_mut() {
+            None => drafts.pass(s, r.slot, r.last, &mut r.out)?,
+            Some(d) => drafts.pass_sampled(
+                s,
+                r.slot,
+                r.last,
+                &mut d.history,
+                &mut d.sampler,
+                &mut r.out,
+            )?,
+        };
         passes += 1;
     }
     if on.is_empty() {
@@ -321,9 +333,34 @@ where
         .iter()
         .map(|&i| std::mem::take(&mut rows[i].out))
         .collect();
+    let mut draws: Vec<Option<RowDraw>> = on.iter().map(|&i| rows[i].draw.take()).collect();
+    let given: Vec<usize> = draws
+        .iter()
+        .map(|d| d.as_ref().map_or(0, |d| d.history.len()))
+        .collect();
     let run = {
+        // A sampled row's draws see its history, then the ids its pass took
+        // before (`SlotDrafts::pass_sampled`'s draw).
+        let mut drawing: Vec<_> = draws
+            .iter_mut()
+            .map(|d| {
+                d.as_mut().map(|d| {
+                    move |row: &[f32]| {
+                        let id = (d.sampler)(row, &d.history);
+                        d.history.push(id);
+                        id
+                    }
+                })
+            })
+            .collect();
         let mut windows: Vec<SlotWindow<'_, B>> = Vec::with_capacity(on.len());
-        for (((&i, spec), out), &width) in on.iter().zip(&mut taken).zip(&mut outs).zip(&*widths) {
+        for ((((&i, spec), out), &width), draw) in on
+            .iter()
+            .zip(&mut taken)
+            .zip(&mut outs)
+            .zip(&*widths)
+            .zip(&mut drawing)
+        {
             out.clear();
             windows.push(SlotWindow {
                 slot: rows[i].slot,
@@ -336,13 +373,20 @@ where
                     .draft_mut()
                     .draft_mut(),
                 out,
+                draw: draw.as_mut().map(|f| f as Draw<'_>),
             });
         }
         app::mtp::pass_slots(s, &mut windows)
     };
-    for ((&i, spec), out) in on.iter().zip(taken).zip(outs) {
+    for ((((&i, spec), out), mut draw), given) in
+        on.iter().zip(taken).zip(outs).zip(draws).zip(given)
+    {
+        if let Some(d) = draw.as_mut() {
+            d.history.truncate(given);
+        }
         specs[rows[i].slot] = spec;
         rows[i].out = out;
+        rows[i].draw = draw;
     }
     let (done, ran) = run?;
     for (&i, c) in on.iter().zip(&done) {
