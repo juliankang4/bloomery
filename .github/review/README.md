@@ -88,21 +88,22 @@ The workflow runs on `pull_request_target`, so a fork's PR gets the key. In exch
   runs, a script from the PR included. The sandbox is what bounds them. Its legacy `workspace-write` mode lets a
   command read every file the runner user can, the Codex login included, so `run-codex.sh` uses a permission profile
   instead (`permissions.review`): a command may read the PR tree, the base tree, the context, the Codex install and
-  the system paths of `:minimal` (on Linux `/bin`, `/sbin`, `/usr`, `/etc`, `/lib`, `/lib64`), write the output
+  the system paths of `:minimal` (on Linux `/bin`, `/sbin`, `/usr`, `/etc`, `/lib`, `/lib64`; on macOS also `/tmp`
+  and `/var/tmp`, which `:minimal` would make writable there, so the profile names them read-only), write the output
   directory only, and use no network (`permissions.review.network.enabled=false`). The login
   (`$RUNNER_TEMP/codex-home/auth.json`) is in none of those. No `AGENTS.md` is loaded, no parent directory is a
   project root, Codex's user config and rules are skipped, hooks, plugins, memories, apps, image generation, web
   search and sub-agents are off, commands get the core environment only, and `run.py` keeps `ANTHROPIC_API_KEY` out
   of the Codex process.
 - Before each Codex run, `run-codex.sh` checks the profile through `codex sandbox`: a read in the base tree and a
-  write to the output directory must work, and a read of a file it puts beside `auth.json`, a write into the PR tree
-  and a TCP connection to 1.1.1.1:443 must fail. If any goes the wrong way, or the sandbox does not start, Codex does
-  not run (exit 69) and Claude reviews. The check judges by what happened (the file read or not, written or not),
-  not by the error, since bubblewrap hides a path (`No such file or directory`) where Seatbelt refuses it
-  (`Operation not permitted`). Measured with Codex 0.160.0 on macOS (Seatbelt) and as root in a privileged Ubuntu
-  24.04 container on arm64 (bubblewrap): the reads and writes went as above and the connection failed. As a non-root
-  user in that container bubblewrap did not start (the host's AppArmor user namespace gate, which the workflow's
-  sysctl step opens on the runner), and the check kept Codex from running.
+  write to the output directory must work, and a read of a file it puts beside `auth.json`, a write into the PR tree,
+  `/tmp` or `/var/tmp` and a TCP connection to 1.1.1.1:443 must fail. If any goes the wrong way, or the sandbox does
+  not start, Codex does not run (exit 69) and Claude reviews. The check judges by what happened (the file read or not,
+  written or not), not by the error, since bubblewrap hides a path (`No such file or directory`) where Seatbelt
+  refuses it (`Operation not permitted`). Measured with Codex 0.160.0 on macOS (Seatbelt) and as root in a privileged
+  Ubuntu 24.04 container on arm64 (bubblewrap): the reads and writes went as above and the connection failed. As a
+  non-root user in that container bubblewrap did not start (the host's AppArmor user namespace gate, which the
+  workflow's sysctl step opens on the runner), and the check kept Codex from running.
 - If a planted instruction still got a token into the output, `run.py` and `post.py check` refuse it: the value of
   `ANTHROPIC_API_KEY`, every long string of `auth.json`, read before and after the run (Codex rewrites the file when
   it refreshes), and token shapes such as a JWT. A review that quotes a JWT from the pull request (a test fixture,

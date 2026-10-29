@@ -10,8 +10,8 @@
 #   Bash, no web). Codex reads it with shell commands, and the PR's text can steer which commands the model runs,
 #   scripts from the PR included. Those commands run in a sandbox (tools/review/run-codex.sh): they read the trees,
 #   CTX, the Codex install and system paths such as /usr and /etc, write only OUT, and have no network. Before each
-#   run a sandbox check tries a read beside the login, a write into the PR tree and a connection; if one works, Codex
-#   does not run.
+#   run a sandbox check tries a read beside the login, a write into the PR tree, /tmp or /var/tmp and a connection; if
+#   one works, Codex does not run.
 # - The engine: REVIEW_ENGINE (a repository variable; claude when unset) is tried first and the other engine is the
 #   fallback, each only when its login is there (tools/review/run.py). With no engine able to review, the run ends
 #   without a review and says why in the summary.

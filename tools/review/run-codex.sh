@@ -8,15 +8,18 @@
 # The login is CODEX_HOME/auth.json (what `codex login` writes), which the workflow puts outside the trees and OUT.
 # Codex reads files by running shell commands, and the PR's text can steer which commands the model runs, so the
 # sandbox is what keeps the run inside. A permission profile lets a command read the PR tree, the base tree, CTX, the
-# Codex install and the system paths of `:minimal` (on Linux /bin, /sbin, /usr, /etc, /lib, /lib64; on macOS also
-# /tmp), write OUT only, and use no network. The legacy `--sandbox workspace-write` is not used: it lets a command
-# read every file the runner user can, auth.json included. The working directory is OUT; no AGENTS.md is loaded
-# (project_doc_max_bytes=0), no parent directory is a project root, and --ignore-user-config and --ignore-rules skip
-# CODEX_HOME's config and rules, so nothing in the PR tree is configuration. Commands get the core environment only.
-# Hooks, plugins, memories, apps, image generation, web search and sub-agents are off.
+# Codex install and the system paths of `:minimal` (on Linux /bin, /sbin, /usr, /etc, /lib, /lib64; on macOS also /tmp
+# and /var/tmp), write OUT only, and use no network. On Linux a command can also write the empty / and /dev that
+# bubblewrap mounts for it, which no process outside sees and which go when the command ends. The legacy
+# `--sandbox workspace-write` is not used: it lets a command read every file the runner user can, auth.json included.
+# The working directory is OUT; no AGENTS.md is loaded (project_doc_max_bytes=0), no parent directory is a project
+# root, and --ignore-user-config and --ignore-rules skip CODEX_HOME's config and rules, so nothing in the PR tree is
+# configuration. Commands get the core environment only. Hooks, plugins, memories, apps, image generation, web search
+# and sub-agents are off.
 #
-# Before the run, `codex sandbox` runs five commands under the same profile: a read in BASE_TREE and a write to OUT
-# must work, and a read of a file beside auth.json, a write into PR_TREE and a connection to 1.1.1.1:443 must not.
+# Before the run, `codex sandbox` runs seven commands under the same profile: a read in BASE_TREE and a write to OUT
+# must work, and a read of a file beside auth.json, a write into PR_TREE, /tmp or /var/tmp and a connection to
+# 1.1.1.1:443 must not.
 # When one of them goes the wrong way the run does not start: the script prints why and exits 69.
 # The JSONL event stream goes to TRACE/<role>.ndjson and tools/review/usage.py's accounting to TRACE/<role>.usage.json.
 # The exit code is codex's, and a stream without a completed turn is exit 1.
@@ -46,6 +49,8 @@ bin=$(command -v codex)
 pkg=$(dirname "$(dirname "$(readlink -f "$bin")")")
 fs="\":minimal\"=\"read\",\"$(dirname "$bin")\"=\"read\",\"$(dirname "$pkg")\"=\"read\""
 fs="$fs,\"$pr\"=\"read\",\"$base\"=\"read\",\"$ctx\"=\"read\",\"$out\"=\"write\""
+# On macOS :minimal makes /tmp and /var/tmp writable; an explicit entry keeps them read-only.
+[ "$(uname -s)" != Darwin ] || fs="$fs,\"/tmp\"=\"read\",\"/var/tmp\"=\"read\""
 profile=(
   -c default_permissions='"review"'
   -c "permissions.review.filesystem={$fs}"
@@ -70,6 +75,10 @@ rm -f "$out/.sandbox-check"
 case "$(sbx /bin/cat "$probe")" in *"$seal"*) why="${why:+$why; }a file beside auth.json was readable" ;; esac
 sbx /usr/bin/touch "$pr/.sandbox-check"
 if [ -e "$pr/.sandbox-check" ]; then why="${why:+$why; }PR_TREE was writable"; rm -f "$pr/.sandbox-check"; fi
+for d in /tmp /var/tmp; do
+  sbx /usr/bin/touch "$d/.sandbox-check.$$"
+  if [ -e "$d/.sandbox-check.$$" ]; then why="${why:+$why; }$d was writable"; rm -f "$d/.sandbox-check.$$"; fi
+done
 [ -z "$(sbx /bin/bash -c 'exec 3<>/dev/tcp/1.1.1.1/443 && echo open')" ] || why="${why:+$why; }the network was open"
 if [ -n "$why" ]; then
   echo "run-codex.sh: sandbox check failed: $why" >&2
