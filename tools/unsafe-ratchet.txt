@@ -1048,7 +1048,10 @@ sampler 4 4 1
 # (the zeroed set, sigemptyset, sigaddset, pthread_sigmask), so the stop reaches a thread other than the key wait's.
 # PIN(2026-10-29): serve 14 -> 54 blocks: one window-size ioctl and one signal-set owner remove
 # seven blocks; the pipe's two owned fds have separate blocks, and signal-set and resize clauses add three.
-serve 54 0 0
+# PIN(2026-10-29): serve 54 -> 56 blocks, 0 -> 2 fns, 0 -> 1 impl, new test code: tests/callstream.rs counts the
+# bytes a streamed Qwen argument allocates through a global allocator that delegates to the system one (the impl, its
+# alloc and dealloc, one block each), each with its SAFETY line.
+serve 56 2 1
 threads 3 0 1
 tokenizer 0 0 0
 # PIN(2026-10-14): verbs 0 -> 57 blocks, 22 fns, 2 impls, new crate, moved from gpu-gates/src/bin/shared/verbs.rs (45
