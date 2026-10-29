@@ -3607,7 +3607,7 @@ mod gate {
     /// (k) structure under the card plan, against the plan's own counts: the
     /// body runs the leg on exactly the layers the plan holds routed experts
     /// on, the captured step holds the header's node count plus the leg's
-    /// five launches on each of them, less the go and the wait of each layer
+    /// five launches on each of them, less the card sum, go and wait of each layer
     /// the load runs without the host leg ([`hostless`]), and the rest of the
     /// layers' goes and waits as batch mem ops, as the program counts. In the
     /// fixture tier the plan is also held to its contract: the header's
@@ -3622,7 +3622,9 @@ mod gate {
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
         let want_memops = shape().memops_card(hostless(plan));
-        let want_nodes = shape().nodes_decode_card(plan.card_layers) - (memops() - want_memops);
+        // PIN(2026-10-29): each hostless layer folds its card sum into the shared add.
+        let want_nodes =
+            shape().nodes_decode_card(plan.card_layers) - (memops() - want_memops) - hostless(plan);
         let ok = layers == plan.card_layers
             && nodes == want_nodes
             && counted == want_nodes
@@ -3865,14 +3867,15 @@ mod gate {
     /// kept whole returns every row's token and logits bit for bit the
     /// steps' — the leg's kernels are independent per slot and column; each
     /// verify's graph holds the header's verify nodes plus the leg's five
-    /// launches on each of the plan's card layers, less the go and the wait
+    /// launches on each of the plan's card layers, less the card sum, go and wait
     /// of each layer it runs without the host leg ([`hostless`]), and its
     /// replay serves each other layer on the host once.
     fn card_rows(m: &mut Qwen38Model, toks: &[u32], plan: &PlanFacts) -> Result<bool, GateError> {
         let (mut ok, _) = paths(m, toks)?;
         let want_memops = shape().memops_card(hostless(plan));
         let want = (
-            shape().nodes_verify_card(plan.card_layers) - (memops() - want_memops),
+            // PIN(2026-10-29): each hostless layer folds its card sum into the shared add.
+            shape().nodes_verify_card(plan.card_layers) - (memops() - want_memops) - hostless(plan),
             want_memops,
         );
         ok &= verify_structure::<2>(m, want)?;

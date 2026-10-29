@@ -34,8 +34,8 @@
 //! none in the step, the verify or the pass: its handoff writes the row's
 //! image and the card's places and no go follows (the pass downloads
 //! nothing and the walk serves nothing), its back has no wait, the host is
-//! not told of it, and the host's sum it adds is zeros
-//! ([`Card38::zero_sum`]), what the host writes for an empty list.
+//! not told of it, and its back sums the retained card rows with the gated
+//! shared expert in one launch, including the empty host list's zero addition.
 //!
 //! On a load with an expert tier (`tier38`) the step and the verify serve
 //! its layers: a tier layer's handoff is `ds41_ffn_handoff_10_cols_tier`
@@ -54,7 +54,7 @@
 //! [`PLE_LAUNCHES`] on its layer, the block's [`FFN_LAUNCHES`] — two of
 //! them the go and the wait, stream memory-operation batches
 //! ([`STEP_MEMOPS`] a layer) — and the card leg's [`CARD_LAUNCHES`] on a
-//! layer with card experts ([`TIER_CARD_LAUNCHES`] on a tier layer); then
+//! layer with card experts ([`TIER_CARD_LAUNCHES`] on a tier or hostless layer); then
 //! the head's mix ([`HEAD_MIX_LAUNCHES`]) and the head's own launches
 //! ([`HeadLaunches`]). A layer without a host leg
 //! ([`Card38::hostless`]) has no go and no wait.
@@ -164,6 +164,13 @@ pub(super) fn verify_launches(
     walk_launches(plans, card, tier, m, head)
 }
 
+/// Layer `l`'s card leg retains its down rows for the join instead of
+/// summing them ([`TIER_CARD_LAUNCHES`]): a tier layer of `tier` or a
+/// layer `card`'s load runs without a host leg ([`Card38::hostless`]).
+fn joins_rows(card: &Card38, tier: Option<&TierSide38>, l: usize) -> bool {
+    tier.is_some_and(|t| t.k(l) > 0) || card.hostless(l)
+}
+
 fn walk_launches(
     plans: &[Layer38],
     card: &Card38,
@@ -190,7 +197,7 @@ fn walk_launches(
                 + p.by_extra(m)
                 + ffn
                 + p.ple.as_ref().map_or(0, |_| PLE_LAUNCHES)
-                + match (card.has(l), tier.is_some_and(|t| t.k(l) > 0)) {
+                + match (card.has(l), joins_rows(card, tier, l)) {
                     (true, true) => TIER_CARD_LAUNCHES,
                     (true, false) => CARD_LAUNCHES,
                     (false, _) => 0,
@@ -738,12 +745,12 @@ impl Parts38<'_> {
 
     /// Layer `l`'s card leg over `x` (`None`: the arena's `ffn_x`): the
     /// places in the arena's `sel`, the router's weights, into the card sum
-    /// ([`Card38::enqueue`], which refuses a layer without card experts by
-    /// name).
+    /// ([`Card38::enqueue`]), or retained down rows for a tier or hostless
+    /// layer's join. Refuses a layer without card experts by name.
     fn card(&mut self, l: usize, x: Option<&DeviceBuffer<f32>>) -> Result<(), GpuError> {
         let s = &*self.s;
         let x = x.unwrap_or(&s.ffn_x);
-        if self.tier_k(l) > 0 {
+        if joins_rows(self.card, self.tier.as_deref(), l) {
             return self.card.enqueue_rows(&self.c, l, x, self.m, &s.sel);
         }
         self.card
@@ -810,7 +817,7 @@ impl Parts38<'_> {
     /// into `y`: on a tier layer the join over both cards' slots with the
     /// combine ([`Card38::enqueue_tier_join`]), else the shared add over the
     /// host's sum ([`Parts38::shared_add`]). A layer without a host leg
-    /// ([`Card38::hostless`]) has no wait and adds zeros for the host's sum.
+    /// ([`Card38::hostless`]) has no wait and fuses its card sum and shared add.
     fn step_back(
         &mut self,
         hy: &mut crate::hybrid::Hybrid<HostRun>,
@@ -844,13 +851,18 @@ impl Parts38<'_> {
     }
 
     /// Layer `l`'s block output into `y`: the host's routed sum `hsum`
-    /// (`None`: the card's zeros, [`Card38::zero_sum`]), on a layer with card
+    /// (`None`: a fused hostless join), on a layer with card
     /// experts the card's, plus the shared expert's output times its gate
     /// weight.
     fn shared_add(&mut self, l: usize, hsum: Option<&DeviceBuffer<f32>>) -> Result<(), GpuError> {
-        let hsum = match hsum {
-            Some(h) => h,
-            None => self.card.zero_sum()?,
+        let Some(hsum) = hsum else {
+            let s = &mut *self.s;
+            return self.card.enqueue_hostless_join(
+                &self.c,
+                (l, self.m),
+                (&s.sel, &s.sh_y, &s.route.weights),
+                &mut s.y,
+            );
         };
         let sink = self.c.gpu.layer_sink(l)?;
         let s = &mut *self.s;
@@ -1949,7 +1961,7 @@ impl<'a> LayerProgram for Pass38<'a> {
     }
 
     /// The gated sum over the host sums the walk's serve uploaded, or the
-    /// card's zeros on a layer without a host leg ([`Card38::zero_sum`]).
+    /// fused card sum on a layer without a host leg.
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let hsum = (!self.p.card.hostless(at.layer)).then(|| port.hsum());
         self.p.shared_add(at.layer, hsum)
