@@ -99,8 +99,8 @@ mod gate {
     use bloomery_gpu_gates::rope_gate::cache_bits;
     use bloomery_gpu_gates::rounding::{U, gamma};
     use bloomery_gpu_gates::{
-        GateError, RefManifest, activations, bits_equal, checks_failed, mask_bits_in,
-        ref_dir_named, ref_model_path, ref_tensor_logical_in, verdict,
+        GateError, NAN_F16 as NAN16, RefManifest, activations, bits_equal, checks_failed,
+        mask_bits_in, ref_dir_named, ref_model_path, ref_tensor_logical_in, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::GgmlType;
@@ -109,8 +109,6 @@ mod gate {
     use model::arch::mimo2::hparams::{Hparams, Kind};
     use refset::arch::mimo2::IK;
 
-    /// An f16 NaN the unread cache rows are overwritten with.
-    const NAN16: u16 = 0x7e00;
     /// An f16 pattern the append gates fill the planes with (no value written
     /// by a kernel is this).
     const SENTINEL: u16 = 0x5a5a;

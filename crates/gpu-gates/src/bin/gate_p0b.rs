@@ -808,17 +808,20 @@ fn run() -> Result<(), GateError> {
         let as_op = bits_equal(&kv_s_op_big, &kv_s_fu_big)
             && bits_equal(&kvr_op_big, &kvr_fu_big)
             && cache_op_big == cache_fu_big;
-        let overflow_pass = op_fault == want_overflow
-            && fu_fault == want_overflow
-            && nan_latent
-            && finite_tail
-            && as_op;
+        // PIN(2026-10-30): the checked op append adds CacheValue to the norm's F32Product.
+        let want_op = Some(Fault::of_sites(
+            LAYER_NONE,
+            &[FaultSite::F32Product, FaultSite::CacheValue],
+        ));
+        let overflow_pass =
+            op_fault == want_op && fu_fault == want_overflow && nan_latent && finite_tail && as_op;
         println!(
-            "key overflow latent={OVERFLOW_VALUE:e} op_fault=\"{}\" fused_fault=\"{}\" want=\"{}\" \
+            "key overflow latent={OVERFLOW_VALUE:e} op_fault=\"{}\" fused_fault=\"{}\" want_op=\"{}\" want_fused=\"{}\" \
              latent_all_nan={nan_latent} rope_tail_finite={finite_tail} \
              bit_identical_to_op={as_op} {}",
             shown(op_fault),
             shown(fu_fault),
+            shown(want_op),
             shown(want_overflow),
             verdict(overflow_pass)
         );
@@ -829,9 +832,9 @@ fn run() -> Result<(), GateError> {
         // What the fused append cannot keep, it names, and writes as
         // computed: a value that is not finite (`F32Product`: the rope tail's
         // turned pair past f32's range) and a finite one past f16's range
-        // (`CacheValue`: the tail, and the latent under a large gain). The
-        // op path's appends check neither, so each word is the fused path's
-        // own, raised from a launch that was clean before.
+        // (`CacheValue`: the tail, and the latent under a large gain). Each
+        // word is the fused path's own, raised from a clean launch; the op
+        // append instead marks every non-finite f16 cache lane NaN.
         const TAIL_BIG: f32 = 3.0e38;
         const PAST_F16: f32 = 7.0e4;
         // The fault word, the rotated latent and the cache row of one launch.

@@ -1,7 +1,7 @@
 //! The rope gates' host inputs, expected outputs, device launch and readback: the NeoX
 //! launch with its per-head norm and the NORM launch without one.
 
-use crate::{GateError, activations, bits_equal, verdict};
+use crate::{GateError, NAN_F16, activations, bits_equal, verdict};
 use bloomery_gpu::fault::{Fault, FaultSink, FaultSite};
 use bloomery_gpu::rope_neox::PartialNeoxArgs;
 use bloomery_gpu::rope_norm::NormArgs;
@@ -129,7 +129,7 @@ pub fn cache_bits(x: f32) -> u16 {
     if x.is_finite() && gguf::quant::half_to_f32(h).is_finite() {
         h
     } else {
-        0x7e00
+        NAN_F16
     }
 }
 
@@ -216,9 +216,10 @@ fn cache_pos_fault(
 
 /// A head of values whose squares overflow the f32 products — query head 0
 /// and key head 0 of token 0, every value `1e20` — has no norm behind it: the
-/// kernel raises the named `F32Product` fault, that head's outputs and its
-/// key row in the cache plane are NaN (never the zeros an infinite sum scales
-/// it to), and every other head, token and plane word is the clean run's.
+/// kernel raises `F32Product` and the f16 append's `CacheValue`, that head's
+/// outputs and its key row in the cache plane are NaN (never the zeros an
+/// infinite sum scales it to), and every other head, token and plane word is
+/// the clean run's.
 pub fn check_overflow<const H: usize>(
     gpu: &Gpu,
     inp: &RopeIn,
@@ -237,7 +238,10 @@ pub fn check_overflow<const H: usize>(
     let before = gpu.fault()?;
     let r = run_at(&big, pos, gpu.layer_sink(layer)?)?;
     let word = gpu.take_fault()?;
-    let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::F32Product));
+    let want = Some(Fault::of_sites(
+        u32::try_from(layer)?,
+        &[FaultSite::F32Product, FaultSite::CacheValue],
+    ));
     let heads_nan = r.q[..H].iter().all(|v| v.is_nan()) && r.k[..H].iter().all(|v| v.is_nan());
     let others = bits_equal(&r.q[H..], &clean.q[H..]) && bits_equal(&r.k[H..], &clean.k[H..]);
     let row = pos[0] as usize * H;

@@ -319,7 +319,7 @@ mod gate {
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::route_core::sigmoid;
     use bloomery_gpu::weights::q8_0_planes;
-    use bloomery_gpu::{Gpu, GpuError, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
     use bloomery_gpu_gates::flash_band::{ExactAttn, exact_attn, judge_prefill, prefill_bound};
     use bloomery_gpu_gates::prefill_gate::{
         HostCache, WindowCase, Windows, cache, window_refusals,
@@ -329,9 +329,9 @@ mod gate {
     use bloomery_gpu_gates::rounding::{U, U_F32, butterfly, gamma, neox_head, norm_head};
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
-        GateError, Layout, RefManifest, RowKind, activations, bits_equal, checks_failed, data_dir,
-        no_local_depot, par_map, ref_ints, ref_model_path, ref_tensor_logical_in, split_f32,
-        verdict,
+        GateError, Layout, NAN_F16 as NAN16, RefManifest, RowKind, activations, bits_equal,
+        checks_failed, data_dir, no_local_depot, par_map, ref_ints, ref_model_path,
+        ref_tensor_logical_in, split_f32, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
@@ -350,10 +350,6 @@ mod gate {
     /// The width of a token's q+gate row, and of one head's pair in it.
     const QG_HEAD: usize = 2 * HEAD;
     const QG_ROW: usize = N_HEAD * QG_HEAD;
-
-    /// An f16 NaN the padded rows are overwritten with; the plane sentinel
-    /// the rope check starts from.
-    const NAN16: u16 = 0x7e00;
 
     /// The rope check's tokens and their first position, and the cache height.
     const ROPE_M: usize = 7;
@@ -729,6 +725,69 @@ mod gate {
                     ok &= pass;
                 }
             }
+        }
+        Ok(generic_cache_value_check(gpu)? && ok)
+    }
+
+    /// The shared decode writer checks valid-position values without touching
+    /// neighbouring lanes or rows, including a multi-block, two-row append.
+    fn generic_cache_value_check(gpu: &Gpu) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let (rows, width, m, pos) = (5usize, 257usize, 2usize, 2usize);
+        let pos_buf = DeviceBuffer::from_host(stream, &[u32::try_from(pos)?])?;
+        let boundary = [0.0, -0.0, 65504.0, -65504.0, 65519.0, -65519.0];
+        let clean: Vec<f32> = (0..m * width)
+            .map(|i| boundary[i % boundary.len()])
+            .collect();
+        let sentinel = vec![SENTINEL; rows * width];
+        let mut ok = true;
+        for (name, bad) in [
+            ("finite", None),
+            ("NaN", Some(f32::NAN)),
+            ("Inf", Some(f32::INFINITY)),
+            ("-Inf", Some(f32::NEG_INFINITY)),
+            ("65520", Some(65520.0)),
+            ("-65520", Some(-65520.0)),
+        ] {
+            let mut input = clean.clone();
+            let lane = width + 1;
+            if let Some(value) = bad {
+                input[lane] = value;
+            }
+            let src = DeviceBuffer::from_host(stream, &input)?;
+            let mut cache = DeviceTensor::<u16>::zeroed(stream, rows, width)?;
+            cache.buf_mut().copy_from_host(stream, &sentinel)?;
+            let before = gpu.fault()?;
+            gpu.flash().enqueue_kv_append_pos_buf(
+                stream,
+                &src,
+                &pos_buf,
+                &mut cache,
+                m,
+                gpu.layer_sink(LAYER)?,
+            )?;
+            stream.synchronize()?;
+            let out = cache.buf().to_host_vec(stream)?;
+            let raised = gpu.take_fault()?;
+            let layer = u32::try_from(LAYER)?;
+            let fault = bad.map(|_| Fault::at(layer, FaultSite::CacheValue));
+            let at = pos * width + lane;
+            let mut want = sentinel.clone();
+            for (i, &value) in clean.iter().enumerate() {
+                want[pos * width + i] = f32_to_f16_bits(value);
+            }
+            let marked = bad.is_none() || half_to_f32(out[at]).is_nan();
+            if bad.is_some() {
+                want[at] = out[at];
+            }
+            let others = out == want;
+            let pass = before.is_none() && raised == fault && marked && others;
+            println!(
+                "generic f16 cache {name}: word={raised:?} want={fault:?} \
+                 NaN={marked} other_bits={others} {}",
+                verdict(pass)
+            );
+            ok &= pass;
         }
         Ok(ok)
     }
@@ -5918,10 +5977,22 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mode =
+            match args.as_slice() {
+                [] => "",
+                [flag] if matches!(flag.as_str(), "--kernel-faults" | "--bench-kernels") => {
+                    flag.as_str()
+                }
+                _ => return Err(format!(
+                    "usage: gate_qwen35moe_attn [--kernel-faults | --bench-kernels]; got {args:?}"
+                )
+                .into()),
+            };
         let gpu = Gpu::new()?;
         let ctx = gpu.context();
         let rope = RopeNeoxKernels::load(ctx)?;
-        if std::env::args().any(|a| a == "--kernel-faults") {
+        if mode == "--kernel-faults" {
             println!(
                 "gate_qwen35moe_attn: PARTIAL run, the kernel-fault clauses only, not the gate"
             );
@@ -5931,7 +6002,7 @@ mod gate {
             return if cache && score {
                 Ok(())
             } else {
-                checks_failed()
+                Err(checks_failed())
             };
         }
         let rope_norm = RopeNormKernels::load(ctx)?;
@@ -5939,7 +6010,7 @@ mod gate {
         let kp = FlashGqaPrefill::load(ctx)?;
         let gq = GatedQuantKernels::load(ctx)?;
         let qk = QsaKernels::load(ctx)?;
-        if std::env::args().any(|a| a == "--bench-kernels") {
+        if mode == "--bench-kernels" {
             return bench_select(&gpu, &k, &kp, &qk);
         }
         println!(

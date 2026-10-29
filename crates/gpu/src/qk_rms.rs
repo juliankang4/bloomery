@@ -11,11 +11,13 @@
 //! token at position `p` is row `h·ctx + p`. A position at or past `ctx`
 //! raises [`FaultSite::CachePos`], writes NaN over the head and appends
 //! nothing.
+//! A non-finite cache source or f16 overflow raises [`FaultSite::CacheValue`]
+//! and marks that cache value NaN.
 
 use crate::GpuError;
 use crate::elem::rms_scale_of_mean_checked;
 use crate::fault::{FaultSink, FaultSite};
-use crate::flash::f32_to_f16_bits;
+use crate::flash::cache_f16_pair;
 use crate::launch_u32;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
@@ -169,11 +171,16 @@ mod qk_rms_kernels {
         // base + tid + 64 is inside v. One thread per pair. The tokens of
         // one launch hold distinct positions, so no two blocks write one row.
         unsafe {
-            *cache_k.get_unchecked_mut(row + tid) = f32_to_f16_bits(n0);
-            *cache_k.get_unchecked_mut(row + tid + THREADS) = f32_to_f16_bits(n1);
-            *cache_v.get_unchecked_mut(row + tid) = f32_to_f16_bits(*v.get_unchecked(base + tid));
-            *cache_v.get_unchecked_mut(row + tid + THREADS) =
-                f32_to_f16_bits(*v.get_unchecked(base + tid + THREADS));
+            let (k0, k1) = cache_f16_pair(n0, n1, fault);
+            let (v0, v1) = cache_f16_pair(
+                *v.get_unchecked(base + tid),
+                *v.get_unchecked(base + tid + THREADS),
+                fault,
+            );
+            *cache_k.get_unchecked_mut(row + tid) = k0;
+            *cache_k.get_unchecked_mut(row + tid + THREADS) = k1;
+            *cache_v.get_unchecked_mut(row + tid) = v0;
+            *cache_v.get_unchecked_mut(row + tid + THREADS) = v1;
         }
     }
 }

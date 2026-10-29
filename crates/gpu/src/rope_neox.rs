@@ -25,7 +25,9 @@
 //!   the rounding ik's compiled CPU NEOX loop produces (its source writes
 //!   `x0·c − x1·s` and `x0·s + x1·c`), so on the same normalized values the
 //!   turn is ik's bit for bit;
-//! - the cache rows rounded once to f16, to nearest even.
+//! - the cache rows rounded once to f16, to nearest even. A non-finite
+//!   source or f16 overflow raises [`FaultSite::CacheValue`] and marks that
+//!   cache value NaN.
 //!
 //! A head with no norm behind it — squares that overflow the f32 products, or
 //! a zero head with no `eps` — has a scale that is not finite and positive:
@@ -99,7 +101,7 @@
 use crate::GpuError;
 use crate::elem::rms_scale_of_mean_checked;
 use crate::fault::{FaultSink, FaultSite};
-use crate::flash::f32_to_f16_bits;
+use crate::flash::{cache_f16_pair, f32_to_f16_bits};
 use crate::flash_gqa::{ROW_PLANES, RowPlanes, RowTable};
 use crate::launch_u32;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -710,16 +712,20 @@ impl KvSink for F16Sink<'_> {
         (y0, y1): (f32, f32),
         v: &[f32],
         (x0, x1): (usize, usize),
-        _fault: FaultSink,
+        fault: FaultSink,
     ) {
+        // SAFETY: both source positions are inside v by the fn's contract.
+        let (v0, v1) = unsafe { (*v.get_unchecked(x0), *v.get_unchecked(x1)) };
+        let (k0, k1) = cache_f16_pair(y0, y1, fault);
+        let (v0, v1) = cache_f16_pair(v0, v1, fault);
         let row = row * HEAD;
         // SAFETY: row + HEAD − 1 < n_kv·ctx·HEAD <= the planes' lengths, and
         // the values are this thread's (the fn's contract).
         unsafe {
-            *self.k.get_unchecked_mut(row + i0) = f32_to_f16_bits(y0);
-            *self.k.get_unchecked_mut(row + i1) = f32_to_f16_bits(y1);
-            *self.v.get_unchecked_mut(row + i0) = f32_to_f16_bits(*v.get_unchecked(x0));
-            *self.v.get_unchecked_mut(row + i1) = f32_to_f16_bits(*v.get_unchecked(x1));
+            *self.k.get_unchecked_mut(row + i0) = k0;
+            *self.k.get_unchecked_mut(row + i1) = k1;
+            *self.v.get_unchecked_mut(row + i0) = v0;
+            *self.v.get_unchecked_mut(row + i1) = v1;
         }
     }
 }
@@ -912,16 +918,18 @@ macro_rules! neox_append_k192_body {
         // region.
         unsafe {
             let at = (kh * $plane_rows as usize + slot) * HEAD_K192;
-            *$cache_k.get_unchecked_mut(at + i0) = f32_to_f16_bits(y0);
-            *$cache_k.get_unchecked_mut(at + i1) = f32_to_f16_bits(y1);
+            let (k0, k1) = cache_f16_pair(y0, y1, $fault);
+            *$cache_k.get_unchecked_mut(at + i0) = k0;
+            *$cache_k.get_unchecked_mut(at + i1) = k1;
             if tid < V_HEAD_K192 / 2 {
                 let vsrc = row + (nh + $n_kv as usize) * HEAD_K192 + kh * V_HEAD_K192;
                 let vat = (kh * $plane_rows as usize + slot) * V_HEAD_K192;
                 let v0 = *$qkv.get_unchecked_mut(vsrc + tid);
                 let v1 = *$qkv.get_unchecked_mut(vsrc + tid + V_HEAD_K192 / 2);
-                *$cache_v.get_unchecked_mut(vat + tid) = f32_to_f16_bits(mul_rn_f32(v0, $v_scale));
-                *$cache_v.get_unchecked_mut(vat + tid + V_HEAD_K192 / 2) =
-                    f32_to_f16_bits(mul_rn_f32(v1, $v_scale));
+                let (v0, v1) =
+                    cache_f16_pair(mul_rn_f32(v0, $v_scale), mul_rn_f32(v1, $v_scale), $fault);
+                *$cache_v.get_unchecked_mut(vat + tid) = v0;
+                *$cache_v.get_unchecked_mut(vat + tid + V_HEAD_K192 / 2) = v1;
             }
         }
     }};
@@ -1086,6 +1094,15 @@ mod rope_neox_kernels {
             *k.get_unchecked_mut(base + tid) = y0;
             *k.get_unchecked_mut(base + tid + THREADS) = y1;
         }
+        // SAFETY: base + tid + THREADS < m·n_kv·HEAD <= v.len().
+        let (v0, v1) = unsafe {
+            (
+                *v.get_unchecked(base + tid),
+                *v.get_unchecked(base + tid + THREADS),
+            )
+        };
+        let (k0, k1) = cache_f16_pair(y0, y1, fault);
+        let (v0, v1) = cache_f16_pair(v0, v1, fault);
         let row = (kh * ctx as usize + p) * HEAD;
         // SAFETY: kh < n_kv and p < ctx, so row + 127 < n_kv·ctx·128 <= the
         // planes' lengths; base + tid + 64 < m·n_kv·128 <= v.len(). One
@@ -1093,11 +1110,10 @@ mod rope_neox_kernels {
         // positions (the launch contract; the engine's embedding launch
         // writes consecutive ones), so no two blocks write one row.
         unsafe {
-            *cache_k.get_unchecked_mut(row + tid) = f32_to_f16_bits(y0);
-            *cache_k.get_unchecked_mut(row + tid + THREADS) = f32_to_f16_bits(y1);
-            *cache_v.get_unchecked_mut(row + tid) = f32_to_f16_bits(*v.get_unchecked(base + tid));
-            *cache_v.get_unchecked_mut(row + tid + THREADS) =
-                f32_to_f16_bits(*v.get_unchecked(base + tid + THREADS));
+            *cache_k.get_unchecked_mut(row + tid) = k0;
+            *cache_k.get_unchecked_mut(row + tid + THREADS) = k1;
+            *cache_v.get_unchecked_mut(row + tid) = v0;
+            *cache_v.get_unchecked_mut(row + tid + THREADS) = v1;
         }
     }
 
