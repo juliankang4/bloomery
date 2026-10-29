@@ -346,7 +346,7 @@ mod gate {
         );
         let plan = inputs.plan_with_slots(
             &machine,
-            CTX as u64,
+            (CTX as u64, u64::try_from(ub)?),
             &PlanLevers::default(),
             Experts::Card,
             1,

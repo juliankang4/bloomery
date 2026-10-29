@@ -232,24 +232,29 @@ const BESIDE: u64 = ROWS + 4 + 36 * runtime::stores::DELTA_REPLAY_BYTES;
 /// A sequence's step and pass arena rows.
 const ROWS: u64 = 9 * 4 * 2560 * 4;
 
-/// The host bytes one saved sequence state of `ctx` positions holds, the
+/// The most host bytes one saved sequence state of `ctx` positions holds, the
 /// prompt cache's entry (`qwen35moe::place::PlanInputs::seq_state_bytes`,
 /// which a box gate holds equal to the engine's `seq38_bytes`) [derived]:
 /// the 12 selecting layers' positional bytes (2,048 B a position and a
-/// 256 B pooled key a pool of four), two checkpoints — the 36 delta layers'
-/// committed state lane, conv ring and carry, 4,093,584 B each, the PLE
-/// ring, 17 · 4 · 2,560 f32, and the 12 raw index key rings, 11 rows of 128
-/// f16 each — and, under the draft, its store (2,048 B a
-/// position), the arena rows ([`ROWS`]) and one point's hidden row
-/// (4 · 2,560 f32).
+/// 256 B pooled key a pool of four), a context- and budget-bounded number
+/// of checkpoint copies of the 36 delta layers' committed state lane,
+/// conv ring and carry, 4,093,584 B each, the PLE ring, 17 · 4 · 2,560 f32,
+/// and the 12 raw index key rings, 11 rows of 128 f16 each. Under the draft,
+/// its store (2,048 B a position), the arena rows ([`ROWS`]) and each saved
+/// inner point's hidden row (4 · 2,560 f32).
 fn state38(ctx: u64, drafts: bool) -> u64 {
     let attention = 12 * (ctx * 2048 + ctx.div_ceil(4) * 256);
+    let points = runtime::seqstate::Price {
+        point_bytes: CHECKPOINT_38,
+        every: UBATCH_PLANNED as u32,
+    }
+    .saved_points(ctx);
     let draft = if drafts {
-        ctx * 2048 + ROWS + 4 * 2560 * 4
+        ctx * 2048 + ROWS + points * 4 * 2560 * 4
     } else {
         0
     };
-    attention + 2 * CHECKPOINT_38 + draft
+    attention + (1 + points) * CHECKPOINT_38 + draft
 }
 
 /// One checkpoint's host bytes: the 36 delta layers' committed state lane,
@@ -444,7 +449,7 @@ fn planned_drafting<'a>(
         &mut plan,
         room,
         2 * state38(ctx, fixed.is_some()),
-        UBATCH_PLANNED,
+        runtime::stores::reader_columns(UBATCH_PLANNED.min(ctx)),
         ROW_PAGE,
         super::RowTableSource::Split,
     )?;
@@ -727,7 +732,7 @@ fn q3_routes_onto_cards_like_the_q4_file() {
             &mut moved,
             PLAN_ROOM,
             0,
-            UBATCH_PLANNED,
+            runtime::stores::reader_columns(UBATCH_PLANNED),
             ROW_PAGE,
             super::RowTableSource::Split,
         ),
@@ -1929,7 +1934,7 @@ fn spark_holds(
             &mut plan,
             room,
             floor,
-            UBATCH_PLANNED,
+            runtime::stores::reader_columns(UBATCH_PLANNED.min(ctx)),
             ROW_PAGE,
             super::RowTableSource::Split,
         )?;
@@ -2104,4 +2109,37 @@ fn a_default_context_on_the_3090_leaves_the_residency_floor() {
         (262_144, Rule::Target),
         "one slot and no draft keep the trained context"
     );
+}
+
+#[test]
+fn saved_state_and_reader_count_the_load_shape() {
+    let point = CHECKPOINT_38;
+    assert_eq!(state38(1, false), 12 * (2048 + 256) + point);
+    let positions: u64 = 16_384;
+    let attention = 12 * (positions * 2048 + positions.div_ceil(4) * 256);
+    assert_eq!(state38(positions, false), attention + 5 * point);
+    assert_eq!(
+        state38(positions, true),
+        attention + 5 * point + positions * 2048 + ROWS + 4 * 4 * 2560 * 4
+    );
+    let mut model = model(false);
+    let table = model
+        .tensors
+        .iter_mut()
+        .find(|t| t.role == Role::EngramTable)
+        .unwrap();
+    table.ty = GgmlType::NVFP4_ROWS;
+    table.dims[0] = 64;
+    table.file_bytes = table.dims.iter().product::<u64>() / 16 * 9;
+    let reserve = |ubatch| {
+        super::row_room(
+            &model,
+            runtime::stores::reader_columns(ubatch),
+            ROW_PAGE,
+            super::RowTableSource::Parts,
+        )
+        .unwrap()
+    };
+    assert_eq!(reserve(4096) - reserve(512), 896 << 20);
+    assert_eq!(reserve(1), reserve(8));
 }

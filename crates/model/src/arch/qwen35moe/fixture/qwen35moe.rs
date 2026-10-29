@@ -123,7 +123,7 @@ fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, Fixtu
         |inputs, machine, levers| {
             inputs.plan_rule(
                 machine,
-                BUDGET_CTX,
+                (BUDGET_CTX, super::place::UBATCH_PLANNED.min(BUDGET_CTX)),
                 levers,
                 routed_rule(Program::Qwen35Body),
             )

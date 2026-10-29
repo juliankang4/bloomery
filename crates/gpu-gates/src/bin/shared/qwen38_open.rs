@@ -153,7 +153,7 @@ impl<'a> Open38<'a> {
     ) -> Result<Plan<'p>, PlaceError> {
         inputs.plan_with_slots(
             machine,
-            self.ctx as u64,
+            (self.ctx as u64, self.ub as u64),
             self.plan_levers,
             self.experts,
             self.slots,

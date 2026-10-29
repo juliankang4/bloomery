@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use gguf::Split;
+use model::arch::qwen35moe::place::UBATCH_PLANNED;
 
 /// The file: unsloth's `UD-Q4_K_XL`. Its first shard holds the header and no
 /// tensor.
@@ -428,7 +429,7 @@ fn hw_qwen4exp_plan() {
     for card in [A6000, RTX_3090] {
         let machine = place::machine(card, n_layer, place::UBATCH_PLANNED);
         for (ctx, kv) in KV_AT {
-            let plan = match inputs.plan(&machine, ctx, &levers) {
+            let plan = match inputs.plan(&machine, (ctx, UBATCH_PLANNED.min(ctx)), &levers) {
                 Ok(p) => p,
                 Err(e) => {
                     check(
@@ -519,7 +520,11 @@ fn hw_qwen4exp_plan() {
             .map_or(0, |&(_, c)| c);
         // The boundary from the plan's own totals: the card's granules, scratch and
         // context, and the cache the layout gives each context, against usable − margin.
-        let Ok(at) = inputs.plan(&machine, KV_AT[0].0, &levers) else {
+        let Ok(at) = inputs.plan(
+            &machine,
+            (KV_AT[0].0, UBATCH_PLANNED.min(KV_AT[0].0)),
+            &levers,
+        ) else {
             check(
                 &mut o,
                 format!("{}: no plan to find the boundary from", card.name),
@@ -547,9 +552,11 @@ fn hw_qwen4exp_plan() {
             }
         }
         let max = lo;
-        let at_max = inputs.plan(&machine, max, &levers).is_ok();
+        let at_max = inputs
+            .plan(&machine, (max, UBATCH_PLANNED.min(max)), &levers)
+            .is_ok();
         let past = matches!(
-            inputs.plan(&machine, max + 1, &levers),
+            inputs.plan(&machine, (max + 1, UBATCH_PLANNED.min(max + 1)), &levers),
             Err(PlaceError::Broken(v)) if v.iter().any(|x| matches!(x, Violation::CardOver { .. }))
         );
         check(
@@ -566,7 +573,11 @@ fn hw_qwen4exp_plan() {
     let machine = place::machine(A6000, n_layer, place::UBATCH_PLANNED);
     // The plan's host set, from the headers: the PLE table's pages once, beside the routed
     // stacks', each run grown to whole pages and merged per shard.
-    match inputs.plan(&machine, KV_AT[0].0, &levers) {
+    match inputs.plan(
+        &machine,
+        (KV_AT[0].0, UBATCH_PLANNED.min(KV_AT[0].0)),
+        &levers,
+    ) {
         Ok(plan) => {
             let src = R8Source::rows(&split);
             let set = |keep: &dyn Fn(&ModelTensor) -> bool| {
@@ -620,7 +631,7 @@ fn hw_qwen4exp_plan() {
         ),
     }
     for ctx in [0, KERNEL_POSITIONS + 1] {
-        let got = inputs.plan(&machine, ctx, &levers);
+        let got = inputs.plan(&machine, (ctx, UBATCH_PLANNED.min(ctx)), &levers);
         let named = matches!(&got, Err(PlaceError::Positions { ctx_max }) if *ctx_max == ctx);
         let text = got.err().map_or("planned".to_string(), |e| e.to_string());
         check(&mut o, format!("ctx {ctx}: {text}"), named);
@@ -1013,15 +1024,28 @@ fn hw_qwen4exp_card_plan() {
         let machine = place::machine_for_experts(card, inputs.spec.layers.len(), u, Experts::Card);
         let got = if with_draft {
             inputs
-                .plan_mtp_with(&machine, ctx, &levers, &mtp, Experts::Card)
+                .plan_mtp_with(
+                    &machine,
+                    (ctx, UBATCH_PLANNED.min(ctx)),
+                    &levers,
+                    &mtp,
+                    Experts::Card,
+                )
                 .map(|m| {
-                    let host = inputs.plan_mtp(&machine, ctx, &levers, &mtp).ok();
+                    let host = inputs
+                        .plan_mtp(&machine, (ctx, UBATCH_PLANNED.min(ctx)), &levers, &mtp)
+                        .ok();
                     let same = host.is_some_and(|h| view(&h.draft) == view(&m.draft));
                     (m.plan, same)
                 })
         } else {
             inputs
-                .plan_with(&machine, ctx, &levers, Experts::Card)
+                .plan_with(
+                    &machine,
+                    (ctx, UBATCH_PLANNED.min(ctx)),
+                    &levers,
+                    Experts::Card,
+                )
                 .map(|p| (p, true))
         };
         let (plan, draft_same) = match got {
@@ -1124,8 +1148,18 @@ fn hw_qwen4exp_card_plan() {
             card_budget_bytes: Some(floor).into(),
         };
         let pair = (
-            inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Card),
-            inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Host),
+            inputs.plan_with(
+                &machine,
+                (KV_AT[0].0, UBATCH_PLANNED.min(KV_AT[0].0)),
+                &levers,
+                Experts::Card,
+            ),
+            inputs.plan_with(
+                &machine,
+                (KV_AT[0].0, UBATCH_PLANNED.min(KV_AT[0].0)),
+                &levers,
+                Experts::Host,
+            ),
         );
         let (ok, text) = match pair {
             (Ok(c), Ok(h)) => (
@@ -1474,15 +1508,28 @@ fn hw_qwen4exp_q3_card_plan() {
         let machine = place::machine_for_experts(card, inputs.spec.layers.len(), u, Experts::Card);
         let got = if with_draft {
             inputs
-                .plan_mtp_with(&machine, ctx, &levers, &mtp, Experts::Card)
+                .plan_mtp_with(
+                    &machine,
+                    (ctx, UBATCH_PLANNED.min(ctx)),
+                    &levers,
+                    &mtp,
+                    Experts::Card,
+                )
                 .map(|m| {
-                    let host = inputs.plan_mtp(&machine, ctx, &levers, &mtp).ok();
+                    let host = inputs
+                        .plan_mtp(&machine, (ctx, UBATCH_PLANNED.min(ctx)), &levers, &mtp)
+                        .ok();
                     let same = host.is_some_and(|h| view(&h.draft) == view(&m.draft));
                     (m.plan, same)
                 })
         } else {
             inputs
-                .plan_with(&machine, ctx, &levers, Experts::Card)
+                .plan_with(
+                    &machine,
+                    (ctx, UBATCH_PLANNED.min(ctx)),
+                    &levers,
+                    Experts::Card,
+                )
                 .map(|p| (p, true))
         };
         let (plan, draft_same) = match got {
@@ -1577,8 +1624,18 @@ fn hw_qwen4exp_q3_card_plan() {
             card_budget_bytes: Some(floor).into(),
         };
         let pair = (
-            inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Card),
-            inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Host),
+            inputs.plan_with(
+                &machine,
+                (KV_AT[0].0, UBATCH_PLANNED.min(KV_AT[0].0)),
+                &levers,
+                Experts::Card,
+            ),
+            inputs.plan_with(
+                &machine,
+                (KV_AT[0].0, UBATCH_PLANNED.min(KV_AT[0].0)),
+                &levers,
+                Experts::Host,
+            ),
         );
         let (ok, text) = match pair {
             (Ok(c), Ok(h)) => (
@@ -1703,10 +1760,20 @@ fn hw_qwen4exp_bp_plan() {
     let mut a_machine = place::machine_for_experts(A6000, n, u, Experts::Card);
     a_machine.cards[0].scratch_bytes += place::card_tier_join_bytes(u);
     let a = inputs
-        .plan_with(&a_machine, ctx, &levers, Experts::Card)
+        .plan_with(
+            &a_machine,
+            (ctx, UBATCH_PLANNED.min(ctx)),
+            &levers,
+            Experts::Card,
+        )
         .unwrap_or_else(|e| panic!("plan (a): {e}"));
     let (high, at_high, low, t_high, t_at_high, t_experts, t_bytes, t_rounding) = BP_PLAIN;
-    match inputs.plan_with(&machine, ctx, &levers, Experts::Card) {
+    match inputs.plan_with(
+        &machine,
+        (ctx, UBATCH_PLANNED.min(ctx)),
+        &levers,
+        Experts::Card,
+    ) {
         Err(e) => check(&mut o, format!("plan (b′) refused: {e}"), false),
         Ok(plan) => {
             let stage: Vec<u64> = (0..n)
@@ -1811,7 +1878,12 @@ fn hw_qwen4exp_bp_plan() {
             );
         }
     }
-    let host = inputs.plan_with(&machine, ctx, &levers, Experts::Host);
+    let host = inputs.plan_with(
+        &machine,
+        (ctx, UBATCH_PLANNED.min(ctx)),
+        &levers,
+        Experts::Host,
+    );
     check(
         &mut o,
         format!(
@@ -1821,7 +1893,12 @@ fn hw_qwen4exp_bp_plan() {
         matches!(host, Err(PlaceError::TierHost { .. })),
     );
     let drafted = machine_bp(n, u, Some(1), batch);
-    let reserve = inputs.plan_with(&drafted, ctx, &levers, Experts::Card);
+    let reserve = inputs.plan_with(
+        &drafted,
+        (ctx, UBATCH_PLANNED.min(ctx)),
+        &levers,
+        Experts::Card,
+    );
     check(
         &mut o,
         format!(

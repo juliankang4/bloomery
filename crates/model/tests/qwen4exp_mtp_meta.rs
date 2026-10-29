@@ -17,6 +17,7 @@ use std::fmt::Write as _;
 
 use gguf::Split;
 use model::arch::models::{DraftSpec, MtpDraft, MtpSource};
+use model::arch::qwen35moe::place::UBATCH_PLANNED;
 
 /// The target: unsloth's `UD-Q4_K_XL`.
 const Q38: &str = "/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
@@ -266,20 +267,21 @@ fn hw_qwen4exp_mtp_plan() {
         let machine = place::machine(card, inputs.spec.layers.len(), place::UBATCH_PLANNED);
         for ctx in [4096u64, 32_768] {
             let plain = inputs
-                .plan(&machine, ctx, &levers)
+                .plan(&machine, (ctx, UBATCH_PLANNED.min(ctx)), &levers)
                 .unwrap_or_else(|e| panic!("{} ctx {ctx}: plan: {e}", card.name));
             for (label, m) in [("full", &full), ("list", &list)] {
-                let with = match inputs.plan_mtp(&machine, ctx, &levers, m) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        check(
-                            &mut o,
-                            format!("{} ctx {ctx} {label}: plan_mtp refused: {e}", card.name),
-                            false,
-                        );
-                        continue;
-                    }
-                };
+                let with =
+                    match inputs.plan_mtp(&machine, (ctx, UBATCH_PLANNED.min(ctx)), &levers, m) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            check(
+                                &mut o,
+                                format!("{} ctx {ctx} {label}: plan_mtp refused: {e}", card.name),
+                                false,
+                            );
+                            continue;
+                        }
+                    };
                 let d = &with.draft.cards[0];
                 let got = (
                     d.dense_bytes,
@@ -333,8 +335,15 @@ fn hw_qwen4exp_mtp_plan() {
                     place::UBATCH_PLANNED.min(ctx),
                     experts,
                 );
-                let plans = [&full, &list]
-                    .map(|m| inputs.plan_mtp_with(&machine, ctx, &levers, m, experts));
+                let plans = [&full, &list].map(|m| {
+                    inputs.plan_mtp_with(
+                        &machine,
+                        (ctx, UBATCH_PLANNED.min(ctx)),
+                        &levers,
+                        m,
+                        experts,
+                    )
+                });
                 let [Ok(f), Ok(l)] = &plans else {
                     let why: Vec<String> = plans
                         .iter()
@@ -383,7 +392,7 @@ fn hw_qwen4exp_mtp_plan() {
             .iter()
             .find(|(n, _)| *n == card.name)
             .map_or(0, |&(_, c)| c);
-        let Ok(at) = inputs.plan_mtp(&machine, 4096, &levers, &full) else {
+        let Ok(at) = inputs.plan_mtp(&machine, (4096, UBATCH_PLANNED), &levers, &full) else {
             check(
                 &mut o,
                 format!("{}: no draft plan to find the boundary from", card.name),
@@ -417,9 +426,11 @@ fn hw_qwen4exp_mtp_plan() {
                 hi = mid - 1;
             }
         }
-        let at_max = inputs.plan_mtp(&machine, lo, &levers, &full).is_ok();
+        let at_max = inputs
+            .plan_mtp(&machine, (lo, UBATCH_PLANNED.min(lo)), &levers, &full)
+            .is_ok();
         let past = matches!(
-            inputs.plan_mtp(&machine, lo + 1, &levers, &full),
+            inputs.plan_mtp(&machine, (lo + 1, UBATCH_PLANNED.min(lo + 1)), &levers, &full),
             Err(PlaceError::Broken(v)) if v.iter().any(|x| matches!(x, Violation::CardOver { .. }))
         );
         check(
@@ -577,7 +588,13 @@ fn hw_qwen4exp_bp_mtp_plan() {
     let mut a_machine = place::machine_for_experts(A6000, n, u, Experts::Card);
     a_machine.cards[0].scratch_bytes += place::card_tier_join_bytes(u);
     let a = inputs
-        .plan_mtp_with(&a_machine, ctx, &levers, &mtp, Experts::Card)
+        .plan_mtp_with(
+            &a_machine,
+            (ctx, UBATCH_PLANNED.min(ctx)),
+            &levers,
+            &mtp,
+            Experts::Card,
+        )
         .unwrap_or_else(|e| panic!("plan (a) with the draft: {e}"));
     let view = |p: &model::placement::Plan<'_>| {
         format!(
@@ -586,7 +603,13 @@ fn hw_qwen4exp_bp_mtp_plan() {
         )
     };
     let (high, at_high, low, t_high, t_at_high, t_experts, t_bytes, t_rounding) = BP_DRAFTED;
-    match inputs.plan_mtp_with(&machine, ctx, &levers, &mtp, Experts::Card) {
+    match inputs.plan_mtp_with(
+        &machine,
+        (ctx, UBATCH_PLANNED.min(ctx)),
+        &levers,
+        &mtp,
+        Experts::Card,
+    ) {
         Err(e) => check(
             &mut o,
             format!("plan (b′) with the draft refused: {e}"),
@@ -653,7 +676,13 @@ fn hw_qwen4exp_bp_mtp_plan() {
     }
     for (label, reserve) in [("none", None), ("one byte more", Some(bytes + 1))] {
         let wrong = machine_bp(n, u, reserve, batch);
-        let got = inputs.plan_mtp_with(&wrong, ctx, &levers, &mtp, Experts::Card);
+        let got = inputs.plan_mtp_with(
+            &wrong,
+            (ctx, UBATCH_PLANNED.min(ctx)),
+            &levers,
+            &mtp,
+            Experts::Card,
+        );
         check(
             &mut o,
             format!(

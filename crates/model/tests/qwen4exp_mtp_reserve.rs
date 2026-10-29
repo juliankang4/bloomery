@@ -30,7 +30,8 @@ use model::arch::models::{
 };
 use model::arch::qwen35moe::mtp::BorrowedHead;
 use model::arch::qwen35moe::place::{
-    Experts, FileTensor, KvLayout, MtpInputs, PlanInputs, mtp_head_act_bytes, mtp_tensors,
+    Experts, FileTensor, KvLayout, MtpInputs, PlanInputs, UBATCH_PLANNED, mtp_head_act_bytes,
+    mtp_tensors,
 };
 use model::placement::workstation::{CONTEXT, GRANULE, MARGIN, SCRATCH};
 use model::placement::{
@@ -365,7 +366,14 @@ fn a_drafted_card_plan_keeps_its_bound_at_any_slack() {
     for slots in [1, 2] {
         let wide = machine(WIDE);
         let at = inputs
-            .plan_mtp_with_slots(&wide, CTX, &levers, &q8, Experts::Card, slots)
+            .plan_mtp_with_slots(
+                &wide,
+                (CTX, UBATCH_PLANNED.min(CTX)),
+                &levers,
+                &q8,
+                Experts::Card,
+                slots,
+            )
             .expect("the Q8_0 head's plan on the wide card");
         let held = at.plan.cards[0].experts;
         assert!(
@@ -375,15 +383,28 @@ fn a_drafted_card_plan_keeps_its_bound_at_any_slack() {
         let slack = u64::try_from(at.headroom_bytes).expect("headroom") - MARGIN;
         let tight = machine(WIDE - slack);
         let q8_tight = inputs
-            .plan_mtp_with_slots(&tight, CTX, &levers, &q8, Experts::Card, slots)
+            .plan_mtp_with_slots(
+                &tight,
+                (CTX, UBATCH_PLANNED.min(CTX)),
+                &levers,
+                &q8,
+                Experts::Card,
+                slots,
+            )
             .expect("the Q8_0 head's plan on the card of no slack");
         assert_eq!(
             (q8_tight.plan.cards[0].experts, q8_tight.headroom_bytes),
             (held, i128::from(MARGIN)),
             "{slots} slot(s): the card shrunk by the slack keeps the fill with the margin left"
         );
-        let with = match inputs.plan_mtp_with_slots(&tight, CTX, &levers, &q6, Experts::Card, slots)
-        {
+        let with = match inputs.plan_mtp_with_slots(
+            &tight,
+            (CTX, UBATCH_PLANNED.min(CTX)),
+            &levers,
+            &q6,
+            Experts::Card,
+            slots,
+        ) {
             Ok(p) => p,
             Err(e) => panic!(
                 "{slots} slot(s), a Q6_K head on the card of no slack ({} B): the plan the expert \
@@ -446,7 +467,14 @@ fn a_drafted_plan_on_one_pool_counts_the_draft_once() {
     // what the pool holds past its cards and host, or its refusal.
     let plan = |experts, slots, pool| {
         inputs
-            .plan_mtp_with_slots(&unified(WIDE, pool), CTX, &levers, &q8, experts, slots)
+            .plan_mtp_with_slots(
+                &unified(WIDE, pool),
+                (CTX, UBATCH_PLANNED.min(CTX)),
+                &levers,
+                &q8,
+                experts,
+                slots,
+            )
             .map(|p| {
                 let held = p.plan.pool_need().expect("a unified machine's pool terms");
                 (

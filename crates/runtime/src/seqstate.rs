@@ -118,6 +118,19 @@ pub struct Price {
 }
 
 impl Price {
+    /// The most inner points a save can carry at `positions`: the first,
+    /// anchors and last below it, capped by the slots the context's budget
+    /// holds. A stateless body (`point_bytes == 0`) carries none. The current
+    /// recurrent state is separate from these points.
+    #[must_use]
+    pub fn saved_points(self, positions: u64) -> u64 {
+        let below = positions.saturating_sub(1);
+        let multiples = below.checked_div(u64::from(self.every)).unwrap_or(0);
+        let anchors = multiples.checked_ilog2().map_or(0, |n| u64::from(n) + 1);
+        let fit = HOST_BUDGET.checked_div(self.point_bytes).unwrap_or(0);
+        below.min(anchors + 2).min(fit)
+    }
+
     /// The host bytes one sequence's checkpoints hold at most in a load of
     /// `ctx` positions: the points one prompt call over the whole context
     /// takes ([`marks`] from 0 to `ctx`) and one more, no more than
@@ -1350,6 +1363,56 @@ mod tests {
             }),
             "a later non-anchor goes before the first anchor"
         );
+    }
+
+    #[test]
+    fn saved_point_bound_counts_anchors_and_the_budget() {
+        let price = Price {
+            point_bytes: 148_065_344,
+            every: 4096,
+        };
+        assert_eq!(price.saved_points(1), 0);
+        assert_eq!(price.saved_points(16_384), 4);
+        assert_eq!(save_points(&marks(0, 16_384, 4096), 16_384, 4096).len(), 3);
+        assert_eq!(price.saved_points(262_144), 8);
+        assert_eq!(
+            Price {
+                point_bytes: HOST_BUDGET / 2,
+                ..price
+            }
+            .saved_points(262_144),
+            2
+        );
+        assert_eq!(
+            Price {
+                point_bytes: 0,
+                ..price
+            }
+            .saved_points(262_144),
+            0
+        );
+        for every in [0, 1, 2, 4] {
+            let price = Price {
+                point_bytes: HOST_BUDGET / 4,
+                every,
+            };
+            for pos in 1..=12 {
+                for bits in 0u32..(1 << (pos - 1)) {
+                    let held: Vec<u32> = (1..pos).filter(|p| bits & (1 << (p - 1)) != 0).collect();
+                    let slots = (u64::from(pos - 1)
+                        .checked_div(u64::from(every))
+                        .unwrap_or(0)
+                        + 2)
+                    .min(4);
+                    if held.len() as u64 <= slots {
+                        assert!(
+                            save_points(&held, pos, every).len() as u64
+                                <= price.saved_points(u64::from(pos))
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

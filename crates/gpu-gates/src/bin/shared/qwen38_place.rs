@@ -101,7 +101,7 @@ pub fn tier_experts(
     )?;
     beside::reserve_on(&mut machine, held);
     reserve_checkpoints(&mut machine, seqs, ctx)?;
-    let plan = inputs.plan_target(&machine, ctx, levers, experts, mtp, slots)?;
+    let plan = inputs.plan_target(&machine, (ctx, ub), levers, experts, mtp, slots)?;
     Ok(plan.tier_n_l.iter().flatten().sum())
 }
 

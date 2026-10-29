@@ -26,6 +26,17 @@ pub const DELTA_REPLAY_BYTES: u64 = (DELTA_REPLAY_WORDS * std::mem::size_of::<u6
 /// position reads.
 pub const PASS_ROWS: usize = 8;
 
+/// The columns a prompt reader and host batch port hold for a load: its
+/// ubatch and at least one verify pass.
+#[must_use]
+pub const fn reader_columns(ubatch: u64) -> u64 {
+    if ubatch < PASS_ROWS as u64 {
+        PASS_ROWS as u64
+    } else {
+        ubatch
+    }
+}
+
 /// Rows of a recurrent layer's conv ring: the reach of a `conv`-tap conv and
 /// a pass.
 ///

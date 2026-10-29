@@ -322,7 +322,12 @@ fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, Fixtu
         budget,
         |inputs| budget_machine(RTX_3090, inputs),
         |inputs, machine, levers| {
-            inputs.plan_with(machine, BUDGET_CTX, levers, place::Experts::Card)
+            inputs.plan_with(
+                machine,
+                (BUDGET_CTX, place::UBATCH_PLANNED.min(BUDGET_CTX)),
+                levers,
+                place::Experts::Card,
+            )
         },
     )
 }
