@@ -269,6 +269,7 @@ import functools
 import glob
 import hashlib
 import importlib.util
+import itertools
 import json
 import os
 import platform
@@ -9045,6 +9046,17 @@ def orphan_tests(tree: Tree, recipes: dict[str, Recipe], prefixes: tuple[str, ..
                     continue
                 enabled = None if param else tree.feature_closure(tree.packages[pname], feats, not inv.no_default, inv.all_features)[0]
                 runs.setdefault(key, []).append(TestRun(rname, enabled, args, mac))
+    # A cfg name a workspace build script both declares (`rustc-check-cfg=cfg(NAME)`) and emits (`rustc-cfg=NAME`)
+    # is set by the box build's target (a card's arch): a test under it exists only in a build where its path
+    # holds, and runs there. A name only declared, a name another package's build script emits (cargo applies a
+    # build script's cfgs to its own package only), or a run on the Mac stays unknown.
+    build_cfgs: dict[str, set[str]] = {pname: set() for pname in tree.packages}
+    for pname, pkg in tree.packages.items():
+        for t in pkg.targets:
+            if t.kind == "build":
+                with open(os.path.join(tree.root, t.src), encoding="utf-8") as fh:
+                    text = fh.read()
+                build_cfgs[pname] |= set(re.findall(r"rustc-check-cfg=cfg\((\w+)\)", text)) & set(re.findall(r"rustc-cfg=(\w+)", text))
     scan = TestScan(tree)
     orphans: list[str] = []
     checked = 0
@@ -9064,19 +9076,25 @@ def orphan_tests(tree: Tree, recipes: dict[str, Recipe], prefixes: tuple[str, ..
                     continue
                 reasons: list[str] = []
                 unknown: list[str] = []
+                used = sorted(n for n in build_cfgs[pname] if any(re.search(rf"\b{n}\b", c[2]) for c in item.cfgs))
+                builds = [dict(zip(used, vals)) for vals in itertools.product((True, False), repeat=len(used))]
                 for run in cands:
-                    bad = None
-                    for f, ln, text, pred in item.cfgs:
-                        keys, names = (_MAC_CFG_KEYS, _MAC_CFG_NAMES) if run.mac else (_BOX_CFG_KEYS, _BOX_CFG_NAMES)
-                        v = eval_cfg(pred, True, keys, names, run.features)
-                        if v is None:
-                            unknown.append(f"cfg({text}) at {f}:{ln} under {run.recipe}")
-                            bad = "?"
+                    keys, names = (_MAC_CFG_KEYS, _MAC_CFG_NAMES) if run.mac else (_BOX_CFG_KEYS, _BOX_CFG_NAMES)
+                    for build in builds if not run.mac else [{}]:
+                        bad = None
+                        for f, ln, text, pred in item.cfgs:
+                            v = eval_cfg(pred, True, keys, {**names, **build}, run.features)
+                            if v is None:
+                                bad = "?"
+                                break
+                            if v is False:
+                                feats = "no feature" if not run.features else "features " + ",".join(sorted(run.features))
+                                bad = f"{run.recipe} ({feats}): cfg({text}) at {f}:{ln} is false"
+                                break
+                        if bad is None:
                             break
-                        if v is False:
-                            feats = "no feature" if not run.features else "features " + ",".join(sorted(run.features))
-                            bad = f"{run.recipe} ({feats}): cfg({text}) at {f}:{ln} is false"
-                            break
+                    if bad == "?":
+                        unknown.append(f"cfg({text}) at {f}:{ln} under {run.recipe}")
                     if bad is None:
                         miss = run.args.misses(item.path, item.ignored)
                         if miss is None:
@@ -12822,6 +12840,18 @@ def orphan_self_test(expect, real: Side) -> None:
                 '#[cfg(target_feature = "avx2")]\n#[test]\nfn avx() {}\n'
                 "#[cfg(foo bar)]\n#[test]\nfn junk() {}\n"
                 'include!("gen.rs");\n'
+                "#[cfg(card_fp4)]\nmod fp4 {\n    #[test]\n    fn t() {}\n}\n"
+                "#[cfg(card_decl)]\nmod decl {\n    #[test]\n    fn t() {}\n}\n"
+            ),
+            "q/build.rs": (
+                'fn main() {\n    println!("cargo:rustc-check-cfg=cfg(card_fp4)");\n    println!("cargo:rustc-check-cfg=cfg(card_decl)");\n'
+                '    if std::env::var("CARD").is_ok() {\n        println!("cargo:rustc-cfg=card_fp4");\n    }\n}\n'
+            ),
+            "r/Cargo.toml": "",
+            "r/src/lib.rs": "#[cfg(card_fp4)]\nmod fp4 {\n    #[test]\n    fn t() {}\n}\n",
+            "r/build.rs": (
+                'fn main() {\n    println!("cargo:rustc-check-cfg=cfg(card_fp4)");\n    println!("cargo:rustc-cfg=card_fp4");\n'
+                '    println!("cargo:rustc-check-cfg=cfg(card_decl)");\n    println!("cargo:rustc-cfg=card_decl");\n}\n'
             ),
         }
         for rel, text in files.items():
@@ -12841,10 +12871,11 @@ def orphan_self_test(expect, real: Side) -> None:
 
         meta = {
             "workspace_root": tmp,
-            "workspace_members": ["p", "q"],
+            "workspace_members": ["p", "q", "r"],
             "packages": [
                 pkg("p", [("lib", "p", "src/lib.rs"), ("test", "it", "tests/it.rs")], {"f": [], "g": [], "default": []}),
-                pkg("q", [("lib", "q", "src/lib.rs")], {"g": []}),
+                pkg("q", [("lib", "q", "src/lib.rs"), ("custom-build", "build-script-build", "build.rs")], {"g": []}),
+                pkg("r", [("lib", "r", "src/lib.rs"), ("custom-build", "build-script-build", "build.rs")], {}),
             ],
         }
         st = Tree(tmp, meta)
@@ -12857,13 +12888,17 @@ def orphan_self_test(expect, real: Side) -> None:
             "gate-p-g": rec("gate-p-g", "bash tools/gate.sh -p p --features g --lib -- on::"),
             "check-p": rec("check-p", "bash tools/gate.sh -p p --test it"),
             "gate-q": rec("gate-q", "bash tools/gate.sh -p q --lib"),
+            "lab-r": Recipe("lab-r", [f"cargo test -p r --lib && ./{MAC_GATE} gate_r"], [], ""),
         }
         orphans, errors, checked = orphan_tests(st, rs)
         names = sorted(o.split(" ")[1] for o in orphans)
         expect(names == ["common::shared", "feat::t", "integ", "mac::t"], f"orphan scan: orphans {names}")
         expect(any("p/src/lib.rs:12 feat::t" in o and 'cfg(feature = "f") at p/src/lib.rs:9 is false' in o for o in orphans), f"orphan scan: feat::t's line {orphans}")
         expect(any(o.startswith("p/tests/it.rs:3 integ — p test it: no gate-* or lab-* recipe") for o in orphans), f"orphan scan: a check-* recipe counted as a runner {orphans}")
-        expect(checked == 11, f"orphan scan: {checked} tests checked, not 11")
+        # a test under a cfg a build script declares and emits (q's card_fp4) is run by the box recipe that runs its
+        # target, in the build that sets it; a name q only declares (card_decl, which r's build script emits for r alone)
+        # and a Mac-only run (r) stay unknown
+        expect(checked == 14, f"orphan scan: {checked} tests checked, not 14")
         # a recipe that runs MAC_GATE runs its tests on the Mac: the macOS module's test is run there, and the
         # feature-gated one stays an orphan
         mac_rs = dict(rs, **{"lab-p": Recipe("lab-p", [f"cargo test -p p --lib && ./{MAC_GATE} gate_p"], [], "")})
@@ -12876,9 +12911,11 @@ def orphan_self_test(expect, real: Side) -> None:
             ("q/src/lib.rs:14 avx:", 'cfg(target_feature = "avx2") at q/src/lib.rs:12'),
             ("q/src/lib.rs:15:", "cfg(foo bar)"),
             ("q/src/lib.rs:18:", "include!"),
+            ("q/src/lib.rs:27 decl::t:", "cfg(card_decl) at q/src/lib.rs:24 under gate-q"),
+            ("r/src/lib.rs:4 fp4::t:", "cfg(card_fp4) at r/src/lib.rs:1 under lab-r"),
         ]:
             expect(any(x.startswith(where) and why in x for x in errors), f"orphan scan: no named error at {where} ({why}): {errors}")
-        expect(len(errors) == 6, f"orphan scan: {len(errors)} errors, not 6: {errors}")
+        expect(len(errors) == 8, f"orphan scan: {len(errors)} errors, not 8: {errors}")
 
     # the real tree: gate-ds41-bind runs every bind test (the deepseek41 feature, the bind:: filter);
     # how many there are is the scan's own count of them, not a number spelled here
