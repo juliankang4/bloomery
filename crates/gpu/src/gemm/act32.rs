@@ -257,26 +257,25 @@ impl GemmAct32 {
         Ok(act)
     }
 
-    /// Scratch for the resident routed formats. FP4-only consumers skip Q8
-    /// stores in the input quantizer; other formats require the Q8 planes.
+    /// Scratch for the resident routed formats. Other formats keep only their Q8 representation.
     pub fn new_routed_for(
         stream: &CudaStream,
         cols: usize,
         k: usize,
         types: impl IntoIterator<Item = GgmlType>,
     ) -> Result<Self, GpuError> {
-        let (mut native, mut q8) = (false, false);
-        for ty in types {
-            native |= ty == GgmlType::NVFP4;
-            q8 |= ty != GgmlType::NVFP4;
-        }
-        let mut act = if native {
-            Self::new_routed(stream, cols, k)?
+        if types.into_iter().any(|ty| ty == GgmlType::NVFP4) {
+            Self::new_routed(stream, cols, k)
         } else {
-            Self::new(stream, cols, k)?
-        };
-        act.q8_required = q8 || !act.has_native_form();
-        Ok(act)
+            Self::new(stream, cols, k)
+        }
+    }
+
+    /// Skip the input quantizer's Q8 stores when all readers use native FP4.
+    /// A non-native build keeps Q8; a Q8 reader of the native-only scratch is refused.
+    pub(crate) fn native_input_only(mut self) -> Self {
+        self.q8_required = !self.has_native_form();
+        self
     }
 
     /// Whether the scratch holds the native FP4 form beside the 32-value one
@@ -323,7 +322,8 @@ impl GemmAct32 {
         self.k.div_ceil(GEMM32_STEP)
     }
 
-    /// The codes, `16 · steps` words per column (struct doc).
+    /// The codes, `16 · steps` words per column (struct doc). An input
+    /// quantizer on a native-only scratch leaves the Q8 planes untouched.
     #[must_use]
     pub fn q(&self) -> &DeviceBuffer<u32> {
         &self.q
@@ -519,8 +519,6 @@ impl Gemm32Kernels {
             stream, &prep, x, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s, fault,
         )?;
         act.fill(n_cols);
-        #[cfg(bloomery_nvfp4_mma)]
-        self.native.quantize(stream, act, None)?;
         Ok(())
     }
 
