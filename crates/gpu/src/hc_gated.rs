@@ -83,10 +83,10 @@ use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{
     Bf16Cols, Bf16Out, Bf16Rows, Bf16WordCols, F32Cols, F32Rows, Gemm32Args, Gemm32Kernels,
-    Gemm32Weight, GemmAct32, GemmInput, GemmRoute, HcUpMixArgs, MMA_CELLS, MMA_COLS, MMA_ROWS,
-    MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH, MmaCols, MmaForm, MmaRows,
-    MmaTile, OutForm, STAGE_FLOATS, STAGES, TileRows, bf16_mma_body, bf16_mma_launch,
-    bf16_mma_tile, form_col, land_values, mma_launch, mma_tile_origin, store_refused,
+    Gemm32Weight, GemmAct32, GemmInput, GemmRoute, HcUpMixArgs, MMA_COLS, MMA_ROWS, MMA_THREADS,
+    MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH, MmaCols, MmaForm, MmaRows, MmaTile, OutForm,
+    STAGE_FLOATS, STAGES, TileRows, bf16_mma_body, bf16_mma_launch, bf16_mma_tile, form_col,
+    land_values, mma_launch, mma_tile_origin, store_refused,
 };
 use crate::linear::{sigmoid, silu};
 use crate::q8f32::{
@@ -1902,36 +1902,42 @@ unsafe fn mix_glue<X: RowValues>(
     unsafe { store_mix(acc, i, fault, mixed) };
 }
 
-/// Rows of the warp's outputs one pass of [`mma_mix`] holds in the scratch.
-const MIX_ROWS: usize = MMA_WARP_SCRATCH / MMA_WARP_COLS;
-/// A thread's cells in those rows ([`MmaTile::value`]).
-const MIX_CELLS: usize = MMA_CELLS * MIX_ROWS / MMA_WARP_ROWS;
-/// Hidden indices one pass mixes, and the warp's columns one lane-wide step
-/// covers: lane `L` mixes hidden index `L % MIX_HIDDEN` of every
-/// `MIX_STEP_COLS`-th column from `L / MIX_HIDDEN`.
-const MIX_HIDDEN: usize = MIX_ROWS / STREAMS;
+/// Columns of the warp's outputs one pass of [`mma_mix`] holds in the
+/// scratch, all [`MMA_WARP_ROWS`] rows of each.
+const MIX_COLS: usize = MMA_WARP_SCRATCH / MMA_WARP_ROWS;
+/// Hidden indices of the warp's rows, and the warp's columns one lane-wide
+/// step covers: lane `L` mixes hidden index `L % MIX_HIDDEN` of every
+/// `MIX_STEP_COLS`-th column of the pass from `L / MIX_HIDDEN`, so a step's
+/// 32 bytes of one stream of a column are one sector of `xn`.
+const MIX_HIDDEN: usize = MMA_WARP_ROWS / STREAMS;
 const MIX_STEP_COLS: usize = 32 / MIX_HIDDEN;
-const _: () = assert!(MIX_ROWS == 32 && MIX_ROWS.is_multiple_of(STREAMS));
-const _: () = assert!(MIX_HIDDEN * MIX_STEP_COLS == 32 && MMA_WARP_COLS == 32);
+const _: () =
+    assert!(MIX_COLS == 16 && MIX_COLS.is_multiple_of(8) && MMA_WARP_COLS == 2 * MIX_COLS);
+const _: () = assert!(MIX_HIDDEN == 16 && MIX_HIDDEN * MIX_STEP_COLS == 32);
 /// Spans of `xn` one tile's mix reads: each holds the tile's hidden indices
 /// of one stream of one column, 64 bytes of BF16 values.
 const XN_LINES: usize = MMA_COLS * STREAMS;
 const _: () = assert!(XN_LINES == 2 * MMA_THREADS as usize && MMA_ROWS / STREAMS * 2 == 64);
 
-/// Scratch slot of the gate in pass row `row` and warp column `col`: rows of
-/// [`MMA_WARP_COLS`], each row's columns permuted by its hidden index, so a
-/// lane-wide step's 32 gates (eight hidden indices of four columns) fall in
-/// 32 banks.
+/// Scratch slot of the gate in warp row `row` and pass column `col`: lines
+/// of 32 floats, each two rows of [`MIX_COLS`], their 32 offsets permuted
+/// by the line, so both a lane-wide step's 32 gates (sixteen hidden indices
+/// of two columns, one stream) and a fragment cell's 32 stores (eight rows
+/// of an aligned eight, four even or odd columns of an aligned eight) fall
+/// in 32 banks.
 #[inline(always)]
 fn mix_slot(row: usize, col: usize) -> usize {
-    row * MMA_WARP_COLS + (col ^ ((row / STREAMS) % MIX_HIDDEN * MIX_STEP_COLS))
+    let line = row / 2;
+    let q = line / 2;
+    let swap = (line & 1) | (q & 6) | ((q & 1) << 3) | ((q & 8) << 1);
+    line * 32 + (((row % 2) * MIX_COLS + col) ^ swap)
 }
 
-/// Mixes the tile's gates: each pass stores the gates of [`MIX_ROWS`] of the
-/// warp's rows in its scratch ([`mix_slot`]), and each lane then mixes the
-/// streams of one hidden index of those rows for every
-/// [`MIX_STEP_COLS`]-th column, so a lane-wide step reads and writes eight
-/// consecutive values of four columns.
+/// Mixes the tile's gates: each pass stores the gates of [`MIX_COLS`] of the
+/// warp's columns in its scratch ([`mix_slot`]), and each lane then mixes the
+/// streams of one hidden index of the warp's rows for every
+/// [`MIX_STEP_COLS`]-th column, so a lane-wide step reads and writes sixteen
+/// consecutive values of two columns.
 ///
 /// # Safety
 /// All 256 threads call converged. The tile and spans come from the checked
@@ -1957,40 +1963,47 @@ unsafe fn mma_mix<const FROM_G: bool>(
     let lane = warp::lane_id() as usize;
     let (r0, c0) = tile.warp_origin();
     let (q, step_col) = (lane % MIX_HIDDEN, lane / MIX_HIDDEN);
-    for pass in 0..MMA_CELLS / MIX_CELLS {
+    let h = r0 / STREAMS + q;
+    for pass in 0..MMA_WARP_COLS / MIX_COLS {
         thread::__unroll_config::<0>();
-        let first = r0 + pass * MIX_ROWS;
-        for i in 0..MIX_CELLS {
+        let first = c0 + pass * MIX_COLS;
+        for mi in 0..MMA_WARP_ROWS / 16 {
             thread::__unroll_config::<0>();
-            let cell = pass * MIX_CELLS + i;
-            let (r, c) = tile.coordinates(cell);
-            let value = if FROM_G {
-                if r < wide && c < m as usize {
-                    // SAFETY: replay completed and this thread owns the live cell.
-                    unsafe { *g.get_unchecked_mut(c * wide + r) }
-                } else {
-                    0.0
+            for half in 0..MIX_COLS / 8 {
+                thread::__unroll_config::<0>();
+                for i in 0..4 {
+                    thread::__unroll_config::<0>();
+                    let cell = mi * 16 + (pass * MIX_COLS / 8 + half) * 4 + i;
+                    let (r, c) = tile.coordinates(cell);
+                    let value = if FROM_G {
+                        if r < wide && c < m as usize {
+                            // SAFETY: replay completed and this thread owns the live cell.
+                            unsafe { *g.get_unchecked_mut(c * wide + r) }
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        tile.value(cell)
+                    };
+                    // SAFETY: the cell's row lies in the warp's rows and its
+                    // column in this pass's, so the slot is inside the
+                    // scratch, this lane's alone.
+                    unsafe { *scratch.add(mix_slot(r - r0, c - first)) = gate_value(value) };
                 }
-            } else {
-                tile.value(cell)
-            };
-            // SAFETY: the cell's row lies in this pass's rows and its column in
-            // the warp's, so the slot is inside the scratch, this lane's alone.
-            unsafe { *scratch.add(mix_slot(r - first, c - c0)) = gate_value(value) };
+            }
         }
         warp::sync_mask(u32::MAX);
-        let h = first / STREAMS + q;
-        for t in 0..MMA_WARP_COLS / MIX_STEP_COLS {
+        for t in 0..MIX_COLS / MIX_STEP_COLS {
             thread::__unroll_config::<0>();
-            let wc = step_col + t * MIX_STEP_COLS;
-            let col = c0 + wc;
+            let pc = step_col + t * MIX_STEP_COLS;
+            let col = first + pc;
             if h < hid && col < m as usize {
                 let mut acc = 0.0f32;
                 for s in 0..STREAMS {
                     thread::__unroll_config::<0>();
-                    // SAFETY: row STREAMS·q + s, column `wc` of the scratch,
+                    // SAFETY: row STREAMS·q + s, column `pc` of the scratch,
                     // published by the warp sync above.
-                    let sg = unsafe { *scratch.add(mix_slot(STREAMS * q + s, wc)) };
+                    let sg = unsafe { *scratch.add(mix_slot(STREAMS * q + s, pc)) };
                     let at = col * wide + hc_stream_row(hid, h * STREAMS + s);
                     // SAFETY: this live column/hidden pair addresses its stream in xn.
                     let x = unsafe { Bf16Words(xn).at(at) };
@@ -3137,16 +3150,16 @@ mod tests {
     #[test]
     fn hc_mix_slots_fill_the_scratch_and_every_bank() {
         let mut seen = std::collections::HashSet::new();
-        for row in 0..MIX_ROWS {
-            for col in 0..MMA_WARP_COLS {
+        for row in 0..MMA_WARP_ROWS {
+            for col in 0..MIX_COLS {
                 assert!(seen.insert(mix_slot(row, col)));
             }
         }
-        assert_eq!(seen.len(), MIX_ROWS * MMA_WARP_COLS);
+        assert_eq!(seen.len(), MMA_WARP_SCRATCH);
         assert!(seen.iter().all(|&slot| slot < MMA_WARP_SCRATCH));
         // Each lane-wide read of the mix: lane L at hidden index L % MIX_HIDDEN
         // of column L / MIX_HIDDEN + t·MIX_STEP_COLS, one stream.
-        for t in 0..MMA_WARP_COLS / MIX_STEP_COLS {
+        for t in 0..MIX_COLS / MIX_STEP_COLS {
             for s in 0..STREAMS {
                 let banks: std::collections::HashSet<usize> = (0..32)
                     .map(|lane| {
@@ -3155,6 +3168,18 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(banks.len(), 32);
+            }
+        }
+        // Each lane-wide store of one fragment cell: lane L at row
+        // L / 4 and column 2·(L % 4) + p of an aligned eight by eight.
+        for r8 in (0..MMA_WARP_ROWS).step_by(8) {
+            for c8 in (0..MIX_COLS).step_by(8) {
+                for p in 0..2 {
+                    let banks: std::collections::HashSet<usize> = (0..32)
+                        .map(|lane| mix_slot(r8 + lane / 4, c8 + 2 * (lane % 4) + p) % 32)
+                        .collect();
+                    assert_eq!(banks.len(), 32);
+                }
             }
         }
     }
