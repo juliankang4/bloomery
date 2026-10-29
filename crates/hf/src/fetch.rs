@@ -352,12 +352,13 @@ impl Client {
     /// `repo`'s listing ([`Client::listing`]), or why the cache stands in
     /// for it: `HF_HUB_OFFLINE` asks the hub nothing, and a listing the
     /// network refuses or the hub answers busy or down is none. Any other
-    /// failure is the refusal.
+    /// failure is the refusal. Here and in every other call that takes a
+    /// `repo`, it is the repo at its revision, [`RepoRef::id`].
     fn listed(&self, repo: &str) -> Result<Listed, HfError> {
         if self.offline {
             return Ok(Listed::Cache(HUB_OFFLINE_WHY.to_owned()));
         }
-        match self.listing_at(repo, &self.revision) {
+        match self.listing(repo) {
             Ok(entries) => Ok(Listed::Hub(entries)),
             Err(HfError::Network { why, .. } | HfError::Unavailable { why, .. }) => {
                 Ok(Listed::Cache(why))
@@ -366,10 +367,17 @@ impl Client {
         }
     }
 
-    /// Every file of `repo`'s main branch, each page of the listing
-    /// followed to its last.
+    /// Every file of `repo` at its revision ([`Client::hub_at`]), each page
+    /// of the listing followed to its last.
     pub fn listing(&self, repo: &str) -> Result<Vec<Entry>, HfError> {
-        self.listing_at(repo, "main")
+        let (repo, rev) = self.hub_at(repo);
+        self.listing_at(repo, rev)
+    }
+
+    /// The repo and the revision the hub serves for `id` ([`RepoRef::id`]):
+    /// the revision `id` names, else the client's [`Client::revision`].
+    pub fn hub_at<'a>(&'a self, id: &'a str) -> (&'a str, &'a str) {
+        id.split_once('@').unwrap_or((id, &self.revision))
     }
 
     /// [`Client::listing`] of `repo` at revision `rev` (a branch, a tag or a
@@ -574,10 +582,8 @@ impl Client {
         if let Some(dir) = part.parent() {
             fs::create_dir_all(dir).map_err(|e| HfError::io(dir, e))?;
         }
-        let url = format!(
-            "{}/{repo}/resolve/{}/{}",
-            self.base, self.revision, entry.path
-        );
+        let (repo, rev) = self.hub_at(repo);
+        let url = format!("{}/{repo}/resolve/{rev}/{}", self.base, entry.path);
         let what = format!("download {url}");
         let mut cmd = Command::new(&self.curl);
         cmd.args(["--fail", "--location", "--silent", "--show-error"]);
@@ -666,37 +672,38 @@ impl Client {
         drafts: &[Draft<'_>],
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<Vec<PathBuf>, HfError> {
-        let entries = match self.listed(&r.repo)? {
+        let id = r.id();
+        let entries = match self.listed(&id)? {
             Listed::Hub(entries) => entries,
             Listed::Cache(why) => return self.offline_set(r, sources, &why, events),
         };
-        let sets = gguf_sets(&r.repo, &entries)?;
+        let sets = gguf_sets(&id, &entries)?;
         if sets.is_empty()
             && let Some(files) = crate::checkpoint_files(&entries)
         {
             let dir = checkpoint(r, sources, &self.root, &files, events)?;
-            self.mark_snapshot_if_ready(&r.repo, &files)?;
+            self.mark_snapshot_if_ready(&id, &files)?;
             for e in &files {
-                self.fetch(&r.repo, e, events)?;
+                self.fetch(&id, e, events)?;
             }
             return Ok(vec![dir]);
         }
-        let set = crate::pick(&r.repo, &sets, r.quant.as_deref())?;
-        events(&Event::Set { repo: &r.repo, set });
-        self.mark_snapshot_if_ready(&r.repo, &set.files)?;
+        let set = crate::pick(&id, &sets, r.quant.as_deref())?;
+        events(&Event::Set { repo: &id, set });
+        self.mark_snapshot_if_ready(&id, &set.files)?;
         let mut files = Vec::with_capacity(set.files.len());
         for e in &set.files {
-            files.push(self.fetch(&r.repo, e, events)?);
+            files.push(self.fetch(&id, e, events)?);
         }
         for d in drafts {
-            if let Some(e) = crate::mtp_draft(&r.repo, &entries, d.name)? {
+            if let Some(e) = crate::mtp_draft(&id, &entries, d.name)? {
                 match (d.usable)(&files[0]) {
                     // Beside the first shard, under the name the engine opens
                     // it by: wherever the repo keeps the draft, the run finds
                     // it there.
                     Ok(()) => {
                         let dest = files[0].with_file_name(d.name);
-                        self.fetch_to(&r.repo, e, &dest, events)?;
+                        self.fetch_to(&id, e, &dest, events)?;
                     }
                     Err(why) => events(&Event::DraftSkip {
                         file: &e.path,
@@ -729,25 +736,26 @@ impl Client {
         why: &str,
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<Vec<PathBuf>, HfError> {
+        let id = r.id();
         let offline = |cache: HfError| HfError::Offline {
-            repo: r.repo.clone(),
+            repo: id.clone(),
             why: why.to_owned(),
             cache: Box::new(cache),
         };
-        let entries = verified_entries(&self.root, &r.repo).map_err(offline)?;
-        let sets = gguf_sets(&r.repo, &entries).map_err(offline)?;
+        let entries = verified_entries(&self.root, &id).map_err(offline)?;
+        let sets = gguf_sets(&id, &entries).map_err(offline)?;
         if sets.is_empty()
             && let Some(files) = crate::checkpoint_files(&entries)
         {
-            events(&Event::Offline { repo: &r.repo, why });
+            events(&Event::Offline { repo: &id, why });
             let dir = checkpoint(r, sources, &self.root, &files, events).map_err(offline)?;
-            self.offline_files(&r.repo, &files, events)?;
+            self.offline_files(&id, &files, events)?;
             return Ok(vec![dir]);
         }
-        let set = crate::pick(&r.repo, &sets, r.quant.as_deref()).map_err(offline)?;
-        events(&Event::Offline { repo: &r.repo, why });
-        events(&Event::Set { repo: &r.repo, set });
-        self.offline_files(&r.repo, &set.files, events)
+        let set = crate::pick(&id, &sets, r.quant.as_deref()).map_err(offline)?;
+        events(&Event::Offline { repo: &id, why });
+        events(&Event::Set { repo: &id, set });
+        self.offline_files(&id, &set.files, events)
     }
 
     /// The cache paths of `files`, each an `offline-cached` event.
@@ -892,23 +900,22 @@ fn checkpoint(
     files: &[Entry],
     events: &mut dyn FnMut(&Event<'_>),
 ) -> Result<PathBuf, HfError> {
+    let id = r.id();
     if let Some(quant) = &r.quant {
         return Err(HfError::CheckpointQuant {
-            repo: r.repo.clone(),
+            repo: id,
             quant: quant.clone(),
         });
     }
     if sources == Sources::Gguf {
-        return Err(HfError::CheckpointUnsupported {
-            repo: r.repo.clone(),
-        });
+        return Err(HfError::CheckpointUnsupported { repo: id });
     }
     events(&Event::Checkpoint {
-        repo: &r.repo,
+        repo: &id,
         files: files.len(),
         bytes: files.iter().map(|f| f.size).sum(),
     });
-    let index = cache_path(root, &r.repo, safetensors::Folder::INDEX)?;
+    let index = cache_path(root, &id, safetensors::Folder::INDEX)?;
     Ok(index.parent().unwrap_or(root).to_path_buf())
 }
 
@@ -1080,9 +1087,19 @@ mod tests {
     /// listing that names them (`curl` reads `tree/main`, the query of the
     /// API's URL dropped); a client caching under `dir/cache`.
     fn hub(dir: &Path, repo: &str, files: &[(&str, &[u8])]) -> Client {
+        hub_at(dir, repo, "main", files)
+    }
+
+    /// [`hub`] at the revision `rev`: `resolve/<rev>` and `tree/<rev>`.
+    fn hub_at(dir: &Path, repo: &str, rev: &str, files: &[(&str, &[u8])]) -> Client {
         let mut json = Vec::new();
         for (path, content) in files {
-            let src = dir.join("hub").join(repo).join("resolve/main").join(path);
+            let src = dir
+                .join("hub")
+                .join(repo)
+                .join("resolve")
+                .join(rev)
+                .join(path);
             fs::create_dir_all(src.parent().expect("parent")).expect("hub dir");
             fs::write(&src, content).expect("hub file");
             json.push(format!(
@@ -1094,7 +1111,7 @@ mod tests {
         }
         let tree = dir.join("hub/api/models").join(repo).join("tree");
         fs::create_dir_all(&tree).expect("tree dir");
-        fs::write(tree.join("main"), format!("[{}]", json.join(","))).expect("listing");
+        fs::write(tree.join(rev), format!("[{}]", json.join(","))).expect("listing");
         Client {
             base: format!("file://{}", dir.join("hub").display()),
             token: None,
@@ -1780,6 +1797,41 @@ mod tests {
             seen[1..],
             ["set m-Q4_K_M", "file m-Q4_K_M.gguf offline-cached"]
         );
+    }
+
+    /// `--hf a/b@v1` reads v1's listing and files into its own cache directory, beside main's,
+    /// and offline only v1's verified files stand in for it: no revision takes another's set.
+    #[test]
+    fn a_revision_names_the_listing_the_files_and_the_cache() {
+        let d = scratch("revision");
+        let file = "m-Q4_K_M.gguf";
+        let c = hub(&d, "a/b", &[(file, b"main bytes")]);
+        hub_at(
+            &d,
+            "a/b",
+            "v1",
+            &[(file, b"v1 bytes"), ("README.md", b"card")],
+        );
+        let pick = |c: &Client, r: &str| offline_run(c, r).0.expect(r)[0].clone();
+        let v1 = pick(&c, "a/b@v1:Q4_K_M");
+        assert_eq!(v1, d.join("cache/a/b@v1").join(file));
+        let main = pick(&c, "a/b:Q4_K_M");
+        assert_eq!(main, d.join("cache/a/b").join(file));
+        assert_eq!(pick(&c, "a/b@main:Q4_K_M"), main);
+        assert_eq!(fs::read(&v1).expect("v1"), b"v1 bytes");
+        assert_eq!(fs::read(&main).expect("main"), b"main bytes");
+        let card = c.resolve_exact("a/b@v1", &["README.md"], &mut |_| {});
+        assert_eq!(card.expect("card"), [d.join("cache/a/b@v1/README.md")]);
+        let off = unreachable(&d.join("cache"));
+        assert_eq!(pick(&off, "a/b@v1:Q4_K_M"), v1);
+        assert!(matches!(
+            offline_run(&off, "a/b@v2:Q4_K_M").0,
+            Err(HfError::Offline { .. })
+        ));
+        let mut pinned = c;
+        pinned.revision = "0123abc".to_owned();
+        assert_eq!(pinned.hub_at("a/b@v1"), ("a/b", "v1"));
+        assert_eq!(pinned.hub_at("a/b"), ("a/b", "0123abc"));
     }
 
     /// A repo with no GGUF set and a safetensors checkpoint at its top level resolves to the

@@ -1,9 +1,12 @@
 //! A model file from a Hugging Face repo: `--hf <repo>[:<quant>]` as
 //! llama.cpp spells it, resolved to one GGUF set of the repo's listing and
-//! fetched into a local cache.
+//! fetched into a local cache. The repo is read at its `main` branch, as
+//! llama.cpp reads it; `--hf <repo>@<rev>[:<quant>]` reads it at the branch,
+//! tag or commit `rev` instead: the listing, every file and the cache
+//! directory are that revision's ([`RepoRef::id`]).
 //!
 //! The pure part is here: the repo string ([`RepoRef`]), the listing the API
-//! answers (`api/models/<repo>/tree/main?recursive=true`, [`listing`]), the
+//! answers (`api/models/<repo>/tree/<rev>?recursive=true`, [`listing`]), the
 //! GGUF sets in it ([`gguf_sets`]) and the one a quant tag picks ([`pick`]),
 //! the files named exactly ([`exact`]), the MTP draft by its file name
 //! ([`mtp_draft`]), a model's image-projector sibling ([`mmproj_sibling`]),
@@ -74,7 +77,7 @@ pub(crate) fn read_json<E>(
 #[derive(Debug, thiserror::Error)]
 pub enum HfError {
     #[error(
-        "--hf {0:?}: a repo is <owner>/<name>[:<quant>], each part of letters, digits, '-', '_' and '.'"
+        "--hf {0:?}: a repo is <owner>/<name>[@<revision>][:<quant>], each part of letters, digits, '-', '_' and '.'"
     )]
     Repo(String),
     #[error("{repo}: the API's listing is not one this reads: {why}")]
@@ -177,22 +180,30 @@ impl HfError {
     }
 }
 
-/// `<owner>/<name>` and the quant tag after a `:`, if one.
+/// `<owner>/<name>`, the revision after an `@`, and the quant tag after a `:`,
+/// each if one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoRef {
     pub repo: String,
+    /// A branch, a tag or a commit hash; `None` is the `main` branch.
+    pub rev: Option<String>,
     pub quant: Option<String>,
 }
 
 impl RepoRef {
-    /// `owner/name[:quant]`: exactly one `/`, both sides and the quant
-    /// non-empty, and every part of letters, digits, `-`, `_` and `.` (no
-    /// part `.` or `..`). Anything else is [`HfError::Repo`].
+    /// `owner/name[@rev][:quant]`: exactly one `/`, both sides, the revision
+    /// and the quant non-empty, and every part of letters, digits, `-`, `_`
+    /// and `.` (no part `.` or `..`). Anything else is [`HfError::Repo`].
+    /// `@main` is the default branch, the repo with no revision.
     pub fn parse(s: &str) -> Result<RepoRef, HfError> {
         let bad = || HfError::Repo(s.to_owned());
         let (repo, quant) = match s.split_once(':') {
             Some((r, q)) => (r, Some(q)),
             None => (s, None),
+        };
+        let (repo, rev) = match repo.split_once('@') {
+            Some((r, v)) => (r, Some(v)),
+            None => (repo, None),
         };
         let word = |p: &str| {
             !p.is_empty()
@@ -202,21 +213,38 @@ impl RepoRef {
                     .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
         };
         let (owner, name) = repo.split_once('/').ok_or_else(bad)?;
-        if !word(owner) || !word(name) || quant.is_some_and(|q| !word(q)) {
+        if !word(owner)
+            || !word(name)
+            || rev.is_some_and(|v| !word(v))
+            || quant.is_some_and(|q| !word(q))
+        {
             return Err(bad());
         }
         Ok(RepoRef {
             repo: repo.to_owned(),
+            rev: rev.filter(|v| *v != "main").map(str::to_owned),
             quant: quant.map(str::to_owned),
         })
+    }
+
+    /// The repo at its revision, as the hub's URLs and the cache
+    /// ([`cache_path`], [`fetch::verified_entries`]) take it:
+    /// `owner/name` on `main`, else `owner/name@rev`, so each revision keeps
+    /// its own cache directory.
+    pub fn id(&self) -> String {
+        match &self.rev {
+            Some(v) => format!("{}@{v}", self.repo),
+            None => self.repo.clone(),
+        }
     }
 }
 
 impl fmt::Display for RepoRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.id())?;
         match &self.quant {
-            Some(q) => write!(f, "{}:{q}", self.repo),
-            None => f.write_str(&self.repo),
+            Some(q) => write!(f, ":{q}"),
+            None => Ok(()),
         }
     }
 }
@@ -671,8 +699,9 @@ pub fn cache_root(cache: Option<OsString>, home: Option<OsString>) -> Result<Pat
     }
 }
 
-/// Where `path` of `repo` lives under `root`: `<root>/<owner>/<name>/<path>`,
-/// a split set's subfolder kept so its shards stay siblings. A path that is
+/// Where `path` of `repo` ([`RepoRef::id`]) lives under `root`:
+/// `<root>/<owner>/<name>[@<rev>]/<path>`, a split set's subfolder kept so
+/// its shards stay siblings. A path that is
 /// empty, absolute, or has an empty, `.` or `..` part or a backslash is
 /// [`HfError::Path`].
 pub fn cache_path(root: &Path, repo: &str, path: &str) -> Result<PathBuf, HfError> {
@@ -719,9 +748,21 @@ mod tests {
         assert_eq!(r.quant.as_deref(), Some("Q5_K_M"));
         assert_eq!(r.to_string(), "bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M");
         let r = RepoRef::parse("Cloudflare/clef-flash").expect("parse");
-        assert_eq!(r.quant, None);
+        assert_eq!((&r.rev, &r.quant), (&None, &None));
+        let r = RepoRef::parse("a/b@v1.2:Q8_0").expect("parse");
+        assert_eq!(
+            (r.repo.as_str(), r.rev.as_deref(), r.quant.as_deref()),
+            ("a/b", Some("v1.2"), Some("Q8_0"))
+        );
+        assert_eq!(
+            (r.id(), r.to_string()),
+            ("a/b@v1.2".into(), "a/b@v1.2:Q8_0".into())
+        );
+        let main = RepoRef::parse("a/b@main").expect("parse");
+        assert_eq!((main.id(), main.rev), ("a/b".into(), None));
         for bad in [
             "", "noslash", "a/b/c", "/b", "a/", "a/b:", "a/b:c:d", "a/..", "a b/c", "a/b:Q4 K",
+            "a/b@", "a/b@:Q4", "a/b@..", "a/b@x/y", "a/b@c@d", "a@b/c", "a/b@v 1",
         ] {
             assert!(
                 matches!(RepoRef::parse(bad), Err(HfError::Repo(_))),

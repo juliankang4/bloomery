@@ -8,7 +8,7 @@
 //! one line a seat with a working `--hf` example.
 //!
 //!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|decide]
-//!                    [-m PATH | --model-file PATH | --hf <repo>[:<quant>]]
+//!                    [-m PATH | --model-file PATH | --hf <repo>[@<rev>][:<quant>]]
 //!                    [--head <weights> [--head-config <file>]]
 //!                    <the seat's own flags>
 //!     bloomery-serve --version
@@ -214,9 +214,9 @@ mod drive {
 
     const USAGE: &str = "usage: bloomery-serve [--model NAME[:VARIANT]|ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|decide] \
                          [--revision REV] [--recommend] [--dry-run] [--json] \
-                         [-m PATH | --model-file PATH | --hf <repo>[:<quant>]] [--head <weights> \
+                         [-m PATH | --model-file PATH | --hf <repo>[@<rev>][:<quant>]] [--head <weights> \
                          [--head-config <file>]] [--embd-model FILE | --embd-hf \
-                         <repo>[:<quant>]] [--embd-ctx N] [--embd-cache-bytes N] [--embd-mmproj FILE | \
+                         <repo>[@<rev>][:<quant>]] [--embd-ctx N] [--embd-cache-bytes N] [--embd-mmproj FILE | \
                          --embd-no-mmproj] [--embd-image-min-tokens N] [--embd-image-max-tokens N] \
                          <the chosen seat's own flags, as \
                          bloomery-serve-ds41, bloomery-serve-qwen38, the glm, the qwen3, the \
@@ -730,7 +730,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 Refusal::new(
                     Code::Usage,
                     "--revision reads a catalog model's repo at a revision: name the model with \
-                     --model NAME",
+                     --model NAME, or give a --hf repo its revision as --hf <repo>@<rev>",
                 )
                 .into(),
             );
@@ -821,7 +821,7 @@ models (the --model word is optional with a model file: the file's architecture 
         // A head names the decide seat; with none the file goes to the
         // generative seats.
         let repo = match flags.hf.as_deref().map(hf::RepoRef::parse).transpose() {
-            Ok(r) => r.map(|r| r.repo),
+            Ok(r) => r.map(|r| r.id()),
             Err(e) => return refuse(Code::Usage, e.into()),
         };
         let (from, rest) = match head_of(word, repo.as_deref(), &rest) {

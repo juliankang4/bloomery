@@ -136,8 +136,9 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **The files**: the GGUF uploads as downloaded, the same quantizations, the chat template read from the file,
   and a tokenizer bit-identical to `llama-tokenize`. Qwen3.8 also serves NVIDIA's NVFP4 safetensors checkpoint as
   downloaded (The seats, below).
-- **The flags**: `-m`/`--model-file`, `--hf <repo>[:<quant>]` (download, resume, sha256 check, never fetched
-  twice; it also fetches the model's MTP draft when the repo publishes it, as unsloth's Qwen3.8-Flash-Next GGUFs
+- **The flags**: `-m`/`--model-file`, `--hf <repo>[@<rev>][:<quant>]` (download, resume, sha256 check, never fetched
+  twice; the repo's `main` branch, or with `@<rev>` the branch, tag or commit `rev`, whose listing, files and cache
+  directory `<owner>/<name>@<rev>` are that revision's, offline too; it also fetches the model's MTP draft when the repo publishes it, as unsloth's Qwen3.8-Flash-Next GGUFs
   do under `MTP/`, landing it beside the set, where the run picks it up), `--parallel/-np`, `--queue-depth`,
   `--cache-ram/-cram` (MiB; `0` turns the prompt cache off; llama-server's `-1`, no limit, is refused by name: the
   cache is host memory beside the load), `--ctx/--ctx-size` (unset, every generative seat and the decide seat take one slot at the model's limit and, where

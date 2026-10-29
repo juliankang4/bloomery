@@ -173,6 +173,7 @@ mod tests {
             source,
             Ok(Source::Hf(RepoRef {
                 repo: "mlx-community/Qwen3-4bit".to_owned(),
+                rev: None,
                 quant: None
             }))
         );

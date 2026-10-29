@@ -4,7 +4,7 @@
 //!
 //!     fixture plan <real first shard> [--draft <real draft>] [flags]
 //!     fixture generate <real first shard> <out dir> [--draft <real draft>] [flags]
-//!     fixture fetch <family | repo[:quant]> <out dir> [--rev R] [flags]
+//!     fixture fetch <family | repo[@rev][:quant]> <out dir> [--rev R] [flags]
 //!     fixture cut <source folder> <out dir> --spec FILE [--shard-bytes B] [--card-budget B]
 //!     fixture verify <fixture first shard> [--source <real first shard>]
 //!                    [--draft-source <real draft>]
@@ -32,11 +32,11 @@
 //! directory beside `<out dir>` that is removed afterwards; the family's draft is the repo's
 //! file its family's source row names, when the row has one (a row can say its draft is not
 //! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen3moe`, `qwen38`, `qwen35moe`, `glm5next`, `solar2`, `nemotron`, `nemotron-bolt`, `musespark`)
-//! reads its row of the registry (`model::arch::registry`): repo, quant and revision; a `<repo>:<quant>` takes `main`.
+//! reads its row of the registry (`model::arch::registry`): repo, quant and revision; a `<repo>:<quant>` takes `main`, a `<repo>@<rev>:<quant>` its `rev`.
 //! After writing, it runs `verify`'s check against the sparse sources it still holds, and a
 //! fixture that fails it is removed with its sidecar, so a failed fetch leaves nothing.
 //! It takes `generate`'s flags but `--draft`, and `--rev R` (a commit hash, tag or branch of the
-//! repo; overrides the row's): a source rewritten upstream has another header, so its fixture
+//! repo; overrides the row's, and is refused beside an `@<rev>`): a source rewritten upstream has another header, so its fixture
 //! is the one of the revision it was made from. `verify` takes the source from `--source`, else the spec's default, and checks
 //! the spec's draft fixture when it exists, against `--draft-source`, else the spec's default
 //! draft, and a whole fixture's sidecar. `variant-rules` prints what the quantizer is run with to
@@ -79,7 +79,7 @@ use model_hf::remote::{self, HeaderStat, RemoteError};
 
 const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft>] [flags]
        fixture generate <real first shard> <out dir> [--draft <real draft>] [flags]
-       fixture fetch <family | repo[:quant]> <out dir> [--rev R] [flags]
+       fixture fetch <family | repo[@rev][:quant]> <out dir> [--rev R] [flags]
        fixture cut <source folder> <out dir> --spec FILE [--shard-bytes B] [--card-budget B]
        fixture verify <fixture first shard> [--source <real first shard>] [--draft-source <real draft>]
        fixture verify <cut dir | its first shard> [--source <source folder>]
@@ -443,7 +443,7 @@ fn write_fixture(
     Ok(())
 }
 
-/// `generate` from the source `repo` (`<owner>/<name>[:<quant>]`) names, its headers read by
+/// `generate` from the source `repo` (`<owner>/<name>[@<rev>][:<quant>]`) names, its headers read by
 /// range. The sources live in `<out>.fetch.<pid>`, removed whether or not the run succeeds.
 fn fetch(target: &str, out: &str, a: &Args) -> Res<()> {
     if let Some(row) = registry::cuts().find(|c| c.family == target) {
@@ -458,11 +458,29 @@ fn fetch(target: &str, out: &str, a: &Args) -> Res<()> {
         Some(s) => (
             RepoRef {
                 repo: s.repo.to_string(),
+                rev: None,
                 quant: Some(s.quant.to_string()),
             },
-            a.rev.as_deref().or(s.rev).unwrap_or("main"),
+            a.rev.as_deref().or(s.rev).unwrap_or("main").to_owned(),
         ),
-        None => (RepoRef::parse(target)?, a.rev.as_deref().unwrap_or("main")),
+        None => {
+            let mut r = RepoRef::parse(target)?;
+            // The parse drops an `@main`, the default; it still names a revision.
+            let at = r
+                .rev
+                .take()
+                .or_else(|| target.contains('@').then(|| "main".into()));
+            let rev = match (at, &a.rev) {
+                (Some(at), Some(flag)) => {
+                    return Err(format!(
+                        "{target}: the revision is named twice, @{at} and --rev {flag}"
+                    )
+                    .into());
+                }
+                (at, flag) => flag.clone().or(at).unwrap_or_else(|| "main".to_owned()),
+            };
+            (r, rev)
+        }
     };
     let out_path = Path::new(out);
     if out_path
@@ -478,7 +496,7 @@ fn fetch(target: &str, out: &str, a: &Args) -> Res<()> {
     tmp.push(format!(".fetch.{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     std::fs::create_dir(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
-    let done = fetch_into(&r, rev, out, a, &tmp);
+    let done = fetch_into(&r, &rev, out, a, &tmp);
     match (done, std::fs::remove_dir_all(&tmp)) {
         (done, Ok(())) => done,
         (Ok(()), Err(e)) => Err(format!("remove {}: {e}", tmp.display()).into()),
@@ -962,6 +980,16 @@ mod tests {
         }
         assert_eq!(cuts, registry::cuts().count());
         assert!(cuts > 0, "no cut row to hold");
+    }
+
+    /// A repo's `@<rev>` beside `--rev`, `@main` included, is refused before any fetch.
+    #[test]
+    fn fetch_refuses_a_revision_named_twice() {
+        for target in ["a/b@v2:Q4_K_M", "a/b@main:Q4_K_M", "a/b@main"] {
+            let args = ["fetch", target, "/nonexistent/out", "--rev", "v1"].map(String::from);
+            let refused = run(&args).expect_err("two revisions").to_string();
+            assert!(refused.contains("the revision is named twice"), "{refused}");
+        }
     }
 
     /// `cut` and `verify` take their folders and flags from the command line: a toy folder cut with

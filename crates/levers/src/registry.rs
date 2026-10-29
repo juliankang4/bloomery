@@ -1650,8 +1650,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     path(
         "BLOOMERY_CACHE",
         None,
-        "The directory a server's `--hf <repo>[:<quant>]` fetches into, \
-         `<dir>/<owner>/<name>/<file>`; `~/.cache/bloomery/hf` when unset.",
+        "The directory a server's `--hf <repo>[@<rev>][:<quant>]` fetches into, \
+         `<dir>/<owner>/<name>[@<rev>]/<file>`; `~/.cache/bloomery/hf` when unset.",
     ),
     path(
         "BLOOMERY_DATA",
