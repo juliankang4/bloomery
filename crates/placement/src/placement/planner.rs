@@ -268,6 +268,7 @@ fn plan_rule<'a>(
             model,
             card,
             c,
+            unified: machine.unified().is_some(),
             rows: &rows,
             eligible: &eligible,
             routed,
@@ -298,6 +299,9 @@ fn plan_rule<'a>(
             model,
             card: tier,
             c: machine.cards.len() + t,
+            unified: machine.nodes[if nodes == 1 { 0 } else { t + 1 }]
+                .unified
+                .is_some(),
             rows: &rows,
             eligible: &eligible,
             routed,
@@ -557,6 +561,7 @@ struct Fill<'m, 'r> {
     model: &'m ModelTensors,
     card: &'m Card,
     c: usize,
+    unified: bool,
     rows: &'r [Option<Row>],
     eligible: &'r [usize],
     routed: Option<RoutedRule>,
@@ -626,7 +631,15 @@ impl Fill<'_, '_> {
         }
         if let Some(free) = card.free_bytes.filter(|&f| f < card.usable_bytes) {
             let dense = footprint.at(n_l)?;
-            check_free_floor(card, free, dense, self.kv, self.reserve, reserves)?;
+            check_free_floor(
+                card,
+                free,
+                dense,
+                self.kv,
+                self.reserve,
+                reserves,
+                self.unified,
+            )?;
         }
         let caps: Vec<u64> = (0..n_l.len())
             .map(|l| self.model.layer_experts(l))
@@ -698,6 +711,7 @@ fn check_free_floor(
     kv: u64,
     beside: u64,
     reserves: u64,
+    unified: bool,
 ) -> Result<(), PlacementError> {
     let context = card.context_bytes - card.context_in_free();
     let floor = plan_floor(card, dense, kv, beside, reserves).map(|f| f - card.context_in_free());
@@ -705,6 +719,7 @@ fn check_free_floor(
         Some(floor) if floor <= free => Ok(()),
         floor => Err(PlacementError::CardFreeFloor(Box::new(CardFreeFloor {
             card: card.name.clone(),
+            unified,
             free,
             usable: card.usable_bytes,
             floor: floor.unwrap_or(u64::MAX),
