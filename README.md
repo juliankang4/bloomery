@@ -182,6 +182,13 @@ These seats serve a file or a checkpoint folder on disk (`-m PATH`):
 | `solar2` | Solar-Open2-250B, two cards | the GGUF, with `--place bp` |
 | `raon1` | Raon-1-mini-preview | `raon-1-mini-preview-Q4_K_M.gguf`, its DFlash2 draft file beside it |
 
+The server has one slot unless `--parallel N` asks for N, so a second request waits for the first. Unset,
+`--ctx-size` gives each slot the largest context its plan holds; a set `--ctx-size` is the total the slots share,
+and one slot takes it whole. A flag on the command line wins over its `LLAMA_ARG_*` variable and over the `BLOOMERY_*`
+lever it stands for. A request field the server does not know is ignored, as in llama-server, so a misspelled sampling field runs at
+its default. Which flags each seat takes, which setting wins and what a request's fields do:
+[`docs/serving.md`](docs/serving.md#settings).
+
 What each model needs in GPU memory, RAM and disk is in [`docs/models.md`](docs/models.md). In short: Qwen3-30B and
 Qwen3.6 run on a 24 GB card (or 12–16 GB, split onto the CPU by itself); Qwen3.8 wants 128 GB of RAM, GLM-5.3 and
 V4.1 256 GB, and less RAM runs with the overflow paged from NVMe. The API, every flag, concurrent requests, drafts and
