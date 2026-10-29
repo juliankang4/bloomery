@@ -389,7 +389,7 @@ def self_test():
         red("a stop cause the docs do not name is red", "stop cause `listener`", agents=("`listener`", "`socket`"))
         red("a loading phase the docs do not name is red", "phase `plan`", agents=("`plan`", "`planning`"))
         red("a README with no pointer is red", "README.md: it does not point at docs/agents.md",
-            readme=("docs/agents.md", "docs/agent.md", 2))
+            readme=("docs/agents.md", "docs/agent.md", 5))
         red("an llms.txt with no pointer is red", "llms.txt: it does not point at docs/agents.md",
             llms=("docs/agents.md", "docs/agent.md", 2))
         base = tree("missing-owner")
