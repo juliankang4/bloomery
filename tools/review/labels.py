@@ -258,7 +258,8 @@ def run(repo, token, number=None, state="open", root=ROOT, dry=False, call=api, 
              + f" | has {','.join(sorted(have)) or '-'}"
              + (f" | kept off by a person: {','.join(kept)}" if kept else "")
              + (f" | {'crate' if is_pr else 'prefix'} not mapped: {','.join(unmapped)}" if unmapped else "")
-             + (f" | {short}: nothing removed, no card label decided" if short else "")
+             + (f" | {short + ': ' if short else ''}nothing removed, no card label decided"
+                if short or kind == "merged" else "")
              + f" | {it['title'][:90]}")
     note(f"labels: {n_add} added, {n_rm} removed{' (dry run: nothing sent)' if dry else ''}")
     return lines
@@ -366,6 +367,13 @@ def self_test():
         s.update(labels=set(stale) if s["pr"] else set(), events=[ev("labeled", x, BOT) for x in stale])
         run("o/r", "t", None, "all", call=github(s), dirs=dirs if dirs is not None else ["crates/gpu/"])
         assert s["labels"] == final, (s, s["labels"])
+
+    s = {"title": "x", "labels": {"tools", "serve"}, "events": [ev("labeled", "serve", BOT)],
+         "pr": pr("closed", merged=True), "merged": [{"filename": "tools/a.sh"}]}
+    lines = run("o/r", "t", 5, call=github(s), dirs=["crates/gpu/"])
+    assert s["labels"] == {"tools", "serve"}, s["labels"]
+    assert lines[-2].startswith("#5 pr merged: unchanged |"), lines
+    assert "nothing removed, no card label decided" in lines[-2], lines
 
     def refuse(code):
         def call(method, url, token, payload=None):
