@@ -131,6 +131,7 @@ use crate::q8f32::{
     Q8_0GemvIdsArgs, SelArgs,
 };
 use crate::q38::{EmbedArgs, EmbedRows, OutGateArgs, SLOTS, SharedAddArgs, W_PITCH};
+use crate::room::Roomed;
 use crate::site::{self, WideIn, WideKernels};
 use crate::tensor::{Q8Act, Window, WindowMut};
 use crate::weights::{DevWeight, Weights};
@@ -142,6 +143,7 @@ use model::arch::models::MtpSource;
 use model::arch::models::headpick::HeadSet;
 use model::placement::Plan;
 use runtime::hc_gated::Geometry;
+use std::sync::Arc;
 
 const WHAT: &str = "qwen4exp Mtp38";
 
@@ -205,7 +207,7 @@ struct HeadMap {
 pub struct Mtp38 {
     /// The draft's own tensors, the widened injects and the joined router.
     w: Weights,
-    store: KvPlanes,
+    store: Roomed<KvPlanes>,
     head: HeadMap,
     /// `token_embd`, then `output` in the form its walk launches.
     embd: BorrowedPlanes,
@@ -242,7 +244,7 @@ pub struct Mtp38 {
 /// must rewrite it before an own walk.
 pub(super) struct DraftSeq38 {
     graphs: Vec<(MtpKey, Graph)>,
-    store: KvPlanes,
+    store: Roomed<KvPlanes>,
     last: Option<(usize, DraftHead)>,
     held: usize,
 }
@@ -368,9 +370,10 @@ impl Mtp38 {
                 }
             }
         };
-        // The draft's store in the target's cache format (the plan's).
+        // The draft's store in the target's cache format (the plan's), its
+        // rows backed as the walks reach them ([`Mtp38::run_walk`]).
         let kv = KvQ8::of(mtp.kv_q8());
-        let store = KvPlanes::zeroed(stream, (geo::N_KV, ctx, geo::HEAD), kv)?;
+        let store = KvPlanes::roomed(&gpu.stream_handle(), (geo::N_KV, ctx, geo::HEAD), kv)?;
         stream.synchronize()?;
         let body = Mtp38 {
             w,
@@ -531,10 +534,15 @@ impl Mtp38 {
         }
         let (ctx, head) = (self.ctx, geo::HEAD);
         let plane = |b: &DeviceBuffer<u16>| -> Result<Vec<u16>, GpuError> {
-            let all = b.to_host_vec(stream)?;
+            let heads = (0..geo::N_KV)
+                .map(|kv| {
+                    let at = kv * ctx * head * size_of::<u16>();
+                    Ok(Window::<u16>::of(b, at, n * head)?.to_host_vec(stream)?)
+                })
+                .collect::<Result<Vec<_>, GpuError>>()?;
             Ok((0..n)
-                .flat_map(|p| (0..geo::N_KV).map(move |kv| (kv * ctx + p) * head))
-                .flat_map(|at| &all[at..at + head])
+                .flat_map(|p| heads.iter().map(move |h| &h[p * head..(p + 1) * head]))
+                .flatten()
                 .copied()
                 .collect())
         };
@@ -547,6 +555,12 @@ impl Mtp38 {
     /// of the state moves only its own rows.
     pub(super) fn store_spans(&mut self, n: usize) -> Result<Vec<Spans<'_>>, GpuError> {
         self.store.spans((geo::N_KV, self.ctx, geo::HEAD), n)
+    }
+
+    /// Back the store's rows of the positions below `n` before a state copy
+    /// moves them ([`Room::fit`](crate::room::Room::fit)).
+    pub(super) fn fit_store(&mut self, n: usize) -> Result<(), GpuError> {
+        self.store.fit(n)
     }
 
     /// The store counted at `n` positions, whose rows a sequence state's
@@ -567,15 +581,33 @@ impl Mtp38 {
     /// A new sequence's side of the draft ([`Body38`]'s
     /// [`Slots`](crate::model::Slots)): a zeroed store no walk has captured
     /// over, no positions held. Load-time allocation.
-    pub(super) fn new_seq(&self, stream: &CudaStream) -> Result<DraftSeq38, GpuError> {
+    pub(super) fn new_seq(&self, stream: &Arc<CudaStream>) -> Result<DraftSeq38, GpuError> {
         // The live store's format: the load's one choice.
         let dims = (geo::N_KV, self.ctx, geo::HEAD);
         Ok(DraftSeq38 {
             graphs: Vec::new(),
-            store: KvPlanes::zeroed(stream, dims, self.store.format())?,
+            store: KvPlanes::roomed(stream, dims, self.store.format())?,
             last: None,
             held: 0,
         })
+    }
+
+    /// A sequence's end: the memory of the store's pages past the rows its
+    /// walks reached given back (`Room::settle`).
+    pub(super) fn settle(&mut self) -> Result<(), GpuError> {
+        self.store.settle()
+    }
+
+    /// Device bytes the live sequence's store holds: its mapped pages, and
+    /// its layout at the load's context.
+    pub(super) fn store_room(&self) -> (usize, usize) {
+        (self.store.mapped(), self.store.bytes())
+    }
+
+    /// Device bytes the live sequence's store holds once every page is
+    /// backed.
+    pub(super) fn store_whole(&self) -> usize {
+        self.store.whole()
     }
 
     /// Exchange the live sequence's side of the draft with `seq`'s: pointer
@@ -1616,6 +1648,7 @@ impl Mtp38 {
         let w = self.checked(target, feed, mode)?;
         let (m, pos0) = (w.m, w.pos0);
         self.own_at = None;
+        self.store.fit(pos0 as usize + m)?;
         if mode == WalkMode::Store {
             let b = StoreBlock { at: 0, m, pos0 };
             self.stage_hidden(stream, &w, b)?;
@@ -1775,6 +1808,7 @@ impl Mtp38 {
                 ),
             ));
         }
+        self.store.fit(w.pos0 as usize + w.m)?;
         let b = StoreBlock {
             at,
             m: w.m,

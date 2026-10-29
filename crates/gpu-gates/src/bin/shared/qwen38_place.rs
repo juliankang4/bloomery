@@ -44,6 +44,7 @@ pub fn choose(
 pub(crate) struct Residents {
     pub(crate) seqs: Seqs,
     pub(crate) held: Beside,
+    pub(crate) page: u64,
 }
 
 /// Plan (b′)'s machine over `place`'s stage and tier card for `layers`
@@ -89,7 +90,7 @@ pub fn tier_experts(
     experts: Experts,
     levers: &PlanLevers,
     mtp: Option<&MtpInputs>,
-    Residents { seqs, held }: Residents,
+    Residents { seqs, held, page }: Residents,
 ) -> Result<u64, GateError> {
     let slots = seqs.slots;
     let mut machine = machine_bp38(
@@ -98,6 +99,11 @@ pub fn tier_experts(
         ub,
         mtp.map(|m| m.card_bytes_of(ctx, slots)).transpose()?,
         tier_batch(&inputs.spec, ub),
+    )?;
+    inputs.reserve_room(
+        &mut machine,
+        (ctx, u64::try_from(slots)?, mtp.is_some()),
+        page,
     )?;
     beside::reserve_on(&mut machine, held);
     reserve_checkpoints(&mut machine, seqs, ctx)?;

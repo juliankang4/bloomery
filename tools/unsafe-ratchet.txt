@@ -711,7 +711,11 @@ gguf 7 2 0
 # PIN(2026-10-29): gpu 2833 -> 2835 blocks, a new kernel entry, not old code relaxed: ple_rows_nvfp4 (ple.rs)
 # reads its group's scale byte (1 block) and its code bytes and writes its 16 values (1 block), each with its
 # SAFETY line.
-gpu 2835 386 10
+# PIN(2026-10-29): gpu 2835 -> 2841 blocks, new code, not old code relaxed: room.rs's buffers over a reserved range
+# (the view of the range, 1 block), the views taken out of a holder that is forgotten (1, `into_parts`, for `map` and
+# `join`), their dissolve on drop (1), the zeroing of a page (1) and its hardware test's 2-D write and read over
+# unbacked pages (2), each with its SAFETY line.
+gpu 2841 386 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

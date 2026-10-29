@@ -17,6 +17,7 @@ use bloomery_gpu::arch::qwen3moe::{Body38, KvQ8, Model38, Qwen38Model};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::generate::stage_page;
 use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::qwen35moe::place::{
@@ -110,14 +111,23 @@ impl<'a> Open38<'a> {
     /// refuses what `ALLOWED` does not name.
     pub fn plan(&self, file: impl Into<Model38>) -> Result<Planned38<'a>, GateError> {
         let file = file.into();
+        let page = stage_page(self.card)?;
         let mut inputs = PlanInputs::describe(file.header())?;
         if let Some(r) = self.room {
             inputs.room = (r, HostRead::Given);
         }
         inputs.kv = inputs.kv.in_q8_if(self.kv == KvQ8::Q8);
         let ub = u64::try_from(self.ub)?;
+        let mut machine =
+            machine_for_experts(self.card, inputs.spec.layers.len(), ub, self.experts);
+        let drafts = false;
+        inputs.reserve_room(
+            &mut machine,
+            (u64::try_from(self.ctx)?, u64::try_from(self.slots)?, drafts),
+            page,
+        )?;
         let (machine, ()) = widen_card_route(
-            machine_for_experts(self.card, inputs.spec.layers.len(), ub, self.experts),
+            machine,
             ub,
             |m, on| self.plan_of(&inputs, m).map(|p| on(&p)),
             |_| (),

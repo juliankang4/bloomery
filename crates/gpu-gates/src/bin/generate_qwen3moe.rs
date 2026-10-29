@@ -459,7 +459,9 @@ mod cli {
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
     use bloomery_gpu::{Gpu, GpuModel, NemotronHModel, NemotronHMoeModel, Qwen3moeModel};
 
-    use bloomery_gpu_gates::generate::{Known, Place, card_words, lane_at, refuse_unknown};
+    use bloomery_gpu_gates::generate::{
+        Known, Place, card_words, lane_at, refuse_unknown, stage_page,
+    };
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::llama_launch::{self, Launcher};
     use bloomery_gpu_gates::logit_rows::{ForcedFacts, ForcedRows};
@@ -1322,6 +1324,7 @@ mod cli {
                 &PlanLevers::from_levers(levers)?,
                 mtp.as_ref(),
                 q38place::Residents {
+                    page: stage_page(offer.card_specs()?[0])?,
                     // The CLI's load leaves checkpoints off (`set_checkpoints`).
                     seqs: Seqs::none(if mtp.is_some() { 1 } else { slots }),
                     held: bloomery_gpu_gates::beside::Beside::default(),
@@ -1385,8 +1388,9 @@ mod cli {
         let ub = u64::try_from(ubatch_for(ctx)?)?;
         let ctx_max = u64::try_from(ctx)?;
         let plan_levers = PlanLevers::from_levers(levers)?;
-        if !mtp {
-            let machine = machine38(place, &inputs, ub, experts, None)?;
+        let drafts = mtp;
+        if !drafts {
+            let machine = machine38(place, &inputs, (ctx_max, ub, slots, drafts), experts, None)?;
             let plan =
                 inputs.plan_with_slots(&machine, (ctx_max, ub), &plan_levers, experts, slots)?;
             return Ok(plan.host.nvme_arena_bytes);
@@ -1397,7 +1401,7 @@ mod cli {
         } else {
             None
         };
-        let machine = machine38(place, &inputs, ub, experts, reserve)?;
+        let machine = machine38(place, &inputs, (ctx_max, ub, 1, drafts), experts, reserve)?;
         let plan = inputs.plan_mtp_with(&machine, (ctx_max, ub), &plan_levers, &mtp, experts)?;
         Ok(plan.plan.host.nvme_arena_bytes)
     }
@@ -1441,20 +1445,23 @@ mod cli {
         Stage::of(place)
     }
 
-    /// The machine a plan of `inputs` at ubatches of `ub` positions under
-    /// `experts` runs on, over `place`'s cards; `draft` the MTP draft's card
+    /// The machine a plan of `inputs` at `ctx` positions per resident slot
+    /// and ubatches of `ub` under `experts` runs on, over `place`'s cards.
+    /// Every slot's room buffers and, under `drafts`, its draft's planes
+    /// reserve their page rounding before planning. `draft` is the MTP draft's card
     /// bytes when the draft runs beside the target, which plan (b′) reserves on
     /// its stage card (`q38place::machine_bp38`) and the one-card plans count in
     /// `plan_mtp_with` instead.
     fn machine38(
         place: Place,
         inputs: &PlanInputs,
-        ub: u64,
+        (ctx, ub, slots, drafts): (u64, u64, usize, bool),
         experts: Experts,
         draft: Option<u64>,
     ) -> Result<Machine, GateError> {
         let layers = inputs.spec.layers.len();
-        Ok(match place.card_specs()?.as_slice() {
+        let page = stage_page(place.card_specs()?[0])?;
+        let mut machine = match place.card_specs()?.as_slice() {
             &[_, _] => {
                 q38place::machine_bp38(place, layers, ub, draft, tier_batch(&inputs.spec, ub))?
             }
@@ -1468,7 +1475,9 @@ mod cli {
                 )
                 .into());
             }
-        })
+        };
+        inputs.reserve_room(&mut machine, (ctx, u64::try_from(slots)?, drafts), page)?;
+        Ok(machine)
     }
 
     /// The `plan` record of `plan` at `place` under `experts`: the stage
@@ -2899,7 +2908,14 @@ mod cli {
         inputs.room = room;
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.spec)?;
         let ub = ubatch_for(ctx)?;
-        let machine = machine38(place, &inputs, u64::try_from(ub)?, experts, None)?;
+        let drafts = false;
+        let machine = machine38(
+            place,
+            &inputs,
+            (u64::try_from(ctx)?, u64::try_from(ub)?, slots, drafts),
+            experts,
+            None,
+        )?;
         // One slot is `plan_with` itself.
         let plan = inputs.plan_with_slots(
             &machine,
@@ -3010,7 +3026,14 @@ mod cli {
         } else {
             None
         };
-        let machine = machine38(place, &inputs, u64::try_from(ub)?, experts, reserve)?;
+        let drafts = true;
+        let machine = machine38(
+            place,
+            &inputs,
+            (ctx_max, u64::try_from(ub)?, 1, drafts),
+            experts,
+            reserve,
+        )?;
         let plan = inputs.plan_mtp_with(
             &machine,
             (ctx_max, u64::try_from(ub)?),

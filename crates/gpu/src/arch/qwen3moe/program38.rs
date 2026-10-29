@@ -509,7 +509,7 @@ fn qsa_of(
     GpuError,
 > {
     match stores.get_mut(l) {
-        Some(Store38::Qsa { kv, ring, pooled }) => Ok((kv, ring, pooled)),
+        Some(Store38::Qsa { kv, ring, pooled }) => Ok((&mut **kv, ring, &mut **pooled)),
         Some(Store38::Rec { .. }) => Err(GpuError::shape(
             WHAT,
             format!("layer {l}'s plan and store are of two kinds"),

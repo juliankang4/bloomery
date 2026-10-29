@@ -1077,6 +1077,13 @@ mod gate {
     /// (p): the graph steps, the eager steps (returned, taps armed), the
     /// pass, and the steps again from `reset` alone.
     fn paths(m: &mut Qwen38Model, toks: &[u32]) -> Result<(bool, Run), GateError> {
+        let token = *toks.first().ok_or("the reset clause has no token")?;
+        m.reset()?;
+        m.reset()?;
+        let empty_room = m.body("reset room")?.store_room().0 == 0;
+        m.step(&[token])?;
+        m.reset()?;
+        let fresh_short = m.body("reset room")?.store_room().0;
         let graph = run_steps(m, toks, StepMode::Graph, true)?;
         let eager = run_steps(m, toks, StepMode::Eager, true)?;
         let mut ok = same_run(
@@ -1125,6 +1132,17 @@ mod gate {
         run_pass(m, prompt)?;
         let decode = run_steps(m, &[last], StepMode::Graph, false)?;
         ok &= same_run("prompt then graph decode vs steps", &decode, &graph, true);
+        m.reset()?;
+        m.step(&[token])?;
+        m.reset()?;
+        let after_short = m.body("reset room")?.store_room().0;
+        let room_ok = empty_room && fresh_short > 0 && after_short == fresh_short;
+        println!(
+            "reset room: empty {empty_room}, fresh short {fresh_short} B, after filled planes \
+             and a short request {after_short} B {}",
+            verdict(room_ok)
+        );
+        ok &= room_ok;
         Ok((ok, eager))
     }
 

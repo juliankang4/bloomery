@@ -97,6 +97,12 @@
 //! under and the memory the context one step above was short of), the slot
 //! context, the slots, their total and the limit with its source. The
 //! `setup` line before the address repeats the slot context and its rule.
+//! A slot's stores by position (the selecting layers' K/V planes and keys,
+//! the MTP draft's store) keep the slot context's addresses but hold on the
+//! card only the pages the rows its sequence reached lie on; a reset gives
+//! back those the ended sequence left. After a call that moved them, a
+//! `kv room` line names the slot, its positions, the mapped bytes and the
+//! bytes the plan counts the stores at.
 //! `--plan` prints the records the decisions before the load make (the `ctx`
 //! line, the `plan` and `residency` records) and exits 0 before the route
 //! trace's directory is made or any model is loaded.
@@ -552,6 +558,8 @@ pub(crate) enum Kind38 {
 pub(crate) struct Place38 {
     pub(crate) kind: Kind38,
     pub(crate) cards: Place,
+    /// The stage card's allocation granularity, read at its first open.
+    page: u64,
     /// The side model's reserve on the stage card, which every machine of the placement
     /// carries ([`Place38::machine`]).
     embedding: Option<u64>,
@@ -568,6 +576,7 @@ impl Place38 {
     const A: Place38 = Place38 {
         kind: Kind38::A,
         cards: Place::A,
+        page: model::placement::workstation::GRANULE.get(),
         embedding: None,
         image: None,
         media: false,
@@ -604,6 +613,7 @@ impl Place38 {
         Place38 {
             kind,
             cards,
+            page: Self::A.page,
             embedding: None,
             image: None,
             media: false,
@@ -688,6 +698,11 @@ impl Place38 {
                 q38place::machine_bp38(self.cards, layers, ub, draft, tier_batch(&inputs.spec, ub))?
             }
         };
+        inputs.reserve_room(
+            &mut machine,
+            (ctx, u64::try_from(slots)?, mtp.is_some()),
+            self.page,
+        )?;
         beside::reserve_on(
             &mut machine,
             Beside {
@@ -1619,11 +1634,11 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         (split, None, None, None)
     };
     // The stage card's first open is made before the room is read
-    // (`Gpu::hold_card`: its context and the bundle), so the plans' room has
+    // (`Gpu::open_card`: its context and the bundle), so the plans' room has
     // lost its host bytes as the load's check after its open has; plan
     // (b′)'s tier card is held once chosen, below.
     let stage = draft_at.cards.on(&census)?.card_specs()?[0];
-    Gpu::hold_card(stage.name, stage.device)?;
+    let page = u64::try_from(Gpu::open_card(stage.name, stage.device)?.allocation_granularity()?)?;
     // The lane's rate, taken before the plan reads the room (`lane_of`).
     // `--plan` probes no lane. The hold above stays first, for a load and
     // for `--plan`.
@@ -1779,6 +1794,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             &plan_levers,
             mtp_inputs.as_ref(),
             q38place::Residents {
+                page,
                 seqs: seqs38(&inputs, slots),
                 held: Beside {
                     image: None,
@@ -1795,6 +1811,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // one the same run without them takes.
     let vision = vision.map(|v| reseated(v, chosen.place)).transpose()?;
     a.place = Place38 {
+        page,
         kind: match a.flag {
             Some(f) => f.kind,
             None if chosen.place.tier_cards().is_empty() => Kind38::A,
@@ -2493,6 +2510,9 @@ struct Q38 {
     /// ([`Q38::before_call_at`]) if the draft is still off then, so a request the
     /// server resets after the load (its keep below the break-even) prints none.
     cut_line: Vec<Option<(u32, String)>>,
+    /// The bytes each slot's stores by position held on the card at its
+    /// last `kv room` line ([`Q38::print_room`]).
+    room: Vec<usize>,
     /// The copy stream and the pinned staging the prompt cache's saves are
     /// made on ([`Seat::snapshots_async`]); none with the cache off.
     lane: Option<SaveLane>,
@@ -2772,6 +2792,7 @@ impl Q38 {
             census,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
             cut_line: vec![None; a.slots],
+            room: vec![0; a.slots],
             lane,
             #[cfg(feature = "vision")]
             vision,
@@ -2918,6 +2939,7 @@ impl Q38 {
     /// since, on stderr, nothing of them without the residency.
     fn print_passes(&mut self) -> Result<(), GateError> {
         self.print_census()?;
+        self.print_room()?;
         if !self.residency {
             return Ok(());
         }
@@ -2941,6 +2963,28 @@ impl Q38 {
             .take_residency_passes()
         {
             record::residency_pass_of(kind, &r).eprint();
+        }
+        Ok(())
+    }
+
+    /// The `kv room` line of the selected slot when the bytes its stores by
+    /// position hold on the card moved since its last one: the selecting
+    /// stores' and the draft store's pages get memory as a call reaches
+    /// them, and a reset gives back those the ended sequence left
+    /// (`Body38::store_room`). The line names the slot, its positions, the
+    /// bytes its pages hold and their unrounded layout bytes. The machine
+    /// reserves page rounding separately before admission.
+    fn print_room(&mut self) -> Result<(), GateError> {
+        let slot = self.s.selected();
+        let (mapped, layout) = self.s.model().body("bloomery-serve-qwen38")?.store_room();
+        if self.room[slot] != mapped {
+            Record::new(&record::KV_ROOM)
+                .u("slot", slot)
+                .u("positions", self.s.pos())
+                .u("mapped_bytes", mapped)
+                .u("layout_bytes", layout)
+                .eprint();
+            self.room[slot] = mapped;
         }
         Ok(())
     }
