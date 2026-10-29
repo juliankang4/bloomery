@@ -135,16 +135,9 @@ pub(super) fn apply() {
 
 /// The terminal's columns and rows, read from the copy of stderr.
 pub(super) fn size() -> Option<(usize, usize)> {
-    let tty = TTY.get()?;
-    let mut size = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: tty is a live fd and size a writable winsize for this ioctl.
-    let rc = unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
-    (rc == 0).then_some((usize::from(size.ws_col), usize::from(size.ws_row)))
+    TTY.get()
+        .and_then(|t| crate::screen::winsize(t.as_raw_fd()).ok())
+        .map(|(columns, rows)| (usize::from(columns), usize::from(rows)))
 }
 
 /// Writes `bytes` to the terminal the view draws on.
@@ -203,8 +196,10 @@ pub(super) fn capture() -> io::Result<Capture> {
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: pipe gave two new descriptors, each owned once from here.
-    let (mut r, w) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    // SAFETY: pipe gave a new read descriptor, owned once from here.
+    let mut r = unsafe { File::from_raw_fd(fds[0]) };
+    // SAFETY: pipe gave a distinct new write descriptor, owned once from here.
+    let w = unsafe { File::from_raw_fd(fds[1]) };
     for fd in fds {
         // SAFETY: fd is one of the pipe's open descriptors; no pointer.
         if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
@@ -212,9 +207,10 @@ pub(super) fn capture() -> io::Result<Capture> {
         }
     }
     let (ends, drained) = mpsc::channel::<()>();
-    std::thread::Builder::new()
-        .name("serve-live-err".to_owned())
-        .spawn(move || {
+    threads::helper::spawn_helper(
+        "serve-live-err",
+        threads::helper::Placement::Float,
+        move || {
             let _ends = ends;
             let mut buf = [0u8; 4096];
             loop {
@@ -236,7 +232,9 @@ pub(super) fn capture() -> io::Result<Capture> {
                     return;
                 }
             }
-        })?;
+        },
+    )
+    .map_err(io::Error::other)?;
     Ok(Capture { w, drained })
 }
 
@@ -312,14 +310,9 @@ pub(super) fn restore_raw() {
     if !APPLIED.swap(false, Ordering::SeqCst) {
         return;
     }
-    // SAFETY: an all-zero sigset_t is a valid set for sigemptyset to clear.
-    let mut ttou: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let ttou = only(libc::SIGTTOU);
     // SAFETY: an all-zero sigset_t is a valid set for pthread_sigmask to fill.
     let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
-    // SAFETY: ttou is a writable set.
-    unsafe { libc::sigemptyset(&mut ttou) };
-    // SAFETY: ttou is an initialized set.
-    unsafe { libc::sigaddset(&mut ttou, libc::SIGTTOU) };
     // SAFETY: ttou is read and old written by the call.
     unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &ttou, &mut old) };
     // SAFETY: orig is an initialized termios read by the call.
@@ -336,12 +329,7 @@ pub(super) fn restore_raw() {
 extern "C" fn on_tstp(_: libc::c_int) {
     restore_raw();
     handle(libc::SIGTSTP, libc::SIG_DFL);
-    // SAFETY: an all-zero sigset_t is a valid set for sigemptyset to clear.
-    let mut tstp: libc::sigset_t = unsafe { std::mem::zeroed() };
-    // SAFETY: tstp is a writable set.
-    unsafe { libc::sigemptyset(&mut tstp) };
-    // SAFETY: tstp is an initialized set.
-    unsafe { libc::sigaddset(&mut tstp, libc::SIGTSTP) };
+    let tstp = only(libc::SIGTSTP);
     // SAFETY: tstp is read by the call; the old mask is not asked for.
     unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &tstp, std::ptr::null_mut()) };
     // SAFETY: raise takes no pointer; the default action stops here.
@@ -356,6 +344,17 @@ extern "C" fn on_tstp(_: libc::c_int) {
 /// `SIGCONT`: cbreak again when the process continues in the foreground.
 extern "C" fn on_cont(_: libc::c_int) {
     apply();
+}
+
+/// A signal set containing only `sig`. Async-signal-safe.
+pub(super) fn only(sig: libc::c_int) -> libc::sigset_t {
+    // SAFETY: an all-zero sigset_t is a valid value for sigemptyset to clear.
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: set is a writable sigset_t.
+    unsafe { libc::sigemptyset(&mut set) };
+    // SAFETY: set is an initialized set.
+    unsafe { libc::sigaddset(&mut set, sig) };
+    set
 }
 
 /// The most lines [`Spill`] keeps; an older one is dropped for a newer.
@@ -451,7 +450,19 @@ pub(super) fn restore_on_panic(utf8: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SPILL_LINES, Seen, Spill};
+    use super::{SPILL_LINE_BYTES, SPILL_LINES, Seen, Spill};
+
+    #[test]
+    fn a_signal_set_contains_only_its_signal() {
+        for sig in [libc::SIGTTOU, libc::SIGTSTP] {
+            let set = super::only(sig);
+            for member in [libc::SIGTTOU, libc::SIGTSTP, libc::SIGCONT, libc::SIGINT] {
+                // SAFETY: set is initialized and the listed signals are valid.
+                let present = unsafe { libc::sigismember(&set, member) };
+                assert_eq!(present, i32::from(member == sig));
+            }
+        }
+    }
 
     /// The keys are taken only with the screen on, both stdin and stderr
     /// terminals, the process in the foreground and a terminal not `dumb`.
@@ -517,5 +528,15 @@ mod tests {
         );
         assert_eq!(lines.len(), SPILL_LINES + 2);
         assert_eq!(s.flush(true), "", "a flush empties it");
+
+        s.take(&vec![b'x'; SPILL_LINE_BYTES]);
+        assert!(s.lines.is_empty(), "the exact bound stays one partial line");
+        assert_eq!(s.flush(false).lines().count(), 2, "the rule and one line");
+        s.take(&vec![b'x'; SPILL_LINE_BYTES + 1]);
+        let text = s.flush(false);
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "the rule and two lines");
+        assert_eq!(lines[1], "x".repeat(SPILL_LINE_BYTES));
+        assert_eq!(lines[2], "x");
     }
 }

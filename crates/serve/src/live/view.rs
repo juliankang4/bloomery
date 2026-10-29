@@ -171,6 +171,9 @@ pub(crate) fn frame(
     columns: usize,
     rows: usize,
 ) -> (String, usize) {
+    if columns < usize::from(screen::MIN_COLUMNS) || rows == 0 {
+        return ("\x1b[H\x1b[Jterminal too small\r\n".to_owned(), scroll);
+    }
     let tabs = fixed.tabs();
     let tab = tabs[index.min(tabs.len() - 1)];
     let margin = if columns > LABEL + MARGIN.len() {
@@ -1186,6 +1189,18 @@ mod tests {
     #[test]
     fn frames_show_each_tab_within_the_terminal() {
         let lines: Vec<&str> = START.lines().collect();
+        let s = style(false, false);
+        let f = fixed(&lines, s);
+        for (columns, rows) in [(0, 24), (3, 24), (80, 0)] {
+            let (got, scroll) = frame(&now(), &f, 0, 7, s, columns, rows);
+            assert_eq!(got, "\x1b[H\x1b[Jterminal too small\r\n");
+            assert_eq!(scroll, 7, "a resize preserves the scroll position");
+        }
+        assert!(
+            !frame(&now(), &f, 0, 0, s, 4, 1)
+                .0
+                .contains("terminal too small")
+        );
         // The tops of the Overview's boxes, which are its tiles'.
         let tops = |text: &str| -> Vec<usize> {
             text.lines()

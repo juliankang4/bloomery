@@ -202,32 +202,39 @@ fn paint(lines: &[String], style: Style, live: bool) -> bool {
     if Start::new(lines).listening().is_none() {
         return false;
     }
-    let mut size = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
+    let (columns, _) = match winsize(std::io::stderr().as_raw_fd()) {
+        Ok(size) => size,
+        Err(e) => {
+            eprintln!("start screen: terminal width: {e}");
+            return false;
+        }
     };
-    // SAFETY: stderr supplies a live fd and size is a writable winsize for this ioctl.
-    let rc = unsafe { libc::ioctl(std::io::stderr().as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
-    if rc != 0 {
-        eprintln!(
-            "start screen: terminal width: {}",
-            std::io::Error::last_os_error()
-        );
-        return false;
-    }
-    if size.ws_col < MIN_COLUMNS {
+    if columns < MIN_COLUMNS {
         eprintln!("start screen: terminal width must be at least 4 columns");
         return false;
     }
-    match render(lines, style, usize::from(size.ws_col), live) {
+    match render(lines, style, usize::from(columns), live) {
         Some(screen) => {
             eprint!("{screen}");
             true
         }
         None => false,
     }
+}
+
+/// The terminal's columns and rows; an invalid or non-terminal fd is an error.
+pub(crate) fn winsize(fd: std::os::fd::RawFd) -> std::io::Result<(u16, u16)> {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: size is a writable winsize for this ioctl, which rejects an invalid fd.
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((size.ws_col, size.ws_row))
 }
 
 /// Names the live view's key on a row of stderr, for a server that takes
@@ -712,21 +719,19 @@ fn where_rows<'a, S: AsRef<str>>(
     match (granted, p.num("paged"), p.num("arena")) {
         (Some((paged, granted)), _, _) => {
             sizes.paged = Some(paged);
+            let paged = gib(paged);
             let planned = nvtier
                 .and_then(|n| n.num("arena_planned"))
                 .filter(|&a| a != granted)
                 .map(|a| format!(" ({} planned)", gib(a)));
+            let granted = gib(granted);
             let planned = planned.unwrap_or_default();
             rows.push((
                 "nvme",
-                format!(
-                    "{} paged through a {} RAM arena{planned}",
-                    gib(paged),
-                    gib(granted),
-                ),
+                format!("{paged} paged through a {granted} RAM arena{planned}"),
             ));
-            section.push(("paged", gib(paged)));
-            section.push(("arena", format!("{} of RAM{planned}", gib(granted))));
+            section.push(("paged", paged));
+            section.push(("arena", format!("{granted} of RAM{planned}")));
         }
         (None, Some(0), _) => {
             sizes.paged = Some(0);
@@ -735,17 +740,20 @@ fn where_rows<'a, S: AsRef<str>>(
         }
         (None, Some(paged), Some(arena)) => {
             sizes.paged = Some(paged);
+            let paged = gib(paged);
+            let arena = gib(arena);
             rows.push((
                 "nvme",
-                format!("{} paged, a {} RAM arena planned", gib(paged), gib(arena)),
+                format!("{paged} paged, a {arena} RAM arena planned"),
             ));
-            section.push(("paged", gib(paged)));
-            section.push(("arena", format!("{} of RAM, planned", gib(arena))));
+            section.push(("paged", paged));
+            section.push(("arena", format!("{arena} of RAM, planned")));
         }
         (None, Some(paged), None) => {
             sizes.paged = Some(paged);
-            rows.push(("nvme", format!("{} paged", gib(paged))));
-            section.push(("paged", gib(paged)));
+            let paged = gib(paged);
+            rows.push(("nvme", format!("{paged} paged")));
+            section.push(("paged", paged));
         }
         (None, None, _) => {}
     }
@@ -2436,6 +2444,8 @@ mod tests {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::process::{Command, Stdio};
 
+        assert!(super::winsize(-1).is_err());
+
         if let Ok(fixture) = std::env::var("SCREEN_PTY_CHILD") {
             assert!(!super::arm(false));
             let armed = super::arm(true);
@@ -2519,6 +2529,7 @@ mod tests {
                     let mut master = unsafe { std::fs::File::from_raw_fd(master) };
                     // SAFETY: openpty succeeded and transferred ownership of this distinct slave fd.
                     let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+                    assert_eq!(super::winsize(slave.as_raw_fd()).unwrap(), (cols, 100));
                     let mut child = command(fixture, term, color)
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())

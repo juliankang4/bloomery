@@ -1019,7 +1019,9 @@ sampler 4 4 1
 # report's registration and write; 8), each with its SAFETY line.
 # PIN(2026-10-29): serve 53 -> 57 blocks, new test code: the PTY test's child blocks SIGTSTP on the threads it starts
 # (the zeroed set, sigemptyset, sigaddset, pthread_sigmask), so the stop reaches a thread other than the key wait's.
-serve 57 0 0
+# PIN(2026-10-29): serve 57 -> 54 blocks: one window-size ioctl and one signal-set owner remove
+# seven blocks; the pipe's two owned fds have separate blocks, and signal-set and resize clauses add three.
+serve 54 0 0
 threads 3 0 1
 tokenizer 0 0 0
 # PIN(2026-10-14): verbs 0 -> 57 blocks, 22 fns, 2 impls, new crate, moved from gpu-gates/src/bin/shared/verbs.rs (45
