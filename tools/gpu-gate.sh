@@ -1842,7 +1842,7 @@ print("test result: ok. " + os.environ.get("LIB_PASSED", "1") + " passed; 0 fail
 sys.exit(int(os.environ.get("LIB_EXIT", "0")))
 PY
   chmod +x "$t/bin/cargo" "$t/bin/rustc" "$t/tree/target/release/lib-test"
-  local lib_build=() # extra words of the cargo call, between --release and --lib
+  local lib_build=() lib_target=(--lib) # Cargo build options and the test target
   lib_gate() {
     local o=$1 c=$2
     shift 2
@@ -1850,8 +1850,57 @@ PY
       BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$t/lease" BLOOMERY_LEASE_PROC="$t/proc" \
       LIB_COMPILED="$t/compiled" LIB_STARTED="$t/started" RUSTC="$t/bin/rustc" CARGO_HOME="$t/cargo-home" "$@" \
       bash -c 'echo "$$" > "$1"; shift; exec bash "$@"' _ "$t/lib-runner" \
-      "${self%/*}/gate.sh" --test-locks "${TL:-$t}" --gpu --oxide -p bloomery-gpu --release ${lib_build[@]+"${lib_build[@]}"} --lib -- --include-ignored "${LIB_FILTER:-probe}") > "$o" 2>&1
+      "${self%/*}/gate.sh" --test-locks "${TL:-$t}" --gpu --oxide -p bloomery-gpu --release ${lib_build[@]+"${lib_build[@]}"} "${lib_target[@]}" -- --include-ignored "${LIB_FILTER:-probe}") > "$o" 2>&1
   }
+  # Binary libtests share the same capture, card and model-load locks as library tests.
+  for selector in --bin --bin=lib-test; do
+    lib_target=("$selector")
+    [ "$selector" != --bin ] || lib_target+=(lib-test)
+    rc=0
+    lib_gate "$t/out" 3090 BLOOMERY_GATE_V41_LOAD=1 CUDA_VISIBLE_DEVICES="$GPU_3090" LIB_STARTED="$t/bin-success-started" || rc=$?
+    judge_all "binary test $selector replays with both locks" "$rc" 0 'V4\.1 load lock' "^lib-card=$GPU_3090$"
+    exec 5> "$t/gate.lock"
+    flock -x 5 || return 1
+    rc=0
+    lib_gate "$t/out" 3090 LIB_STARTED="$t/bin-card-started" || rc=$?
+    [ -e "$t/bin-card-started" ] || echo child-not-started >> "$t/out"
+    judge_all "binary test $selector waits for the shared card lock" "$rc" 75 'no gate lock' '^child-not-started$'
+    exec 5>&-
+    exec 7> "$t/v41-load.lock"
+    flock -x 7 || return 1
+    rc=0
+    lib_gate "$t/out" 3090 BLOOMERY_GATE_V41_LOAD=1 LIB_STARTED="$t/bin-load-started" || rc=$?
+    [ -e "$t/bin-load-started" ] || echo child-not-started >> "$t/out"
+    judge_all "binary test $selector waits for the shared model-load lock" "$rc" 75 'V4\.1 load lock.*not free' '^child-not-started$'
+    exec 7>&-
+    for captures in 0 2; do
+      rc=0
+      lib_gate "$t/out" 3090 LIB_CAPTURES="$captures" LIB_STARTED="$t/bin-refused-started" || rc=$?
+      [ -e "$t/bin-refused-started" ] || echo child-not-started >> "$t/out"
+      judge_all "binary test $selector refuses $captures captured executables" "$rc" 64 "select exactly one test target; got $captures" '^child-not-started$'
+    done
+  done
+  lib_target=(--lib)
+  # Run the checkpoint input recipe itself with the compiler and box transport stubbed.
+  mkdir -p "$t/tree/tools/ref"
+  printf '%s\n' '#!/usr/bin/env bash' 'exec bash -c "$1"' > "$t/tree/tools/box.sh"
+  printf '#!/usr/bin/env bash\nif [ "${1:-}" = --gpu ]; then exec bash %q --test-locks %q "$@"; fi\nexec bash %q "$@"\n' \
+    "${self%/*}/gate.sh" "$t" "${self%/*}/gate.sh" > "$t/tree/tools/gate.sh"
+  ln -s "${self%/*}/ref/needs-env.sh" "$t/tree/tools/ref/needs-env.sh"
+  chmod +x "$t/tree/tools/box.sh"
+  exec 7> "$t/v41-load.lock"
+  flock -x 7 || return 1
+  for tier in real fixture; do
+    rc=0
+    (cd "$t/tree" && "${gate_env[@]}" BLOOMERY_GATE_CARD=3090 BLOOMERY_LEASE_LOCK="$t/lease" \
+      BLOOMERY_LEASE_PROC="$t/proc" BLOOMERY_QWEN38_FOLDER="$t/checkpoint folder" LIB_STARTED="$t/recipe-$tier-started" \
+      BLOOMERY_TIER="$tier" BLOOMERY_REF_MODEL="$t/fixture.gguf" BLOOMERY_FIXTURE_MODEL="$t/fixture.gguf" \
+      RUSTC="$t/bin/rustc" CARGO_HOME="$t/cargo-home" \
+      just --justfile "${self%/*}/../justfile" --working-directory "$t/tree" arch=sm_86 gate-gpu-qwen4exp-mtp-input) > "$t/out" 2>&1 || rc=$?
+    [ -e "$t/recipe-$tier-started" ] || echo child-not-started >> "$t/out"
+    judge_all "checkpoint input recipe in $tier tier waits for the shared model-load lock" "$rc" 75 'V4\.1 load lock.*not free' '^child-not-started$'
+  done
+  exec 7>&-
   # Ordinary binary holds the card: compilation completes, but libtest never starts.
   fifos
   gate "$t/first" 3090 "$t/lease" CUDA_VISIBLE_DEVICES="$GPU_3090" STUB_READY="$t/ready" STUB_HOLD="$t/hold" &

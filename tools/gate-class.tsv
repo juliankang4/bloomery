@@ -172,6 +172,7 @@ gate-gpu-qwen3vl-tower	family	qwen35	media	serve_media
 gate-gpu-qwen4exp-e2e	family	qwen4exp	e2e	graph_fault+attn_linear_gdn_kda+moe_route+attn_ds41_csa_hca
 gate-gpu-qwen4exp-iqleg	family	qwen4exp	tier	tier_legs+quant_iq
 gate-gpu-qwen4exp-mtp	family	qwen4exp	draft	drafts_mtp
+gate-gpu-qwen4exp-mtp-input	family	qwen4exp	by-hand	drafts_mtp
 gate-gpu-qwen4exp-nvfp4	family	qwen4exp	by-hand	quant_mxfp4
 gate-gpu-radio-tower	family	nemotron_h	media	serve_media
 gate-gpu-routed-legs	common		tier	tier_legs+placement_sizing

@@ -19,7 +19,7 @@
 # --gpu builds first by its own cargo call (`cargo test … --no-run`: cargo's arguments, before the first `--`) under
 # the build bound, then runs under the run bound; the second call finds everything built (a --doc call has no build call:
 # cargo refuses --no-run with --doc). A build that runs out ends 124 and says it was the build phase; the run never starts.
-# --gpu before --oxide selects one native --lib test target. Its bounded Cargo call compiles
+# --gpu before --oxide selects one native --lib or --bin test target. Its bounded Cargo call compiles
 # outside the card lock and invokes a capture-only target runner, never the test. Cargo owns the
 # executable, arguments, package cwd and runtime environment; a private JSON capture retains them.
 # Replay enters gpu-gate.sh in that context, so the common runner applies card selection last and
@@ -132,7 +132,7 @@ ARGS=("$@")
 CAPTURE=''
 if [ "$GPU" = 1 ]; then
   BUILD_ARGS=()
-  LIB=0
+  TEST_TARGET=0
   ARGS=()
   after=0
   for a in "$@"; do
@@ -142,15 +142,15 @@ if [ "$GPU" = 1 ]; then
       after=1
     else
       case "$a" in
-        --lib) LIB=1 ;;
+        --lib | --bin | --bin=*) TEST_TARGET=1 ;;
         --target | --target=* | --doc)
-          echo "gate.sh --gpu: only native library tests are supported; '$a' is not allowed" >&2
+          echo "gate.sh --gpu: only native tests are supported; '$a' is not allowed" >&2
           exit 64 ;;
       esac
       BUILD_ARGS+=("$a")
     fi
   done
-  [ "$LIB" = 1 ] || { echo "gate.sh --gpu: select a library test with --lib" >&2; exit 64; }
+  [ "$TEST_TARGET" = 1 ] || { echo "gate.sh --gpu: select a test with --lib or --bin" >&2; exit 64; }
   SELF=$(cd "${BASH_SOURCE[0]%/*}" && pwd -P)/gate.sh
   GPU_RUNNER=${SELF%/*}/gpu-gate.sh
   # Cargo merges runner arrays; a scalar override replaces a configured runner or refuses a
@@ -242,7 +242,7 @@ import sys
 directory, runner, *runner_args = sys.argv[1:]
 captures = list(Path(directory).glob("run-*.json"))
 if len(captures) != 1:
-    print("gate.sh --gpu: select exactly one library test; got " + str(len(captures)), file=sys.stderr)
+    print("gate.sh --gpu: select exactly one test target; got " + str(len(captures)), file=sys.stderr)
     sys.exit(64)
 with captures[0].open(encoding="utf-8") as stream:
     context = json.load(stream)

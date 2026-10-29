@@ -2375,6 +2375,213 @@ mod gate {
         Ok(ok && runs_ok)
     }
 
+    /// Only completed target rows may feed MTP: a headless pass or ubatch leaves none,
+    /// a headed ubatch leaves its last row, and a sink completes every requested row.
+    fn completed_rows(m: &mut Qwen38Model, prompt: &[u32]) -> Result<bool, GateError> {
+        let ids = &prompt[..4];
+        let zeros = vec![0.0; 5 * WIDE];
+        let (h, e) = (DraftHead::Rows, WalkMode::Eager);
+        let feed = |walk, first, pos0| {
+            DraftFeed::Rows(Feed {
+                tokens: &ids[..1],
+                pos0,
+                hidden: Hidden::Target { walk, first },
+                media: None,
+            })
+        };
+        let warm = |m: &mut Qwen38Model| {
+            m.mtp_walk(
+                DraftFeed::Rows(Feed {
+                    tokens: &[ids[0]; 5],
+                    pos0: 0,
+                    hidden: Hidden::Host(&zeros),
+                    media: None,
+                }),
+                h,
+                WalkMode::Store,
+            )
+        };
+        let mut ok = true;
+        for (path, walk) in [
+            (Prompt38::Gemm, TargetRows::Ubatch),
+            (Prompt38::Pass, TargetRows::Pass),
+        ] {
+            m.reset()?;
+            m.body_parts("completed rows")?.2.set_checkpoints(false);
+            // Seed finite final streams before overwriting their arena without a reader.
+            let mut sink = |_: &mut Qwen38Model, _, _, _| Ok(());
+            m.prefill38_with(ids, path, Some(&mut sink))?;
+            m.reset()?;
+            m.prefill38_with(ids, path, None)?;
+            warm(m)?;
+            ok &= refused(
+                &format!("{walk:?} unfinished first hidden row"),
+                m.mtp_draft(feed(walk, 0, 1), h, e),
+                "final hidden rows",
+            );
+            ok &= refused(
+                &format!("{walk:?} unfinished last hidden row"),
+                m.mtp_draft(feed(walk, 3, 4), h, e),
+                "final hidden rows",
+            );
+            m.reset()?;
+            m.prefill38_with(ids, path, Some(&mut sink))?;
+            warm(m)?;
+            let ran = m.mtp_draft(feed(walk, 0, 1), h, e).is_ok();
+            println!(
+                "(iv) {walk:?} sink completed first hidden row {}",
+                verdict(ran)
+            );
+            ok &= ran;
+        }
+        m.reset()?;
+        m.prompt38(ids, Prompt38::Gemm)?;
+        warm(m)?;
+        ok &= refused(
+            "Ubatch headed but unfinished first hidden row",
+            m.mtp_draft(feed(TargetRows::Ubatch, 0, 1), h, e),
+            "final hidden rows",
+        );
+        let ran = m.mtp_draft(feed(TargetRows::Ubatch, 3, 4), h, e).is_ok();
+        println!("(iv) Ubatch completed last hidden row {}", verdict(ran));
+        m.reset()?;
+        Ok(ok && ran)
+    }
+
+    /// The shared own row is valid only at the next position of the live slot's walk.
+    fn own_row(m: &mut Qwen38Model, prompt: &[u32]) -> Result<bool, GateError> {
+        m.add_slots(2)?;
+        let zeros = vec![0.0; WIDE];
+        let (h, e) = (DraftHead::Rows, WalkMode::Eager);
+        let refresh = |m: &mut Qwen38Model, token| {
+            m.mtp_walk(
+                DraftFeed::Rows(Feed {
+                    tokens: &[token],
+                    pos0: 0,
+                    hidden: Hidden::Host(&zeros),
+                    media: None,
+                }),
+                h,
+                e,
+            )
+        };
+        m.reset()?;
+        refresh(m, prompt[0])?;
+        let mut ok = refused(
+            "own row at the wrong position",
+            m.mtp_draft(DraftFeed::Own { pos0: 0 }, h, e),
+            "own row",
+        );
+        m.select_slot(1)?;
+        m.reset()?;
+        refresh(m, prompt[1])?;
+        m.select_slot(0)?;
+        ok &= refused(
+            "own row after A to B to A",
+            m.mtp_draft(DraftFeed::Own { pos0: 1 }, h, e),
+            "own row",
+        );
+        refresh(m, prompt[0])?;
+        let ran = m
+            .mtp_draft(DraftFeed::Own { pos0: 1 }, h, WalkMode::Graph)
+            .is_ok();
+        println!("(iv) own row after Rows refresh {}", verdict(ran));
+        // A verify's rejected tail cannot leave its branch's own input live.
+        m.verify_slots(&[(0, &prompt[..2])])?;
+        m.commit_slots(&[1])?;
+        ok &= refused(
+            "own row after a cut",
+            m.mtp_draft(DraftFeed::Own { pos0: 1 }, h, e),
+            "own row",
+        );
+        m.reset()?;
+        Ok(ok && ran)
+    }
+
+    /// The input boundary on an existing checkpoint, without an oracle set or a server.
+    #[cfg(all(test, feature = "checkpoint"))]
+    #[test]
+    #[ignore = "needs one NVIDIA card and a Qwen3.8 checkpoint folder with MTP at $BLOOMERY_QWEN38_FOLDER"]
+    fn hw_mtp_input_validity() -> Result<(), GateError> {
+        use bloomery_gpu::arch::qwen3moe::Folder38;
+        const CTX_INPUT: u64 = 64;
+        const UB: usize = 8;
+        let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
+        let path = PathBuf::from(
+            std::env::var_os("BLOOMERY_QWEN38_FOLDER")
+                .ok_or("$BLOOMERY_QWEN38_FOLDER names the checkpoint folder")?,
+        );
+        let mut f = bloomery_gpu_gates::model_file::open_folder(&path)?;
+        let inputs = PlanInputs::describe(&f.header)?;
+        let draft = f.draft?.ok_or("the checkpoint has no MTP layer")?;
+        let mtp = MtpInputs::read(
+            &draft,
+            &f.header,
+            &inputs,
+            HeadSet::List {
+                ids: (0..64).collect::<Vec<_>>().into(),
+                digest: vocab_sha256(&f.header)?,
+            },
+        )?;
+        let census = bloomery_gpu::census()?;
+        let device = census.first().ok_or("no visible card")?;
+        let machine = machine_for_experts(
+            model::placement::devices::spec_of_device(device),
+            inputs.spec.layers.len(),
+            UB as u64,
+            Experts::Card,
+        );
+        let plan_levers = PlanLevers {
+            card_budget_bytes: levers.card_budget(),
+        };
+        let plan = inputs.plan_mtp_with_slots(
+            &machine,
+            (CTX_INPUT, UB as u64),
+            &plan_levers,
+            &mtp,
+            Experts::Card,
+            2,
+        )?;
+        let ple = f
+            .rows
+            .remove(&model::arch::qwen35moe::names::per_layer_token_embd());
+        let model = Folder38::with(f.header, f.source, ple);
+        let mut m = Body38::open_placed_mtp_slots(
+            model,
+            &plan,
+            &inputs,
+            0,
+            levers.host(),
+            UB,
+            &draft,
+            &mtp,
+            2,
+        )?;
+        m.set_mode(bloomery_gpu::model::StepMode::Graph);
+        let prompt = [1, 2, 3, 4];
+        let rows_ok = completed_rows(&mut m, &prompt)?;
+        let own_ok = own_row(&mut m, &prompt)?;
+        // Use the gate's existing greedy runner and drafted session on the same load.
+        let (m, plain, _) = plain_to(m, &prompt, Prompt38::Gemm, 8)?;
+        let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Gemm), CTX_INPUT as u32)?;
+        let first = spec.prompt(&mut s, &prompt)?;
+        let drafted = runtime::generate(
+            &mut s,
+            &mut spec,
+            &prompt,
+            first,
+            &runtime::Stop::new(8, CTX_INPUT as u32)?,
+            &mut Kept::default(),
+        )?;
+        let same = plain == drafted.tokens;
+        println!("(iv) drafted greedy ids = plain ids {}", verdict(same));
+        if rows_ok && own_ok && same {
+            Ok(())
+        } else {
+            Err(checks_failed())
+        }
+    }
+
     /// The target position and the draft's committed store count travel together in a state.
     #[derive(Clone, Copy, PartialEq)]
     struct DraftEnd {
@@ -3902,6 +4109,8 @@ mod gate {
         m: Qwen38Model,
         prompt: &[u32],
     ) -> Result<(Qwen38Model, Stored, bool), GateError> {
+        let mut m = m;
+        let completed = completed_rows(&mut m, prompt)?;
         let n = prompt.len();
         let (m, one) = drafted_store(m, prompt, Prompt38::Gemm, SplitWalk::Off)?;
         let (m, two) = drafted_store(m, prompt, Prompt38::Gemm, SplitWalk::Every)?;
@@ -3929,7 +4138,7 @@ mod gate {
             steps.next,
             verdict(pass_ok)
         );
-        Ok((m, one, shape_ok && split_ok && pass_ok))
+        Ok((m, one, completed && shape_ok && split_ok && pass_ok))
     }
 
     /// (fr) on a load of the gate's plan whose ubatch holds a third of the
@@ -4836,6 +5045,7 @@ mod gate {
             2,
         )?;
         m.set_mode(bloomery_gpu::model::StepMode::Graph);
+        let own_ok = own_row(&mut m, a)?;
         let mut s = app::Session::from_model(m, ctx);
         let mut spec = s.with_draft::<app::mtp::MtpDraft<Body38>, 4>(
             app::mtp::MtpDraft::open(
@@ -4946,7 +5156,7 @@ mod gate {
         kp_ok &= slots_put_back(&mut s, [a, b])?;
         tier::sc("(kp-draft) an off slot beside a drafted window in one pass")?;
         kp_ok &= slots_off_beside(&mut s, [a, b])?;
-        Ok(ids_ok && passes_ok && stores_ok && z_ok && kp_ok)
+        Ok(own_ok && ids_ok && passes_ok && stores_ok && z_ok && kp_ok)
     }
 
     /// (kp-draft) two slots cut to points at one position: each slot's drafted request with
