@@ -618,6 +618,34 @@ def self_test():
             check("an unknown type is refused by name", False, "no refusal")
         except Refusal as e:
             check("an unknown type is refused by name", e.code == 65 and "type id 140" in str(e), str(e))
+        kvs = [_kv_string("general.architecture", "tst"), _kv_scalar("tst.block_count", 4, 1)]
+        f32, q8 = (0, [32], b"\0" * 128), (8, [32], b"\0" * 34)
+        for what, ts in (("F32 then Q8_0", [("token_embd.weight", *f32), ("token_embd.weight", *q8)]),
+                         ("Q8_0 then F32", [("token_embd.weight", *q8), ("token_embd.weight", *f32)])):
+            dup = os.path.join(d, "dup.gguf")
+            write_gguf(dup, kvs, ts)
+            try:
+                header(dup)
+                check(f"a tensor name declared twice ({what}) is refused", False, "no refusal")
+            except Refusal as e:
+                check(f"a tensor name declared twice ({what}) is refused",
+                      e.code == 65 and "duplicate tensor name 'token_embd.weight'" in str(e), str(e))
+        write_gguf(dup, kvs, [("token_embd.weight", *q8), ("output.weight", *f32)])
+        try:
+            check("unique tensor names read", [t[:2] for t in header(dup)[1]] == [("token_embd.weight", 8),
+                                                                              ("output.weight", 0)])
+        except Refusal as e:
+            check("unique tensor names read", False, str(e))
+        s1, s2 = (os.path.join(d, f"x-0000{i}-of-00002.gguf") for i in (1, 2))
+        split = kvs + [_kv_scalar("split.count", 2, 2)]
+        write_gguf(s1, split + [_kv_scalar("split.no", 2, 0)], [("token_embd.weight", *f32)])
+        write_gguf(s2, split + [_kv_scalar("split.no", 2, 1)], [("token_embd.weight", *q8)])
+        try:
+            tensors_of(s1)
+            check("a tensor name in two shards is refused", False, "no refusal")
+        except Refusal as e:
+            check("a tensor name in two shards is refused",
+                  e.code == 65 and "token_embd.weight" in str(e) and "also in" in str(e), str(e))
     return ok
 
 
