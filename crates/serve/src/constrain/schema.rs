@@ -6,10 +6,22 @@
 //!   not the schema lists it. `required` may only name properties;
 //!   `additionalProperties` is accepted (none are written).
 //! - `type: string`, with an optional `maxLength`: a free string.
+//! - `type: integer` and `type: number`: a free JSON number; `type: boolean`
+//!   and `type: null`.
+//! - `type: array` with `items`: any count of items, each of the `items`
+//!   schema.
+//! - `anyOf`: one of its schemas.
+//! - `$ref` into the schema itself (`#` or a JSON pointer after it, such as
+//!   `#/$defs/name`): the schema it points to, written out where it stands;
+//!   `$defs` and `definitions` hold such schemas and constrain nothing. A
+//!   `$ref` met again inside the schema it points to is a refusal.
 //! - `enum` of strings, of integers or of booleans (one kind), and `const` of
-//!   one of those; `type: boolean`.
-//! - Any other keyword (`$ref`, `anyOf`, `items`, `pattern`, `minLength`,
-//!   `format`, a bare `type: integer`, ...) is a refusal naming it and its path.
+//!   one of those.
+//! - Any other keyword (`oneOf`, `allOf`, `pattern`, `minLength`, `minItems`,
+//!   `minimum`, `format`, ...) is a refusal naming it and its path.
+//!
+//! `response_format` `json_object` asks for any JSON object with at least one
+//! member, written in the same style ([`program::json_object`]).
 //!
 //! The JSON text is compact with one space after `:` and `,`. A `<` in a JSON
 //! string's text (a constant, an enum option, a property name) is written as
@@ -22,6 +34,9 @@
 //! subset, written in the style the chat format reads; its parameters are read
 //! as one object by [`value`].
 
+use std::borrow::Cow;
+use std::sync::Arc;
+
 use serde_json::{Map, Value};
 
 use super::Refusal;
@@ -29,10 +44,11 @@ use super::program::{self, Alt, Constraint, Env, Part, Style};
 use super::vocab::Vocab;
 use crate::dsml::{ToolFormat, parses_tools};
 use crate::engine::Tokenizer;
+use crate::http::MAX_BODY;
 use crate::reasoning::ThinkTags;
 
 /// Keywords the subset reads, besides the annotations.
-const READ: [&str; 7] = [
+const READ: [&str; 9] = [
     "type",
     "enum",
     "const",
@@ -40,7 +56,15 @@ const READ: [&str; 7] = [
     "required",
     "additionalProperties",
     "maxLength",
+    "items",
+    "anyOf",
 ];
+
+/// Keywords that hold schemas a `$ref` points to and constrain nothing.
+const DEFS: [&str; 2] = ["$defs", "definitions"];
+
+/// The schemas a schema may hold once its `$ref`s are written out.
+const MAX_SCHEMAS: usize = 4096;
 
 /// Keywords that describe a schema and constrain nothing.
 const ANNOTATIONS: [&str; 10] = [
@@ -59,7 +83,7 @@ const ANNOTATIONS: [&str; 10] = [
 /// What the fields are read against.
 pub(crate) struct Ask<'a> {
     pub tok: &'a dyn Tokenizer,
-    pub vocab: &'a Vocab,
+    pub vocab: &'a Arc<Vocab>,
     pub format: ToolFormat,
     /// The tags of the model's think span: a prompt that left the span open
     /// has it closed with `think.close` before the program.
@@ -209,6 +233,10 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
         only(o, "enum", &["enum", "type"], path)?;
         return enumeration(e, ty, style, path);
     }
+    if let Some(a) = o.get("anyOf") {
+        only(o, "anyOf", &["anyOf"], path)?;
+        return any_of(a, style, path);
+    }
     match ty {
         Some("object") => {
             only(
@@ -254,11 +282,30 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
                     .to_vec(),
             )])
         }
+        Some(t @ ("integer" | "number")) => {
+            only(o, &format!("type {t}"), &["type"], path)?;
+            Ok(vec![Part::Num {
+                integer: t == "integer",
+            }])
+        }
+        Some("null") => {
+            only(o, "type null", &["type"], path)?;
+            Ok(vec![Part::Text("null".to_owned())])
+        }
+        Some("array") => {
+            only(o, "type array", &["type", "items"], path)?;
+            let items = o
+                .get("items")
+                .ok_or_else(|| refuse(path, "type array needs items, the schema of each item"))?;
+            Ok(vec![Part::List {
+                item: value(items, style.nested(), &format!("{path}.items"))?,
+            }])
+        }
         Some(other) => Err(refuse(
             path,
             format!(
-                "type \"{other}\" is not supported by this server without an enum or a const \
-                 (supported: object, string, boolean)"
+                "type \"{other}\" is not supported by this server (supported: object, array, \
+                 string, integer, number, boolean, null)"
             ),
         )),
         None => Err(refuse(
@@ -266,6 +313,164 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
             "a schema needs a type, an enum or a const to be served",
         )),
     }
+}
+
+/// One of `alts`, the schemas of an `anyOf`. Written raw, a text option is a
+/// refusal: a chat format reads a raw value as text or as JSON by its schema,
+/// which would not say which.
+fn any_of(alts: &Value, style: Style, path: &str) -> Result<Vec<Part>, Refusal> {
+    let here = format!("{path}.anyOf");
+    let Some(list) = alts.as_array().filter(|a| !a.is_empty()) else {
+        return Err(refuse(
+            &here,
+            format!("anyOf must be a non-empty array, not {alts}"),
+        ));
+    };
+    if style == Style::Raw && list.iter().any(is_text) {
+        return Err(refuse(
+            &here,
+            "an anyOf with a text option is not supported by this server in a chat format's \
+             markup, which reads a value as text or as JSON by its schema",
+        ));
+    }
+    let mut options = list
+        .iter()
+        .enumerate()
+        .map(|(i, s)| value(s, style, &format!("{here}[{i}]")))
+        .collect::<Result<Vec<_>, Refusal>>()?;
+    Ok(if options.len() == 1 {
+        options.remove(0)
+    } else {
+        vec![Part::Any(options)]
+    })
+}
+
+/// `node` with every `$ref` in it replaced by the schema it points to in
+/// `root`, and the definitions dropped. A `$ref` met again inside the schema
+/// it points to is a refusal (a recursive schema is not served), and so is a
+/// schema that writes out to more than [`MAX_SCHEMAS`] schemas or past the
+/// `bytes` left: each schema's path, key and value is charged before it is
+/// copied.
+fn inline_refs(
+    root: &Value,
+    node: &Value,
+    path: &str,
+    seen: &mut Vec<String>,
+    left: &mut usize,
+    bytes: &mut usize,
+) -> Result<Value, Refusal> {
+    *left = left.checked_sub(1).ok_or_else(|| {
+        refuse(
+            path,
+            format!(
+                "the schema holds more than {MAX_SCHEMAS} schemas once its $refs are written out"
+            ),
+        )
+    })?;
+    let charge = |bytes: &mut usize, n: usize| -> Result<(), Refusal> {
+        *bytes = bytes.checked_sub(n).ok_or_else(|| {
+            refuse(
+                path,
+                format!("the schema passes {MAX_BODY} bytes once its $refs are written out"),
+            )
+        })?;
+        Ok(())
+    };
+    charge(bytes, path.len())?;
+    let Some(o) = node.as_object() else {
+        charge(bytes, node.to_string().len())?;
+        return Ok(node.clone());
+    };
+    if let Some(r) = o.get("$ref") {
+        let Some(r) = r.as_str() else {
+            return Err(refuse(path, format!("$ref must be a string, not {r}")));
+        };
+        if let Some(k) = o.keys().find(|k| {
+            let k = k.as_str();
+            k != "$ref" && !ANNOTATIONS.contains(&k) && !DEFS.contains(&k)
+        }) {
+            return Err(refuse(
+                path,
+                format!("the keyword \"{k}\" beside $ref is not supported by this server"),
+            ));
+        }
+        let target = r
+            .strip_prefix('#')
+            .and_then(|p| root.pointer(p))
+            .ok_or_else(|| {
+                refuse(
+                    path,
+                    format!(
+                        "$ref {r:?} does not point into this schema (\"#\" or a JSON pointer \
+                         after it)"
+                    ),
+                )
+            })?;
+        if seen.iter().any(|s| s == r) {
+            return Err(refuse(
+                path,
+                format!(
+                    "$ref {r:?} is met again inside the schema it points to: a recursive \
+                     schema is not supported by this server"
+                ),
+            ));
+        }
+        seen.push(r.to_owned());
+        let out = inline_refs(root, target, path, seen, left, bytes);
+        seen.pop();
+        return out;
+    }
+    let mut out = Map::new();
+    for (k, v) in o {
+        if DEFS.contains(&k.as_str()) {
+            continue;
+        }
+        charge(bytes, k.len())?;
+        let v = match (k.as_str(), v) {
+            ("properties", Value::Object(p)) => Value::Object(
+                p.iter()
+                    .map(|(name, s)| {
+                        charge(bytes, name.len())?;
+                        let here = format!("{path}.properties.{name}");
+                        Ok((
+                            name.clone(),
+                            inline_refs(root, s, &here, seen, left, bytes)?,
+                        ))
+                    })
+                    .collect::<Result<_, Refusal>>()?,
+            ),
+            ("items", s) => inline_refs(root, s, &format!("{path}.items"), seen, left, bytes)?,
+            ("anyOf", Value::Array(a)) => Value::Array(
+                a.iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        inline_refs(root, s, &format!("{path}.anyOf[{i}]"), seen, left, bytes)
+                    })
+                    .collect::<Result<_, Refusal>>()?,
+            ),
+            _ => {
+                charge(bytes, v.to_string().len())?;
+                v.clone()
+            }
+        };
+        out.insert(k.clone(), v);
+    }
+    Ok(Value::Object(out))
+}
+
+/// `schema` with its `$ref`s written out ([`inline_refs`]) within the
+/// request's `bytes` left of [`MAX_BODY`], refused when the JSON parser that
+/// read the request could not read it back: a value nests no deeper than its
+/// schema, so a call the program writes parses again.
+fn written_out(schema: &Value, path: &str, bytes: &mut usize) -> Result<Value, Refusal> {
+    let mut left = MAX_SCHEMAS;
+    let out = inline_refs(schema, schema, path, &mut Vec::new(), &mut left, bytes)?;
+    serde_json::from_str(&out.to_string()).map_err(|e| {
+        refuse(
+            path,
+            format!("the schema is too deeply nested once its $refs are written out ({e})"),
+        )
+    })
 }
 
 /// Refuses a string literal (`const` or `enum`) with a `<` where the value is
@@ -412,7 +617,7 @@ fn object(o: &Map<String, Value>, inner: Style, path: &str) -> Result<Vec<Part>,
         .flatten()
         .map(|(key, schema)| Arg {
             key,
-            schema,
+            schema: Cow::Borrowed(schema),
             path: format!("{path}.properties.{key}"),
         })
         .collect();
@@ -426,16 +631,16 @@ fn object_of(args: &[Arg<'_>], inner: Style) -> Result<Vec<Part>, Refusal> {
     for (i, a) in args.iter().enumerate() {
         let sep = if i == 0 { "" } else { ", " };
         parts.push(Part::Text(format!("{sep}\"{}\": ", json_inner(a.key))));
-        parts.extend(value(a.schema, inner, &a.path)?);
+        parts.extend(value(&a.schema, inner, &a.path)?);
     }
     parts.push(Part::Text("}".to_owned()));
     Ok(parts)
 }
 
-/// One argument of a tool: its name and schema.
+/// One argument of a tool: its name and schema, its `$ref`s written out.
 pub(crate) struct Arg<'a> {
     pub key: &'a str,
-    pub schema: &'a Value,
+    pub schema: Cow<'a, Value>,
     pub path: String,
 }
 
@@ -498,6 +703,8 @@ fn funs<'a>(tools: &'a Value) -> Result<Vec<Fun<'a>>, Refusal> {
         return Err(refuse("tools", "tool_choice needs a non-empty tools array"));
     };
     let mut out: Vec<Fun<'a>> = Vec::new();
+    // One budget for every tool's written-out parameters.
+    let mut bytes = MAX_BODY;
     for (i, tool) in list.iter().enumerate() {
         let path = format!("tools[{i}]");
         let f = tool.get("function").unwrap_or(tool);
@@ -510,6 +717,17 @@ fn funs<'a>(tools: &'a Value) -> Result<Vec<Fun<'a>>, Refusal> {
         let args = match f.get("parameters") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Object(p)) => {
+                // A call's markup writes the arguments as one object's
+                // properties, which a root anyOf or $ref would not say.
+                if let Some(k) = ["anyOf", "$ref"].into_iter().find(|k| p.contains_key(*k)) {
+                    return Err(refuse(
+                        &here,
+                        format!(
+                            "the keyword \"{k}\" is not supported by this server at the root of \
+                             a tool's parameters, which are one object's properties"
+                        ),
+                    ));
+                }
                 if let Some(t) = p.get("type").filter(|t| t.as_str() != Some("object")) {
                     return Err(refuse(
                         &here,
@@ -518,19 +736,27 @@ fn funs<'a>(tools: &'a Value) -> Result<Vec<Fun<'a>>, Refusal> {
                 }
                 // The schema compiler reads the whole object, so a keyword the
                 // subset does not read is a refusal here and never ignored.
-                let mut root = p.clone();
-                root.entry("type")
-                    .or_insert_with(|| Value::String("object".to_owned()));
-                value(&Value::Object(root), Style::JsonInMarkup, &here)?;
+                let mut root = written_out(&Value::Object(p.clone()), &here, &mut bytes)?;
+                if let Some(r) = root.as_object_mut() {
+                    r.entry("type")
+                        .or_insert_with(|| Value::String("object".to_owned()));
+                }
+                value(&root, Style::JsonInMarkup, &here)?;
+                let props = match root.get_mut("properties") {
+                    Some(Value::Object(w)) => std::mem::take(w),
+                    _ => Map::new(),
+                };
+                // `written_out` keeps every property, in order.
                 p.get("properties")
                     .and_then(Value::as_object)
                     .into_iter()
                     .flatten()
-                    .map(|(key, schema)| {
+                    .zip(props)
+                    .map(|((key, _), (_, schema))| {
                         plain_name("the parameter name", key, &here)?;
                         Ok(Arg {
                             key,
-                            schema,
+                            schema: Cow::Owned(schema),
                             path: format!("{here}.properties.{key}"),
                         })
                     })
@@ -615,34 +841,38 @@ fn tool_parts(
     format.call_parts(&funs)
 }
 
-/// `response_format`'s schema, or `None` for a request that asks for text.
-fn response_schema(o: &Map<String, Value>) -> Result<Option<&Value>, Refusal> {
+/// What `response_format` asks the reply to be.
+enum Reply<'a> {
+    Text,
+    Schema(&'a Value),
+    /// Any JSON object.
+    Object,
+}
+
+/// `response_format`'s ask.
+fn response_schema(o: &Map<String, Value>) -> Result<Reply<'_>, Refusal> {
     let Some(rf) = o.get("response_format").filter(|v| !v.is_null()) else {
-        return Ok(None);
+        return Ok(Reply::Text);
     };
     match rf.get("type").and_then(Value::as_str) {
-        Some("text") => Ok(None),
+        Some("text") => Ok(Reply::Text),
+        Some("json_object") => Ok(Reply::Object),
         Some("json_schema") => {
             let schema = rf
                 .get("json_schema")
                 .and_then(|j| j.get("schema"))
                 .or_else(|| rf.get("schema"));
             match schema {
-                Some(s @ Value::Object(_)) => Ok(Some(s)),
+                Some(s @ Value::Object(_)) => Ok(Reply::Schema(s)),
                 _ => Err(refuse(
                     "response_format",
                     "type json_schema needs json_schema.schema, an object",
                 )),
             }
         }
-        Some("json_object") => Err(refuse(
-            "response_format",
-            "type json_object is not supported by this server: it needs a schema (send type \
-             json_schema)",
-        )),
         _ => Err(refuse(
             "response_format",
-            format!("{rf} is not supported by this server (type text or json_schema)"),
+            format!("{rf} is not supported by this server (type text, json_object or json_schema)"),
         )),
     }
 }
@@ -661,37 +891,41 @@ pub(crate) fn request(
                 .to_owned(),
         ));
     }
-    let schema = response_schema(o)?;
+    let reply = response_schema(o)?;
     let forces = tool_choice(o)?;
-    let parts = match (schema, &forces) {
-        (Some(_), Some(_)) => {
+    let env = Env::new(ask.tok, ask.vocab);
+    // The reply is read for a call's markup when the request has tools to
+    // scan for, so its strings keep clear of a `<` then.
+    let style = if parses_tools(o) {
+        Style::JsonInMarkup
+    } else {
+        Style::Json
+    };
+    let (prog, rules) = match (reply, &forces) {
+        (Reply::Text, None) => return Ok(None),
+        (Reply::Schema(_) | Reply::Object, Some(_)) => {
             return Err(refuse(
                 "response_format",
-                "a json_schema and a forced tool_choice together are not supported by this \
-                 server: a request has one program",
+                "a JSON response_format and a forced tool_choice together are not supported by \
+                 this server: a request has one program",
             ));
         }
-        (Some(s), None) => {
-            // The reply is read for a call's markup when the request has tools
-            // to scan for, so its strings keep clear of a `<` then.
-            let style = if parses_tools(o) {
-                Style::JsonInMarkup
-            } else {
-                Style::Json
-            };
-            value(s, style, "response_format.json_schema.schema")?
+        (Reply::Schema(s), None) => {
+            let path = "response_format.json_schema.schema";
+            let mut bytes = MAX_BODY;
+            let parts = value(&written_out(s, path, &mut bytes)?, style, path)?;
+            (program::compile(&parts, &env)?, Vec::new())
         }
-        (None, Some(f)) => tool_parts(o, f, ask.format)?,
-        (None, None) => return Ok(None),
+        (Reply::Object, None) => program::json_object(style, &env)?,
+        (Reply::Text, Some(f)) => (
+            program::compile(&tool_parts(o, f, ask.format)?, &env)?,
+            Vec::new(),
+        ),
     };
-    let env = Env {
-        tok: ask.tok,
-        vocab: ask.vocab,
-    };
-    let prog = program::compile(&parts, &env)?;
     Ok(Some(Constraint::new(
         prog,
+        rules,
         ask.tok.encode(&format!("{}\n\n", ask.think.close)),
-        ask.vocab.stops().clone(),
+        Arc::clone(ask.vocab),
     )))
 }

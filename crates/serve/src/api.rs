@@ -1725,17 +1725,18 @@ fn wrong_type(k: &str, takes: &str, v: &Value) -> ApiError {
 }
 
 /// A real field as `f32`. Absent or `null` is `None`, any other type than a
-/// number a 400; a number whose `f32` is not finite (`1e39`) is a 400 naming
-/// the field, as a penalty's is, where the sampler would refuse it and the
-/// request would run greedy.
+/// number a 400; a number whose `f32` is not finite (`1e39`, or `1e999` past
+/// `f64`) is a 400 naming the field, as a penalty's is, where the sampler
+/// would refuse it and the request would run greedy.
 fn get_f32(o: &Map<String, Value>, k: &str) -> Result<Option<f32>, ApiError> {
     let Some(v) = o.get(k).filter(|v| !v.is_null()) else {
         return Ok(None);
     };
-    let Some(x) = v.as_f64() else {
+    if !v.is_number() {
         return Err(wrong_type(k, "a number", v));
-    };
-    Some(x as f32)
+    }
+    v.as_f64()
+        .map(|x| x as f32)
         .filter(|x| x.is_finite())
         .map(Some)
         .ok_or_else(|| invalid(format!("{k} must be a finite number, not {v}")))
@@ -1965,12 +1966,14 @@ fn sampler_order(o: &Map<String, Value>, sp: &SamplingParams) -> Result<(), ApiE
 /// unknown fields are ignored. `logit_bias` is read by [`logit_bias`].
 ///
 /// Structured output ([`constrain::request`]) is served for a `response_format`
-/// of type `json_schema` in the subset it reads, and for `tool_choice`
-/// `"required"` or a named function over the request's tools; any other
-/// `response_format`, `json_schema`, `tool_choice` or schema keyword is a 400
-/// naming it. Such a request decodes greedily: `temperature` defaults to 0, a
-/// positive one, a penalty, `ignore_eos` and `reasoning_budget` are 400s. The two routes whose answers render
-/// probabilities take their fields out of the body before this runs
+/// of type `json_object`, or `json_schema` in the subset it reads, and for
+/// `tool_choice` `"required"` or a named function over the request's tools;
+/// any other `response_format`, `json_schema`, `tool_choice` or schema keyword
+/// is a 400 naming it. Such a request's `temperature` defaults to 0 (greedy); a
+/// positive one and the penalties draw with the sampler among the ids the
+/// program allows, and `ignore_eos` and `reasoning_budget` are 400s. The two
+/// routes whose answers render probabilities take their fields out of the body
+/// before this runs
 /// ([`completion_plan_logprobs`], [`chat_plan_logprobs`]); every other route
 /// keeps the refusal.
 ///
@@ -2090,7 +2093,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
     let reasoning_budget = reasoning_budget(o)?;
     let logit_bias = logit_bias(o, state.info.n_vocab)?;
     if constraint.is_some() {
-        greedy_only(&sampling, ignore_eos, reasoning_budget)?;
+        program_ends_itself(ignore_eos, reasoning_budget)?;
     }
     let p = GenParams {
         n_predict,
@@ -2164,37 +2167,20 @@ fn logit_bias(o: &Map<String, Value>, n_vocab: usize) -> Result<Vec<(u32, f32)>,
     Ok(bias.into_iter().filter(|&(_, b)| b != 0.0).collect())
 }
 
-/// What a structured-output request leaves out: its pick is the largest
-/// allowed logit, so a draw (`temperature` above 0) and the penalties that move
-/// a logit have no place in it, `ignore_eos` would ban the id its program ends
-/// on, and a think budget would force a close the program writes itself.
-fn greedy_only(
-    sampling: &SamplingParams,
-    ignore_eos: bool,
-    budget: Option<usize>,
-) -> Result<(), ApiError> {
-    let why = if sampling.temperature > 0.0 {
-        format!(
-            "temperature {} is not supported with structured output, which decodes greedily \
-             (leave it out or send 0)",
-            sampling.temperature
-        )
-    } else if sampling.penalizes() {
-        "repeat_penalty, frequency_penalty and presence_penalty are not supported with \
-         structured output, which decodes greedily"
-            .to_owned()
-    } else if ignore_eos {
+/// What a structured-output request leaves out: `ignore_eos` would ban the id
+/// its program ends on, and a think budget would force a close the program
+/// writes itself.
+fn program_ends_itself(ignore_eos: bool, budget: Option<usize>) -> Result<(), ApiError> {
+    let why = if ignore_eos {
         "ignore_eos is not supported with structured output: its program ends on an \
          end-of-generation id"
-            .to_owned()
     } else if budget.is_some() {
         "reasoning_budget is not supported with structured output: the program starts after \
          the think span and closes an open one itself"
-            .to_owned()
     } else {
         return Ok(());
     };
-    Err(invalid(why))
+    Err(invalid(why.to_owned()))
 }
 
 /// `reasoning_budget`: absent or `null` unrestricted, `-1` unrestricted
@@ -2249,29 +2235,30 @@ fn gate_reasoning_budget(p: &mut GenParams, prompt: &str) {
 
 /// llama-server's `generation_settings`, with the values this server applies.
 /// Knobs it does not implement are reported at their neutral setting.
+/// Its f32 values are widened to f64 before JSON serialization.
 fn generation_settings(state: &State, p: &GenParams) -> Value {
     let logit_bias: Vec<Value> = p
         .logit_bias
         .iter()
-        .map(|&(token, bias)| json!({"bias": bias, "token": token}))
+        .map(|&(token, bias)| json!({"bias": f64::from(bias), "token": token}))
         .collect();
     let mut v = json!({
         "n_ctx": state.info.ctx_max,
         "n_predict": p.n_predict,
         "model": state.alias,
         "seed": p.sampling.seed,
-        "temperature": p.sampling.temperature,
+        "temperature": f64::from(p.sampling.temperature),
         "dynatemp_range": 0.0,
         "dynatemp_exponent": 1.0,
         "top_k": p.sampling.top_k,
-        "top_p": p.sampling.top_p,
-        "min_p": p.sampling.min_p,
+        "top_p": f64::from(p.sampling.top_p),
+        "min_p": f64::from(p.sampling.min_p),
         "tfs_z": 1.0,
         "typical_p": 1.0,
         "repeat_last_n": p.sampling.repeat_last_n,
-        "repeat_penalty": p.sampling.repeat_penalty,
-        "presence_penalty": p.sampling.presence_penalty,
-        "frequency_penalty": p.sampling.frequency_penalty,
+        "repeat_penalty": f64::from(p.sampling.repeat_penalty),
+        "presence_penalty": f64::from(p.sampling.presence_penalty),
+        "frequency_penalty": f64::from(p.sampling.frequency_penalty),
         "penalty_prompt_tokens": [],
         "use_penalty_prompt_tokens": false,
         "mirostat": 0,
@@ -5314,6 +5301,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn generation_settings_keep_widened_f32_json_text() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let body = json!({
+            "prompt": "ab", "n_predict": 1,
+            "temperature": 0.8, "top_p": 0.9, "min_p": 0.1,
+            "repeat_penalty": 1.1, "presence_penalty": -0.3, "frequency_penalty": 0.7,
+            "logit_bias": {"7": 0.8, "8": -0.3},
+        });
+        let (status, text) = roundtrip(addr, "POST", "/completion", &body.to_string());
+        assert_eq!(status, 200, "{text}");
+        let reply: Value = serde_json::from_str(&text).expect("the completion is JSON");
+        for (field, want) in [
+            ("temperature", "0.800000011920929"),
+            ("top_p", "0.8999999761581421"),
+            ("min_p", "0.10000000149011612"),
+            ("repeat_penalty", "1.100000023841858"),
+            ("presence_penalty", "-0.30000001192092896"),
+            ("frequency_penalty", "0.699999988079071"),
+        ] {
+            assert_eq!(
+                reply["generation_settings"][field].to_string(),
+                want,
+                "{field}"
+            );
+        }
+        assert_eq!(
+            reply["generation_settings"]["logit_bias"].to_string(),
+            r#"[{"bias":0.800000011920929,"token":7},{"bias":-0.30000001192092896,"token":8}]"#,
+        );
+    }
+
     /// A `temperature`, `top_p` or `min_p` whose `f32` is not finite (`1e39`
     /// is a finite JSON number and an infinite `f32`) is a 400 naming the
     /// field and "a finite number", where the sampler would refuse it and the
@@ -5331,7 +5353,7 @@ mod tests {
             roundtrip(addr, "POST", "/completion", &body)
         };
         for field in ["temperature", "top_p", "min_p"] {
-            for value in ["1e39", "-1e39"] {
+            for value in ["1e39", "-1e39", "1e999"] {
                 let (status, text) = ask(field, value);
                 assert_eq!(status, 400, "{field} {value}: {text}");
                 let v: Value = serde_json::from_str(&text).expect("the 400's body is JSON");
@@ -5930,6 +5952,97 @@ mod tests {
         );
         let (status, text) = applied(addr, &tool_call_body(json!("not json")));
         assert_eq!(status, 200, "{text}");
+    }
+
+    /// Parsed `arguments` keep their numbers in the next prompt: a float
+    /// prints as Python's `json.dumps` does, integers keep their decimal
+    /// digits, a number past `f64` (`1e999`,
+    /// which `arbitrary_precision` lets serde_json read) prints as it came,
+    /// and reads as an infinity, not as zero or a missing number.
+    #[test]
+    fn tool_call_arguments_keep_their_numbers_in_the_prompt() {
+        let args = json!(
+            r#"{"n":1e999,"x":2.5,"y":1e2,"p":18446744073709551617,"m":-18446744073709551617}"#
+        );
+        let (status, text) = applied(
+            served_with(TOJSONS_ARGUMENTS),
+            &tool_call_body(args.clone()),
+        );
+        assert_eq!(status, 200, "{text}");
+        assert_eq!(
+            applied_prompt(&text),
+            r#"<user>w?<assistant>[get_weather {"n": 1e+999, "x": 2.5, "y": 100.0, "p": 18446744073709551617, "m": -18446744073709551617}]"#
+        );
+        let reads = concat!(
+            "{%- for m in messages %}{%- for tc in m.tool_calls or [] %}",
+            "{%- for k, v in tc.function.arguments.items() %} {{ k }}",
+            "{%- if v is number %}={{ v > 1 }},{{ v and 1 }}{%- endif %}",
+            "{%- endfor %}{%- endfor %}{%- endfor %}",
+        );
+        let (status, text) = applied(served_with(reads), &tool_call_body(args.clone()));
+        assert_eq!(status, 200, "{text}");
+        assert_eq!(
+            applied_prompt(&text),
+            " n=True,1 x=True,1 y=True,1 p=True,1 m=False,1"
+        );
+        let negates = concat!(
+            "{%- for m in messages %}{%- for tc in m.tool_calls or [] %}",
+            "{%- for k, v in tc.function.arguments.items() %} {{ k }}",
+            "{%- if v is number %}={{ -v }}{%- endif %}",
+            "{%- endfor %}{%- endfor %}{%- endfor %}",
+        );
+        let (status, text) = applied(served_with(negates), &tool_call_body(args));
+        assert_ne!(status, 200, "{text}");
+        assert!(message_of(&text).contains("not a finite number"), "{text}");
+    }
+
+    /// Integer expressions either keep the exact value or name the existing
+    /// arithmetic range limit instead of converting the operands to floats.
+    #[test]
+    fn tool_call_argument_integer_expressions_keep_their_values() {
+        let vars = serde_json::from_str::<serde_json::Map<String, Value>>(
+            r#"{"p":18446744073709551617,"q":18446744073709551616,"m":-18446744073709551617,"u":18446744073709551615,"f":18446744073709551616.0}"#,
+        )
+        .unwrap();
+        let mut failures = Vec::new();
+        for (source, want) in [
+            (
+                "{{ p }}|{{ m }}|{{ [p, m] }}",
+                "18446744073709551617|-18446744073709551617|[18446744073709551617, -18446744073709551617]",
+            ),
+            (
+                "{{ -p }}|{{ -m }}|{{ -u }}",
+                "-18446744073709551617|18446744073709551617|-18446744073709551615",
+            ),
+            ("{{ p == q }}|{{ p > q }}|{{ m < -q }}", "False|True|True"),
+            (
+                "{{ p == f }}|{{ p > f }}|{{ q == f }}|{{ f < p }}",
+                "False|True|True|True",
+            ),
+            ("{{ [p] == [q] }}|{{ p in [q] }}", "False|False"),
+            ("{{ p and 1 }}|{{ m and 1 }}|{{ u and 1 }}", "1|1|1"),
+        ] {
+            let got = ChatTemplate::parse(source).unwrap().render(&vars);
+            if !got.as_deref().is_ok_and(|text| text == want) {
+                failures.push(format!("{source}: {got:?}, expected {want}"));
+            }
+        }
+        for source in [
+            "{{ p + 1 }}",
+            "{{ p - 1 }}",
+            "{{ p * 2 }}",
+            "{{ p // 2 }}",
+            "{{ p % 2 }}",
+        ] {
+            let got = ChatTemplate::parse(source).unwrap().render(&vars);
+            if !got
+                .as_ref()
+                .is_err_and(|e| e.0.contains("integer overflow"))
+            {
+                failures.push(format!("{source}: {got:?}, expected integer overflow"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     use super::fixture_templates::FIXTURE_TEMPLATES;

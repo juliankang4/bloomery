@@ -1022,9 +1022,9 @@ pub(crate) fn call_parts(spelling: Spelling, funs: &[Fun<'_>]) -> Result<Vec<Par
                     "{}{}\" string=\"{}\">",
                     t.param_open,
                     a.key,
-                    is_text(a.schema)
+                    is_text(&a.schema)
                 )));
-                parts.extend(value(a.schema, Style::Raw, &a.path)?);
+                parts.extend(value(&a.schema, Style::Raw, &a.path)?);
                 parts.push(Part::Text(format!("{}\n", t.param_close)));
             }
             parts.push(Part::Text(format!("{}\n{}", t.invoke_close, t.calls_close)));

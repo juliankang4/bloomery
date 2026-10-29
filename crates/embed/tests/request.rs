@@ -4,6 +4,25 @@ use embed::{Norm, encode_base64, mean, normalize};
 use serde_json::json;
 
 #[test]
+fn embedding_json_keeps_widened_f32_text() {
+    let pooled = vec![vec![0.8, -0.3]];
+    let want = "[0.800000011920929,-0.30000001192092896]";
+    let mut got = Vec::new();
+    for oai in [false, true] {
+        let b = json!({"input": "text", "embd_normalize": -1});
+        let request = Request::parse(b.as_object().unwrap(), "encoder", &[2], oai).unwrap();
+        let answer = request.answer(&pooled, 1).unwrap();
+        let vector = if oai {
+            &answer["data"][0]["embedding"]
+        } else {
+            &answer[0]["embedding"][0]
+        };
+        got.push(vector.to_string());
+    }
+    assert_eq!(got, [want, want], "native and OpenAI embeddings");
+}
+
+#[test]
 fn pooling_and_wire_bytes() {
     let rows = [1.0e10, 3.0, 1.0, -4.0, -1.0e10, 1.0];
     assert_eq!(mean(&rows, 2), [1.0 / 3.0, 0.0]);
@@ -17,7 +36,13 @@ fn pooling_and_wire_bytes() {
         let request = Request::parse(b.as_object().unwrap(), "encoder", &[3], true).unwrap();
         assert_eq!(
             request.answer(&pooled, 1).unwrap()["data"][0]["embedding"],
-            json!(normalize(&pooled[0], Norm::of(p).unwrap()).unwrap())
+            json!(
+                normalize(&pooled[0], Norm::of(p).unwrap())
+                    .unwrap()
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>()
+            )
         );
     }
 }
@@ -56,7 +81,7 @@ fn request_shapes_and_named_refusals() {
         assert_eq!(r.key, "content");
         assert_eq!(
             r.answer(&pooled, 1).unwrap(),
-            json!([{"embedding": [normalize(&pooled[0], Norm::default()).unwrap()], "index": 0}])
+            json!([{"embedding": [normalize(&pooled[0], Norm::default()).unwrap().into_iter().map(f64::from).collect::<Vec<_>>()], "index": 0}])
         );
     }
     for (field, value, message) in [

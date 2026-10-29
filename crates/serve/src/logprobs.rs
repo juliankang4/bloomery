@@ -349,7 +349,7 @@ fn piece(vocab: &dyn Tokenizer, id: u32) -> (String, Value) {
 /// A log-probability as JSON: the logarithm of 0 is the lowest f32, as
 /// llama-server writes it.
 fn logprob_json(lp: f32) -> Value {
-    json!(if lp.is_finite() { lp } else { f32::MIN })
+    json!(f64::from(if lp.is_finite() { lp } else { f32::MIN }))
 }
 
 /// The chat path's `logprobs` object around `entries`.

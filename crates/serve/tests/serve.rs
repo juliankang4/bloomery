@@ -432,7 +432,6 @@ fn hw_two_requests_share_the_slot() {
 fn hw_unsupported_fields_are_refused() {
     let addr = start(4096);
     let refused = [
-        ("response_format", json!({"type": "json_object"})),
         ("json_schema", json!({"type": "object"})),
         ("grammar", json!("root ::= \"a\"")),
         ("logprobs", json!(5)),
@@ -458,6 +457,8 @@ fn hw_unsupported_fields_are_refused() {
     }
     let neutral = [
         ("response_format", json!({"type": "text"})),
+        // PIN(2026-10-29): json_object has a grammar; its refusal case is retired.
+        ("response_format", json!({"type": "json_object"})),
         ("json_schema", Value::Null),
         ("grammar", json!("")),
         ("logprobs", json!(false)),
@@ -482,11 +483,11 @@ fn hw_unsupported_fields_are_refused() {
 /// Structured output on the mock: a `json_schema` answers a document of the
 /// schema on the chat path (whole and streamed) and on `/completion`, the same
 /// bytes each time because the request decodes greedily without a
-/// `temperature`; a draw, a penalty, `ignore_eos` and a think budget are
-/// refused by name.
+/// `temperature`; a draw and a penalty answer a document of the schema too;
+/// `ignore_eos` and a think budget are refused by name.
 #[test]
 #[ignore = "gate: just gate-serve"]
-fn hw_structured_output_is_served_greedily() {
+fn hw_structured_output_is_served() {
     let addr = start(4096);
     let schema = json!({"type": "object", "properties": {
         "id": {"type": "integer", "enum": [7, 8]}, "ok": {"type": "boolean"},
@@ -541,12 +542,20 @@ fn hw_structured_output_is_served_greedily() {
     );
     assert_eq!(c.status, 200, "{}", c.body);
     valid(c.json()["content"].as_str().expect("content"));
+    // PIN(2026-10-29): masked sampling replaces temperature and penalty refusals.
+    for extra in [
+        json!({"temperature": 0.7, "seed": 3}),
+        json!({"repeat_penalty": 1.3}),
+    ] {
+        let r = post(addr, "/v1/chat/completions", &chat(extra.clone()));
+        assert_eq!(r.status, 200, "{extra}: {}", r.body);
+        valid(
+            r.json()["choices"][0]["message"]["content"]
+                .as_str()
+                .expect("content"),
+        );
+    }
     for (extra, part) in [
-        (
-            json!({"temperature": 0.7}),
-            "temperature 0.7 is not supported",
-        ),
-        (json!({"repeat_penalty": 1.3}), "repeat_penalty"),
         (json!({"ignore_eos": true}), "ignore_eos is not supported"),
         (
             json!({"reasoning_budget": 4}),

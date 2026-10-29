@@ -245,7 +245,7 @@ impl ParamKinds {
 /// member, a string keyword (`pattern`, `minLength`, `maxLength`) or a string
 /// `format`. A `$ref` into the tool's `parameters` (`#/…`) is followed, each
 /// once per parameter; any other `$ref`, or one met again, is not a string.
-fn resolves_to_string(schema: &Value, root: &Value, seen: &mut Vec<String>) -> bool {
+pub(crate) fn resolves_to_string(schema: &Value, root: &Value, seen: &mut Vec<String>) -> bool {
     let Some(s) = schema.as_object() else {
         return false;
     };
@@ -706,7 +706,7 @@ pub(crate) fn call_parts(framing: Framing, funs: &[Fun<'_>]) -> Result<Vec<Part>
                     a.key,
                     framing.value_open()
                 )));
-                parts.extend(value(a.schema, Style::Raw, &a.path)?);
+                parts.extend(value(&a.schema, Style::Raw, &a.path)?);
                 parts.push(Part::Text(match framing {
                     Framing::Lines => PARAM_VALUE_CLOSE.to_owned(),
                     Framing::Compact => format!("{PARAM_CLOSE}\n"),
