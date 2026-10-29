@@ -3359,6 +3359,13 @@ mod gate {
             mtp,
         )?;
         let mut m = Body38::open_placed_mtp(file, &plan, inputs, 0, cfg().host, ub, &draft, mtp)?;
+        let token = *prompt.first().ok_or("the reset clause has no token")?;
+        m.reset()?;
+        m.reset()?;
+        let empty_room = m.body("draft reset room")?.store_room().0 == 0;
+        m.step(&[token])?;
+        m.reset()?;
+        let fresh_short = m.body("draft reset room")?.store_room().0;
         let vocab = u32::try_from(m.body("(kp-draft)")?.vocab())?;
         let ids: Vec<u32> = (0..p + prompt.len())
             .map(|i| Ok((prompt[i % prompt.len()] + u32::try_from(i / prompt.len())?) % vocab))
@@ -3383,6 +3390,15 @@ mod gate {
         let pre_walk = walk_at(&mut m, ids[p], p)?;
         m.body_parts("(kp-draft)")?.2.set_checkpoints(false);
         m.reset()?;
+        m.step(&[token])?;
+        m.reset()?;
+        let after_short = m.body("draft reset room")?.store_room().0;
+        let room_ok = empty_room && fresh_short > 0 && after_short == fresh_short;
+        println!(
+            "draft reset room: empty {empty_room}, fresh short {fresh_short} B, after a long \
+             drafted request and a short request {after_short} B {}",
+            verdict(room_ok)
+        );
         drop(m);
         let said = |a: &AtPoint, w: &Result<Vec<u32>, String>| {
             format!(
@@ -3416,7 +3432,7 @@ mod gate {
             pre_walk == roll_walk,
             verdict(pre_ok)
         );
-        Ok(roll_ok && pre_ok)
+        Ok(roll_ok && pre_ok && room_ok)
     }
 
     /// (x): a resume refused before any copy. A state of a load without the

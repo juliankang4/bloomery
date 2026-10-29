@@ -2,7 +2,9 @@
 //! every layer of one walk shares (they run in turn) for up to `rows` tokens
 //! — the decode step's one, an eager pass's up to [`PASS_ROWS`], a ubatch
 //! walk's up to its load-time size ([`Arena38::wide`]). Everything is
-//! allocated once at load. Buffers are token-major (`[rows][width]`)
+//! allocated once at load; a selecting store's addresses are reserved there
+//! and its rows backed as a sequence's positions reach them
+//! ([`Store38::fit`]). Buffers are token-major (`[rows][width]`)
 //! unless their comment names another layout; a unit of `m <= rows` tokens
 //! uses the first `m` rows.
 //!
@@ -23,11 +25,13 @@ use crate::hc_gated::HcScratch;
 use crate::linear::{self, LinearShape};
 use crate::ple;
 use crate::qsa::{self, QsaScratch};
+use crate::room::{Room, Roomed, Run};
 use crate::site::ByName;
 use crate::tensor::WindowMut;
 use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::hc_gated::Geometry;
 use runtime::stores;
+use std::sync::Arc;
 
 /// The most tokens an eager pass walks: the m-column kernels' width.
 pub(super) const PASS_ROWS: usize = 8;
@@ -82,16 +86,18 @@ pub(super) const VERIFY_ROWS: usize = LANES;
 /// lanes' stamps (`linear::delta`'s module doc), conv ring and carry, or a
 /// selecting attention layer's K/V planes, its raw indexer key ring
 /// (`[qsa::RING_ROWS][IDX_DIM]` f16, `crate::qsa`'s module doc) and its pooled
-/// keys (`[pools][IDX_DIM]` f16).
+/// keys (`[pools][IDX_DIM]` f16), the planes and the pooled keys each in a
+/// room whose pages are backed as far as the sequence's positions reach
+/// ([`Store38::fit`]).
 pub(super) enum Store38 {
     Rec {
         rec: RecStore,
         stamp: DeviceBuffer<u32>,
     },
     Qsa {
-        kv: KvPlanes,
+        kv: Roomed<KvPlanes>,
         ring: DeviceBuffer<u16>,
-        pooled: DeviceBuffer<u16>,
+        pooled: Roomed<DeviceBuffer<u16>>,
     },
 }
 
@@ -114,22 +120,78 @@ impl Store38 {
         Ok(())
     }
 
-    /// A zeroed selecting store of `ctx` positions over the planes `d` cuts,
-    /// its K/V planes in the load's cache format `kv` (the index keys f16).
-    pub(super) fn qsa(stream: &CudaStream, d: &Dims, kv: KvQ8) -> Result<Store38, GpuError> {
+    /// A selecting store of `ctx` positions over the planes `d` cuts, its
+    /// K/V planes in the load's cache format `kv` (the index keys f16), no
+    /// row backed until a fit reaches it, zeroed then on `stream`.
+    pub(super) fn qsa(stream: &Arc<CudaStream>, d: &Dims, kv: KvQ8) -> Result<Store38, GpuError> {
+        let pools = qsa::pools_for(d.ctx);
+        let run = Run {
+            at: 0,
+            row: geo::IDX_DIM * size_of::<u16>(),
+            per: geo::POOL,
+            rows: pools,
+        };
         Ok(Store38::Qsa {
-            kv: KvPlanes::new(stream, d, kv)?,
+            kv: KvPlanes::roomed(stream, (d.n_kv, d.ctx, d.head), kv)?,
             ring: DeviceBuffer::zeroed(stream, qsa::RING_ROWS * geo::IDX_DIM)?,
-            pooled: DeviceBuffer::zeroed(stream, qsa::pools_for(d.ctx) * geo::IDX_DIM)?,
+            pooled: Roomed::new(Arc::clone(stream), pools * geo::IDX_DIM, &[run], |[b]| b)?,
         })
     }
 
-    /// Device bytes.
+    /// Device bytes the store's layout takes: what the plan counts it at.
     pub(super) fn bytes(&self) -> usize {
         match self {
             Store38::Rec { rec, stamp } => rec.bytes() + stamp.num_bytes(),
             Store38::Qsa { kv, ring, pooled } => kv.bytes() + ring.num_bytes() + pooled.num_bytes(),
         }
+    }
+
+    /// Device bytes a selecting store's pages with memory of their own
+    /// hold; none for a delta store.
+    pub(super) fn mapped(&self) -> usize {
+        match self {
+            Store38::Rec { .. } => 0,
+            Store38::Qsa { kv, pooled, .. } => kv.mapped() + pooled.mapped(),
+        }
+    }
+
+    /// Device bytes a selecting store's pages hold once all are backed;
+    /// none for a delta store.
+    pub(super) fn whole(&self) -> usize {
+        match self {
+            Store38::Rec { .. } => 0,
+            Store38::Qsa { kv, pooled, .. } => kv.whole() + pooled.whole(),
+        }
+    }
+
+    /// A selecting store's rooms; none for a delta store, which holds no
+    /// rows by position.
+    fn rooms(&mut self) -> impl Iterator<Item = &mut Room> {
+        let qsa = match self {
+            Store38::Rec { .. } => None,
+            Store38::Qsa { kv, pooled, .. } => Some((kv, pooled)),
+        };
+        qsa.into_iter().flat_map(|(kv, pooled)| {
+            (kv.rooms_mut().iter_mut()).chain(pooled.rooms_mut().iter_mut())
+        })
+    }
+
+    /// A selecting store's rows of the first `positions` positions backed
+    /// ([`Room::fit`]). Never inside a capture.
+    pub(super) fn fit(&mut self, positions: usize) -> Result<(), GpuError> {
+        self.rooms().try_for_each(|r| r.fit(positions))
+    }
+
+    /// Every row of a selecting store backed: what a read or write of its
+    /// whole planes takes.
+    pub(super) fn fill(&mut self) -> Result<(), GpuError> {
+        self.fit(usize::MAX)
+    }
+
+    /// A sequence's end: the memory of a selecting store's pages past the
+    /// rows it reached given back ([`Room::settle`]).
+    pub(super) fn settle(&mut self) -> Result<(), GpuError> {
+        self.rooms().try_for_each(Room::settle)
     }
 }
 
@@ -617,6 +679,133 @@ mod tests {
     use crate::site::ByName;
     use crate::weights::Weights;
     use model::arch::models::shape::{MoeShape, rules};
+
+    /// Admission counts the actual rooms' whole capacities at a small,
+    /// non-pool-aligned context on every slot, and one shared spare page.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_room_admission_counts_every_slots_whole_pages() {
+        use super::{KvPlanes, KvQ8, Store38, dims};
+        use model::arch::models::{
+            Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, OutGate, PoolRule,
+            Residual, Rope, RopeMode, Selector,
+        };
+        use model::placement::{ModelTensors, RowTableSource, workstation::HostRead};
+        let gpu = crate::Gpu::new().expect("CUDA device 0");
+        let page = gpu.allocation_granularity().expect("the granularity") as u64;
+        let ctx = 17;
+        let stream = gpu.stream_handle();
+        let rope = Rope {
+            mode: RopeMode::NormTail,
+            dims: geo::HEAD as u32,
+            base: 1e7,
+            yarn: None,
+            factors: false,
+        };
+        let spec = ModelSpec {
+            arch: Arch::Qwen4Exp,
+            hidden: geo::HIDDEN as u32,
+            vocab: 2,
+            ctx_train: ctx as u32,
+            rms_eps: 1e-6,
+            layers: vec![LayerSpec {
+                mixer: Mixer::Gqa(Gqa {
+                    heads: geo::N_HEAD as u32,
+                    kv_heads: geo::N_KV as u32,
+                    head_dim: geo::HEAD as u32,
+                    value_dim: geo::HEAD as u32,
+                    rope,
+                    qk_norm: true,
+                    o_norm: false,
+                    out_gate: OutGate::Packed,
+                    select: Some(Selector::TokenPool {
+                        heads: 4,
+                        d: geo::IDX_DIM as u32,
+                        top_k: 2048,
+                        pool: geo::POOL as u32,
+                        rule: PoolRule::Mean { rope },
+                    }),
+                    window: None,
+                    sinks: false,
+                    value_scale: None,
+                }),
+                ffn: Ffn::Dense {
+                    ff: 1,
+                    act: Act::SwiGlu { limit: None },
+                },
+                residual: Residual::Plain,
+                extras: Vec::new(),
+            }],
+            mtp: Vec::new(),
+            hc: None,
+            engram: None,
+            encoder: None,
+            logit_epilogue: None,
+            chat: ChatSpec {
+                pre: String::new(),
+                template: None,
+                tools: None,
+                reasoning: None,
+            },
+        };
+        let mut inputs = model::arch::qwen35moe::place::PlanInputs {
+            kv: model::arch::qwen35moe::place::KvLayout::of_spec(&spec).expect("the layout"),
+            spec,
+            model: ModelTensors {
+                tensors: Vec::new(),
+                layers: 1,
+                experts: 0,
+                experts_used: 0,
+                bf16_words: |_| false,
+            },
+            room: (u64::MAX, HostRead::Given),
+            row_source: RowTableSource::Split,
+            arena: None,
+        };
+        let router = RouterDims::of(MoeShape {
+            rule: rules::SOFTMAX_NORM_GATED,
+            experts: geo::EXPERTS as u32,
+            top_k: geo::N_USED as u32,
+        })
+        .expect("Qwen3.8's router");
+        for kv in [KvQ8::F16, KvQ8::Q8] {
+            inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
+            for slots in [1, 16] {
+                let stores: Vec<_> = (0..slots)
+                    .map(|_| {
+                        Store38::qsa(&stream, &dims(router, ctx), kv).expect("a selecting store")
+                    })
+                    .collect();
+                for drafts in [false, true] {
+                    let draft: Vec<_> = (0..if drafts { slots } else { 0 })
+                        .map(|_| {
+                            KvPlanes::roomed(&stream, (geo::N_KV, ctx, geo::HEAD), kv)
+                                .expect("a draft store")
+                        })
+                        .collect();
+                    let raw = runtime::stores::selecting_rows_bytes(
+                        geo::N_KV,
+                        geo::HEAD,
+                        kv == KvQ8::Q8,
+                        geo::IDX_DIM,
+                        geo::POOL,
+                        ctx,
+                    ) * slots as u64
+                        + draft.iter().map(|s| s.bytes() as u64).sum::<u64>();
+                    let whole = stores.iter().map(Store38::whole).sum::<usize>()
+                        + draft.iter().map(|s| s.whole()).sum::<usize>();
+                    let padding = inputs
+                        .room_padding(ctx as u64, slots as u64, drafts, page)
+                        .expect("admitted padding");
+                    assert_eq!(
+                        raw + padding,
+                        whole as u64 + page,
+                        "{kv:?}, slots {slots}, drafts {drafts}"
+                    );
+                }
+            }
+        }
+    }
 
     /// A ubatch walk's arena holds each position the bytes the plan counts
     /// for it (`place::UBATCH_ARENA_TOKEN_BYTES`), no more and no fewer:

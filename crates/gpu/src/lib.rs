@@ -94,6 +94,7 @@ pub mod qsa;
 pub mod quant_sel;
 pub(crate) mod recur;
 pub(crate) mod ring_gemm;
+pub(crate) mod room;
 pub mod rope_neox;
 pub mod rope_norm;
 pub mod rope_table;
@@ -2358,6 +2359,24 @@ pub fn census() -> Result<Vec<::model::placement::workstation::DeviceInfo>, GpuE
     (0..n).map(device_info).collect()
 }
 
+/// The driver's minimum VMM allocation granularity on visible device
+/// `device`, read once per device without retaining a context or loading a
+/// kernel bundle. Both room buffers and their admission plans use it.
+pub fn allocation_granularity(device: usize) -> Result<usize, GpuError> {
+    static PAGES: Mutex<Vec<Option<usize>>> = Mutex::new(Vec::new());
+    let mut pages = PAGES.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(Some(page)) = pages.get(device) {
+        return Ok(*page);
+    }
+    let raw = cuda_core::Device::raw_device(device)?;
+    let page = cuda_core::vmm::allocation_granularity(raw)?;
+    if pages.len() <= device {
+        pages.resize(device + 1, None);
+    }
+    pages[device] = Some(page);
+    Ok(page)
+}
+
 /// The census row of the visible device at `ordinal` ([`census`]).
 pub(crate) fn device_info(
     ordinal: usize,
@@ -2945,7 +2964,7 @@ impl Gpu {
     /// The ordinal of the visible device a plan's card is, with every refusal
     /// of [`Gpu::open_card`] that names a card and none of its context or
     /// module load: what a load checks before it starts work beside the open.
-    pub(crate) fn resolve_card(
+    pub fn resolve_card(
         name: &str,
         device: Option<::model::placement::workstation::DeviceId>,
     ) -> Result<usize, GpuError> {
@@ -3038,9 +3057,7 @@ impl Gpu {
     /// physical backing is counted in.
     pub fn allocation_granularity(&self) -> Result<usize, GpuError> {
         self.ctx.bind_to_thread()?;
-        Ok(cuda_core::vmm::allocation_granularity(
-            self.ctx.cu_device(),
-        )?)
+        allocation_granularity(self.ctx.ordinal())
     }
 
     /// Q4_K gemv over expert slots selected on the device (the down shape).

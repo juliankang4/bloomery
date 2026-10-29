@@ -906,6 +906,12 @@ mod gate {
             experts,
         );
         machine.cards[0].free_bytes = Some(server_card_free(err_log)?);
+        let page = bloomery_gpu_gates::generate::stage_page(
+            bloomery_gpu_gates::generate::Place::Gate
+                .on(&bloomery_gpu::census()?)?
+                .card_specs()?[0],
+        )?;
+        inputs.reserve_room(&mut machine, (u64::try_from(CTX)?, 1, mtp), page)?;
         // Under the draft the plan carries it (its granules, its store, its
         // row map and its program's arena beside the target's card terms),
         // and `/props` files its bytes as the card's `draft` class.

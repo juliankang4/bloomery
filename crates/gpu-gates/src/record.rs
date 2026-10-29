@@ -974,6 +974,20 @@ pub static TIER_CENSUS: Kind = Kind {
     ],
 };
 
+/// A Qwen3.8 slot's stores by position on the card: the bytes their backed
+/// pages hold and the bytes the plan counts them at.
+pub static KV_ROOM: Kind = Kind {
+    name: "kv_room",
+    head: "kv room",
+    doc: "A slot's stores by position on the card when the bytes they hold moved since the slot's last line: the slot, its positions, the bytes its pages with memory of their own hold (the rows its sequence reached, by pages) and the bytes the plan counts the stores at.",
+    parts: &[
+        key("slot", U64, ""),
+        key("positions", U64, ""),
+        key("mapped_bytes", U64, "B"),
+        key("layout_bytes", U64, "B"),
+    ],
+};
+
 /// One result row of `probe_nvread`: an arm over a case of cold routed-expert
 /// runs, the batches' rate quantiles and what the run asked of the drive.
 pub static NVREAD: Kind = Kind {
@@ -3060,7 +3074,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
     ],
     groups::bind::SLOTS,
     groups::drafted::WIDTH,
-    &[&DRAFT_YIELD, &NVTIER, &TIER_CENSUS],
+    &[&DRAFT_YIELD, &NVTIER, &TIER_CENSUS, &KV_ROOM],
 ];
 
 /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: the

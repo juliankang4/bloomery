@@ -33,6 +33,7 @@ use crate::site::WideForms;
 use chain::arch::qwen3moe::router::ubatch_at;
 
 pub(super) use crate::recur::{RecStore, fresh_stamps, stamps_at};
+use crate::room::{Roomed, Run, Views};
 use crate::rope_neox::{
     NeoxArgs, NeoxQ8Args, NeoxRowsArgs, PartialNeoxArgs, PartialNeoxQ8Args, RopeNeoxKernels,
     q8_plane_lens,
@@ -44,6 +45,7 @@ use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
 use gguf::quant::f32_to_f16_bits;
 use model::quant::quantize_q8_0;
 use std::ops::Range;
+use std::sync::Arc;
 
 pub(super) use crate::rope_table::RopeRows;
 
@@ -362,6 +364,46 @@ impl KvPlanes {
             (KvPlanes::F16 { .. }, _) => Ok(()),
             (KvPlanes::Q8 { .. }, _) => Err(q8_unserved(what, flash, "scalar")),
         }
+    }
+
+    /// Planes of `n_kv` key heads, `ctx` rows and `head` values in the `kv`
+    /// format, each in a room: every head's `[ctx][·]` rows of a plane a run
+    /// (the f16 rows, or the q8_0 codes and scales [`q8_plane_lens`] counts), so
+    /// a fit backs the rows of the positions it reaches in every head of
+    /// every plane ([`Roomed::fit`]). Load-time only.
+    pub(super) fn roomed(
+        stream: &Arc<CudaStream>,
+        (n_kv, ctx, head): (usize, usize, usize),
+        kv: KvQ8,
+    ) -> Result<Roomed<KvPlanes>, GpuError> {
+        fn planes<T, const N: usize>(
+            stream: &Arc<CudaStream>,
+            (n_kv, ctx): (usize, usize),
+            row: usize,
+        ) -> Result<Roomed<[DeviceBuffer<T>; N]>, GpuError> {
+            let runs: Vec<Run> = (0..n_kv)
+                .map(|h| Run {
+                    at: h * ctx * row * size_of::<T>(),
+                    row: row * size_of::<T>(),
+                    per: 1,
+                    rows: ctx,
+                })
+                .collect();
+            Roomed::new(Arc::clone(stream), n_kv * ctx * row, &runs, |b| b)
+        }
+        Ok(match kv {
+            KvQ8::F16 => {
+                planes::<u16, 2>(stream, (n_kv, ctx), head)?.map(|[k, v]| KvPlanes::F16 { k, v })
+            }
+            KvQ8::Q8 => {
+                let (codes, scales) = q8_plane_lens(head, 1, 1);
+                Roomed::join(
+                    planes::<u32, 2>(stream, (n_kv, ctx), codes)?,
+                    planes::<u16, 2>(stream, (n_kv, ctx), scales)?,
+                    |[kq, vq], [kd, vd]| KvPlanes::Q8 { kq, kd, vq, vd },
+                )
+            }
+        })
     }
 
     /// The layer's planes of `d`'s shape in the `kv` format. Load-time only.
@@ -1436,6 +1478,23 @@ impl KvPlanes {
         match self {
             KvPlanes::F16 { k, v } => bytes(k) + bytes(v),
             KvPlanes::Q8 { kq, kd, vq, vd } => bytes(kq) + bytes(kd) + bytes(vq) + bytes(vd),
+        }
+    }
+}
+
+impl Views for KvPlanes {
+    fn dissolve(self) {
+        match self {
+            KvPlanes::F16 { k, v } => {
+                k.dissolve();
+                v.dissolve();
+            }
+            KvPlanes::Q8 { kq, kd, vq, vd } => {
+                kq.dissolve();
+                kd.dissolve();
+                vq.dissolve();
+                vd.dissolve();
+            }
         }
     }
 }

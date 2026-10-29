@@ -25,7 +25,7 @@ use bloomery_gpu::arch::qwen3moe::checkpoint_price38;
 use bloomery_gpu::arch::qwen3moe::swap38;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::generate::{Place, stage_page};
 use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
 use gguf::Split;
 use model::arch::models::Mixer;
@@ -143,6 +143,7 @@ fn choose(inputs: &PlanInputs, ctx: u64, seqs: Seqs) -> Result<Place, Outcome> {
             // unset.
             None,
             q38place::Residents {
+                page: stage_page(offer.card_specs()?[0])?,
                 seqs,
                 held: bloomery_gpu_gates::beside::Beside::default(),
             },
@@ -179,11 +180,8 @@ fn machine(
 ) -> Result<Machine, Outcome> {
     let (ctx, ub) = terms;
     let layers = inputs.spec.layers.len();
-    let mut machine = match place
-        .card_specs()
-        .map_err(|e| outcome_of(e.as_ref()))?
-        .as_slice()
-    {
+    let cards = place.card_specs().map_err(|e| outcome_of(e.as_ref()))?;
+    let mut machine = match cards.as_slice() {
         &[stage] => machine_for_experts(stage, layers, ub, Experts::Card),
         &[_, _] => q38place::machine_bp38(place, layers, ub, None, tier_batch(&inputs.spec, ub))
             .map_err(|e| outcome_of(e.as_ref()))?,
@@ -196,6 +194,12 @@ fn machine(
             )));
         }
     };
+    let page = stage_page(cards[0]).map_err(|e| outcome_of(e.as_ref()))?;
+    let slots = u64::try_from(seqs.slots).map_err(|e| Outcome::Red(e.to_string()))?;
+    let drafts = false;
+    inputs
+        .reserve_room(&mut machine, (ctx, slots, drafts), page)
+        .map_err(|e| outcome_of(&e))?;
     reserve_checkpoints(&mut machine, seqs, ctx).map_err(|e| outcome_of(e.as_ref()))?;
     Ok(machine)
 }

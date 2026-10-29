@@ -361,6 +361,69 @@ fn refuse_other_program(spec: &ModelSpec) -> Result<(), PlacementError> {
 }
 
 impl PlanInputs {
+    /// Bytes beyond the positional rows that room-backed stores can hold:
+    /// every buffer rounded independently on every resident slot, and the
+    /// device's one shared spare page. `page` is read when the stage card opens.
+    pub fn room_padding(
+        &self,
+        ctx: u64,
+        slots: u64,
+        drafts: bool,
+        page: u64,
+    ) -> Result<u64, PlacementError> {
+        assert!(page > 0, "the device allocation granularity is positive");
+        let padding = |n: u64| n.div_ceil(page).checked_mul(page)?.checked_sub(n);
+        let planes = |g: &models::Gqa| -> Option<u64> {
+            let values = u64::from(g.kv_heads)
+                .checked_mul(ctx)?
+                .checked_mul(u64::from(g.head_dim))?;
+            let one = if self.kv.is_q8() {
+                padding(values)?.checked_add(padding(values / 16)?)?
+            } else {
+                padding(values.checked_mul(2)?)?
+            };
+            one.checked_mul(2)
+        };
+        let count = || -> Option<u64> {
+            let mut extra = 0u64;
+            for layer in &self.spec.layers {
+                if let Mixer::Gqa(g) = &layer.mixer {
+                    extra = extra.checked_add(planes(g)?)?;
+                    if let Some(Selector::TokenPool { d, pool, .. }) = &g.select {
+                        let bytes = ctx
+                            .div_ceil(u64::from(*pool))
+                            .checked_mul(u64::from(*d))?
+                            .checked_mul(2)?;
+                        extra = extra.checked_add(padding(bytes)?)?;
+                    }
+                }
+            }
+            if drafts {
+                extra = extra.checked_add(planes(self.spec.gqa()?)?)?;
+            }
+            extra.checked_mul(slots)?.checked_add(page)
+        };
+        count().ok_or_else(|| PlacementError::CardBytesPastU64 {
+            card: "room-backed stores".to_owned(),
+        })
+    }
+
+    /// `machine`'s stage card with the page rounding of room-backed stores
+    /// ([`PlanInputs::room_padding`]) reserved: what every plan of a load
+    /// that backs its stores by room counts before admission.
+    pub fn reserve_room(
+        &self,
+        machine: &mut Machine,
+        (ctx, slots, drafts): (u64, u64, bool),
+        page: u64,
+    ) -> Result<(), PlacementError> {
+        let padding = self.room_padding(ctx, slots, drafts, page)?;
+        machine.cards[0]
+            .reserves
+            .push(("store page rounding".to_owned(), padding));
+        Ok(())
+    }
+
     /// `split`'s description and its tensors' roles, then the host's room
     /// ([`PlanInputs::describe`]), the first that fails being the error; then
     /// the file is refused if it has a feature the engine does not run
@@ -4052,6 +4115,101 @@ mod tests {
                 room: (u64::MAX, HostRead::Given),
                 row_source: placement::RowTableSource::Split,
                 arena: None,
+            }
+        }
+
+        /// Every positional buffer rounds independently on every resident
+        /// slot, including the draft's planes; the shared spare counts once.
+        /// The reserve is part of admission even with no expert stream.
+        #[test]
+        fn room_padding_counts_each_buffer_each_slot_and_one_spare() {
+            for q8 in [false, true] {
+                let mut inputs = inputs();
+                inputs.kv = inputs.kv.in_q8_if(q8);
+                for ctx in [16u64, 17, 4096, 16896] {
+                    let values = 2 * ctx * 256;
+                    let planes = if q8 {
+                        vec![values, values / 16, values, values / 16]
+                    } else {
+                        vec![2 * values; 2]
+                    };
+                    let pooled = ctx.div_ceil(4) * 128 * 2;
+                    for page in [65536u64, 2 << 20] {
+                        for slots in [1u64, 16] {
+                            for drafts in [false, true] {
+                                let mut buffers = planes.clone();
+                                buffers.push(pooled);
+                                if drafts {
+                                    buffers.extend(&planes);
+                                }
+                                let raw: u64 = buffers.iter().sum();
+                                let whole: u64 = buffers
+                                    .iter()
+                                    .map(|&n| {
+                                        if n.is_multiple_of(page) {
+                                            n
+                                        } else {
+                                            n + page - n % page
+                                        }
+                                    })
+                                    .sum();
+                                let padding = inputs
+                                    .room_padding(ctx, slots, drafts, page)
+                                    .expect("room padding");
+                                assert_eq!(
+                                    raw * slots + padding,
+                                    whole * slots + page,
+                                    "q8 {q8}, ctx {ctx}, page {page}, slots {slots}, drafts {drafts}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let mut inputs = inputs();
+            inputs.kv = inputs.kv.in_q8_if(true);
+            let (ctx, slots, page) = (16, 16, 2 << 20);
+            let drafts = false;
+            let padding = inputs
+                .room_padding(ctx, slots, drafts, page)
+                .expect("padding");
+            let mut machine = machine();
+            inputs
+                .reserve_room(&mut machine, (ctx, slots, drafts), page)
+                .expect("reserve");
+            let levers = PlanLevers::default();
+            let plan = inputs
+                .plan_with_slots(&machine, (ctx, 1), &levers, Experts::Host, slots as usize)
+                .expect("admitted plan");
+            assert_eq!(plan.cards[0].reserve_bytes, padding);
+            let budget = plan.cards[0].bytes();
+            drop(plan);
+            machine.cards[0].usable_bytes = budget - 1;
+            assert!(
+                inputs
+                    .plan_with_slots(&machine, (ctx, 1), &levers, Experts::Host, slots as usize)
+                    .is_err(),
+                "one byte below the whole load refuses admission"
+            );
+            machine.cards[0].usable_bytes = budget;
+            assert!(
+                inputs
+                    .plan_with_slots(&machine, (ctx, 1), &levers, Experts::Host, slots as usize)
+                    .is_ok(),
+                "the exact whole-load budget admits"
+            );
+            let drafts = true;
+            for (ctx, slots, page) in [
+                (u64::MAX, 1, 4096),
+                (16, u64::MAX, 2 << 20),
+                (16, 1, u64::MAX),
+            ] {
+                let e = inputs
+                    .room_padding(ctx, slots, drafts, page)
+                    .expect_err("overflow refuses");
+                assert!(
+                    matches!(e, PlacementError::CardBytesPastU64 { ref card } if card == "room-backed stores")
+                );
             }
         }
 

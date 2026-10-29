@@ -2172,7 +2172,8 @@ impl WideParts<'_> {
                 narrow(c, x, u, keep)
             }
             (Mixer38::Qsa(q), Store38::Qsa { kv, ring, pooled }) => {
-                let split = qsa(c, q, (kv, ring, pooled), (s, x), (u, keep), sink)?;
+                let planes = (&mut **kv, ring, &mut **pooled);
+                let split = qsa(c, q, planes, (s, x), (u, keep), sink)?;
                 u.split = Some(split);
                 Ok(())
             }

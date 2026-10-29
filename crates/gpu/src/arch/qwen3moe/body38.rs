@@ -1987,11 +1987,12 @@ impl Body38 {
         let d = dims(router_dims, ctx);
         // The plan's cache format is the one the stores take.
         let kv = KvQ8::of(inputs.kv.is_q8());
+        let handle = gpu.stream_handle();
         let stores = kinds
             .iter()
             .map(|k| match k {
                 Kind38::Gdn => Store38::rec(stream),
-                Kind38::Qsa => Store38::qsa(stream, &d, kv),
+                Kind38::Qsa => Store38::qsa(&handle, &d, kv),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (rec, sel) = store_rule_bytes(ctx, kv);
@@ -2542,6 +2543,31 @@ impl Body38 {
         self.stores.iter().map(Store38::bytes).sum::<usize>() + self.ple_ring.num_bytes()
     }
 
+    /// The live sequence's stores by position on the card, the selecting
+    /// stores' and the draft store's: the bytes their mapped pages hold
+    /// (the rows the sequence reached, by pages) and the bytes their layout
+    /// takes at the load's context, which the plan counts.
+    #[must_use]
+    pub fn store_room(&self) -> (usize, usize) {
+        let draft = self.mtp.as_ref().map_or((0, 0), Mtp38::store_room);
+        let (mapped, layout) = self
+            .stores
+            .iter()
+            .filter(|s| matches!(s, Store38::Qsa { .. }))
+            .fold(draft, |(m, l), s| (m + s.mapped(), l + s.bytes()));
+        (mapped, layout)
+    }
+
+    /// The device bytes the planned slots' stores by position may still
+    /// back as their sequences grow: every slot's pages at the load's
+    /// context, less the pages the live sequence already backs. A slot not
+    /// live is counted as backing none, so the count errs high.
+    fn store_growth(&self) -> usize {
+        let whole = self.mtp.as_ref().map_or(0, Mtp38::store_whole)
+            + self.stores.iter().map(Store38::whole).sum::<usize>();
+        (self.slots_planned * whole).saturating_sub(self.store_room().0)
+    }
+
     /// The host tier.
     #[must_use]
     pub fn hybrid(&self) -> &Hybrid<HostRun> {
@@ -2610,8 +2636,10 @@ impl Body38 {
             } else {
                 XSTREAM_COSTS_UNFITTED
             };
-            // The plan reserves no ring: it takes what the card's margin leaves past the keep-free.
-            let cfg = XCfg::new(costs, geo::EXPERTS, geo::N_USED, DEADLINE, None);
+            // The plan reserves no ring: it takes what the card's margin leaves past the keep-free
+            // and the pages the slots' stores may still back.
+            let mut cfg = XCfg::new(costs, geo::EXPERTS, geo::N_USED, DEADLINE, None);
+            cfg.keep_free += self.store_growth() as u64;
             let half = self
                 .hybrid
                 .xstream_start(
@@ -2787,9 +2815,13 @@ impl Body38 {
 
     /// Every layer's store and the PLE ring, read back: what a run leaves
     /// behind, for a gate to compare bit for bit — a delta store's state as
-    /// the committed lane holds it. Blocking.
-    pub fn stores_host(&self, gpu: &Gpu) -> Result<(Vec<Store38Host>, Vec<f32>), GpuError> {
+    /// the committed lane holds it, a selecting store's whole planes (every
+    /// row backed first, [`Store38::fill`]). Blocking.
+    pub fn stores_host(&mut self, gpu: &Gpu) -> Result<(Vec<Store38Host>, Vec<f32>), GpuError> {
         let stream = gpu.stream();
+        for s in &mut self.stores {
+            s.fill()?;
+        }
         let stores = self
             .stores
             .iter()
@@ -2814,7 +2846,7 @@ impl Body38 {
                             halves.extend(scales.to_host_vec(stream)?);
                             Ok::<_, GpuError>(halves)
                         };
-                        let (k, v) = match kv {
+                        let (k, v) = match &**kv {
                             KvPlanes::F16 { k, v } => {
                                 (k.to_host_vec(stream)?, v.to_host_vec(stream)?)
                             }
@@ -2843,8 +2875,9 @@ impl Body38 {
         let fill = |buf: &mut DeviceBuffer<u16>| buf.copy_from_host(stream, &vec![bits; buf.len()]);
         let word = u32::from(bits) * 0x1_0001;
         for s in &mut self.stores {
+            s.fill()?;
             if let Store38::Qsa { kv, ring, pooled } = s {
-                match kv {
+                match &mut **kv {
                     KvPlanes::F16 { k, v } => {
                         fill(k)?;
                         fill(v)?;
@@ -2872,6 +2905,7 @@ impl Body38 {
         let stream = gpu.stream();
         for s in &mut self.stores {
             if let Store38::Qsa { pooled, .. } = s {
+                pooled.fill()?;
                 let mut rows = pooled.to_host_vec(stream)?;
                 let at = (from * crate::qsa::DIM).min(rows.len());
                 rows[at..].fill(bits);
@@ -3438,6 +3472,9 @@ impl Body38 {
         // The draft's side reads the arenas, none of the stores lent below,
         // and `Copied`'s drop holds its borrow to the end.
         let draft = self.draft_rows(stream, pos)?;
+        if let Some(d) = self.mtp.as_mut() {
+            d.fit_store(pos as usize)?;
+        }
         let mut c = Copied::of(
             &mut self.stores,
             &mut self.ple_ring,
@@ -3714,6 +3751,14 @@ impl Body38 {
             None => {}
         }
         let lane = self.lane.lane();
+        // The put-back writes the rows of the prefix it keeps alone.
+        let kept = s.keep_point(ask) as usize;
+        for st in &mut self.stores {
+            st.fit(kept)?;
+        }
+        if let Some(d) = self.mtp.as_mut() {
+            d.fit_store(kept)?;
+        }
         let (at, cur, pts) = {
             let mut c = Copied::of(
                 &mut self.stores,
@@ -3782,7 +3827,10 @@ impl Body38 {
     }
 
     /// Stage a call of `rows` from `pos` whose PLE rows `fill` returned the
-    /// history past: [`Body38::launch`] takes it.
+    /// history past: [`Body38::launch`] takes it. The stores' rows through
+    /// the call's last position are backed first ([`Store38::fit`]), so every
+    /// call that writes a row, a long reply's steps and a verify's rows
+    /// among them, finds its pages mapped.
     fn stage(
         &mut self,
         pos: u32,
@@ -3790,6 +3838,9 @@ impl Body38 {
         hist: History,
         verify: Option<Vec<u32>>,
     ) -> Result<(), GpuError> {
+        for s in &mut self.stores {
+            s.fit(pos as usize + rows)?;
+        }
         self.staged = Some(Staged38 {
             pos,
             rows: launch_u32(WHAT, "positions", rows)?,
@@ -5519,7 +5570,9 @@ impl ChainBody for Body38 {
     /// host tier's reset. The K/V planes, the
     /// raw key rings and the pooled keys need nothing: nothing reads a row at
     /// or past a live count, and every row below it is written by its own
-    /// step first.
+    /// step first; the pages of the planes and the pooled keys past the rows
+    /// the ended sequence reached give their memory back, as do the draft
+    /// store's ([`Store38::settle`]).
     /// Synchronizes: the engine stream waited for within
     /// [`crate::host::ENGINE_BOUND`] before zeroing the stores and at
     /// the end ([`crate::host::await_done`]).
@@ -5533,6 +5586,7 @@ impl ChainBody for Body38 {
                 rec.clear(stream)?;
             }
             s.restamp(stream)?;
+            s.settle()?;
         }
         self.lane.set(stream, 0)?;
         self.pending = None;
@@ -5545,6 +5599,7 @@ impl ChainBody for Body38 {
         self.point_rows.clear();
         if let Some(d) = self.mtp.as_mut() {
             d.forget();
+            d.settle()?;
         }
         if let Some(rope) = self.seq_rope.as_mut() {
             rope.restore(stream, MropeSeq::new())?;
@@ -5637,6 +5692,7 @@ impl Slots for Body38 {
             ));
         }
         let stream = gpu.stream();
+        let handle = gpu.stream_handle();
         let d = dims(self.s.route.dims(), self.ctx);
         // The load's one cache format, read back from the live planes.
         let kv = self.kv_format();
@@ -5645,7 +5701,7 @@ impl Slots for Body38 {
             .into_iter()
             .map(|k| match k {
                 LayerKind38::Gdn => Store38::rec(stream),
-                LayerKind38::Qsa => Store38::qsa(stream, &d, kv),
+                LayerKind38::Qsa => Store38::qsa(&handle, &d, kv),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let ckpt = Checkpoints::sequence(
@@ -5667,7 +5723,7 @@ impl Slots for Body38 {
         );
         let draft = match self.mtp.as_ref() {
             None => None,
-            Some(d) => Some(d.new_seq(stream)?),
+            Some(d) => Some(d.new_seq(&handle)?),
         };
         let rope = self
             .rope_base
@@ -6104,7 +6160,7 @@ impl<'a> Copied<'a> {
                         let d = geo::IDX_DIM;
                         c.spans.extend(kv.spans((geo::N_KV, ctx, geo::HEAD), n)?);
                         c.spans
-                            .push(Spans::by_pool(pooled, 1, 0, n, (geo::POOL, d))?);
+                            .push(Spans::by_pool(&mut **pooled, 1, 0, n, (geo::POOL, d))?);
                     }
                 }
             }
