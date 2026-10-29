@@ -358,8 +358,8 @@ pub(crate) fn call_parts(funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
         for a in &f.args {
             parts.push(Part::Text(format!("{PARAM_OPEN}{key}\">", key = a.key)));
             parts.extend(value(
-                a.schema,
-                if is_text(a.schema) {
+                &a.schema,
+                if is_text(&a.schema) {
                     Style::Raw
                 } else {
                     Style::JsonInMarkup

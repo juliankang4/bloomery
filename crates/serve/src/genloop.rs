@@ -40,16 +40,16 @@
 //! it is read and one where a token's text goes out.
 //!
 //! A request that follows a program ([`GenParams::constraint`]) takes one
-//! [`Engine::next`] a token, greedy: each token is the program's pick from the
-//! row ([`crate::constrain::Walk`]) — a forced id as it stands, otherwise the
-//! largest logit among the ids the program allows there — and once the program
-//! is spent the vocabulary's stop ids are the only ones left. The request's
-//! `logit_bias` is added to the row before the pick and the program's mask
-//! comes after it, so a bias reorders the allowed ids and never lets in
-//! another one; an id the program fixes takes no bias. The row is read
-//! only where the pick needs it: a token the program fixes (a forced id, the
-//! only child of a choice's node) asks the engine for none unless the request
-//! wants probabilities. A pick the program cannot make ends the request with a
+//! [`Engine::next`] a token: each token is the program's pick from the row
+//! ([`crate::constrain::Walk`]) — a forced id as it stands, otherwise the
+//! largest logit among the ids the program allows there, or for a request that
+//! samples or penalizes its sampler's draw with every other id masked out —
+//! and once the program is spent the vocabulary's stop ids are the only ones
+//! left. The request's `logit_bias` is added before the mask, so it reorders
+//! allowed ids and lets in no other; a fixed id takes no bias. The row is
+//! read only where the pick needs it: a token the program
+//! fixes (a forced id, the only child of a choice's node) asks the engine for
+//! none unless the request wants probabilities. A pick the program cannot make ends the request with a
 //! named error ([`GenError::Constrained`]).
 //!
 //! That is the step arm. The jump arm (on by default, [`Slot::schema_jump`])
@@ -70,9 +70,10 @@
 //! whose stops lack it feeds its closing text as a run and picks its stop
 //! from the row). The answer is the step arm's but for that stop id, and the
 //! prompt cache holds the answer up to its last decision. A request that
-//! asks for probabilities reads every row, so it takes the step arm. A run
-//! shorter than [`MIN_FILL`] ids is stepped: a call of one id is no cheaper
-//! than the step it replaces.
+//! asks for probabilities reads every row, and a penalized one counts the
+//! fixed ids in its history before each draw, so each takes the step arm.
+//! A run shorter than [`MIN_FILL`] ids is stepped: a call of one id is no
+//! cheaper than the step it replaces.
 //!
 //! A request runs as a [`Gen`], one engine call at a time, so the engine
 //! thread can make one call of several slots' steps: each running request's
@@ -95,7 +96,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use crate::api::logprobs::{Ask, Collector, RowError};
-use crate::constrain::{Constraint, StepError, Walk};
+use crate::constrain::{Constraint, Draw, StepError, Walk};
 use crate::engine::{
     CacheNote, Decoder, Drafted, Engine, EngineError, Landed, Pending, Sampler, SamplerFactory,
     SamplerRefused, SamplingParams, SaveInFlight, Saved, SlotDraw, SlotPass, SlotRow, StateError,
@@ -141,8 +142,9 @@ pub(crate) struct GenParams {
     /// set it.
     pub logprobs: Option<Ask>,
     /// The program the output follows (structured output), `None` for free
-    /// text. Its request decodes greedily: every token is the largest logit
-    /// among the ids the program allows.
+    /// text. Every token is the request's pick among the ids the program
+    /// allows: the largest logit when it decodes greedily, else its sampler's
+    /// draw from the row with every other id masked out.
     pub constraint: Option<Constraint>,
     /// OpenAI's `logit_bias`: each id's addition to its logit before every
     /// pick, by id, none zero; empty changes nothing.
@@ -1796,11 +1798,14 @@ pub(crate) struct Gen {
     probs: Option<Collector>,
     /// The request's position in its program, `None` for free text.
     walk: Option<Walk>,
+    /// The row a sampled request's walk draws from, the ids its program does
+    /// not allow masked ([`Draw::Sampled`]), kept for its capacity.
+    masked: Vec<f32>,
     /// The program's refusal of a step, which the next [`Gen::pump`] returns.
     refused: Option<StepError>,
     /// Whether the request takes the jump arm: it follows a program, asks for
-    /// no probabilities and has no think budget, and the server has the arm
-    /// on.
+    /// no probabilities, has no think budget and no penalty, and the server
+    /// has the arm on.
     jump: bool,
     /// The run being fed, `None` between runs.
     span: Option<Span>,
@@ -1909,13 +1914,16 @@ impl Gen {
                 .constraint
                 .as_ref()
                 .map(|c| Walk::new(c, p.think_entry == ThinkEntry::Open)),
+            masked: Vec::new(),
             refused: None,
             // A think budget's forced close would compete with a run for the
-            // ids after it, so a request with one steps.
+            // ids after it, and a penalized draw reads the ids a run feeds
+            // after it, so a request with either steps.
             jump: slot.jump
                 && p.constraint.is_some()
                 && p.logprobs.is_none()
-                && p.reasoning_budget.is_none(),
+                && p.reasoning_budget.is_none()
+                && !p.sampling.penalizes(),
             span: None,
             lead: Vec::new(),
             end,
@@ -1964,7 +1972,17 @@ impl Gen {
                 self.bias.apply(&self.logits, false, &mut self.biased_row);
                 &self.biased_row
             };
-            let picked = walk.choose(row);
+            let picked = match self.sampler.as_mut() {
+                Some(sampler) => walk.choose_by(
+                    row,
+                    &mut Draw::Sampled {
+                        sampler,
+                        history: &self.history,
+                        masked: &mut self.masked,
+                    },
+                ),
+                None => walk.choose(row),
+            };
             let picks = walk.picks();
             if let Some(j) = self.tim.jump.as_mut() {
                 j.decisions = picks.decisions;

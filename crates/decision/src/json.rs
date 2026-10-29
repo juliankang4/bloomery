@@ -8,8 +8,8 @@
 //! the f64 range (Python reads it as `inf`), and an escaped lone surrogate (a Rust string cannot hold
 //! one).
 //!
-//! The reader is ours rather than serde_json's because exact integers would need serde_json's
-//! `arbitrary_precision`, a feature that cargo unifies into every crate built beside this one.
+//! This reader owns Python's integer/float distinction, key order and named refusals independently
+//! of the serde_json features cargo unifies into crates built beside this one.
 
 use std::collections::HashMap;
 

@@ -333,7 +333,8 @@ A request field is read, refused or ignored:
 
 Unset, a generation samples at llama-server's defaults: `temperature` 0.8, `top_k` 40, `top_p` 0.95, `min_p` 0.05,
 `repeat_penalty` 1, `repeat_last_n` 64, no token limit but the context (`n_predict` -1) and `cache_prompt` true. A
-structured-output request decodes greedily, so its `temperature` defaults to 0 (Limits, below).
+structured-output request's `temperature` defaults to 0, so it decodes greedily unless it asks to sample (Limits,
+below).
 
 ## Placement
 
@@ -795,34 +796,47 @@ and the model fits) states no need and consults no hook; a set hook is named on 
   which move a probability by under 3e-4 against the release's bf16 head on the eight reference requests).
 - V4.1 decode is bound by host memory bandwidth in each step's expert part, and by the card's own serial work
   before it; a long V4.1 prompt (P = 4096) is bound by the card, since the prompt call streams host experts in.
-- Structured output is served for `response_format` of type `json_schema` and for `tool_choice` `"required"` or a named
-  function (Anthropic `any` and `tool`, Responses `text.format` `json_schema`), on every generative seat: an object
-  (every property written, in the schema's order), string, integer and boolean enums, `const`, booleans, and free
-  strings with an optional `maxLength`. The request decodes greedily (the largest logit among the ids the schema
-  allows), so `temperature` defaults to 0.
+- Structured output is served for `response_format` of type `json_schema` or `json_object` and for `tool_choice`
+  `"required"` or a named function (Anthropic `any` and `tool`, Responses `text.format` `json_schema` or
+  `json_object`), on every generative seat. The schema subset is an object (every property written, in the schema's
+  order), an array of `items`, `anyOf`, a `$ref` into the schema itself (`#/$defs/...`, written out where it stands;
+  a recursive one, or one that writes out deeper than the 128 nested JSON levels the request parser reads, is
+  refused), string, integer and boolean enums, `const`, booleans, `null`, integers, numbers, and free strings with an optional
+  `maxLength`. `json_object` is any JSON object with at least one member (an empty object or array is served only
+  nested). The JSON is compact with one space after `:` and `,`, and a free string takes no escape. `temperature` defaults to 0, and the request then decodes greedily (the largest logit among
+  the ids the schema allows). A positive `temperature` or a penalty draws with the request's sampler from the row with
+  every id the schema does not allow masked out, so `top_k`, `top_p`, `min_p` and `seed` apply as on free text.
+  Arrays, numbers and `json_object` have no length bound; reaching the token or context limit can leave incomplete JSON with a `length` finish reason.
 - Two arms follow the schema. The step arm is one `next` an id. The jump arm is the default: the fixed text that opens
   the answer rides the prompt's call, and each later run of ids the schema fixes (forced text, the rest of a chosen
   option) is fed as one call that also steps its last id, so the next decision is read from that call's row. Free
-  strings step token by token on both arms. Both arms pick the largest allowed logit at every decision, ties to the
-  lowest id, so a run of fixed ids costs the engine one call instead of one step each. Nothing is fed after the last
-  decision: the closing text and the stop are written with no call, the stop being the vocabulary's end of sequence,
-  and the prompt cache holds the answer up to its last decision. The step arm picks its stop from a row, so the two
-  arms' token lists can differ in that last id alone; the text and the finish reason are the same. A run under two ids
-  is stepped, and a request that asks for `logprobs` takes the step arm. `BLOOMERY_SCHEMAJUMP=off` is the way back to
-  the step arm until the jump arm's gain is measured on each seat. A prompt call can round a row differently from the
-  steps it replaces (a Qwen3.8 tier load runs a prompt call on the batch path; the Qwen3 seats' prompt call of more
-  than eight ids runs the wide walk), so a decision inside a rounding of a tie can differ between the arms. A request's
-  `timings.constrained` counts its arm's work after the prompt: `spans` and `span_ids` (the runs fed and their ids),
-  `decisions`, `free_steps`, `next_calls`, `prefill_calls`, `next_after_calls` (the calls that fed a run and stepped
-  it), `lead` (the ids the prompt's call carried) and `tail` (the ids taken after the last decision with no call). With
-  `--parallel`, a run, and a prompt call with its lead, are calls the engine thread makes one quantum of ids a round
-  beside other busy slots, never inside a step.
-- Refused by name: any other schema keyword (`$ref`, `anyOf`, `items`, `pattern`, `minLength`, `minProperties`, an
-  `integer` with no enum; a forced tool's `parameters` are read whole by the same rules, so a root `anyOf`, a `$ref` or a
-  `required` name no property has is a 400), `json_object`, a top-level `json_schema`, `grammar`, a schema beside a
-  forced call, `temperature` above 0, the penalties, `ignore_eos` and `reasoning_budget`. An enum whose options tokenise
-  so that one is a prefix of another (`[1, 10]` on a vocabulary that splits digits) is a 400, and so is a constant, enum
-  option or property name whose text tokenises to a stop id.
+  strings step token by token on both arms. Both arms pick the largest allowed logit at every decision of a greedy
+  request, ties to the lowest id, and draw with the request's sampler otherwise; either way a run of fixed ids costs the
+  engine one call instead of one step each. Nothing is fed after the last decision: the closing text and the stop are
+  written with no call, the stop being the vocabulary's end of sequence, and the prompt cache holds the answer up to its
+  last decision. The step arm picks its stop from a row, so the two arms' token lists can differ in that last id alone;
+  the text and the finish reason are the same. A run under two ids is stepped, and a request that asks for `logprobs`
+  or sets a penalty takes the step arm, so its penalties count every fixed id before a draw. Where options of an
+  `anyOf`, an array's close and its next item, or a JSON value's kinds begin with the same ids, the arms follow them
+  side by side, and an id is fixed only when every one of them fixes it.
+  `BLOOMERY_SCHEMAJUMP=off` is the way back to the step arm until the jump arm's gain is measured on each seat. A prompt
+  call can round a row differently from the steps it replaces (a Qwen3.8 tier load runs a prompt call on the batch path;
+  the Qwen3 seats' prompt call of more than eight ids runs the wide walk), so a decision inside a rounding of a tie can
+  differ between the arms. A request's `timings.constrained` counts its arm's work after the prompt: `spans` and
+  `span_ids` (the runs fed and their ids), `decisions`, `free_steps`, `next_calls`, `prefill_calls`, `next_after_calls`
+  (the calls that fed a run and stepped it), `lead` (the ids the prompt's call carried) and `tail` (the ids taken after
+  the last decision with no call). With `--parallel`, a run, and a prompt call with its lead, are calls the engine
+  thread makes one quantum of ids a round beside other busy slots, never inside a step.
+- Refused by name: any other schema keyword (`oneOf`, `allOf`, `pattern`, `minLength`, `minItems`, `minimum`,
+  `minProperties`, a list of types, ...), a `$ref` that points outside the schema or is met again inside the schema it
+  points to (a recursive schema), a schema that writes out to more than 4,096 schemas, a schema or a request's tools
+  together that write out past 64 MiB (the request body's limit, paths included), a program that tokenises more than
+  16 MiB of fixed text (an `anyOf` tokenises the text on each side of it once per option), a forced tool's
+  `parameters` with a root `anyOf` or `$ref` (they are read whole by the same rules, so a `required` name no property
+  has is a 400 too), an `anyOf` with a text option in a tool argument that a Qwen, GLM, Solar or DSML markup writes
+  raw, a top-level `json_schema`, `grammar`, a JSON `response_format` beside a forced call, `ignore_eos` and `reasoning_budget`. An enum
+  whose options tokenise so that one is a prefix of another (`[1, 10]` on a vocabulary that splits digits) is a 400, and
+  so is a constant, enum option or property name whose text tokenises to a stop id.
 - A `<` never reaches a tool call's markup as data. A free JSON string inside a tool call (Hermes' arguments, or an
   object that a Qwen, GLM or DSML parameter holds) takes no token with a `<`, and so does one in a `response_format` reply that comes with
   tools (`tool_choice` other than `none`), since the reply is scanned for a call. A free string in a `response_format`

@@ -1,11 +1,14 @@
 //! The segment program and the walk over it.
 //!
 //! A program is text first ([`Part`]): forced text, a choice among option
-//! texts, a free string. [`compile`] turns it into ids ([`Program`]) with the
-//! serve [`Tokenizer`], each forced text and each option canonically on its own
-//! (a string's opening quote belongs to the text before it, its closing quote
-//! to the text after). A [`Walk`] then answers, at each token, which ids the
-//! program allows and takes the masked argmax over them.
+//! texts, a free string, a JSON number, a fork among part lists, a JSON array
+//! or object of repeated items, and a rule of the program's grammar.
+//! [`compile`] turns it into ids ([`Program`]) with the serve [`Tokenizer`],
+//! each forced text and each option canonically on its own (a string's opening
+//! quote belongs to the text before it, its closing quote to the text after).
+//! A [`Walk`] then answers, at each token, which ids the program allows and
+//! picks among them: the largest logit, or the request's sampler over the row
+//! with every other id masked out ([`Draw`]).
 //!
 //! - `Forced(ids)`: one allowed id at a time.
 //! - A choice is a trie of its options' ids. The options must be prefix-free
@@ -16,25 +19,34 @@
 //!   every other choice returns to the parts after it.
 //! - A free string takes any token of its class ([`Class`]) while it fits the
 //!   length limit, and ends on a token whose text is a non-empty prefix of the
-//!   forced text after it: a token `",` ends a string and takes the `,` that
-//!   follows. The rest of that text is tokenised canonically from where the
-//!   end token stopped.
+//!   forced text that can follow it: a token `",` ends a string and takes the
+//!   `,` after it. The rest of that text is tokenised canonically from where
+//!   the end token stopped. A number takes the tokens of a JSON number's
+//!   characters while they still spell the front of one, and ends the same
+//!   way once they spell a whole one.
+//! - A fork ([`Part::Any`], [`Part::List`]) takes the text on each side of it
+//!   into each of its options, so every option is tokenised whole. The walk
+//!   then follows every option whose ids the tokens taken so far match (its
+//!   heads), and a fork's options that begin alike share their ids until they
+//!   part. An array or object repeats its item after `, ` until it takes its
+//!   closing text.
 //! - Once the program is spent the only allowed ids are the vocabulary's
 //!   stops. A stop id inside the program would end the generation with the
 //!   program unspent, so [`compile`] refuses any text that tokenises to one
 //!   and the walk refuses to take one before the program is spent.
 //!
-//! The pick at every decision is the largest logit among the allowed ids, ties
-//! to the lowest id ([`sampling::argmax_in`]): the engine's argmax rule over
-//! the allowed set. The walk reads no row at a forced id, nor at the only
-//! child of a choice's node ([`Walk::fixed_next`]).
+//! A greedy pick is the largest logit among the allowed ids, ties to the lowest
+//! id ([`sampling::argmax_in`]): the engine's argmax rule over the allowed set.
+//! The walk reads no row at an id every head fixes alike: a forced id, or the
+//! only child of a choice's node ([`Walk::fixed_next`]).
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 
 use super::Refusal;
 use super::vocab::{Class, Vocab};
 use crate::api::relock;
-use crate::engine::Tokenizer;
+use crate::engine::{Sampler, Tokenizer};
 use crate::sampling;
 
 /// How a free string is quoted.
@@ -60,8 +72,8 @@ impl Style {
         matches!(self, Style::Json | Style::JsonInMarkup)
     }
 
-    /// The style of a JSON string inside an object written in this style: a
-    /// raw value is markup's, so the strings in an object it holds are in
+    /// The style of a JSON string inside an object or array written in this
+    /// style: a raw value is markup's, so the strings in one it holds are in
     /// markup.
     pub(crate) fn nested(self) -> Style {
         match self {
@@ -81,6 +93,18 @@ pub(crate) enum Part {
     /// A free string of at most `max` characters; the forced text after it
     /// ends it.
     Free { max: Option<usize>, style: Style },
+    /// A JSON number, an integer alone when `integer`; the forced text after
+    /// it ends it.
+    Num { integer: bool },
+    /// One of several part lists, each followed by the parts after this one.
+    Any(Vec<Vec<Part>>),
+    /// A JSON array: no item or `item` again and again apart by `, `.
+    List { item: Vec<Part> },
+    /// The rule of the program's grammar at this index ([`json_object`]).
+    Rule(usize),
+    /// After an item of a grammar's array or object: `close`, or `more` (the
+    /// next item) and back to this part.
+    Rep { close: Vec<Part>, more: Vec<Part> },
 }
 
 /// One option of a [`Part::Pick`].
@@ -101,9 +125,41 @@ pub(crate) struct Program {
 
 #[derive(Debug)]
 enum Step {
-    Forced(Vec<u32>),
+    Forced(Forced),
     Pick(Trie),
     Free(FreeStep),
+    Num {
+        integer: bool,
+    },
+    /// The walk goes on in each program, then after this step.
+    Fork(Vec<Arc<Program>>),
+    /// After an item: `close` and on past this step, or `more` (the next
+    /// item) and back to this step.
+    Rep {
+        close: Arc<Program>,
+        more: Arc<Program>,
+    },
+    /// The program, then the step after this one.
+    Sub(Arc<Program>),
+    /// The grammar's rule at this index, then the step after this one.
+    Rule(usize),
+}
+
+#[derive(Debug)]
+struct Forced {
+    ids: Vec<u32>,
+    text: String,
+    /// For each token-reachable character boundary inside the text, by byte
+    /// offset ascending, the ids after it. No end token reaches beyond the
+    /// longest vocabulary piece. Empty for a text no end token reaches.
+    rests: Vec<(usize, Vec<u32>)>,
+}
+
+impl Forced {
+    fn rest(&self, at: usize) -> Option<&[u32]> {
+        let p = self.rests.binary_search_by_key(&at, |r| r.0).ok()?;
+        Some(&self.rests[p].1)
+    }
 }
 
 #[derive(Debug)]
@@ -149,16 +205,50 @@ struct Node {
 struct FreeStep {
     class: Class,
     max: Option<usize>,
-    /// The ids that end the string, ascending, with the ids of the text each
-    /// leaves to be forced.
-    ends: Vec<(u32, Vec<u32>)>,
-    end_ids: Vec<u32>,
 }
 
-/// What [`compile`] tokenises with.
+impl FreeStep {
+    /// The characters a string of `chars` has left, `usize::MAX` with no
+    /// limit.
+    fn room(&self, chars: usize) -> usize {
+        self.max.map_or(usize::MAX, |m| m.saturating_sub(chars))
+    }
+}
+
+/// The bytes of text one request's program may tokenise. An `anyOf` repeats
+/// the text on each side of it in every option, and the text after a string
+/// or a number is tokenised again from each boundary an end token can reach,
+/// so this, not the request's size, bounds the compile's work and its ids.
+const COMPILE_BYTES: usize = 1 << 24;
+
+/// What [`compile`] tokenises with, and the bytes it has left to tokenise.
 pub(crate) struct Env<'a> {
     pub tok: &'a dyn Tokenizer,
     pub vocab: &'a Vocab,
+    bytes_left: Cell<usize>,
+}
+
+impl<'a> Env<'a> {
+    pub(crate) fn new(tok: &'a dyn Tokenizer, vocab: &'a Vocab) -> Self {
+        Self {
+            tok,
+            vocab,
+            bytes_left: Cell::new(COMPILE_BYTES),
+        }
+    }
+
+    /// The ids of `text`, its bytes charged to the compile's budget.
+    fn encode(&self, text: &str) -> Result<Vec<u32>, Refusal> {
+        let Some(left) = self.bytes_left.get().checked_sub(text.len()) else {
+            return Err(refuse(format!(
+                "the schema's fixed text is too long: its program tokenises more than \
+                 {COMPILE_BYTES} bytes (an anyOf repeats the text on each side of it in every \
+                 option)"
+            )));
+        };
+        self.bytes_left.set(left);
+        Ok(self.tok.encode(text))
+    }
 }
 
 fn refuse(message: String) -> Refusal {
@@ -192,37 +282,165 @@ fn merged(parts: &[Part]) -> Vec<Part> {
 
 /// `parts` as a program of ids.
 pub(crate) fn compile(parts: &[Part], env: &Env<'_>) -> Result<Program, Refusal> {
+    compile_in(parts, env, false)
+}
+
+/// `parts` as a program; `reached` says whether an end token can reach its
+/// first step (an option of a fork, or what follows a string or a number).
+fn compile_in(parts: &[Part], env: &Env<'_>, reached: bool) -> Result<Program, Refusal> {
     let parts = merged(parts);
     let mut steps = Vec::new();
+    let mut reach = reached;
+    let mut pre = String::new();
     let mut i = 0;
     while i < parts.len() {
-        match &parts[i] {
+        let part = &parts[i];
+        i += 1;
+        match part {
+            Part::Text(t) if matches!(parts.get(i), Some(Part::Any(_) | Part::List { .. })) => {
+                pre.clone_from(t);
+            }
             Part::Text(t) => {
-                let ids = env.tok.encode(t);
-                no_stop(&ids, t, env)?;
-                steps.push(Step::Forced(ids));
+                steps.push(Step::Forced(forced(t, reach, env)?));
+                reach = false;
             }
             Part::Pick(alts) => {
-                if alts.iter().any(|a| !a.then.is_empty()) && i + 1 != parts.len() {
+                if alts.iter().any(|a| !a.then.is_empty()) && i != parts.len() {
                     return Err(refuse(
                         "internal: a choice with continuations is not last in its list".to_owned(),
                     ));
                 }
                 steps.push(Step::Pick(trie(alts, env)?));
+                reach = false;
             }
             Part::Free { max, style } => {
-                let Some(Part::Text(tail)) = parts.get(i + 1) else {
-                    return Err(refuse(
-                        "internal: a free string is not followed by forced text".to_owned(),
-                    ));
+                steps.push(Step::Free(free_step(*max, *style, parts.get(i), env)?));
+                reach = true;
+            }
+            Part::Num { integer } => {
+                steps.push(Step::Num { integer: *integer });
+                reach = true;
+            }
+            Part::Rule(r) => {
+                steps.push(Step::Rule(*r));
+                reach = true;
+            }
+            Part::Rep { close, more } => {
+                steps.push(Step::Rep {
+                    close: Arc::new(compile_in(close, env, true)?),
+                    more: Arc::new(compile_in(more, env, true)?),
+                });
+                reach = true;
+            }
+            Part::Any(_) | Part::List { .. } => {
+                let post = match parts.get(i) {
+                    Some(Part::Text(t)) => {
+                        i += 1;
+                        t.as_str()
+                    }
+                    _ => "",
                 };
-                steps.push(Step::Free(free_step(*max, *style, tail, env)?));
-                i += 1;
+                steps.push(fork(part, &std::mem::take(&mut pre), post, env)?);
+                reach = true;
             }
         }
-        i += 1;
     }
     Ok(Program { steps })
+}
+
+/// A forced text's step; `reached` adds the rest after each character
+/// boundary an end token can reach inside it, bounded by the longest piece.
+fn forced(text: &str, reached: bool, env: &Env<'_>) -> Result<Forced, Refusal> {
+    let ids = env.encode(text)?;
+    no_stop(&ids, text, env)?;
+    let mut rests = Vec::new();
+    if reached {
+        let max_bytes = env.vocab.longest_piece();
+        for (at, _) in text
+            .char_indices()
+            .skip(1)
+            .take_while(|&(at, _)| at <= max_bytes)
+        {
+            let rest = env.encode(&text[at..])?;
+            no_stop(&rest, text, env)?;
+            rests.push((at, rest));
+        }
+    }
+    Ok(Forced {
+        ids,
+        text: text.to_owned(),
+        rests,
+    })
+}
+
+/// A program of one forced text that an end token can reach.
+fn text_program(text: &str, env: &Env<'_>) -> Result<Arc<Program>, Refusal> {
+    Ok(Arc::new(Program {
+        steps: vec![Step::Forced(forced(text, true, env)?)],
+    }))
+}
+
+/// A fork's step, with `pre` and `post`, the texts on each side of it, inside
+/// each option. A list's item is compiled once: its leading and trailing texts
+/// go into the texts around it (`[` and the lead, the trail and `, ` and the
+/// lead, the trail and `]`), so each of those is tokenised whole.
+fn fork(part: &Part, pre: &str, post: &str, env: &Env<'_>) -> Result<Step, Refusal> {
+    match part {
+        Part::Any(alts) => {
+            let progs = alts
+                .iter()
+                .map(|a| {
+                    let mut parts = vec![Part::Text(pre.to_owned())];
+                    parts.extend(a.iter().cloned());
+                    parts.push(Part::Text(post.to_owned()));
+                    compile_in(&parts, env, true).map(Arc::new)
+                })
+                .collect::<Result<_, Refusal>>()?;
+            Ok(Step::Fork(progs))
+        }
+        Part::List { item } => {
+            let mut body = merged(item);
+            let lead = match body.first() {
+                Some(Part::Text(t)) => {
+                    let t = t.clone();
+                    body.remove(0);
+                    t
+                }
+                _ => String::new(),
+            };
+            let trail = match body.last() {
+                Some(Part::Text(t)) => {
+                    let t = t.clone();
+                    body.pop();
+                    t
+                }
+                _ => String::new(),
+            };
+            let body = if body.is_empty() {
+                None
+            } else {
+                Some(Arc::new(compile_in(&body, env, true)?))
+            };
+            let item_after = |text: String| -> Result<Vec<Step>, Refusal> {
+                let mut steps = vec![Step::Forced(forced(&text, true, env)?)];
+                steps.extend(body.clone().map(Step::Sub));
+                Ok(steps)
+            };
+            let rep = Step::Rep {
+                close: text_program(&format!("{trail}]{post}"), env)?,
+                more: Arc::new(Program {
+                    steps: item_after(format!("{trail}, {lead}"))?,
+                }),
+            };
+            let mut first = item_after(format!("{pre}[{lead}"))?;
+            first.push(rep);
+            Ok(Step::Fork(vec![
+                text_program(&format!("{pre}[]{post}"), env)?,
+                Arc::new(Program { steps: first }),
+            ]))
+        }
+        _ => Err(refuse("internal: a fork of no options".to_owned())),
+    }
 }
 
 fn trie(alts: &[Alt], env: &Env<'_>) -> Result<Trie, Refusal> {
@@ -233,7 +451,7 @@ fn trie(alts: &[Alt], env: &Env<'_>) -> Result<Trie, Refusal> {
     let mut subs = Vec::with_capacity(alts.len());
     let mut seqs: Vec<Vec<u32>> = Vec::with_capacity(alts.len());
     for (k, alt) in alts.iter().enumerate() {
-        let ids = env.tok.encode(&alt.text);
+        let ids = env.encode(&alt.text)?;
         if ids.is_empty() {
             return Err(refuse(format!(
                 "the option {:?} tokenises to no token",
@@ -282,16 +500,23 @@ fn trie(alts: &[Alt], env: &Env<'_>) -> Result<Trie, Refusal> {
     Ok(Trie { nodes, subs })
 }
 
+/// A free string's step. `next` is the part after it: a raw string's class
+/// depends on the first byte of that text, which must be there; a JSON
+/// string's text after it, when it is in the same list, opens with its
+/// closing quote.
 fn free_step(
     max: Option<usize>,
     style: Style,
-    tail: &str,
+    next: Option<&Part>,
     env: &Env<'_>,
 ) -> Result<FreeStep, Refusal> {
-    let first = tail.as_bytes()[0];
+    let tail = match next {
+        Some(Part::Text(t)) => Some(t.as_str()),
+        _ => None,
+    };
     let class = match style {
         Style::Json | Style::JsonInMarkup => {
-            if first != b'"' {
+            if tail.is_some_and(|t| !t.starts_with('"')) {
                 return Err(refuse(
                     "internal: a JSON string's closing text does not begin with a quote".to_owned(),
                 ));
@@ -303,6 +528,12 @@ fn free_step(
             }
         }
         Style::Raw => {
+            let Some(tail) = tail else {
+                return Err(refuse(
+                    "internal: a raw string is not followed by forced text".to_owned(),
+                ));
+            };
+            let first = tail.as_bytes()[0];
             if !first.is_ascii() {
                 return Err(refuse(format!(
                     "a raw value ends at {tail:?}, whose first character is not ASCII"
@@ -311,25 +542,67 @@ fn free_step(
             env.vocab.raw_class(first)
         }
     };
-    let mut ends: Vec<(u32, Vec<u32>)> = Vec::new();
-    for (id, len) in env.vocab.prefixes_of(tail) {
-        let rest = env.tok.encode(&tail[len..]);
-        no_stop(&rest, tail, env)?;
-        ends.push((id, rest));
-    }
-    if ends.is_empty() {
+    if let Some(tail) = tail
+        && !env.vocab.prefixes_of(tail)
+    {
         return Err(refuse(format!(
             "no token of the vocabulary is a prefix of {tail:?}, so a free string before it \
              could never end"
         )));
     }
-    let end_ids = ends.iter().map(|&(id, _)| id).collect();
-    Ok(FreeStep {
-        class,
-        max,
-        ends,
-        end_ids,
-    })
+    Ok(FreeStep { class, max })
+}
+
+/// Any JSON object of at least one member, its strings in `style`: the
+/// program and the rules it reaches. An empty reply object answers no request,
+/// and a model that would open a pretty-printed one (`{` and a newline) is
+/// left `{}` or `{"` to pick from, so the empty one is the nested values'
+/// alone. Its text is compact with one space after `:` and `,`, as a
+/// schema's is. The rules are any JSON value after `": `, after `, ` and after
+/// nothing, so the text before a value is tokenised with the value's first
+/// characters (a space joins the quote, brace or word after it).
+pub(crate) fn json_object(
+    style: Style,
+    env: &Env<'_>,
+) -> Result<(Program, Vec<Arc<Program>>), Refusal> {
+    const PRES: [&str; 3] = ["\": ", ", ", ""];
+    let (colon, comma, bare) = (0, 1, 2);
+    let text = |t: &str| Part::Text(t.to_owned());
+    let free = Part::Free { max: None, style };
+    let member = |open: &str| vec![text(open), free.clone(), Part::Rule(colon)];
+    let mut first = member("{\"");
+    first.push(Part::Rep {
+        close: vec![text("}")],
+        more: member(", \""),
+    });
+    let object = Part::Any(vec![vec![text("{}")], first.clone()]);
+    let array = Part::Any(vec![
+        vec![text("[]")],
+        vec![
+            text("["),
+            Part::Rule(bare),
+            Part::Rep {
+                close: vec![text("]")],
+                more: vec![Part::Rule(comma)],
+            },
+        ],
+    ]);
+    let rules = PRES
+        .iter()
+        .map(|pre| {
+            let value = Part::Any(vec![
+                vec![text(&format!("{pre}\"")), free.clone(), text("\"")],
+                vec![text(pre), Part::Num { integer: false }],
+                vec![text(pre), object.clone()],
+                vec![text(pre), array.clone()],
+                vec![text(&format!("{pre}true"))],
+                vec![text(&format!("{pre}false"))],
+                vec![text(&format!("{pre}null"))],
+            ]);
+            compile_in(&[value], env, true).map(Arc::new)
+        })
+        .collect::<Result<_, Refusal>>()?;
+    Ok((compile(&first, env)?, rules))
 }
 
 /// One child of a choice's node at a decision: its id, the logit the decision's
@@ -369,10 +642,12 @@ impl Watch {
 #[derive(Clone)]
 pub(crate) struct Constraint {
     prog: Arc<Program>,
+    /// The programs a [`Step::Rule`] names, by index.
+    rules: Arc<[Arc<Program>]>,
     /// The ids that close an open think span, forced first when the prompt
     /// leaves one open.
     close: Arc<[u32]>,
-    stops: Arc<[u32]>,
+    vocab: Arc<Vocab>,
     /// Where its walks write their decisions, `None` for a request that reads
     /// none.
     watch: Option<Watch>,
@@ -387,11 +662,17 @@ impl std::fmt::Debug for Constraint {
 }
 
 impl Constraint {
-    pub(crate) fn new(prog: Program, close: Vec<u32>, stops: Arc<[u32]>) -> Constraint {
+    pub(crate) fn new(
+        prog: Program,
+        rules: Vec<Arc<Program>>,
+        close: Vec<u32>,
+        vocab: Arc<Vocab>,
+    ) -> Constraint {
         Constraint {
             prog: Arc::new(prog),
+            rules: rules.into(),
             close: close.into(),
-            stops,
+            vocab,
             watch: None,
         }
     }
@@ -410,10 +691,103 @@ pub(crate) enum StepError {
     NoAllowed { taken: usize, why: String },
 }
 
+/// How a walk picks among the ids its program allows at a decision.
+pub(crate) enum Draw<'a> {
+    /// The largest logit, ties to the lowest id.
+    Greedy,
+    /// The request's sampler, drawing from a copy of the row (`masked`, kept
+    /// for its capacity) that holds minus infinity at every id the program
+    /// does not allow, with the request's `history` for its penalties.
+    Sampled {
+        sampler: &'a mut Sampler,
+        history: &'a [u32],
+        masked: &'a mut Vec<f32>,
+    },
+}
+
+impl Draw<'_> {
+    fn pick(&mut self, row: &[f32], ids: impl Iterator<Item = u32>) -> Option<u32> {
+        match self {
+            Draw::Greedy => sampling::argmax_in(row, ids),
+            Draw::Sampled {
+                sampler,
+                history,
+                masked,
+            } => {
+                masked.clear();
+                masked.resize(row.len(), f32::NEG_INFINITY);
+                let mut any = false;
+                for id in ids {
+                    if let Some(&l) = row.get(id as usize) {
+                        masked[id as usize] = l;
+                        any = true;
+                    }
+                }
+                any.then(|| sampler(masked, history))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Frame {
     prog: Arc<Program>,
     at: usize,
+}
+
+impl Frame {
+    fn of(prog: &Arc<Program>) -> Frame {
+        Frame {
+            prog: Arc::clone(prog),
+            at: 0,
+        }
+    }
+}
+
+/// Where a JSON number stands, by the characters it has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumAt {
+    Start,
+    Minus,
+    /// A leading `0`, which no digit follows.
+    Zero,
+    Int,
+    Dot,
+    Frac,
+    E,
+    ESign,
+    Exp,
+}
+
+impl NumAt {
+    fn next(self, c: u8, integer: bool) -> Option<NumAt> {
+        use NumAt::{Dot, E, ESign, Exp, Frac, Int, Minus, Start, Zero};
+        Some(match (self, c) {
+            (Start, b'-') => Minus,
+            (Start | Minus, b'0') => Zero,
+            (Start | Minus, b'1'..=b'9') | (Int, b'0'..=b'9') => Int,
+            (Zero | Int, b'.') if !integer => Dot,
+            (Dot | Frac, b'0'..=b'9') => Frac,
+            (Zero | Int | Frac, b'e' | b'E') if !integer => E,
+            (E, b'+' | b'-') => ESign,
+            (E | ESign | Exp, b'0'..=b'9') => Exp,
+            _ => return None,
+        })
+    }
+
+    /// Where the number stands after a token's text, `None` when the text
+    /// is empty or leaves no number.
+    fn after(self, text: &str, integer: bool) -> Option<NumAt> {
+        if text.is_empty() {
+            return None;
+        }
+        text.bytes().try_fold(self, |at, c| at.next(c, integer))
+    }
+
+    /// Whether the characters so far are a whole number.
+    fn whole(self) -> bool {
+        matches!(self, NumAt::Zero | NumAt::Int | NumAt::Frac | NumAt::Exp)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -429,18 +803,100 @@ enum Ctx {
         prog: Arc<Program>,
         step: usize,
         chars: usize,
+        /// The ids that end it, ascending, read once it is picked from.
+        ends: Option<Arc<[u32]>>,
+    },
+    Num {
+        prog: Arc<Program>,
+        step: usize,
+        at: NumAt,
+        /// The ids that end it, ascending, read once it is whole.
+        ends: Option<Arc<[u32]>>,
     },
     /// The program is spent.
     Done,
+}
+
+/// One position in the program the ids taken so far lead to.
+#[derive(Clone, Debug)]
+struct Head {
+    frames: Vec<Frame>,
+    ctx: Ctx,
+    /// Forced ids not yet taken, the next one last.
+    forced: Vec<u32>,
+}
+
+impl Head {
+    fn settled(&self) -> bool {
+        !self.forced.is_empty() || !matches!(self.ctx, Ctx::Idle)
+    }
+
+    /// The id this head alone allows and needs no row for.
+    fn fixed(&self) -> Option<u32> {
+        if let Some(&id) = self.forced.last() {
+            return Some(id);
+        }
+        match &self.ctx {
+            Ctx::Trie { prog, step, node } => match &prog.steps[*step] {
+                Step::Pick(t) => t.only_kid(*node).map(|(id, _)| id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.forced.is_empty() && matches!(self.ctx, Ctx::Done)
+    }
+
+    /// The head past its string or number, nothing forced.
+    fn after(&self) -> Head {
+        Head {
+            frames: self.frames.clone(),
+            ctx: Ctx::Idle,
+            forced: Vec::new(),
+        }
+    }
+
+    /// The head's place inside its step, beside its frames: the context's
+    /// program and step are always the last frame's, one step back.
+    fn mark(&self) -> (u8, usize) {
+        match &self.ctx {
+            Ctx::Idle => (0, 0),
+            Ctx::Done => (1, 0),
+            Ctx::Trie { node, .. } => (2, *node),
+            Ctx::Free { chars, .. } => (3, *chars),
+            Ctx::Num { at, .. } => (4, *at as usize),
+        }
+    }
+
+    fn same(&self, o: &Head) -> bool {
+        self.mark() == o.mark()
+            && self.forced == o.forced
+            && self.frames.len() == o.frames.len()
+            && self
+                .frames
+                .iter()
+                .zip(&o.frames)
+                .all(|(a, b)| a.at == b.at && Arc::ptr_eq(&a.prog, &b.prog))
+    }
+}
+
+/// Adds `h` unless a head in the same place is there.
+fn push_new(out: &mut Vec<Head>, h: Head) {
+    if !out.iter().any(|o| o.same(&h)) {
+        out.push(h);
+    }
 }
 
 /// How many ids a walk picked from a row, by kind (the ids the program fixes
 /// and the stop pick are in neither).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Picks {
-    /// Among the children of a choice's node, which has more than one.
+    /// Among the children of a choice's node, which has more than one, or
+    /// among several heads' ids.
     pub decisions: usize,
-    /// Inside a free string, its end token included.
+    /// Inside a free string or a number, its end token included.
     pub free: usize,
 }
 
@@ -456,16 +912,25 @@ pub(crate) fn aheads() -> usize {
 }
 
 /// One request's position in its program.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct Walk {
-    frames: Vec<Frame>,
-    ctx: Ctx,
-    /// Forced ids not yet taken, the next one last.
-    forced: Vec<u32>,
-    stops: Arc<[u32]>,
+    /// Every place the ids taken so far lead to: one, but where a fork's
+    /// options have begun alike.
+    heads: Vec<Head>,
+    rules: Arc<[Arc<Program>]>,
+    vocab: Arc<Vocab>,
     taken: usize,
     picks: Picks,
     watch: Option<Watch>,
+}
+
+impl std::fmt::Debug for Walk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Walk")
+            .field("heads", &self.heads.len())
+            .field("taken", &self.taken)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Walk {
@@ -476,17 +941,17 @@ impl Walk {
             relock(&w.0).clear();
         }
         Walk {
-            frames: vec![Frame {
-                prog: Arc::clone(&c.prog),
-                at: 0,
+            heads: vec![Head {
+                frames: vec![Frame::of(&c.prog)],
+                ctx: Ctx::Idle,
+                forced: if close_think {
+                    c.close.iter().rev().copied().collect()
+                } else {
+                    Vec::new()
+                },
             }],
-            ctx: Ctx::Idle,
-            forced: if close_think {
-                c.close.iter().rev().copied().collect()
-            } else {
-                Vec::new()
-            },
-            stops: Arc::clone(&c.stops),
+            rules: Arc::clone(&c.rules),
+            vocab: Arc::clone(&c.vocab),
             taken: 0,
             picks: Picks::default(),
             watch: c.watch.clone(),
@@ -505,63 +970,391 @@ impl Walk {
         self.clone()
     }
 
-    /// Moves to the next decision, or to the next forced id.
+    fn stops(&self) -> &[u32] {
+        self.vocab.stops()
+    }
+
+    /// Moves every head to its next decision or forced id.
+    /// A whole number the program ends with may also end the answer: a
+    /// spent head joins it, so the stop is allowed beside its next digit.
     fn settle(&mut self) {
+        if !self.heads.iter().all(Head::settled) {
+            let mut out = Vec::with_capacity(self.heads.len());
+            for h in std::mem::take(&mut self.heads) {
+                self.settle_into(h, &mut out);
+            }
+            self.heads = out;
+        }
+        if !self.heads.iter().any(Head::done)
+            && self.heads.iter().any(|h| {
+                h.forced.is_empty()
+                    && matches!(&h.ctx, Ctx::Num { at, .. } if at.whole())
+                    && h.frames.iter().all(|f| f.at >= f.prog.steps.len())
+            })
+        {
+            self.heads.push(Head {
+                frames: Vec::new(),
+                ctx: Ctx::Done,
+                forced: Vec::new(),
+            });
+        }
+    }
+
+    /// The heads the step at `h`'s place leads into when it holds no ids of
+    /// its own: a sub-program or a rule, each option of a fork, an array's
+    /// close (past the step) and its next item (back to the step after it).
+    /// `None` for any other step.
+    fn enter(&self, h: &Head) -> Option<Vec<Head>> {
+        let frame = h.frames.last()?;
+        let into = |prog: &Arc<Program>, back: bool| {
+            let mut k = h.clone();
+            if let Some(f) = k.frames.last_mut()
+                && !back
+            {
+                f.at += 1;
+            }
+            k.frames.push(Frame::of(prog));
+            k
+        };
+        Some(match frame.prog.steps.get(frame.at)? {
+            Step::Sub(p) => vec![into(p, false)],
+            Step::Rule(r) => vec![into(&self.rules[*r], false)],
+            Step::Fork(alts) => alts.iter().map(|a| into(a, false)).collect(),
+            Step::Rep { close, more } => vec![into(close, false), into(more, true)],
+            Step::Forced(_) | Step::Pick(_) | Step::Free(_) | Step::Num { .. } => return None,
+        })
+    }
+
+    fn settle_into(&self, mut h: Head, out: &mut Vec<Head>) {
         loop {
-            if !self.forced.is_empty() || !matches!(self.ctx, Ctx::Idle) {
+            if h.settled() {
+                push_new(out, h);
                 return;
             }
-            let Some(frame) = self.frames.last_mut() else {
-                self.ctx = Ctx::Done;
+            let Some(frame) = h.frames.last() else {
+                h.ctx = Ctx::Done;
+                push_new(out, h);
                 return;
             };
             if frame.at >= frame.prog.steps.len() {
-                self.frames.pop();
+                h.frames.pop();
                 continue;
             }
+            if let Some(next) = self.enter(&h) {
+                for k in next {
+                    self.settle_into(k, out);
+                }
+                return;
+            }
+            let Some(frame) = h.frames.last_mut() else {
+                return;
+            };
             let step = frame.at;
             frame.at += 1;
             let prog = Arc::clone(&frame.prog);
-            match &prog.steps[step] {
-                Step::Forced(ids) => self.forced = ids.iter().rev().copied().collect(),
-                Step::Pick(_) => {
-                    self.ctx = Ctx::Trie {
-                        prog,
-                        step,
-                        node: 0,
-                    }
+            h.ctx = match &prog.steps[step] {
+                Step::Forced(f) => {
+                    h.forced = f.ids.iter().rev().copied().collect();
+                    Ctx::Idle
                 }
-                Step::Free(_) => {
-                    self.ctx = Ctx::Free {
-                        prog,
-                        step,
-                        chars: 0,
-                    };
+                Step::Pick(_) => Ctx::Trie {
+                    prog,
+                    step,
+                    node: 0,
+                },
+                Step::Free(_) => Ctx::Free {
+                    prog,
+                    step,
+                    chars: 0,
+                    ends: None,
+                },
+                _ => Ctx::Num {
+                    prog,
+                    step,
+                    at: NumAt::Start,
+                    ends: None,
+                },
+            };
+        }
+    }
+
+    /// The heads `h` (past a string or a number, nothing forced) leads to once
+    /// it takes `text`, into `out`: through forced texts, forks and rules,
+    /// ending inside a forced text with the rest of it forced.
+    fn eat(&self, mut h: Head, mut text: &str, out: &mut Vec<Head>) {
+        loop {
+            if text.is_empty() {
+                push_new(out, h);
+                return;
+            }
+            let Some(frame) = h.frames.last() else {
+                return;
+            };
+            if frame.at >= frame.prog.steps.len() {
+                h.frames.pop();
+                continue;
+            }
+            if let Some(next) = self.enter(&h) {
+                for k in next {
+                    self.eat(k, text, out);
                 }
+                return;
+            }
+            let Some(frame) = h.frames.last_mut() else {
+                return;
+            };
+            let prog = Arc::clone(&frame.prog);
+            let Step::Forced(f) = &prog.steps[frame.at] else {
+                return;
+            };
+            frame.at += 1;
+            if let Some(rest) = text.strip_prefix(f.text.as_str()) {
+                text = rest;
+            } else {
+                if f.text.starts_with(text)
+                    && let Some(rest) = f.rest(text.len())
+                {
+                    h.forced = rest.iter().rev().copied().collect();
+                    push_new(out, h);
+                }
+                return;
             }
         }
     }
 
-    /// Whether the next id is the program's alone to give: a forced id, or the
-    /// only child of a choice's node. [`Walk::choose`] reads no row for it.
+    /// Marks the first byte of each forced text `h` (past a string or a
+    /// number) can go on with.
+    fn firsts(&self, mut h: Head, marks: &mut [bool; 256]) {
+        loop {
+            let Some(frame) = h.frames.last() else {
+                return;
+            };
+            if frame.at >= frame.prog.steps.len() {
+                h.frames.pop();
+                continue;
+            }
+            if let Some(next) = self.enter(&h) {
+                for k in next {
+                    self.firsts(k, marks);
+                }
+                return;
+            }
+            if let Step::Forced(f) = &frame.prog.steps[frame.at]
+                && let Some(&b) = f.text.as_bytes().first()
+            {
+                marks[usize::from(b)] = true;
+            }
+            return;
+        }
+    }
+
+    /// The ids that end a string or a number whose head is `h`, ascending:
+    /// those whose text the text that can follow takes.
+    fn ends_of(&self, h: &Head) -> Arc<[u32]> {
+        let after = h.after();
+        let mut marks = [false; 256];
+        self.firsts(after.clone(), &mut marks);
+        let mut ids = Vec::new();
+        let mut out = Vec::new();
+        for b in (0..=u8::MAX).filter(|&b| marks[usize::from(b)]) {
+            for &id in self.vocab.starting_with(b) {
+                if self.stops().contains(&id) {
+                    continue;
+                }
+                out.clear();
+                self.eat(after.clone(), self.vocab.piece(id), &mut out);
+                if !out.is_empty() {
+                    ids.push(id);
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.into()
+    }
+
+    /// Reads the end ids of each string, and of each whole number, that a
+    /// pick may end.
+    fn prime(&mut self) {
+        for i in 0..self.heads.len() {
+            let h = &self.heads[i];
+            let wants = h.forced.is_empty()
+                && match &h.ctx {
+                    Ctx::Free { ends, .. } => ends.is_none(),
+                    Ctx::Num { ends, at, .. } => ends.is_none() && at.whole(),
+                    _ => false,
+                };
+            if !wants {
+                continue;
+            }
+            let read = self.ends_of(h);
+            if let Ctx::Free { ends, .. } | Ctx::Num { ends, .. } = &mut self.heads[i].ctx {
+                *ends = Some(read);
+            }
+        }
+    }
+
+    /// The ids `h` allows, of a row of `n`.
+    fn allowed<'a>(&'a self, h: &'a Head, n: usize) -> Box<dyn Iterator<Item = u32> + 'a> {
+        if let Some(&id) = h.forced.last() {
+            return Box::new(std::iter::once(id));
+        }
+        let ends = |e: &'a Option<Arc<[u32]>>| e.iter().flat_map(|e| e.iter().copied());
+        match &h.ctx {
+            Ctx::Done => Box::new(self.stops().iter().copied()),
+            Ctx::Trie { prog, step, node } => match &prog.steps[*step] {
+                Step::Pick(t) => Box::new(t.nodes[*node].kids.iter().map(|&(id, _)| id)),
+                _ => Box::new(std::iter::empty()),
+            },
+            Ctx::Free {
+                prog,
+                step,
+                chars,
+                ends: e,
+            } => {
+                let Step::Free(f) = &prog.steps[*step] else {
+                    return Box::new(std::iter::empty());
+                };
+                let room = f.room(*chars);
+                let n = if room > 0 {
+                    n.min(f.class.n_vocab())
+                } else {
+                    0
+                };
+                let class = (0..n)
+                    .filter_map(|i| u32::try_from(i).ok())
+                    .filter(move |&id| f.class.fits(id, room));
+                Box::new(class.chain(ends(e)))
+            }
+            Ctx::Num {
+                prog,
+                step,
+                at,
+                ends: e,
+            } => {
+                let Step::Num { integer } = prog.steps[*step] else {
+                    return Box::new(std::iter::empty());
+                };
+                let at = *at;
+                let more = self
+                    .vocab
+                    .numeric()
+                    .iter()
+                    .copied()
+                    .filter(move |&id| at.after(self.vocab.piece(id), integer).is_some());
+                Box::new(more.chain(ends(e).filter(move |_| at.whole())))
+            }
+            Ctx::Idle => Box::new(std::iter::empty()),
+        }
+    }
+
+    /// The heads `h` leads to once it takes `id`, into `out`.
+    fn take_into(&self, mut h: Head, id: u32, out: &mut Vec<Head>) {
+        if let Some(&f) = h.forced.last() {
+            if f == id {
+                h.forced.pop();
+                push_new(out, h);
+            }
+            return;
+        }
+        let ends =
+            |e: &Option<Arc<[u32]>>| e.as_ref().is_some_and(|e| e.binary_search(&id).is_ok());
+        match std::mem::replace(&mut h.ctx, Ctx::Idle) {
+            Ctx::Done => {
+                if self.stops().contains(&id) {
+                    h.ctx = Ctx::Done;
+                    push_new(out, h);
+                }
+            }
+            Ctx::Trie { prog, step, node } => {
+                let Step::Pick(t) = &prog.steps[step] else {
+                    return;
+                };
+                let kids = &t.nodes[node].kids;
+                let Ok(p) = kids.binary_search_by_key(&id, |&(k, _)| k) else {
+                    return;
+                };
+                let child = kids[p].1;
+                match t.nodes[child].leaf {
+                    Some(alt) => {
+                        if let Some(sub) = &t.subs[alt] {
+                            h.frames.push(Frame::of(sub));
+                        }
+                    }
+                    None => {
+                        h.ctx = Ctx::Trie {
+                            prog: Arc::clone(&prog),
+                            step,
+                            node: child,
+                        };
+                    }
+                }
+                push_new(out, h);
+            }
+            Ctx::Free {
+                prog,
+                step,
+                chars,
+                ends: e,
+            } => {
+                let Step::Free(f) = &prog.steps[step] else {
+                    return;
+                };
+                if ends(&e) {
+                    self.eat(h, self.vocab.piece(id), out);
+                } else if f.class.fits(id, f.room(chars)) {
+                    h.ctx = Ctx::Free {
+                        prog: Arc::clone(&prog),
+                        step,
+                        chars: chars + f.class.len_of(id),
+                        ends: e,
+                    };
+                    push_new(out, h);
+                }
+            }
+            Ctx::Num {
+                prog,
+                step,
+                at,
+                ends: e,
+            } => {
+                let Step::Num { integer } = prog.steps[step] else {
+                    return;
+                };
+                let piece = self.vocab.piece(id);
+                if at.whole() && ends(&e) {
+                    self.eat(h, piece, out);
+                } else if let Some(at) = at.after(piece, integer) {
+                    h.ctx = Ctx::Num {
+                        prog,
+                        step,
+                        at,
+                        ends: e,
+                    };
+                    push_new(out, h);
+                }
+            }
+            Ctx::Idle => {}
+        }
+    }
+
+    /// Whether the next id is the program's alone to give: one every head
+    /// fixes alike, a forced id or the only child of a choice's node.
+    /// [`Walk::choose`] reads no row for it.
     pub(crate) fn fixed_next(&mut self) -> bool {
         self.settle();
-        if !self.forced.is_empty() {
-            return true;
-        }
-        match &self.ctx {
-            Ctx::Trie { prog, step, node } => match &prog.steps[*step] {
-                Step::Pick(t) => t.only_kid(*node).is_some(),
-                _ => false,
-            },
-            _ => false,
-        }
+        self.fixed_id().is_some()
+    }
+
+    fn fixed_id(&self) -> Option<u32> {
+        let (first, rest) = self.heads.split_first()?;
+        let id = first.fixed()?;
+        rest.iter().all(|h| h.fixed() == Some(id)).then_some(id)
     }
 
     /// Whether the program is spent: nothing is left but the stop.
     pub(crate) fn spent(&mut self) -> bool {
         self.settle();
-        self.forced.is_empty() && matches!(self.ctx, Ctx::Done)
+        !self.heads.is_empty() && self.heads.iter().all(Head::done)
     }
 
     /// The run of ids the program fixes from here: forced ids and the only
@@ -578,27 +1371,39 @@ impl Walk {
         Ok(run)
     }
 
-    /// The next id: the forced one, or the largest logit of `row` among the
+    /// The next id: the fixed one, or the largest logit of `row` among the
     /// ids the program allows here; the walk then stands past it. A stop id
     /// before the program is spent is an error.
     pub(crate) fn choose(&mut self, row: &[f32]) -> Result<u32, StepError> {
+        self.choose_by(row, &mut Draw::Greedy)
+    }
+
+    /// The next id: the fixed one, or `draw`'s pick from `row` among the ids
+    /// the program allows here; the walk then stands past it. A stop id
+    /// before the program is spent, or a drawn id the program does not allow,
+    /// is an error.
+    pub(crate) fn choose_by(&mut self, row: &[f32], draw: &mut Draw<'_>) -> Result<u32, StepError> {
         self.settle();
-        let id = match self.forced.pop() {
+        let id = match self.fixed_id() {
             Some(id) => id,
-            None => match std::mem::replace(&mut self.ctx, Ctx::Idle) {
-                Ctx::Done => {
-                    self.ctx = Ctx::Done;
-                    sampling::argmax_in(row, self.stops.iter().copied())
-                        .ok_or_else(|| self.stuck("the row holds none of the stop ids"))?
-                }
-                Ctx::Trie { prog, step, node } => self.pick_option(row, prog, step, node)?,
-                Ctx::Free { prog, step, chars } => self.pick_free(row, prog, step, chars)?,
-                Ctx::Idle => return Err(self.stuck("the walk stands between steps")),
-            },
+            None => {
+                self.prime();
+                self.pick(row, draw)?
+            }
         };
-        if self.stops.contains(&id) && !matches!(self.ctx, Ctx::Done) {
+        if self.stops().contains(&id) && !self.heads.iter().any(Head::done) {
             return Err(self.stuck("a stop id occurs before the program is spent"));
         }
+        let mut out = Vec::with_capacity(self.heads.len());
+        for h in std::mem::take(&mut self.heads) {
+            self.take_into(h, id, &mut out);
+        }
+        if out.is_empty() {
+            return Err(self.stuck(&format!(
+                "the drawn id {id} is not one the program allows here"
+            )));
+        }
+        self.heads = out;
         self.taken += 1;
         Ok(id)
     }
@@ -610,110 +1415,138 @@ impl Walk {
         }
     }
 
-    /// One id of the choice at `node`: its only child, else the largest logit
-    /// among its children.
-    fn pick_option(
-        &mut self,
-        row: &[f32],
-        prog: Arc<Program>,
-        step: usize,
-        node: usize,
-    ) -> Result<u32, StepError> {
-        let Step::Pick(t) = &prog.steps[step] else {
-            return Err(self.stuck("a choice context stands on another step"));
+    /// `draw`'s pick among the ids the heads allow, counted by kind; a lone
+    /// choice's decision goes to the watch.
+    fn pick(&mut self, row: &[f32], draw: &mut Draw<'_>) -> Result<u32, StepError> {
+        let n = row.len();
+        let [h] = self.heads.as_slice() else {
+            let id = draw.pick(row, self.heads.iter().flat_map(|h| self.allowed(h, n)));
+            let id =
+                id.ok_or_else(|| self.stuck("the row holds none of the ids the program allows"))?;
+            if self
+                .heads
+                .iter()
+                .any(|h| matches!(h.ctx, Ctx::Free { .. } | Ctx::Num { .. }))
+            {
+                self.picks.free += 1;
+            } else {
+                self.picks.decisions += 1;
+            }
+            return Ok(id);
         };
-        let kids = &t.nodes[node].kids;
-        let several = kids.len() > 1;
-        let picked = t.only_kid(node).or_else(|| {
-            sampling::argmax_in(row, kids.iter().map(|&(id, _)| id))
-                .and_then(|id| kids.iter().find(|&&(k, _)| k == id).map(|&(_, c)| (id, c)))
-        });
-        let Some((id, child)) = picked else {
-            self.ctx = Ctx::Trie { prog, step, node };
-            return Err(self.stuck("the row holds none of the option ids"));
-        };
-        self.picks.decisions += usize::from(several);
-        if several && let Some(w) = &self.watch {
-            relock(&w.0).push(Decision {
-                kids: kids
-                    .iter()
-                    .map(|&(kid, below)| Kid {
-                        id: kid,
-                        logit: row.get(kid as usize).copied().unwrap_or(f32::NAN),
-                        option: t.sole_option(below),
-                    })
-                    .collect(),
-                picked: id,
-            });
-        }
-        match t.nodes[child].leaf {
-            Some(alt) => {
-                if let Some(sub) = &t.subs[alt] {
-                    self.frames.push(Frame {
-                        prog: Arc::clone(sub),
-                        at: 0,
+        let picked = draw.pick(row, self.allowed(h, n));
+        match &h.ctx {
+            Ctx::Done => picked.ok_or_else(|| self.stuck("the row holds none of the stop ids")),
+            Ctx::Trie { prog, step, node } => {
+                let Step::Pick(t) = &prog.steps[*step] else {
+                    return Err(self.stuck("a choice context stands on another step"));
+                };
+                let id =
+                    picked.ok_or_else(|| self.stuck("the row holds none of the option ids"))?;
+                let kids = &t.nodes[*node].kids;
+                if let Some(w) = &self.watch {
+                    relock(&w.0).push(Decision {
+                        kids: kids
+                            .iter()
+                            .map(|&(kid, below)| Kid {
+                                id: kid,
+                                logit: row.get(kid as usize).copied().unwrap_or(f32::NAN),
+                                option: t.sole_option(below),
+                            })
+                            .collect(),
+                        picked: id,
                     });
                 }
+                self.picks.decisions += 1;
+                Ok(id)
             }
-            None => {
-                self.ctx = Ctx::Trie {
-                    prog: Arc::clone(&prog),
-                    step,
-                    node: child,
+            Ctx::Free {
+                prog, step, chars, ..
+            } => {
+                let room = match &prog.steps[*step] {
+                    Step::Free(f) => f.room(*chars),
+                    _ => 0,
                 };
+                let id = picked.ok_or_else(|| {
+                    self.stuck(if room == 0 {
+                        "a free string reached its length limit and no end token is allowed"
+                    } else {
+                        "the row holds no token a free string may take"
+                    })
+                })?;
+                self.picks.free += 1;
+                Ok(id)
             }
+            Ctx::Num { .. } => {
+                let id =
+                    picked.ok_or_else(|| self.stuck("the row holds no token a number may take"))?;
+                self.picks.free += 1;
+                Ok(id)
+            }
+            Ctx::Idle => Err(self.stuck("the walk stands between steps")),
         }
-        Ok(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mock::{MockTokenizer, SPECIALS};
+    use serde_json::json;
+
+    #[test]
+    fn suffix_storage_is_bounded_by_the_longest_token() {
+        let tok = MockTokenizer;
+        let vocab = Vocab::read(&tok);
+        let env = Env::new(&tok, &vocab);
+        let max_bytes = SPECIALS.iter().map(|s| s.len()).max().unwrap();
+        for letter in ["a", "é"] {
+            let key = letter.repeat(4096);
+            let schema = json!({"type": "object", "properties": {
+                "first": {"type": "string"},
+                (key): {"type": "null"}
+            }});
+            let parts = super::super::schema::value(&schema, Style::Json, "schema").unwrap();
+            let prog = compile(&parts, &env).unwrap();
+            let Step::Forced(tail) = prog.steps.last().unwrap() else {
+                panic!("the property after the free string is forced");
+            };
+            assert!(tail.text.len() > 4096);
+            assert!(
+                tail.rests.iter().all(|(at, _)| *at <= max_bytes),
+                "an end token cannot reach beyond its vocabulary's longest piece"
+            );
+            assert_eq!(
+                tail.rest(max_bytes).is_some(),
+                tail.text.is_char_boundary(max_bytes),
+                "the exact limit is retained only at a character boundary"
+            );
+            assert!(tail.rests.len() <= max_bytes);
+            assert!(
+                tail.rests.iter().map(|(_, ids)| ids.len()).sum::<usize>()
+                    <= max_bytes * tail.ids.len(),
+                "suffix ids must grow linearly with literal length"
+            );
+        }
     }
 
-    /// One id of a free string that has `chars` characters: the largest
-    /// logit among the class tokens that fit and the tokens that end it.
-    fn pick_free(
-        &mut self,
-        row: &[f32],
-        prog: Arc<Program>,
-        step: usize,
-        chars: usize,
-    ) -> Result<u32, StepError> {
-        let Step::Free(f) = &prog.steps[step] else {
-            return Err(self.stuck("a string context stands on another step"));
-        };
-        let room = f.max.map_or(usize::MAX, |m| m.saturating_sub(chars));
-        let in_class = if room > 0 {
-            let n = row.len().min(f.class.n_vocab());
-            sampling::argmax_in(
-                row,
-                (0..n)
-                    .filter_map(|i| u32::try_from(i).ok())
-                    .filter(|&id| f.class.fits(id, room)),
-            )
-        } else {
-            None
-        };
-        let ending = sampling::argmax_in(row, f.end_ids.iter().copied());
-        let id = match (in_class, ending) {
-            (Some(a), Some(b)) => sampling::argmax_in(row, [a, b]),
-            (a, b) => a.or(b),
-        };
-        let Some(id) = id else {
-            self.ctx = Ctx::Free { prog, step, chars };
-            return Err(self.stuck(if room == 0 {
-                "a free string reached its length limit and no end token is allowed"
-            } else {
-                "the row holds no token a free string may take"
-            }));
-        };
-        self.picks.free += 1;
-        match f.end_ids.binary_search(&id) {
-            Ok(p) => self.forced = f.ends[p].1.iter().rev().copied().collect(),
-            Err(_) => {
-                self.ctx = Ctx::Free {
-                    prog: Arc::clone(&prog),
-                    step,
-                    chars: chars + f.class.len_of(id),
-                };
-            }
-        }
-        Ok(id)
+    #[test]
+    fn taking_a_forced_token_preserves_the_heads_buffers() {
+        let tok = MockTokenizer;
+        let vocab = Arc::new(Vocab::read(&tok));
+        let prog = compile(&[Part::Text("a".repeat(16384))], &Env::new(&tok, &vocab)).unwrap();
+        let c = Constraint::new(prog, Vec::new(), Vec::new(), vocab);
+        let mut walk = Walk::new(&c, false);
+        walk.settle();
+        let forced = walk.heads[0].forced.as_ptr();
+        let frames = walk.heads[0].frames.as_ptr();
+        walk.choose(&[]).unwrap();
+        assert_eq!(walk.heads[0].forced.len(), 16383);
+        assert_eq!(
+            walk.heads[0].forced.as_ptr(),
+            forced,
+            "move the remaining ids"
+        );
+        assert_eq!(walk.heads[0].frames.as_ptr(), frames, "move the frames");
     }
 }

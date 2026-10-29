@@ -8,7 +8,7 @@ use std::net::TcpStream;
 
 const MAX_LINE: usize = 16 * 1024;
 const MAX_HEADERS: usize = 100;
-const MAX_BODY: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_BODY: usize = 64 * 1024 * 1024;
 
 /// One parsed request.
 pub(crate) struct Request {

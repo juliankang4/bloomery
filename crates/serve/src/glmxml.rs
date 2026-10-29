@@ -232,8 +232,9 @@ pub struct ArgTypes {
 impl ArgTypes {
     /// Reads OpenAI `tools` (each `{"type": "function", "function": {...}}` or
     /// the function object itself, as the template accepts both): every
-    /// `parameters.properties.<key>.type`. Anything else in the list is left
-    /// out, and its arguments fall to the JSON-else-text rule.
+    /// `parameters.properties.<key>.type`, and a `$ref` that resolves to a
+    /// string as text. Anything else in the list is left out, and its
+    /// arguments fall to the JSON-else-text rule.
     #[must_use]
     pub fn of_tools(tools: Option<&Value>) -> ArgTypes {
         let mut kinds: HashMap<String, HashMap<String, Kind>> = HashMap::new();
@@ -242,13 +243,18 @@ impl ArgTypes {
             let Some(name) = f.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            let props = f
-                .get("parameters")
-                .and_then(|p| p.get("properties"))
-                .and_then(Value::as_object);
+            let root = f.get("parameters").unwrap_or(&Value::Null);
+            let props = root.get("properties").and_then(Value::as_object);
             let args = kinds.entry(name.to_owned()).or_default();
             for (key, schema) in props.into_iter().flatten() {
-                if let Some(kind) = schema.get("type").and_then(kind_of) {
+                let kind = if schema.get("$ref").is_some()
+                    && crate::qwenxml::resolves_to_string(schema, root, &mut Vec::new())
+                {
+                    Some(Kind::String)
+                } else {
+                    schema.get("type").and_then(kind_of)
+                };
+                if let Some(kind) = kind {
                     args.insert(key.clone(), kind);
                 }
             }
@@ -511,8 +517,9 @@ fn partial_call(m: &Markers, body: &str, types: &ArgTypes) -> Option<(String, St
 /// inverse of [`KvScan`]. The name, then the key, value and closing markers
 /// per parameter in the schema's order, as the template writes them. The
 /// scanner reads a value as text only where the schema says `"type":
-/// "string"`, so a text-valued parameter that does not say it is refused
-/// rather than written as something that could read back as JSON.
+/// "string"`, itself or through a `$ref`, so a text-valued parameter that
+/// does not say it is refused rather than written as something that could
+/// read back as JSON.
 pub(crate) fn call_parts(spelling: KvSpelling, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
     let m = spelling.markers();
     call(
@@ -522,7 +529,7 @@ pub(crate) fn call_parts(spelling: KvSpelling, funs: &[Fun<'_>]) -> Result<Vec<P
         |f| {
             let mut parts = Vec::new();
             for a in &f.args {
-                if is_text(a.schema)
+                if is_text(&a.schema)
                     && a.schema.get("type").and_then(Value::as_str) != Some("string")
                 {
                     return Err(Refusal::invalid(format!(
@@ -535,7 +542,7 @@ pub(crate) fn call_parts(spelling: KvSpelling, funs: &[Fun<'_>]) -> Result<Vec<P
                     "{}{}{}{}",
                     m.key_open, a.key, m.key_close, m.value_open
                 )));
-                parts.extend(value(a.schema, Style::Raw, &a.path)?);
+                parts.extend(value(&a.schema, Style::Raw, &a.path)?);
                 parts.push(Part::Text(format!("{}{}", m.value_close, m.line())));
             }
             parts.push(Part::Text(m.call_close.to_owned()));

@@ -6,11 +6,12 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::program::{self, Env};
 use super::{Ask, Constraint, Part, Refusal, Vocab, Walk, request};
 use crate::api::logprobs::Ask as Probs;
+use crate::callstream::CallPiece;
 use crate::dsml::{ChatParser, DsmlScan, MarkupError, Spelling, ToolFormat, Tools};
 use crate::engine::{Decoder, Engine, EngineError, SamplingParams, Tokenizer};
 use crate::genloop::{
@@ -227,15 +228,9 @@ fn params(constraint: Option<Constraint>, think: ThinkEntry) -> GenParams {
     }
 }
 
-/// One generation over rows that favour `want`, with whether each step's row
-/// was asked for.
-fn run_read(
-    tok: &Arc<dyn Tokenizer>,
-    constraint: Option<Constraint>,
-    think: ThinkEntry,
-    want: &[u32],
-    logprobs: Option<Probs>,
-) -> (Outcome, Vec<bool>) {
+/// One generation of `p` over rows that favour `want`, with whether each
+/// step's row was asked for.
+fn run_read(tok: &Arc<dyn Tokenizer>, p: &GenParams, want: &[u32]) -> (Outcome, Vec<bool>) {
     let read = Arc::new(Mutex::new(Vec::new()));
     // The rows follow the engine's step count, which is the step arm's.
     let mut slot = Slot::new(Box::new(Rows {
@@ -245,13 +240,11 @@ fn run_read(
         read: Arc::clone(&read),
     }))
     .schema_jump(false);
-    let mut p = params(constraint, think);
-    p.logprobs = logprobs;
     let o = generate(
         &mut slot,
         &sampling::reference_factory(),
         &tok.encode("hi"),
-        &p,
+        p,
         &mut |_| Ok(()),
         &mut |_| {},
         &mut Timings::default(),
@@ -268,7 +261,7 @@ fn run(
     think: ThinkEntry,
     want: &[u32],
 ) -> Outcome {
-    run_read(tok, constraint, think, want, None).0
+    run_read(tok, &params(constraint, think), want).0
 }
 
 fn build(
@@ -276,7 +269,7 @@ fn build(
     format: ToolFormat,
     body: &Value,
 ) -> Result<Constraint, Refusal> {
-    let vocab = Vocab::read(&**tok);
+    let vocab = Arc::new(Vocab::read(&**tok));
     request(
         body.as_object().expect("a body"),
         &Ask {
@@ -397,6 +390,148 @@ fn a_bias_reorders_the_allowed_ids_and_lets_in_none() {
     assert_eq!(o.stop, StopKind::Eos);
 }
 
+/// The subset past objects and scalars: an integer, an array of a `$ref`'s
+/// strings, an `anyOf` of a number and null, an array of integers.
+fn wide_schema() -> Value {
+    json!({
+        "$defs": {"tag": {"type": "string", "maxLength": 4}},
+        "type": "object",
+        "properties": {
+            "n": {"type": "integer"},
+            "xs": {"type": "array", "items": {"$ref": "#/$defs/tag"}},
+            "o": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+            "e": {"type": "array", "items": {"type": "integer"}}
+        }
+    })
+}
+
+/// Whether `text` is a document of [`wide_schema`].
+fn wide_valid(text: &str) {
+    let v: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}"));
+    let keys: Vec<&str> = v
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["n", "xs", "o", "e"], "{text}");
+    assert!(v["n"].is_i64(), "{text}");
+    for x in v["xs"].as_array().expect("xs") {
+        assert!(x.as_str().expect("a tag").chars().count() <= 4, "{text}");
+    }
+    assert!(v["o"].is_number() || v["o"].is_null(), "{text}");
+    assert!(
+        v["e"].as_array().expect("e").iter().all(Value::is_i64),
+        "{text}"
+    );
+}
+
+/// The wider subset (integers, numbers, arrays, `$ref`, `anyOf`, null) and
+/// `json_object` are greedy where greedy obeys, the documents' ids taken as
+/// they are, but for an empty reply object, which `json_object` does not
+/// write; where greedy does not obey the mask holds; a free string in an array ends
+/// on a token that takes the text after it (`", "` and `"]`); and a
+/// `json_object` value's first characters are tokenised with the `: ` before
+/// them (` "`), as the document's own ids have them.
+#[test]
+fn the_wider_subset_and_json_object_are_greedy_where_greedy_obeys() {
+    let tok = bytes_tok();
+    // PIN(2026-10-29): arrays, anyOf, refs and free numbers replace subset refusals.
+    let wide = build(&tok, ToolFormat::Hermes, &schema_body(&wide_schema())).expect("served");
+    let object = json!({"response_format": {"type": "json_object"}});
+    let any = build(&tok, ToolFormat::Hermes, &object).expect("served");
+    for (c, doc) in [
+        (
+            &wide,
+            r#"{"n": -12, "xs": ["ab", "c"], "o": 2.5e-3, "e": [0, 7]}"#,
+        ),
+        (&wide, r#"{"n": 0, "xs": [], "o": null, "e": []}"#),
+        (
+            &any,
+            r#"{"a": [1, {"b": null}, []], "c": "x", "d": {}, "e": -0.5E+2, "f": [true, false]}"#,
+        ),
+    ] {
+        let want = ids(&tok, doc);
+        let o = run(&tok, Some(c.clone()), ThinkEntry::Closed, &want);
+        assert_eq!(o.tokens, with_eos(&tok, want), "{doc}");
+        assert_eq!(o.content, doc);
+    }
+    let empty = run(
+        &tok,
+        Some(any.clone()),
+        ThinkEntry::Closed,
+        &ids(&tok, "{}"),
+    );
+    assert!(empty.content.starts_with("{\""), "{}", empty.content);
+    let wrong = vec![BYTES + u32::from(b'Z'); 400];
+    wide_valid(&run(&tok, Some(wide), ThinkEntry::Closed, &wrong).content);
+    let quotes = vec![BYTES + u32::from(b'"'); 400];
+    let o = run(&tok, Some(any), ThinkEntry::Closed, &quotes);
+    assert!(
+        serde_json::from_str::<Value>(&o.content).is_ok_and(|v| v.is_object()),
+        "{}",
+        o.content
+    );
+    let pieces = Arc::new(PieceTok(&["[\"", "\", \"", "\"]", " \""]));
+    let want = vec![
+        pieces.piece("[\""),
+        BYTES + u32::from(b'a'),
+        pieces.piece("\", \""),
+        BYTES + u32::from(b'b'),
+        pieces.piece("\"]"),
+    ];
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(pieces));
+    let list = json!({"type": "array", "items": {"type": "string"}});
+    let c = build(&tok, ToolFormat::Hermes, &schema_body(&list)).expect("served");
+    let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+    assert_eq!(o.tokens, with_eos(&tok, want));
+    assert_eq!(o.content, r#"["a", "b"]"#);
+    let c = build(&tok, ToolFormat::Hermes, &object).expect("served");
+    let doc = r#"{"a": "b", "c": [1, "d"]}"#;
+    let want = ids(&tok, doc);
+    let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+    assert_eq!(o.tokens, with_eos(&tok, want));
+    assert_eq!(o.content, doc);
+}
+
+/// Rows that favour these bytes in turn, of which a number's end is one now
+/// and then.
+fn cycling(bytes: &[u8], n: usize) -> Vec<u32> {
+    bytes
+        .iter()
+        .cycle()
+        .take(n)
+        .map(|&b| BYTES + u32::from(b))
+        .collect()
+}
+
+/// A request that samples, or penalizes at temperature 0, draws among the ids
+/// the program allows: rows that favour letters the schema mostly refuses
+/// still give documents of the schema, and the draws differ by seed.
+#[test]
+fn a_sampled_request_draws_inside_the_mask() {
+    let tok = bytes_tok();
+    let mut schema = wide_schema();
+    schema["properties"]["o"] = json!({"anyOf": [{"type": "integer"}, {"type": "null"}]});
+    let c = build(&tok, ToolFormat::Hermes, &schema_body(&schema)).expect("served");
+    let wrong = cycling(b"Z7,]}n", 400);
+    let mut texts = Vec::new();
+    for (seed, temperature, repeat_penalty) in [(1, 1.5, 1.0), (2, 1.5, 1.0), (3, 0.0, 1.3)] {
+        let mut p = params(Some(c.clone()), ThinkEntry::Closed);
+        p.sampling = SamplingParams {
+            temperature,
+            repeat_penalty,
+            seed,
+            ..SamplingParams::default()
+        };
+        let o = run_read(&tok, &p, &wrong).0;
+        wide_valid(&o.content);
+        assert_eq!(o.stop, StopKind::Eos);
+        texts.push(o.content);
+    }
+    assert_ne!(texts[0], texts[1]);
+}
+
 /// A free string's end token takes the front of the text after it, and the
 /// rest of that text is tokenised from there: `", "` is one id, `b": ` four.
 #[test]
@@ -469,7 +604,28 @@ fn each_refusal_names_its_field() {
     let tok = bytes_tok();
     let node = |s: Value| schema_body(&json!({"type": "object", "properties": {"p": s}}));
     let tools = json!([{"type": "function", "function": {"name": "f"}}]);
+    // Each definition is an array of the one before it: shallow as written,
+    // 129 arrays deep once its $refs are written out.
+    let mut defs = Map::new();
+    defs.insert("d0".to_owned(), json!({"type": "null"}));
+    for i in 1..130 {
+        let items = json!({"$ref": format!("#/$defs/d{}", i - 1)});
+        defs.insert(format!("d{i}"), json!({"type": "array", "items": items}));
+    }
+    let deep = json!({"type": "object", "$defs": defs,
+        "properties": {"x": {"$ref": "#/$defs/d129"}}});
     let cases: Vec<(Value, ToolFormat, &str)> = vec![
+        (
+            json!({"tool_choice": "required", "tools": [{"function": {"name": "f",
+                "parameters": deep}}]}),
+            ToolFormat::Dsml(Spelling::Joined),
+            "tools[0].f.parameters: the schema is too deeply nested once its $refs are written out",
+        ),
+        (
+            schema_body(&deep),
+            ToolFormat::Hermes,
+            "schema: the schema is too deeply nested once its $refs are written out",
+        ),
         (
             node(json!({"type": "string", "pattern": "a+"})),
             ToolFormat::Hermes,
@@ -478,22 +634,49 @@ fn each_refusal_names_its_field() {
         (
             node(json!({"$ref": "#/x"})),
             ToolFormat::Hermes,
-            "the keyword \"$ref\"",
+            "$ref \"#/x\" does not point into this schema",
         ),
         (
-            node(json!({"anyOf": [{"type": "string"}]})),
+            schema_body(&json!({"type": "object", "properties": {"p": {"$ref": "#"}}})),
             ToolFormat::Hermes,
-            "the keyword \"anyOf\"",
+            "$ref \"#\" is met again inside the schema it points to",
         ),
         (
-            node(json!({"type": "integer"})),
+            node(json!({"$ref": "#/$defs/d", "type": "string"})),
             ToolFormat::Hermes,
-            "type \"integer\" is not supported by this server without an enum",
+            "the keyword \"type\" beside $ref",
         ),
         (
-            node(json!({"type": "array", "items": {"type": "string"}})),
+            node(json!({"oneOf": [{"type": "string"}]})),
             ToolFormat::Hermes,
-            "the keyword \"items\"",
+            "the keyword \"oneOf\"",
+        ),
+        (
+            node(json!({"anyOf": []})),
+            ToolFormat::Hermes,
+            "anyOf must be a non-empty array",
+        ),
+        (
+            node(json!({"type": "integer", "minimum": 0})),
+            ToolFormat::Hermes,
+            "the keyword \"minimum\"",
+        ),
+        (
+            node(json!({"type": "array"})),
+            ToolFormat::Hermes,
+            "type array needs items",
+        ),
+        (
+            node(json!({"type": "array", "items": {"type": "string"}, "minItems": 1})),
+            ToolFormat::Hermes,
+            "the keyword \"minItems\"",
+        ),
+        (
+            json!({"tool_choice": "required", "tools": [{"function": {"name": "f", "parameters":
+            {"type": "object", "properties": {"q": {"anyOf": [{"type": "integer"},
+            {"type": "string"}]}}}}}]}),
+            QWEN,
+            "an anyOf with a text option",
         ),
         (
             node(json!({"type": "number", "enum": [1.5]})),
@@ -551,9 +734,10 @@ fn each_refusal_names_its_field() {
             "required names \"q\"",
         ),
         (
-            json!({"response_format": {"type": "json_object"}}),
+            json!({"tool_choice": "required", "tools": tools,
+                "response_format": {"type": "json_object"}}),
             ToolFormat::Hermes,
-            "json_object",
+            "has one program",
         ),
         (
             json!({"response_format": {"type": "xml"}}),
@@ -621,6 +805,60 @@ fn each_refusal_names_its_field() {
     )
     .expect_err("no markup");
     assert!(e.unsupported && e.message.contains("no inverse"), "{e}");
+}
+
+/// A schema small as sent but large once written out or compiled is refused
+/// by name before the copies or the tokenising are done: `$ref`s to a 65 KiB
+/// constant, in one schema or across a request's tools, a long name above
+/// many schemas, and an `anyOf` that repeats a 10,000-byte property name in
+/// each of its options.
+#[test]
+fn a_schema_is_refused_before_it_grows_past_its_budget() {
+    let tok = bytes_tok();
+    let refused = |schema: Value| {
+        build(&tok, ToolFormat::Hermes, &schema_body(&schema))
+            .expect_err("over budget")
+            .message
+    };
+    let over = "the schema passes 67108864 bytes once its $refs are written out";
+    let large = |refs: usize| {
+        let props: Map<String, Value> = (0..refs)
+            .map(|i| (format!("p{i}"), json!({"$ref": "#/$defs/large"})))
+            .collect();
+        json!({"type": "object", "properties": props,
+            "$defs": {"large": {"const": "a".repeat(65 * 1024)}}})
+    };
+    let e = refused(large(1024));
+    assert!(e.contains(over), "{e}");
+    // The tools of a request share one budget.
+    let tools: Vec<Value> = (0..2)
+        .map(|i| json!({"function": {"name": format!("f{i}"), "parameters": large(520)}}))
+        .collect();
+    let e = build(
+        &tok,
+        ToolFormat::Hermes,
+        &json!({"tool_choice": "required", "tools": tools}),
+    )
+    .expect_err("over budget")
+    .message;
+    assert!(e.starts_with("tools[1]") && e.contains(over), "{e}");
+    // Each schema's path is copied too: a long name above many schemas.
+    let props: Map<String, Value> = (0..2000)
+        .map(|i| (format!("p{i}"), json!({"type": "null"})))
+        .collect();
+    let e = refused(json!({"type": "object", "properties": {
+        ("n".repeat(40 * 1024)): {"type": "object", "properties": props}}}));
+    assert!(e.contains(over), "{e}");
+    let named = |options: usize| {
+        json!({"type": "object", "properties": {
+            ("k".repeat(10_000)): {"anyOf": vec![json!({"type": "null"}); options]}}})
+    };
+    let e = refused(named(1000));
+    assert!(
+        e.contains("its program tokenises more than 16777216 bytes"),
+        "{e}"
+    );
+    build(&tok, ToolFormat::Hermes, &schema_body(&named(50))).expect("50 options compile");
 }
 
 fn forecast_tools() -> Value {
@@ -838,6 +1076,194 @@ fn a_forced_call_obeys_the_tools_when_greedy_does_not() {
     }
 }
 
+/// A forced call whose arguments are an integer, an array of integers and an
+/// `anyOf` of an integer and null is read back by each format's scanner as
+/// those values, on rows that favour letters the schema mostly refuses.
+#[test]
+fn a_forced_calls_numbers_arrays_and_any_of_read_back() {
+    let tok = bytes_tok();
+    let params = json!({"type": "object", "properties": {
+        "n": {"type": "integer"},
+        "xs": {"type": "array", "items": {"type": "integer"}},
+        "o": {"anyOf": [{"type": "integer"}, {"type": "null"}]}}});
+    let tools = json!([{"type": "function", "function": {"name": "f", "parameters": params}}]);
+    let wrong = cycling(b"Z7,]}\n<n", 300);
+    for format in FORMATS.into_iter().chain([ToolFormat::MuseSpark]) {
+        let c =
+            build(&tok, format, &call_body(&params)).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+        let o = run(&tok, Some(c), ThinkEntry::Closed, &wrong);
+        let calls = scanned(format, &tools, &o.content);
+        let [(name, args)] = calls.as_slice() else {
+            panic!("{format:?}: {}", o.content);
+        };
+        assert_eq!(name, "f");
+        assert!(args["n"].is_i64(), "{format:?}: {args}");
+        assert!(
+            args["xs"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(Value::is_i64)),
+            "{format:?}: {args}"
+        );
+        assert!(
+            args["o"].is_i64() || args["o"].is_null(),
+            "{format:?}: {args}"
+        );
+        assert_eq!(o.stop, StopKind::Eos);
+    }
+}
+
+/// Numeric arguments retain their values in complete calls and streamed
+/// argument pieces, including numbers nested inside arrays and objects.
+#[test]
+fn numeric_tool_arguments_keep_their_values() {
+    let mut wrong = Vec::new();
+    for (value, want, schema) in [
+        (
+            "18446744073709551617",
+            "18446744073709551617",
+            json!({"type": "integer"}),
+        ),
+        ("1e999", "1e+999", json!({"type": "number"})),
+        (
+            "-18446744073709551617",
+            "-18446744073709551617",
+            json!({"type": "integer"}),
+        ),
+        ("-1e-999", "-1e-999", json!({"type": "number"})),
+        (
+            r#"[18446744073709551617,{"x":1e999}]"#,
+            r#"[18446744073709551617,{"x":1e+999}]"#,
+            json!({"type": "array"}),
+        ),
+    ] {
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {
+            "type": "object", "properties": {"n": schema}}}}]);
+        let verbatim = format!(r#"{{"n":{value}}}"#);
+        let want = format!(r#"{{"n":{want}}}"#);
+        for format in FORMATS.into_iter().chain([ToolFormat::MuseSpark]) {
+            let raw = match format {
+                ToolFormat::Hermes => format!(
+                    "<tool_call>\n{{\"name\":\"f\",\"arguments\":{{\"n\":{value}}}}}\n</tool_call>"
+                ),
+                QWEN => format!(
+                    "<tool_call>\n<function=f>\n<parameter=n>\n{value}\n</parameter>\n</function>\n</tool_call>"
+                ),
+                QWEN_COMPACT => format!(
+                    "<tool_call>\n<function=f>\n<parameter=n>{value}</parameter>\n</function>\n</tool_call>"
+                ),
+                GLM => format!(
+                    "<tool_call>f<arg_key>n</arg_key><arg_value>{value}</arg_value></tool_call>"
+                ),
+                SOLAR => format!(
+                    "<|tool_call:start|>f\n<|tool_arg:start|>n<|tool_arg:value|>{value}<|tool_arg:end|>\n<|tool_call:end|>"
+                ),
+                ToolFormat::Dsml(spelling) => {
+                    let raw = format!(
+                        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n<｜DSML｜parameter name=\"n\" string=\"false\">{value}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+                    );
+                    if spelling == Spelling::Spaced {
+                        raw.replace("｜DSML｜tool_calls", "｜DSML｜ calls")
+                            .replace("｜DSML｜invoke", "｜DSML｜ invoke")
+                            .replace("｜DSML｜parameter", "｜DSML｜ parameter")
+                    } else {
+                        raw
+                    }
+                }
+                ToolFormat::MuseSpark => format!(
+                    " to=f<|message|><atem:function_calls>\n<atem:invoke name=\"f\">\n<atem:parameter name=\"n\">{value}</atem:parameter>\n</atem:invoke>\n</atem:function_calls>"
+                ),
+                _ => unreachable!("a parsed format"),
+            };
+            let mut whole = parser(format, &tools);
+            let result = whole.try_push(&raw).and_then(|_| whole.try_finish());
+            match result {
+                Ok(_)
+                    if whole.message().calls.len() == 1
+                        && whole.message().calls[0].name == "f"
+                        && (whole.message().calls[0].arguments == want
+                            || whole.message().calls[0].arguments == verbatim) => {}
+                result => wrong.push(format!(
+                    "{format:?} {value} whole: {result:?} {:?}",
+                    whole.message()
+                )),
+            }
+            let mut stream = parser(format, &tools).streaming_calls();
+            let mut args = String::new();
+            let result = raw
+                .chars()
+                .try_for_each(|ch| {
+                    stream.try_push(&ch.to_string())?;
+                    for piece in stream.take_pieces() {
+                        if let CallPiece::Args { text, .. } = piece {
+                            args.push_str(&text);
+                        }
+                    }
+                    Ok::<_, MarkupError>(())
+                })
+                .and_then(|()| stream.try_finish().map(|_| ()));
+            for piece in stream.take_pieces() {
+                if let CallPiece::Args { text, .. } = piece {
+                    args.push_str(&text);
+                }
+            }
+            // Streaming may keep the exponent's original spelling.
+            if result.is_err() || (args != want && args != verbatim) {
+                wrong.push(format!("{format:?} {value} stream: {result:?} {args:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A parameter whose `$ref` names a string reads back as that string through
+/// the GLM and Solar scanners, whole and streamed byte by byte: its digits
+/// stay text.
+#[test]
+fn a_string_ref_reads_back_as_text() {
+    let tok = bytes_tok();
+    let params = json!({"type": "object",
+        "$defs": {"s": {"type": "string", "const": "123"}},
+        "properties": {"s": {"$ref": "#/$defs/s"}}});
+    let tools = json!([{"type": "function", "function": {"name": "f", "parameters": params}}]);
+    let want = json!({"s": "123"});
+    for (format, spelling) in [(GLM, KvSpelling::Glm), (SOLAR, KvSpelling::Solar)] {
+        let c =
+            build(&tok, format, &call_body(&params)).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+        let o = run(&tok, Some(c), ThinkEntry::Closed, &[]);
+        assert_eq!(
+            scanned(format, &tools, &o.content),
+            vec![("f".to_owned(), want.clone())],
+            "{format:?}: {}",
+            o.content
+        );
+        let mut p = ChatParser::with_tools(
+            "",
+            ReasoningFormat::None,
+            Some(Tools::KvMarkup(spelling, ArgTypes::of_tools(Some(&tools)))),
+        )
+        .streaming_calls();
+        let mut args = String::new();
+        let mut take = |p: &mut ChatParser| {
+            for piece in p.take_pieces() {
+                if let CallPiece::Args { text, .. } = piece {
+                    args.push_str(&text);
+                }
+            }
+        };
+        for ch in o.content.chars() {
+            p.try_push(&ch.to_string()).expect("parses");
+            take(&mut p);
+        }
+        p.try_finish().expect("closes");
+        take(&mut p);
+        assert_eq!(
+            serde_json::from_str::<Value>(&args).expect("JSON arguments"),
+            want,
+            "{format:?}"
+        );
+    }
+}
+
 /// A forced call of the function `f` whose parameters are `params`.
 fn call_body(params: &Value) -> Value {
     json!({"tool_choice": "required", "tools": [
@@ -917,13 +1343,10 @@ fn a_stop_special_in_a_json_literal_is_written_whole() {
 #[test]
 fn a_walk_takes_no_stop_id_before_the_program_is_spent() {
     let tok = bytes_tok();
-    let vocab = Vocab::read(&*tok);
-    let env = Env {
-        tok: &*tok,
-        vocab: &vocab,
-    };
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let env = Env::new(&*tok, &vocab);
     let prog = program::compile(&[Part::Text("{".to_owned())], &env).expect("compiles");
-    let c = Constraint::new(prog, vec![tok.eos()], Arc::clone(vocab.stops()));
+    let c = Constraint::new(prog, Vec::new(), vec![tok.eos()], vocab);
     let e = Walk::new(&c, true)
         .choose(&[])
         .expect_err("a stop id before the program is spent");
@@ -1168,9 +1591,8 @@ fn a_response_format_string_may_hold_an_angle_bracket() {
     }
 }
 
-/// What the request's chat parser reads out of a reply: the content it
-/// leaves and how many calls it found, or the markup it refuses.
-fn parsed(format: ToolFormat, tools: &Value, text: &str) -> Result<(String, usize), MarkupError> {
+/// The request's chat parser, with its format and parameter types.
+fn parser(format: ToolFormat, tools: &Value) -> ChatParser {
     let scan = match format {
         ToolFormat::Hermes => Tools::Hermes,
         ToolFormat::QwenXml(framing) => Tools::QwenXml(framing, ParamKinds::of_tools(Some(tools))),
@@ -1181,7 +1603,12 @@ fn parsed(format: ToolFormat, tools: &Value, text: &str) -> Result<(String, usiz
         ToolFormat::MuseSpark => Tools::MuseSpark,
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
-    let mut p = ChatParser::with_tools("", ReasoningFormat::None, Some(scan));
+    ChatParser::with_tools("", ReasoningFormat::None, Some(scan))
+}
+
+/// The content and call count read by the request's parser.
+fn parsed(format: ToolFormat, tools: &Value, text: &str) -> Result<(String, usize), MarkupError> {
+    let mut p = parser(format, tools);
     let (a, b) = (p.try_push(text)?, p.try_finish()?);
     Ok((
         format!("{}{}", a.content, b.content),
@@ -1258,11 +1685,12 @@ fn a_fixed_id_asks_for_no_row() {
     .expect("served");
     let want = ids(&tok, "true");
     // t or f; then r, u, e, each the only child of its node; then a stop.
-    let (o, read) = run_read(&tok, Some(c.clone()), ThinkEntry::Closed, &want, None);
+    let mut p = params(Some(c), ThinkEntry::Closed);
+    let (o, read) = run_read(&tok, &p, &want);
     assert_eq!(o.content, "true");
     assert_eq!(read, [true, false, false, false, true]);
-    let probs = Probs::new(1, tok.n_vocab());
-    let (o, read) = run_read(&tok, Some(c), ThinkEntry::Closed, &want, Some(probs));
+    p.logprobs = Some(Probs::new(1, tok.n_vocab()));
+    let (o, read) = run_read(&tok, &p, &want);
     assert_eq!(o.content, "true");
     assert_eq!(read, [true; 5]);
 }
@@ -1413,17 +1841,19 @@ fn scripted(
     jump: bool,
     n_predict: i64,
 ) -> Ran {
-    scripted_in(tok, c, seed, peaks, jump, n_predict, 4096)
+    let mut p = params(Some(c.clone()), ThinkEntry::Closed);
+    p.n_predict = n_predict;
+    scripted_in(tok, &p, seed, peaks, jump, 4096)
 }
 
-/// [`scripted`] on an engine whose context holds `ctx_max` positions.
+/// [`scripted`] of the request `p` on an engine whose context holds
+/// `ctx_max` positions.
 fn scripted_in(
     tok: &Arc<dyn Tokenizer>,
-    c: &Constraint,
+    p: &GenParams,
     seed: u64,
     peaks: Peaks,
     jump: bool,
-    n_predict: i64,
     ctx_max: usize,
 ) -> Ran {
     let seen = Arc::new(Mutex::new(Seen::default()));
@@ -1435,13 +1865,11 @@ fn scripted_in(
         seen: Arc::clone(&seen),
     }))
     .schema_jump(jump);
-    let mut p = params(Some(c.clone()), ThinkEntry::Closed);
-    p.n_predict = n_predict;
     let out = generate(
         &mut slot,
         &sampling::reference_factory(),
         &tok.encode(PROMPT),
-        &p,
+        p,
         &mut |_| Ok(()),
         &mut |_| {},
         &mut Timings::default(),
@@ -1491,16 +1919,9 @@ fn assert_step_arms_ids(tok: &Arc<dyn Tokenizer>, jump: &Ran, step: &Ran, what: 
 
 /// A program of text parts compiled on `tok`.
 fn compiled(tok: &Arc<dyn Tokenizer>, parts: &[Part]) -> Constraint {
-    let vocab = Vocab::read(&**tok);
-    let prog = program::compile(
-        parts,
-        &Env {
-            tok: &**tok,
-            vocab: &vocab,
-        },
-    )
-    .expect("a program");
-    Constraint::new(prog, tok.encode("</think>\n\n"), Arc::clone(vocab.stops()))
+    let vocab = Arc::new(Vocab::read(&**tok));
+    let prog = program::compile(parts, &Env::new(&**tok, &vocab)).expect("a program");
+    Constraint::new(prog, Vec::new(), tok.encode("</think>\n\n"), vocab)
 }
 
 /// The jump arm takes the ids the step arm takes, over programs that mix
@@ -1530,6 +1951,12 @@ fn the_jump_arm_takes_the_step_arms_ids() {
         (bytes_tok(), QWEN, call.clone()),
         (bytes_tok(), QWEN_COMPACT, call.clone()),
         (stop_tok(), GLM, call),
+        (bytes_tok(), ToolFormat::Hermes, schema_body(&wide_schema())),
+        (
+            bytes_tok(),
+            ToolFormat::Hermes,
+            json!({"response_format": {"type": "json_object"}}),
+        ),
     ] {
         let c = build(&tok, format, &body).expect("served");
         for seed in 0..8 {
@@ -1551,6 +1978,36 @@ fn the_jump_arm_takes_the_step_arms_ids() {
         }
     }
     assert!(spanned > 0);
+}
+
+/// A whole number with nothing after it may end the answer: rows that favour
+/// `7` and then the end give `7` and the end on both arms, for an integer, a
+/// number and an `anyOf` of the two at the root.
+#[test]
+fn a_whole_root_number_may_end_the_answer() {
+    let tok = bytes_tok();
+    let seven = BYTES + u32::from(b'7');
+    for schema in [
+        json!({"type": "integer"}),
+        json!({"type": "number"}),
+        json!({"anyOf": [{"type": "integer"}, {"type": "number"}]}),
+    ] {
+        let c = build(&tok, ToolFormat::Hermes, &schema_body(&schema)).expect("served");
+        let peaks: Peaks = vec![
+            (Vec::new(), vec![(seven, 10.0)]),
+            (vec![seven], vec![(tok.eos(), 10.0)]),
+        ];
+        let step = scripted(&tok, &c, 0, peaks.clone(), false, 40);
+        let jump = scripted(&tok, &c, 0, peaks, true, 40);
+        for r in [&step, &jump] {
+            assert_eq!(
+                (r.out.content.as_str(), r.out.stop),
+                ("7", StopKind::Eos),
+                "{schema}"
+            );
+        }
+        assert_step_arms_ids(&tok, &jump, &step, &schema.to_string());
+    }
 }
 
 /// A first step's lead that a later step reverses: with p(a) = .6, p(b|a) =
@@ -1807,14 +2264,43 @@ fn a_run_is_cut_at_the_budget_and_the_context() {
         cut += j.spans + j.lead;
     }
     assert!(cut > 0);
+    let p = params(Some(c), ThinkEntry::Closed);
     for ctx_max in [3, 4, 5, 9, 20, 41] {
-        let step = scripted_in(&tok, &c, 4, Vec::new(), false, 400, ctx_max);
-        let jump = scripted_in(&tok, &c, 4, Vec::new(), true, 400, ctx_max);
+        let step = scripted_in(&tok, &p, 4, Vec::new(), false, ctx_max);
+        let jump = scripted_in(&tok, &p, 4, Vec::new(), true, ctx_max);
         assert_eq!(jump.out.tokens, step.out.tokens, "ctx {ctx_max}");
         assert_eq!(jump.out.truncated, step.out.truncated, "ctx {ctx_max}");
         assert_fed_the_answer(&tok, &step);
         assert_fed_the_answer(&tok, &jump);
         assert!(jump.fed.len() <= ctx_max);
+    }
+}
+
+/// A penalized request's draws count the fixed ids before them: the lead
+/// `{"a": "` holds `a` and the later run `", "c": "` holds `c`, so rows that
+/// favour `a` over `b` and then `c` over `d` give `b` and `d` under a repeat
+/// penalty of 2, the jump arm on or off.
+#[test]
+fn a_penalty_counts_the_fixed_ids_before_a_decision() {
+    let tok = bytes_tok();
+    let pair = |x: &str, y: &str| json!({"type": "string", "enum": [x, y]});
+    let schema =
+        json!({"type": "object", "properties": {"a": pair("a", "b"), "c": pair("c", "d")}});
+    let c = build(&tok, ToolFormat::Hermes, &schema_body(&schema)).expect("served");
+    let byte = |b: u8| BYTES + u32::from(b);
+    let favour = |hi: u8, lo: u8| vec![(byte(hi), 10.0), (byte(lo), 9.0)];
+    // The second decision's rows follow either first pick, so each run's
+    // count is seen apart from the other's.
+    let peaks: Peaks = vec![
+        (ids(&tok, "{\"a\": \""), favour(b'a', b'b')),
+        (ids(&tok, "{\"a\": \"a\", \"c\": \""), favour(b'c', b'd')),
+        (ids(&tok, "{\"a\": \"b\", \"c\": \""), favour(b'c', b'd')),
+    ];
+    let mut p = params(Some(c), ThinkEntry::Closed);
+    p.sampling.repeat_penalty = 2.0;
+    for jump in [false, true] {
+        let r = scripted_in(&tok, &p, 0, peaks.clone(), jump, 4096);
+        assert_eq!(r.out.content, r#"{"a": "b", "c": "d"}"#, "jump {jump}");
     }
 }
 

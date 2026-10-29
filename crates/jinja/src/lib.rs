@@ -1277,7 +1277,7 @@ impl V {
             V::J(v) => match v {
                 Value::Null => false,
                 Value::Bool(b) => *b,
-                Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+                Value::Number(n) => float(n) != 0.0,
                 Value::String(s) => !s.is_empty(),
                 Value::Array(a) => !a.is_empty(),
                 Value::Object(o) => !o.is_empty(),
@@ -1385,15 +1385,33 @@ fn py_repr(v: &Value, out: &mut String) {
 }
 
 /// An integer as Python prints it, a float as `float.__repr__` (which
-/// `json.dumps` uses too).
+/// `json.dumps` uses too), and a number past `f64` (`1e999`, which a
+/// caller's serde_json with `arbitrary_precision` keeps as text) as it came.
 fn py_number(n: &serde_json::Number, out: &mut String) {
     if let Some(i) = n.as_i64() {
         let _ = write!(out, "{i}");
     } else if let Some(u) = n.as_u64() {
         let _ = write!(out, "{u}");
-    } else if let Some(f) = n.as_f64() {
-        py_float(f, out);
+    } else {
+        let text = n.to_string();
+        if text.contains(['.', 'e', 'E'])
+            && let Some(f) = n.as_f64()
+        {
+            py_float(f, out);
+        } else {
+            out.push_str(&text);
+        }
     }
+}
+
+/// The number as Python's `float` reads it: a number past `f64` (`1e999`,
+/// which `as_f64` refuses under `arbitrary_precision`) is an infinity.
+fn float(n: &serde_json::Number) -> f64 {
+    n.as_f64().unwrap_or_else(|| {
+        n.to_string()
+            .parse()
+            .expect("a JSON number reads as an f64")
+    })
 }
 
 /// `float.__repr__` of a finite float: the shortest digits that read back
@@ -1937,7 +1955,20 @@ impl Renderer {
                         i.checked_neg()
                             .ok_or_else(|| TemplateError("integer overflow".into()))?,
                     )),
-                    None => V::J(Value::from(-n.as_f64().unwrap_or(0.0))),
+                    None => {
+                        let text = n.to_string();
+                        if text.contains(['.', 'e', 'E']) {
+                            V::J(finite(-float(&n))?)
+                        } else {
+                            let neg = match text.strip_prefix('-') {
+                                Some(digits) => digits.to_owned(),
+                                None => format!("-{text}"),
+                            };
+                            V::J(serde_json::from_str(&neg).map_err(|e| {
+                                TemplateError(format!("cannot negate integer {text}: {e}"))
+                            })?)
+                        }
+                    }
                 },
                 other => return err(format!("cannot negate {other:?}")),
             },
@@ -2901,9 +2932,65 @@ fn py_int(v: &V) -> Option<i64> {
 
 fn num(v: &V) -> Option<f64> {
     match v {
-        V::J(Value::Number(n)) => n.as_f64(),
+        V::J(Value::Number(n)) => Some(float(n)),
         V::J(Value::Bool(b)) => Some(f64::from(u8::from(*b))),
         _ => None,
+    }
+}
+
+/// An integer's exact decimal digits, including Python's integer booleans.
+fn integer_text(v: &V) -> Option<String> {
+    match v {
+        V::J(Value::Bool(b)) => Some(u8::from(*b).to_string()),
+        V::J(Value::Number(n)) => {
+            let text = n.to_string();
+            (!text.contains(['.', 'e', 'E'])).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+/// Numeric comparison without rounding an integer through `f64`.
+fn numeric_cmp(a: &V, b: &V) -> Option<std::cmp::Ordering> {
+    fn decimal_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+        let x = a.trim_start_matches('-').trim_start_matches('0');
+        let y = b.trim_start_matches('-').trim_start_matches('0');
+        let (neg_x, neg_y) = (
+            a.starts_with('-') && !x.is_empty(),
+            b.starts_with('-') && !y.is_empty(),
+        );
+        match (neg_x, neg_y) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => {
+                let ord = x.len().cmp(&y.len()).then_with(|| x.cmp(y));
+                if neg_x { ord.reverse() } else { ord }
+            }
+        }
+    }
+    if let Some((x, y)) = py_int(a).zip(py_int(b)) {
+        return Some(x.cmp(&y));
+    }
+    match (integer_text(a), integer_text(b)) {
+        (Some(x), Some(y)) => Some(decimal_cmp(&x, &y)),
+        (Some(x), None) => {
+            let y = num(b)?;
+            if y.is_infinite() {
+                return Some(if y.is_sign_positive() {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                });
+            }
+            let ord = decimal_cmp(&x, &format!("{:.0}", y.trunc()));
+            Some(if ord.is_eq() {
+                0.0f64.partial_cmp(&y.fract())?
+            } else {
+                ord
+            })
+        }
+        (None, Some(_)) => numeric_cmp(b, a).map(std::cmp::Ordering::reverse),
+        (None, None) => num(a)?.partial_cmp(&num(b)?),
     }
 }
 
@@ -2914,10 +3001,7 @@ fn json_eq(a: &Value, b: &Value) -> bool {
     let (x, y) = (V::J(a.clone()), V::J(b.clone()));
     match (a, b) {
         (Value::Number(_) | Value::Bool(_), Value::Number(_) | Value::Bool(_)) => {
-            match (py_int(&x), py_int(&y)) {
-                (Some(p), Some(q)) => p == q,
-                _ => num(&x) == num(&y),
-            }
+            numeric_cmp(&x, &y).is_some_and(std::cmp::Ordering::is_eq)
         }
         (Value::Array(p), Value::Array(q)) => {
             p.len() == q.len() && p.iter().zip(q).all(|(p, q)| json_eq(p, q))
@@ -2979,16 +3063,21 @@ fn binop(l: &V, op: BinOp, r: &V) -> Result<V, TemplateError> {
     use BinOp::*;
     let int_pair = py_int(l).zip(py_int(r));
     let overflow = || TemplateError("integer overflow".into());
+    if matches!(op, Add | Sub | Mul | FloorDiv | Mod)
+        && int_pair.is_none()
+        && integer_text(l).is_some()
+        && integer_text(r).is_some()
+    {
+        return Err(overflow());
+    }
     Ok(V::J(match op {
         Eq => Value::Bool(eq(l, r)),
         Ne => Value::Bool(!eq(l, r)),
         Lt | Le | Gt | Ge => {
             let ord = match (l, r) {
                 (V::J(Value::String(a)), V::J(Value::String(b))) => a.cmp(b),
-                _ => match (num(l), num(r)) {
-                    (Some(a), Some(b)) => a.total_cmp(&b),
-                    _ => return err(format!("cannot compare {l:?} and {r:?}")),
-                },
+                _ => numeric_cmp(l, r)
+                    .ok_or_else(|| TemplateError(format!("cannot compare {l:?} and {r:?}")))?,
             };
             Value::Bool(match op {
                 Lt => ord.is_lt(),

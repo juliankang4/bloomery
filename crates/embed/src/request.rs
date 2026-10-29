@@ -130,12 +130,15 @@ impl<'a> Request<'a> {
                 normalize(cut, self.norm).map_err(Error::Invalid)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // JSON numbers use the widened f32 value, as llama-server writes it.
+        let json_vector =
+            |v: &[f32]| -> Value { v.iter().map(|&x| Value::from(f64::from(x))).collect() };
         if !self.oai {
             return Ok(Value::Array(
                 vectors
                     .into_iter()
                     .enumerate()
-                    .map(|(i, v)| json!({ "embedding": [v], "index": i }))
+                    .map(|(i, v)| json!({ "embedding": [json_vector(&v)], "index": i }))
                     .collect(),
             ));
         }
@@ -152,7 +155,7 @@ impl<'a> Request<'a> {
                         "object": "embedding",
                     })
                 } else {
-                    json!({ "embedding": v, "index": i, "object": "embedding" })
+                    json!({ "embedding": json_vector(v), "index": i, "object": "embedding" })
                 }
             })
             .collect();

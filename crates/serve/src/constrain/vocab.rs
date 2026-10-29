@@ -75,9 +75,13 @@ pub(crate) struct Vocab {
     /// Every id's text, concatenated; id `i` is `text[at[i]..at[i + 1]]`.
     text: String,
     at: Vec<u32>,
+    longest: usize,
     chars: Arc<[u8]>,
     /// The ids with a non-empty text, by the first byte of it.
     first: Vec<Vec<u32>>,
+    /// The ids whose text is only a JSON number's characters (digits, sign,
+    /// point, exponent), ascending.
+    numeric: Vec<u32>,
     stops: Arc<[u32]>,
     json: Class,
     /// `json` without the tokens that hold a `<`.
@@ -95,6 +99,7 @@ impl Vocab {
         let mut at = Vec::with_capacity(n + 1);
         let mut chars = Vec::with_capacity(n);
         let mut first: Vec<Vec<u32>> = vec![Vec::new(); 256];
+        let mut numeric = Vec::new();
         let mut json = Bits::new(n);
         let mut json_in_markup = Bits::new(n);
         for id in 0..n {
@@ -107,6 +112,14 @@ impl Vocab {
                 first[usize::from(b)].push(id32);
             }
             let stop = stops.contains(&id32);
+            if !stop
+                && !piece.is_empty()
+                && piece
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b"+-.eE".contains(&b))
+            {
+                numeric.push(id32);
+            }
             let safe = !piece.is_empty()
                 && !stop
                 && !piece.bytes().any(|b| matches!(b, b'"' | b'\\') || b < 0x20);
@@ -119,6 +132,11 @@ impl Vocab {
             text.push_str(&piece);
         }
         at.push(u32::try_from(text.len()).expect("the vocabulary's text fits u32"));
+        let longest = at
+            .windows(2)
+            .map(|w| (w[1] - w[0]) as usize)
+            .max()
+            .expect("a model's vocabulary is non-empty");
         let chars: Arc<[u8]> = chars.into();
         Vocab {
             json: Class {
@@ -131,11 +149,18 @@ impl Vocab {
             },
             text,
             at,
+            longest,
             chars,
             first,
+            numeric,
             stops,
             raw: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The byte length of the longest piece.
+    pub(crate) fn longest_piece(&self) -> usize {
+        self.longest
     }
 
     pub(crate) fn n_vocab(&self) -> usize {
@@ -166,8 +191,8 @@ impl Vocab {
             .or_insert_with(|| {
                 let mut ok = Bits::new(self.n_vocab());
                 for id in 0..self.n_vocab() {
-                    let piece = self.piece(id);
                     let id32 = u32::try_from(id).expect("a vocabulary fits u32");
+                    let piece = self.piece(id32);
                     if !piece.is_empty()
                         && !self.stops.contains(&id32)
                         && !piece.bytes().any(|b| b == stop)
@@ -183,23 +208,32 @@ impl Vocab {
             .clone()
     }
 
-    fn piece(&self, id: usize) -> &str {
-        &self.text[self.at[id] as usize..self.at[id + 1] as usize]
+    /// The text of `id`, empty for an id past the vocabulary.
+    pub(crate) fn piece(&self, id: u32) -> &str {
+        let id = id as usize;
+        match (self.at.get(id), self.at.get(id + 1)) {
+            (Some(&a), Some(&b)) => &self.text[a as usize..b as usize],
+            _ => "",
+        }
     }
 
-    /// The ids whose text is a non-empty prefix of `tail`, in id order, with
-    /// the length of each text in bytes. A stop id is none of them.
-    pub(crate) fn prefixes_of(&self, tail: &str) -> Vec<(u32, usize)> {
+    /// The ids whose text begins with `b`, ascending.
+    pub(crate) fn starting_with(&self, b: u8) -> &[u32] {
+        &self.first[usize::from(b)]
+    }
+
+    /// The ids whose text is only a JSON number's characters, ascending.
+    pub(crate) fn numeric(&self) -> &[u32] {
+        &self.numeric
+    }
+
+    /// Whether some id's text is a non-empty prefix of `tail`. A stop id is none of them.
+    pub(crate) fn prefixes_of(&self, tail: &str) -> bool {
         let Some(&b) = tail.as_bytes().first() else {
-            return Vec::new();
+            return false;
         };
         self.first[usize::from(b)]
             .iter()
-            .filter(|&&id| !self.stops.contains(&id))
-            .filter_map(|&id| {
-                let piece = self.piece(id as usize);
-                tail.starts_with(piece).then_some((id, piece.len()))
-            })
-            .collect()
+            .any(|&id| !self.stops.contains(&id) && tail.starts_with(self.piece(id)))
     }
 }
