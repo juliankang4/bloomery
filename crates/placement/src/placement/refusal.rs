@@ -304,6 +304,8 @@ pub enum PlacementError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardFreeFloor {
     pub card: String,
+    /// The device shares the host's memory, so its free bytes are the host room.
+    pub unified: bool,
     /// The device's free bytes at plan time.
     pub free: u64,
     /// The card's usable bytes.
@@ -332,6 +334,7 @@ impl fmt::Display for CardFreeFloor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let CardFreeFloor {
             card,
+            unified,
             free,
             usable,
             floor,
@@ -345,15 +348,37 @@ impl fmt::Display for CardFreeFloor {
             beside,
             held,
         } = self;
+        write!(f, "card {card}: ")?;
+        if *unified {
+            write!(
+                f,
+                "the device's host room is {free} B ({} when set, otherwise the host's memory \
+                 reading), of its usable {usable} B at plan time{held}",
+                bloomery_levers::HOST_ROOM
+            )?;
+        } else {
+            write!(
+                f,
+                "the device had {free} B free of its usable {usable} B at plan time{held}"
+            )?;
+        }
         write!(
             f,
-            "card {card}: the device had {free} B free of its usable {usable} B at plan \
-             time{held}, and the plan's dense trunk alone needs {floor} B = dense {dense} B (the \
+            ", and the plan's dense trunk alone needs {floor} B = dense {dense} B (the \
              allocator's granules) + KV {kv} B + context {context} B + scratch {scratch} B + \
              reserves {reserves} B + margin {margin} B + beside {beside} B (what the caller holds \
-             beside the plan), past the {free} B by {over} B: free the card, or plan a placement \
-             on a card with room"
-        )
+             beside the plan), past the {free} B by {over} B: "
+        )?;
+        if *unified {
+            write!(
+                f,
+                "raise or unset {} if set, or free host memory",
+                bloomery_levers::HOST_ROOM
+            )?;
+        } else {
+            f.write_str("free the card")?;
+        }
+        f.write_str(", or plan a placement on a card with room")
     }
 }
 

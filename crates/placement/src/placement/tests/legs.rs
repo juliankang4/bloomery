@@ -127,6 +127,7 @@ fn a_trunk_past_the_free_bytes_is_refused_by_name() {
         Err(PlacementError::CardFreeFloor(terms)) => {
             assert_eq!((terms.free, terms.floor), (HEAD - 1, HEAD));
             let text = terms.to_string();
+            assert!(!text.contains(bloomery_levers::HOST_ROOM), "{text}");
             for part in [
                 "card held: the device had 4351 B free of its usable",
                 "(held by pid 7 (977 MiB))",
@@ -141,6 +142,21 @@ fn a_trunk_past_the_free_bytes_is_refused_by_name() {
         Err(e) => panic!("{e}, not CardFreeFloor"),
         Ok(_) => panic!("a trunk past the free bytes was planned"),
     }
+    let mut unified = machine(HEAD - 1);
+    unified.nodes[0].unified = Some(UnifiedPool { bytes: HEAD - 1 });
+    let text = plan_with(&model, &unified, 4096, &NoKv, None)
+        .expect_err("a trunk past the unified room")
+        .to_string();
+    for part in [
+        "the device's host room is 4351 B",
+        "BLOOMERY_HOST_ROOM when set, otherwise the host's memory reading",
+        "(held by pid 7 (977 MiB))",
+        "past the 4351 B by 1 B",
+        "raise or unset BLOOMERY_HOST_ROOM if set, or free host memory",
+    ] {
+        assert!(text.contains(part), "{part:?} in {text}");
+    }
+    assert!(!text.contains("free the card"), "{text}");
     // A floor within the free bytes never refuses; the holder list is
     // absent when the census named none.
     let mut quiet = machine(HEAD);
