@@ -117,10 +117,12 @@ fn nvfp4_pack_q8(words: [u32; 4], d: f32, gs: f32) -> ([u32; 2], u32) {
     (packed, scale)
 }
 
-// The column's Q8 words, block scales and two warp maxima fit in shared memory.
-const ACT_SHARED_MAX: usize =
-    (crate::tensor::Q8ACT_MAX_K / 4 + crate::tensor::Q8ACT_MAX_K / 32 + 2) * 4;
-const _: () = assert!(ACT_SHARED_MAX == 24776);
+/// Dynamic shared bytes of `fused_swiglu` for a K-wide column: its Q8 words,
+/// block scales and two warp maxima.
+const fn act_shared_bytes(k: u32) -> u32 {
+    (k / 4 + k / 32 + 2) * 4
+}
+const _: () = assert!(act_shared_bytes(crate::tensor::Q8ACT_MAX_K as u32) == 24776);
 
 /// # Safety
 /// The input spans contain four values at `base`. SwiGLU inputs are
@@ -2063,7 +2065,8 @@ impl Kernels {
         act: &mut GemmAct32,
         fault: crate::fault::FaultSink,
     ) -> Result<(), GpuError> {
-        let shared = ((act.k / 4 + act.k / 32 + 2) * 4) as u32;
+        let k = crate::launch_u32("NVFP4 activation", "k", act.k)?;
+        let shared = act_shared_bytes(k);
         let prep = self
             .module
             .prepare_swiglu_nvfp4_32(LaunchConfig1D::new(cols, 64, shared))?;
@@ -2078,7 +2081,7 @@ impl Kernels {
             x,
             u32::MAX,
             0.0,
-            act.k as u32,
+            k,
             act.q8_required,
             &mut act.q,
             &mut act.d,
@@ -2116,8 +2119,8 @@ impl Kernels {
             "u",
             u,
         )?;
-        let k = act.k as u32;
-        let shared = ((act.k / 4 + act.k / 32 + 2) * 4) as u32;
+        let k = crate::launch_u32("NVFP4 activation", "k", act.k)?;
+        let shared = act_shared_bytes(k);
         let out = act
             .native
             .as_mut()
@@ -2484,6 +2487,11 @@ mod tests {
             let mut route = GemmRoute::new(stream, cols, 2)?;
             kernels.enqueue_route_remap(stream, &ids, &map, cols, &mut route, sink)?;
             let _ = gpu.take_fault()?;
+            // Cells past the four listed slots name unlisted slot 1, so a block
+            // past the prefix overwrites a sentinel.
+            let mut listed = route.cols.to_host_vec(stream)?;
+            listed[4..].fill(1);
+            route.cols.copy_from_host(stream, &listed)?;
             let expected = reference.native.as_ref().unwrap();
             let expected_q = expected.q.to_host_vec(stream)?;
             let expected_e = expected.e.to_host_vec(stream)?;
