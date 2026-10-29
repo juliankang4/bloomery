@@ -68,9 +68,10 @@
 //! in place of its width's median, would move the gate starts that width's
 //! readings over from it: the width runs again until it holds
 //! [`Rule::min_timings`] readings taken since, and the gate decides on their
-//! median. A chain draft's width past an open gate's starts over at every
-//! probe, because no other pass reaches its positions past the gate's width,
-//! and those positions' means start over with it. One fast reading cannot
+//! median. A chain draft's probe past an open gate refreshes the means of
+//! the positions past it, because no other pass reaches them; its costs
+//! start over only if the refreshed profile and reading would move the gate.
+//! One fast reading cannot
 //! move the gate and one slow one cannot hold a width out of it, and one
 //! probe after a load step replaces a median read under the old load. A
 //! proposal shorter than the room it was handed (the context's end) moves
@@ -822,6 +823,13 @@ pub struct GateState {
     /// The mean acceptance profile, `a_i` one a proposal index: the
     /// conditional mean ([`Stats::mean`]) times the calibration.
     pub a: Vec<f64>,
+    /// Each width's gate rate on the recent windows, in positions per
+    /// millisecond, index 0 the plain step; `None` while a cost or the
+    /// recent windows needed to rate it are unread.
+    pub rates: Vec<Option<f64>>,
+    /// A chain draft's estimated walk of one id in milliseconds; 0 until
+    /// enough cut passes have read it, and for a draft that is not a chain.
+    pub walk_ms: f64,
 }
 
 /// What the chooser measured of itself ([`Choosing::stats`]): its
@@ -838,6 +846,10 @@ pub struct Stats {
     /// over those proposals. A window that stopped short of a position is
     /// rated past it by this mean.
     pub mean: Vec<f64>,
+    /// The recent-window gate rates by width ([`GateState::rates`]).
+    pub rates: Vec<Option<f64>>,
+    /// The estimated per-id chain walk in milliseconds ([`GateState::walk_ms`]).
+    pub walk_ms: f64,
     /// The chooser's own passes counted while the gate stood closed
     /// ([`Tally::closed`]).
     pub closed: u64,
@@ -1080,6 +1092,8 @@ impl<D, C: Clock> Choosing<D, C> {
         Some(Stats {
             gains: self.gains.clone(),
             mean: self.mean.clone(),
+            rates: self.gate_rates(),
+            walk_ms: self.walk_ms,
             closed: t.closed,
             windows: t.scored,
             predicted_e: mean_of(t.predicted),
@@ -1092,8 +1106,8 @@ impl<D, C: Clock> Choosing<D, C> {
         std::mem::replace(&mut self.tally, Tally::new(self.costs.len()))
     }
 
-    /// The gate, each width's cost median and the mean profile as they
-    /// stand now.
+    /// The gate, each width's cost median, the mean profile, recent-window
+    /// gate rates and the per-id walk cost as they stand now.
     #[must_use]
     pub fn gate_state(&self) -> GateState {
         GateState {
@@ -1105,7 +1119,22 @@ impl<D, C: Clock> Choosing<D, C> {
                 .zip(&self.gains)
                 .map(|(&p, &g)| (p * g).clamp(0.0, 1.0))
                 .collect(),
+            rates: self.gate_rates(),
+            walk_ms: self.walk_ms,
         }
+    }
+
+    fn gate_rates(&self) -> Vec<Option<f64>> {
+        let mut a = vec![0.0; self.mean.len()];
+        (0..self.costs.len())
+            .map(|k| {
+                if k == 0 {
+                    self.medians[0].map(|ms| 1.0 / ms)
+                } else {
+                    self.gate_rate(k, &mut a).map(|(rate, _)| rate)
+                }
+            })
+            .collect()
     }
 
     /// The conditional acceptance learned from whole-round windows.
@@ -1610,12 +1639,9 @@ where
             let k = self.stalest();
             if D::CHAIN && !closed && k > self.width {
                 // No other pass reaches the positions past the gate's width.
-                self.start_over(k);
                 self.seen[self.width..k].fill(0);
-                (Some(k), false)
-            } else {
-                (Some(k), true)
             }
+            (Some(k), true)
         } else {
             (None, false)
         };
@@ -2244,10 +2270,26 @@ mod tests {
         );
         r.run(200);
         let c = r.choosing();
-        for output in [format!("{:?}", c.gate_state()), format!("{:?}", c.stats())] {
-            assert!(output.contains("rates:"), "gate rates missing: {output}");
-            assert!(output.contains("walk_ms:"), "walk cost missing: {output}");
+        c.medians
+            .copy_from_slice(&[Some(1.0), Some(2.0), Some(3.0), Some(4.0)]);
+        c.gains.fill(1.0);
+        (c.recent_len, c.recent_at) = (0, 0);
+        for p in [[1.0; 3], [0.0; 3]] {
+            c.p.copy_from_slice(&p);
+            c.learn(3);
         }
+        c.walk_ms = 0.5;
+        let state = c.gate_state();
+        let stats = c.stats().unwrap();
+        assert_eq!(state.rates, stats.rates);
+        assert_eq!((state.walk_ms, stats.walk_ms), (0.5, 0.5));
+        for (rate, want) in state.rates.iter().zip([1.0, 0.75, 8.0 / 11.0, 5.0 / 7.0]) {
+            assert!((rate.unwrap() - want).abs() < 1e-12, "{state:?}");
+        }
+        c.medians[2] = None;
+        assert_eq!(c.gate_state().rates, [Some(1.0), Some(0.75), None, None]);
+        c.recent_len = 0;
+        assert_eq!(c.gate_state().rates, [Some(1.0), None, None, None]);
     }
 
     /// A seeded stream of values in `[-1, 1]` (xorshift64).
@@ -2558,13 +2600,7 @@ mod tests {
     fn a_losing_chain_probe_does_not_restart_its_cost() {
         let acc = [0.95, 0.90, 0.30];
         let rule = Rule::DEFAULT;
-        let mut r = Rig::<true>::build(
-            acc,
-            acc.map(|a| a as f32),
-            &LINEAR,
-            Mode::Cost,
-            rule,
-        );
+        let mut r = Rig::<true>::build(acc, acc.map(|a| a as f32), &LINEAR, Mode::Cost, rule);
         r.run(600);
         let c = r.choosing();
         assert_eq!(c.width(), 2);

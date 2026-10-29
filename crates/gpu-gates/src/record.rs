@@ -1677,7 +1677,8 @@ pub static DRAFT_SUMMARY: Kind = Kind {
           positions per second, the draft, and the width chooser's mode (`BLOOMERY_MTP_WIDTH`, \
           cost or fixed); under cost the chooser's state at the run's end (the gate's width, 0 \
           closed; each width's cost median, index 0 the plain step, `-` while unread; the mean \
-          acceptance profile it rates them by) and the passes it ran closed.",
+          acceptance profile; the recent-window gate rates by width in positions/ms; the \
+          estimated per-id chain walk in ms) and the passes it ran closed.",
     parts: &[
         key("proposals", U64, ""),
         key("accepts", U64, ""),
@@ -1689,6 +1690,8 @@ pub static DRAFT_SUMMARY: Kind = Kind {
         opt("gate", U64, ""),
         opt("costs", Csv, "ms"),
         opt("a", Csv, ""),
+        opt("rates", Csv, "positions/ms"),
+        opt("walk_ms", F64(3), "ms/id"),
         opt("closed", U64, "passes"),
     ],
 };
@@ -1718,7 +1721,9 @@ pub static MTP_SUMMARY: Kind = Kind {
           kept passes' positions per second; under `BLOOMERY_MTP_WIDTH=cost` the width \
           chooser's own account of the arm: its calibration a proposal index (`gains`), the \
           mean of the draft's own probabilities a proposal index before the calibration \
-          (`mean`, the gate rates the widths by `mean · gains`), its own passes it ran with the \
+          (`mean`), the recent-window gate rates by width in positions/ms (`rates`, index 0 \
+          the plain step, `-` while unread), the estimated per-id chain walk in ms \
+          (`walk_ms`, 0 until read), its own passes it ran with the \
           gate closed (`closed`) and, with a window, the mean rows it predicted the windows' \
           widths to keep over each window's own profile (`predicted_e`) against the mean rows \
           they kept (`realized_e`).",
@@ -1731,6 +1736,8 @@ pub static MTP_SUMMARY: Kind = Kind {
         key("tok/s(positions)", F64(2), "tok/s"),
         opt("gains", Csv, ""),
         opt("mean", Csv, ""),
+        opt("rates", Csv, "positions/ms"),
+        opt("walk_ms", F64(3), "ms/id"),
         opt("closed", U64, "passes"),
         opt("predicted_e", F64(3), ""),
         opt("realized_e", F64(3), ""),
@@ -1769,7 +1776,9 @@ pub static MTP_WIDTH: Kind = Kind {
           step: the gate closed, the warm-up's or a probe's plain turn, a shadow's pass), E, the \
           mean rows a window kept; then the chooser's state at the request's end (the gate's \
           width, 0 closed; each width's cost median, index 0 the plain step, `-` while unread; \
-          the mean acceptance profile it rates them by) and the request's passes of its own the \
+          the mean acceptance profile; the recent-window gate rates by width in positions/ms \
+          (`rates`, `-` while unread); the estimated per-id chain walk in ms \
+          (`walk_ms`, 0 until read)) and the request's passes of its own the \
           gate stood closed for (a round of several slots' windows is none).",
     parts: &[
         key("windows", U64, ""),
@@ -1779,6 +1788,8 @@ pub static MTP_WIDTH: Kind = Kind {
         key("gate", U64, ""),
         key("costs", Csv, "ms"),
         key("a", Csv, ""),
+        key("rates", Csv, "positions/ms"),
+        key("walk_ms", F64(3), "ms/id"),
         key("closed", U64, "passes"),
     ],
 };
@@ -3356,7 +3367,8 @@ pub static LINK_PROBE: &[&Kind] = &[&LINK_GATHER];
 
 /// The width chooser's state on `r`, a `draft summary` or an `mtp width`
 /// record: the gate's width, each width's cost median in ms (`-` while
-/// unread), the mean acceptance profile, and `closed`, its own passes it
+/// unread), the mean acceptance profile, the recent-window gate rates and
+/// per-id walk cost, and `closed`, its own passes it
 /// ran closed over what the record covers (`runtime::width::Tally::closed`).
 #[cfg(feature = "gpu")]
 pub fn width_gate(r: Record, s: &runtime::width::GateState, closed: u64) -> Record {
@@ -3364,10 +3376,23 @@ pub fn width_gate(r: Record, s: &runtime::width::GateState, closed: u64) -> Reco
         Some(ms) => format!("{ms:.2}"),
         None => "-".to_string(),
     });
-    r.u("gate", s.width)
+    let r = r
+        .u("gate", s.width)
         .csv("costs", costs)
-        .csv("a", s.a.iter().map(|a| format!("{a:.3}")))
-        .u("closed", closed)
+        .csv("a", s.a.iter().map(|a| format!("{a:.3}")));
+    width_rates(r, &s.rates, s.walk_ms).u("closed", closed)
+}
+
+#[cfg(feature = "gpu")]
+fn width_rates(r: Record, rates: &[Option<f64>], walk_ms: f64) -> Record {
+    r.csv(
+        "rates",
+        rates.iter().map(|r| match r {
+            Some(rate) => format!("{rate:.6}"),
+            None => "-".to_string(),
+        }),
+    )
+    .f("walk_ms", walk_ms)
 }
 
 /// The `draft summary` record of a drafted run's `passes`, each whether it
@@ -3426,8 +3451,8 @@ pub fn mtp_stats(
     }
     let r = r
         .csv("gains", s.gains.iter().map(|g| format!("{g:.4}")))
-        .csv("mean", s.mean.iter().map(|p| format!("{p:.4}")))
-        .u("closed", s.closed);
+        .csv("mean", s.mean.iter().map(|p| format!("{p:.4}")));
+    let r = width_rates(r, &s.rates, s.walk_ms).u("closed", s.closed);
     Ok(match (s.predicted_e, s.realized_e) {
         (Some(p), Some(e)) => r.f("predicted_e", p).f("realized_e", e),
         _ => r,
@@ -4267,6 +4292,50 @@ mod tests {
     use super::*;
 
     use bloomery_record::missing;
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn width_records_include_gate_rates_and_walk_cost() {
+        let state = runtime::width::GateState {
+            width: 1,
+            costs: vec![Some(2.0), Some(3.0), None],
+            a: vec![0.8, 0.6],
+            rates: vec![Some(0.5), Some(0.6), None],
+            walk_ms: 0.125,
+        };
+        let r = Record::new(&MTP_WIDTH)
+            .u("windows", 0)
+            .csv("kept", [0, 0, 0])
+            .csv("widths", [0, 0, 0])
+            .f("e", 0.0);
+        let line = width_gate(r, &state, 0).line();
+        assert_eq!(
+            line,
+            "mtp width windows=0 kept=0,0,0 widths=0,0,0 e=0.000 gate=1 costs=2.00,3.00,- a=0.800,0.600 rates=0.500000,0.600000,- walk_ms=0.125 closed=0"
+        );
+        let stats = runtime::width::Stats {
+            gains: vec![1.0; 2],
+            mean: state.a,
+            rates: state.rates,
+            walk_ms: state.walk_ms,
+            closed: 0,
+            windows: 0,
+            predicted_e: None,
+            realized_e: None,
+        };
+        let r = Record::new(&MTP_SUMMARY)
+            .u("proposals", 0)
+            .list("kept", &[0, 0, 0])
+            .list("widths", &[0, 0, 0])
+            .u("positions", 0)
+            .u("passes", 0)
+            .f("tok/s(positions)", 0.0);
+        let line = mtp_stats(r, Some(&stats), 0).unwrap().line();
+        assert!(
+            line.ends_with("rates=0.500000,0.600000,- walk_ms=0.125 closed=0"),
+            "{line}"
+        );
+    }
 
     #[test]
     fn host_only_records_name_causes_and_skip_an_all_host_choice() {
