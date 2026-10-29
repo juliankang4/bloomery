@@ -61,6 +61,7 @@ const _: () = assert!(
     linear::PASS_ROWS == stores::PASS_ROWS
         && linear::RING_ROWS == stores::conv_ring_rows(linear::CONV_TAPS)
         && ple::RING_ROWS == stores::ple_ring_rows(ple::TAPS, ple::DILATION)
+        && qsa::RING_ROWS == stores::index_ring_rows(geo::POOL)
         && PASS_ROWS <= stores::PASS_ROWS
         && ROUTE_ROWS * (geo::N_USED + 1) <= crate::gemm::GEMM_MAX_SLOTS
 );
@@ -79,8 +80,9 @@ pub(super) const VERIFY_ROWS: usize = LANES;
 
 /// A layer's store: the delta rule's recurrent state ([`LANES`] lanes), its
 /// lanes' stamps (`linear::delta`'s module doc), conv ring and carry, or a
-/// selecting attention layer's K/V planes with its raw and pooled indexer
-/// keys (`[ctx][IDX_DIM]` and `[pools][IDX_DIM]` f16).
+/// selecting attention layer's K/V planes, its raw indexer key ring
+/// (`[qsa::RING_ROWS][IDX_DIM]` f16, `crate::qsa`'s module doc) and its pooled
+/// keys (`[pools][IDX_DIM]` f16).
 pub(super) enum Store38 {
     Rec {
         rec: RecStore,
@@ -88,7 +90,7 @@ pub(super) enum Store38 {
     },
     Qsa {
         kv: KvPlanes,
-        raw: DeviceBuffer<u16>,
+        ring: DeviceBuffer<u16>,
         pooled: DeviceBuffer<u16>,
     },
 }
@@ -117,7 +119,7 @@ impl Store38 {
     pub(super) fn qsa(stream: &CudaStream, d: &Dims, kv: KvQ8) -> Result<Store38, GpuError> {
         Ok(Store38::Qsa {
             kv: KvPlanes::new(stream, d, kv)?,
-            raw: DeviceBuffer::zeroed(stream, d.ctx * geo::IDX_DIM)?,
+            ring: DeviceBuffer::zeroed(stream, qsa::RING_ROWS * geo::IDX_DIM)?,
             pooled: DeviceBuffer::zeroed(stream, qsa::pools_for(d.ctx) * geo::IDX_DIM)?,
         })
     }
@@ -126,7 +128,7 @@ impl Store38 {
     pub(super) fn bytes(&self) -> usize {
         match self {
             Store38::Rec { rec, stamp } => rec.bytes() + stamp.num_bytes(),
-            Store38::Qsa { kv, raw, pooled } => kv.bytes() + raw.num_bytes() + pooled.num_bytes(),
+            Store38::Qsa { kv, ring, pooled } => kv.bytes() + ring.num_bytes() + pooled.num_bytes(),
         }
     }
 }

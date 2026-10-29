@@ -203,16 +203,17 @@ fn indexer_projection(t: &ModelTensor) -> bool {
 /// of 128 × 128 f32 with a u32 stamp each, its conv ring of 11 rows of
 /// 10,240 f32 and its carry of 124,324 f32, 13,530,784 B; the PLE layer's
 /// ring beside it, 17 rows of 4 · 2,560 f32; a selecting layer, every
-/// fourth, its K, V and raw index key, 2,304 B a position, and a pooled key,
-/// 256 B a pool of four; and beside the cache the stage's rope rows, the
-/// file's 64 rope dims of f32 a position.
+/// fourth, its K and V, 2,048 B a position, a pooled key, 256 B a pool of
+/// four, and its raw index key ring of 11 rows of 128 f16, 2,816 B; and
+/// beside the cache the stage's rope rows, the file's 64 rope dims of f32 a
+/// position.
 struct Kv38;
 
 impl KvBytes for Kv38 {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
         let ple = if layer == 1 { 17 * 4 * 2560 * 4 } else { 0 };
         let own = if layer % 4 == 3 {
-            ctx_max * 2304 + ctx_max.div_ceil(4) * 256
+            ctx_max * 2048 + ctx_max.div_ceil(4) * 256 + 11 * 128 * 2
         } else {
             13_530_784
         };
@@ -234,14 +235,15 @@ const ROWS: u64 = 9 * 4 * 2560 * 4;
 /// The host bytes one saved sequence state of `ctx` positions holds, the
 /// prompt cache's entry (`qwen35moe::place::PlanInputs::seq_state_bytes`,
 /// which a box gate holds equal to the engine's `seq38_bytes`) [derived]:
-/// the 12 selecting layers' positional bytes (2,304 B a position and a
+/// the 12 selecting layers' positional bytes (2,048 B a position and a
 /// 256 B pooled key a pool of four), two checkpoints — the 36 delta layers'
-/// committed state lane, conv ring and carry, 4,093,584 B each, and the PLE
-/// ring, 17 · 4 · 2,560 f32 — and, under the draft, its store (2,048 B a
+/// committed state lane, conv ring and carry, 4,093,584 B each, the PLE
+/// ring, 17 · 4 · 2,560 f32, and the 12 raw index key rings, 11 rows of 128
+/// f16 each — and, under the draft, its store (2,048 B a
 /// position), the arena rows ([`ROWS`]) and one point's hidden row
 /// (4 · 2,560 f32).
 fn state38(ctx: u64, drafts: bool) -> u64 {
-    let attention = 12 * (ctx * 2304 + ctx.div_ceil(4) * 256);
+    let attention = 12 * (ctx * 2048 + ctx.div_ceil(4) * 256);
     let draft = if drafts {
         ctx * 2048 + ROWS + 4 * 2560 * 4
     } else {
@@ -251,8 +253,9 @@ fn state38(ctx: u64, drafts: bool) -> u64 {
 }
 
 /// One checkpoint's host bytes: the 36 delta layers' committed state lane,
-/// conv ring and carry, and the PLE ring ([`state38`]'s term).
-const CHECKPOINT_38: u64 = 36 * 4_093_584 + 17 * 4 * 2560 * 4;
+/// conv ring and carry, the PLE ring and the 12 selecting layers' raw index
+/// key rings ([`state38`]'s term).
+const CHECKPOINT_38: u64 = 36 * 4_093_584 + 17 * 4 * 2560 * 4 + 12 * 11 * 128 * 2;
 
 /// The stage card of `qwen35moe::place::machine_for_experts(spec, 48, 4096,
 /// Experts::Card)`: every layer, the head and the token embedding, its
@@ -539,8 +542,12 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
     // 592,544,256 B of rounding, the box gate's CARD_PLANS row; was 263 on the first 30. The ubatch
     // arena's query, β·α and one-row indexer rows leave the stage's scratch, 110,624,768 B at 4,096,
     // which the spread fills with experts and their granules [derived: this plan].
+    // PIN(2026-10-29): 264 on the first 20 layers, 39,624,806,400 B and 595,911,168 B of rounding;
+    // was 264 on the first 17 and 39,615,590,400 B. A selecting layer's raw index keys leave its
+    // positional bytes for a ring of 11 rows (`Kv38`), 12 · (256 · 4,096 − 2,816) = 12,549,120 B at
+    // 4,096, which the spread fills with 3 experts of 3,072,000 B [derived: this plan].
     let want: Vec<u64> = (0..LAYERS)
-        .map(|l| if l < 17 { 264 } else { 263 })
+        .map(|l| if l < 20 { 264 } else { 263 })
         .collect();
     assert_eq!(
         (
@@ -548,7 +555,7 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
             a6000.cards[0].expert_bytes,
             a6000.cards[0].rounding_bytes
         ),
-        (&want, 39_615_590_400, 592_544_256)
+        (&want, 39_624_806_400, 595_911_168)
     );
 
     let one = picked("a", &census_96(1))[0];
@@ -694,9 +701,13 @@ fn q3_routes_onto_cards_like_the_q4_file() {
     // PIN(2026-10-28): 196,300,800 B more experts on the card, off the host and both needs; was
     // 41,884,544,000, 70,684,682,240 and 42,421,414,912 B. The ubatch arena's query, β·α and one-row
     // indexer rows leave the stage's scratch, 110,624,768 B at 4,096 [derived: the same spread].
+    // PIN(2026-10-29): 12 experts of 2,176,000 B more on the card, 26,112,000 B off the host and both
+    // needs; was 41,688,243,200, 70,488,381,440 and 42,225,114,112 B. A selecting layer's raw index
+    // keys leave its positional bytes for a ring of 11 rows (`Kv38`), 12,549,120 B of the card at
+    // 4,096, which the spread fills with experts and their granules [derived: the same spread].
     assert_eq!(
         (host.host.expert_bytes, host_need, nvme_need),
-        (41_688_243_200, 70_488_381_440, 42_225_114_112)
+        (41_662_131_200, 70_462_269_440, 42_199_002_112)
     );
     assert_eq!(nvme_need + PLE_TABLE, host_need + ROW_ROOM);
     assert!(nvme_need <= SCOPE_61G && SCOPE_61G < host_need);
@@ -793,7 +804,7 @@ fn two_slots_at_4096_hold_every_routed_expert() {
     assert_eq!((bytes, n_l, host), (Q4_ROUTED, vec![EXPERTS; LAYERS], 0));
 }
 
-/// 254,976 positions a slot on one such card, two sequences and no draft,
+/// 285,696 positions a slot on one such card, two sequences and no draft,
 /// is the last step of 256 whose plan holds at most the plan's margin fewer
 /// card expert bytes than the plan at 4,096
 /// ([`two_slots_at_4096_hold_every_routed_expert`]: every routed byte); the
@@ -825,11 +836,16 @@ fn two_slots_at_4096_hold_every_routed_expert() {
 // 337 on the host (was 505 on every layer and 336). The ubatch arena's query, β·α and one-row
 // indexer rows leave the stage's scratch, 110,624,768 B at 4,096, and the boundary moved eight
 // steps of 256 within the granules [derived: the plan's own boundary, 254,976 − 252,928 = 2,048].
+// PIN(2026-10-29): 285,696 positions (was 254,976), the same 504 or 505 experts a layer with 47 at
+// 505 and 337 on the host. A selecting layer's raw index keys leave its positional bytes for a ring
+// of 11 rows (`Kv38`): 3,072 B a position a slot, the two slots' cache and the stage's rope rows
+// 50,944 B a position (was 57,088), and the boundary moved 120 steps of 256 [derived: the plan's
+// own boundary, 285,696 − 254,976 = 30,720].
 #[test]
-fn two_slots_at_252416_stay_within_the_margin() {
-    let (at, n_l, host) = two_slots(254_976);
+fn two_slots_at_285696_stay_within_the_margin() {
+    let (at, n_l, host) = two_slots(285_696);
     assert!(Q4_ROUTED - at <= MARGIN);
-    let (next, _, _) = two_slots(254_976 + 256);
+    let (next, _, _) = two_slots(285_696 + 256);
     assert!(Q4_ROUTED - next > MARGIN);
     let (lo, hi) = (
         *n_l.iter().min().expect("layers"),

@@ -284,7 +284,7 @@ mod gate {
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::act_rule::{Arm, site_rel};
     use bloomery_gpu_gates::flip::{self, Flip};
-    use bloomery_gpu_gates::q38_fixture::Shape;
+    use bloomery_gpu_gates::q38_fixture::{Shape, key_ring_live};
     use bloomery_gpu_gates::rounding::{U, gamma, q8_32_rel};
     use bloomery_gpu_gates::slots_gate;
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
@@ -2973,7 +2973,7 @@ mod gate {
         let (state, pending) = m.seq_save_async(&lane)?.map_err(GateError::from)?;
         let cost = pending.land()?;
         let copies = 1 + pending.points().len() as u64;
-        let target = seq_positional_bytes(qsa, n, KvQ8::F16) + copies * checkpoint_bytes(gdn);
+        let target = seq_positional_bytes(qsa, n, KvQ8::F16) + copies * checkpoint_bytes(gdn, qsa);
         let store = kv_bytes * n as u64 / store_ctx as u64;
         let derived = target + store;
         m.reset()?;
@@ -3260,7 +3260,8 @@ mod gate {
 
     /// The store comparison's shape: the e2e gate's `(v)` rule in one bool —
     /// the committed delta lane and its carry, the conv ring's eight slots before the
-    /// count, the K/V planes' and raw keys' rows below it, the pools
+    /// count, the K/V planes' rows below it, the raw key ring's slots of the
+    /// count's pool not yet complete, the pools
     /// complete at the count (a pool a rejected row completed is read only
     /// at a count that completes it again), the PLE ring's fourteen slots
     /// before it.
@@ -3316,18 +3317,19 @@ mod gate {
                     bits(s, s2) && ring_same(r, r2, CONV_RING, conv_ch, 8) && bits(c, c2)
                 }
                 (
-                    Store38Host::Qsa { k, v, raw, pooled },
+                    Store38Host::Qsa { k, v, ring, pooled },
                     Store38Host::Qsa {
                         k: k2,
                         v: v2,
-                        raw: raw2,
+                        ring: ring2,
                         pooled: pooled2,
                     },
                 ) => {
                     let live = pos / POOL * IDX_DIM;
                     rows_same(k, k2, N_KV, HEAD)
                         && rows_same(v, v2, N_KV, HEAD)
-                        && rows_same(raw, raw2, 1, IDX_DIM)
+                        && key_ring_live(ring, pos)
+                            .is_some_and(|x| Some(x) == key_ring_live(ring2, pos))
                         && pooled.len() == pooled2.len()
                         && live <= pooled.len()
                         && pooled[..live] == pooled2[..live]

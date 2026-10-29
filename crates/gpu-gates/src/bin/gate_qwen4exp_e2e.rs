@@ -60,8 +60,8 @@
 //!   selecting store's planes set to [`PLANE_FILL`] (`reset` leaves them, so
 //!   a row a path reads without writing reads the pattern, not the previous
 //!   run's value), leave the same last token, the same last logits and every
-//!   store — the delta states and conv rings, the K/V planes, the raw and
-//!   pooled indexer keys, the PLE ring — bit for bit; the graph and eager
+//!   store — the delta states and conv rings, the K/V planes, the raw key
+//!   rings and the pooled indexer keys, the PLE ring — bit for bit; the graph and eager
 //!   steps also every position's token and logits. Then five graph steps
 //!   from `reset` after the pass's state leave the first run's everything:
 //!   `reset` clears the recurrent state.
@@ -120,8 +120,8 @@
 //!   `(c + k − 1) mod 4`, computed here from the lane before the verify, and
 //!   the live stores bit for bit the k steps' — each delta layer's committed
 //!   lane, the conv ring's slots of the eight positions before the count,
-//!   the K/V planes and raw keys below it, the pooled plane's pools complete
-//!   at the count, the PLE ring's slots of the fourteen positions before the
+//!   the K/V planes below it, the raw key ring's slots of the count's pool
+//!   not yet complete, the pooled plane's pools complete at the count, the PLE ring's slots of the fourteen positions before the
 //!   count (a rejected row wrote position-indexed rows past the count —
 //!   among them the pool it completed — which nothing reads until the row
 //!   at that position rewrites them first) — and the step after the commit
@@ -158,7 +158,8 @@
 //!   a state whose copy ran on a save lane (`seq_save_async`); the state's
 //!   bytes equal their derivation ([`seq38_bytes`]); each way's model stands
 //!   at the point, and after the rest's call every live row of every store
-//!   (the delta states and rings, the K/V planes, the raw and pooled keys)
+//!   (the delta states and rings, the K/V planes, the raw key rings and the
+//!   pooled keys)
 //!   and [`KP_STEPS`] steps' ids and logits are bit for bit the same, and
 //!   the unbroken run's.
 //! - (o) one owner of the position: after the prefix, a graph step, an eager
@@ -372,7 +373,7 @@ mod gate {
     use bloomery_gpu_gates::act_rule::{Arm, site_rel};
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::nodes::count_kinds;
-    use bloomery_gpu_gates::q38_fixture::Shape;
+    use bloomery_gpu_gates::q38_fixture::{Shape, key_ring_live};
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
@@ -677,10 +678,12 @@ mod gate {
     /// a pass.
     const CONV_RING: usize = CONV - 1 + PASS_ROWS;
     const PLE_RING: usize = (PLE_TAPS - 1) * PLE_DILATION + PASS_ROWS;
+    const KEY_RING: usize = POOL - 1 + PASS_ROWS;
     // The windows are derived from these copies: they are the engine's.
     const _: () = assert!(
         CONV_RING == bloomery_gpu::linear::RING_ROWS
             && PLE_RING == bloomery_gpu::ple::RING_ROWS
+            && KEY_RING == bloomery_gpu::qsa::RING_ROWS
             && PASS_ROWS == bloomery_gpu::linear::PASS_ROWS
             && POOL == bloomery_gpu::qsa::POOL
     );
@@ -712,8 +715,9 @@ mod gate {
     /// delta layer's state, 48 heads of 128 × 128 f32, and conv ring,
     /// `CONV − 1 + PASS_ROWS` rows of the conv's `2·16·128 + 48·128`
     /// channels in f32; each selecting layer's K and V rows, `2 · 2 · 256`
-    /// f16 a position, its raw indexer key, 128 f16 a position, and its
-    /// pooled key, 128 f16 a pool of 4 (the last pool counted whole); the
+    /// f16 a position, its pooled key, 128 f16 a pool of 4 (the last pool
+    /// counted whole), and its raw indexer key ring, `POOL − 1 + PASS_ROWS`
+    /// rows of 128 f16 whatever the context; the
     /// PLE ring, `(taps − 1)·dilation + PASS_ROWS` rows of the four streams
     /// in f32. PIN(2026-09-28): a delta layer's state is [`LANES`] lanes, a
     /// verify's rows each keeping its own, with a u32 stamp a lane.
@@ -724,7 +728,8 @@ mod gate {
         let conv_ch = 2 * K_HEADS * HEAD_V + V_HEADS * HEAD_V;
         let carry = (4 + 15 * ((K_HEADS + V_HEADS) * HEAD_V + 2 * V_HEADS)) * 4;
         let rec = LANES * (V_HEADS * HEAD_V * HEAD_V * 4 + 4) + CONV_RING * conv_ch * 4 + carry;
-        let sel = CTX * (2 * N_KV * HEAD * 2 + IDX_DIM * 2) + CTX.div_ceil(POOL) * IDX_DIM * 2;
+        let sel =
+            CTX * 2 * N_KV * HEAD * 2 + CTX.div_ceil(POOL) * IDX_DIM * 2 + KEY_RING * IDX_DIM * 2;
         let ple = ((PLE_TAPS - 1) * PLE_DILATION + PASS_ROWS) * STREAMS * HIDDEN * 4;
         n_gdn() * rec + n_qsa() * sel + ple
     }
@@ -1797,8 +1802,9 @@ mod gate {
     /// The layers whose live stores differ at count `pos`, and whether the
     /// PLE rings' live slots do ((v)'s rule: the committed lane and the
     /// carry, the conv ring's eight positions before the count, the K/V
-    /// planes' and raw keys' rows below it, the pools complete at the count,
-    /// the PLE ring's fourteen positions before the count).
+    /// planes' rows below it, the raw key ring's slots of the positions of the
+    /// count's pool not yet complete, the pools complete at the count, the PLE
+    /// ring's fourteen positions before the count).
     fn live_diff(a: &VRun, b: &VRun, pos: usize) -> (Vec<usize>, bool) {
         let conv_ch = 2 * K_HEADS * HEAD_V + V_HEADS * HEAD_V;
         let slots =
@@ -1845,11 +1851,11 @@ mod gate {
                         && same_bits(c, c2))
                 }
                 (
-                    Some(Store38Host::Qsa { k, v, raw, pooled }),
+                    Some(Store38Host::Qsa { k, v, ring, pooled }),
                     Some(Store38Host::Qsa {
                         k: k2,
                         v: v2,
-                        raw: raw2,
+                        ring: ring2,
                         pooled: pooled2,
                     }),
                 ) => {
@@ -1858,7 +1864,8 @@ mod gate {
                     let live = pos / POOL * IDX_DIM;
                     !(rows_same(k, k2, N_KV, HEAD)
                         && rows_same(v, v2, N_KV, HEAD)
-                        && rows_same(raw, raw2, 1, IDX_DIM)
+                        && key_ring_live(ring, pos)
+                            .is_some_and(|x| Some(x) == key_ring_live(ring2, pos))
                         && pooled.len() == pooled2.len()
                         && live <= pooled.len()
                         && pooled[..live] == pooled2[..live])
@@ -2520,8 +2527,9 @@ mod gate {
     /// `pos` — the committed lane with the rows its carry holds taken in
     /// ([`Store38Host::live_lane`]: a ubatch walk leaves the lane at its last
     /// chunk's start and the rows past it in the carry, where the pass takes
-    /// every row into the lane) and the conv ring, the K/V planes' and raw
-    /// keys' rows below the count and the pools complete at it — and the PLE
+    /// every row into the lane) and the conv ring, the K/V planes' rows below
+    /// the count, the raw key ring's live slots ([`key_ring_live`]) and the
+    /// pools complete at it — and the PLE
     /// rings'. Rows past the count hold [`PLANE_FILL`] in both and would only
     /// dilute the distance.
     fn live_rel(a: &Run, b: &Run, pos: usize) -> Result<(Vec<f64>, f64), GateError> {
@@ -2549,26 +2557,31 @@ mod gate {
                     rel(&live(pair.0, r), &live(pair.1, r2))
                 }
                 (
-                    Store38Host::Qsa { k, v, raw, pooled },
+                    Store38Host::Qsa { k, v, ring, pooled },
                     Store38Host::Qsa {
                         k: k2,
                         v: v2,
-                        raw: raw2,
+                        ring: ring2,
                         pooled: pooled2,
                     },
                 ) => {
+                    let (Some(kr), Some(kr2)) =
+                        (key_ring_live(ring, pos), key_ring_live(ring2, pos))
+                    else {
+                        return f64::INFINITY;
+                    };
                     let live = (pos / POOL * IDX_DIM).min(pooled.len()).min(pooled2.len());
                     let x: Vec<f32> = [
                         rows(k, N_KV, HEAD),
                         rows(v, N_KV, HEAD),
-                        rows(raw, 1, IDX_DIM),
+                        f(&kr),
                         f(&pooled[..live]),
                     ]
                     .concat();
                     let y: Vec<f32> = [
                         rows(k2, N_KV, HEAD),
                         rows(v2, N_KV, HEAD),
-                        rows(raw2, 1, IDX_DIM),
+                        f(&kr2),
                         f(&pooled2[..live]),
                     ]
                     .concat();
@@ -4618,8 +4631,8 @@ mod gate {
                 Store38Host::Rec { state, ring, carry } => {
                     h = h.f32s(state).f32s(ring).f32s(carry);
                 }
-                Store38Host::Qsa { k, v, raw, pooled } => {
-                    h = u16s(u16s(u16s(u16s(h, k), v), raw), pooled);
+                Store38Host::Qsa { k, v, ring, pooled } => {
+                    h = u16s(u16s(u16s(u16s(h, k), v), ring), pooled);
                 }
             }
         }

@@ -7,6 +7,20 @@
 
 use crate::GateError;
 
+/// The live raw keys of Qwen3.8's unfinished pool, or None for a malformed ring.
+#[cfg(feature = "gpu")]
+pub fn key_ring_live(ring: &[u16], pos: usize) -> Option<Vec<u16>> {
+    use bloomery_gpu::qsa::{DIM, POOL, RING_ROWS};
+    (ring.len() == RING_ROWS * DIM).then(|| {
+        (pos / POOL * POOL..pos)
+            .flat_map(|p| {
+                let s = p % RING_ROWS * DIM;
+                ring[s..s + DIM].iter().copied()
+            })
+            .collect()
+    })
+}
+
 /// Launches of the embedding row.
 const EMBED_LAUNCHES: usize = 1;
 /// Launches of a delta layer: its two mixes' 3 each, the mixer's 7 (q·k·v, z, β·α, the conv, the

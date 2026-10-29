@@ -488,8 +488,8 @@ fn rec_of(
     }
 }
 
-/// Layer `l`'s selecting store of `stores`: its K/V planes, raw and pooled
-/// keys.
+/// Layer `l`'s selecting store of `stores`: its K/V planes, raw key ring and
+/// pooled keys.
 fn qsa_of(
     stores: &mut [Store38],
     l: usize,
@@ -502,7 +502,7 @@ fn qsa_of(
     GpuError,
 > {
     match stores.get_mut(l) {
-        Some(Store38::Qsa { kv, raw, pooled }) => Ok((kv, raw, pooled)),
+        Some(Store38::Qsa { kv, ring, pooled }) => Ok((kv, ring, pooled)),
         Some(Store38::Rec { .. }) => Err(GpuError::shape(
             WHAT,
             format!("layer {l}'s plan and store are of two kinds"),
@@ -1339,7 +1339,7 @@ fn qsa(
     let fork = qsa_qkv(c, qp, branch, s, (m, sink))?;
     match seqs {
         Seqs38::One { stores, .. } => {
-            let (kv, raw, pooled) = qsa_of(stores, l)?;
+            let (kv, ring, pooled) = qsa_of(stores, l)?;
             {
                 let Arena38 {
                     mixed,
@@ -1355,7 +1355,7 @@ fn qsa(
                     pos,
                     n_keys,
                 };
-                qsa_keys(c, qp, by, (raw, pooled), keys, (m, sink))?;
+                qsa_keys(c, qp, by, (ring, pooled), keys, (m, sink))?;
             }
             qsa_query(c, qp, s, (m, sink))?;
             fork.join()?;
@@ -1402,7 +1402,7 @@ fn qsa(
                     table: q.table,
                     ..*c
                 };
-                let (kv, raw, pooled) = qsa_of(q.stores, l)?;
+                let (kv, ring, pooled) = qsa_of(q.stores, l)?;
                 let (pos, n_keys) = (rows_of(pos, r, 1)?, rows_of(n_keys, r, 1)?);
                 let keys = KeysIo {
                     x: &*rows_of(mixed, r, h)?,
@@ -1410,7 +1410,7 @@ fn qsa(
                     pos: &pos,
                     n_keys: &n_keys,
                 };
-                qsa_keys(c, qp, by, (raw, pooled), keys, (r.len(), sink))?;
+                qsa_keys(c, qp, by, (ring, pooled), keys, (r.len(), sink))?;
                 let io = AttendIo {
                     qsel: &*rows_of(&qa.qi, r, geo::IDX_HEADS * d)?,
                     n_keys: &n_keys,
@@ -1465,34 +1465,24 @@ fn qsa_qkv<'b>(
 }
 
 /// A selecting layer's indexer keys of one sequence's `m` rows: their
-/// projection (token-major, a sequence's own launch), the raw keys appended
-/// to the store at the rows' positions, then the pools those rows complete.
+/// projection (token-major, a sequence's own launch), the pools those rows
+/// complete, then the rows' raw keys appended to the store's ring.
 fn qsa_keys(
     c: &Ctx38<'_>,
     qp: &QsaPlan,
     bn: &mut ByName,
-    (raw, pooled): (&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>),
+    (ring, pooled): (&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>),
     io: KeysIo<'_>,
     (m, sink): (usize, FaultSink),
 ) -> Result<(), GpuError> {
     let (w, stream, ctx) = (c.w, c.gpu.stream(), c.ctx);
     let KeysIo { x, kr, pos, n_keys } = io;
     c.project(bn, &qp.idx_k, x, m, sink, Out::whole(&mut *kr))?;
-    c.k.q38.enqueue_key_append(
-        stream,
-        KeyAppendArgs {
-            kr,
-            pos,
-            m,
-            ctx,
-            fault: sink,
-            raw: &mut *raw,
-        },
-    )?;
     c.k.qsa.enqueue_pool(
         stream,
         PoolArgs {
-            raw,
+            kr: &*kr,
+            ring: &*ring,
             gain: f32_gain(w, &qp.idx_k_norm)?,
             table: c.table,
             n_keys,
@@ -1501,6 +1491,17 @@ fn qsa_keys(
             m,
             fault: sink,
             pooled,
+        },
+    )?;
+    c.k.q38.enqueue_key_append(
+        stream,
+        KeyAppendArgs {
+            kr: &*kr,
+            pos,
+            m,
+            ctx,
+            fault: sink,
+            ring,
         },
     )
 }

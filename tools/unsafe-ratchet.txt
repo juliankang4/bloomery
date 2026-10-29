@@ -697,7 +697,11 @@ gguf 7 2 0
 # code chunk's address, its copy and its zero fill, the scales chunk's address, its copy and its fill, and the group's
 # commit, 7 blocks, as `prefill_256_p`'s q8_0 stage) and the three new entries (`gqa_prefill_flash_256_p12_sel_q8`,
 # `_p12_sel_gated_q8`, `_p4_gated_q8`), one block each over their body. Each block has its SAFETY line.
-gpu 2806 381 10
+# PIN(2026-10-29): gpu 2806 -> 2812 blocks, new code, not old code relaxed: qsa_pool checks contributing counts (1 new block)
+# and narrows its projection, ring and gain reads to separate unsafe scopes (2 additional blocks).
+# The pool's count reads and qsa_key_append's position and projection reads each have one scope per read
+# (1 and 2 additional blocks, respectively).
+gpu 2812 381 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
