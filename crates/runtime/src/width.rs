@@ -2233,6 +2233,23 @@ mod tests {
         assert_eq!(r.choosing().stats(), None);
     }
 
+    #[test]
+    fn gate_diagnostics_include_the_rates_and_walk_cost() {
+        let mut r = Rig::<true>::build(
+            [0.95, 0.90, 0.30],
+            [0.95, 0.90, 0.30],
+            &LINEAR,
+            Mode::Cost,
+            Rule::DEFAULT,
+        );
+        r.run(200);
+        let c = r.choosing();
+        for output in [format!("{:?}", c.gate_state()), format!("{:?}", c.stats())] {
+            assert!(output.contains("rates:"), "gate rates missing: {output}");
+            assert!(output.contains("walk_ms:"), "walk cost missing: {output}");
+        }
+    }
+
     /// A seeded stream of values in `[-1, 1]` (xorshift64).
     struct Noise(u64);
 
@@ -2533,6 +2550,31 @@ mod tests {
             "{:.4} of the best fixed width's rate",
             rate / best
         );
+    }
+
+    /// A wider probe that still loses reads its cost once and leaves the
+    /// incumbent free to run on the next pass.
+    #[test]
+    fn a_losing_chain_probe_does_not_restart_its_cost() {
+        let acc = [0.95, 0.90, 0.30];
+        let rule = Rule::DEFAULT;
+        let mut r = Rig::<true>::build(
+            acc,
+            acc.map(|a| a as f32),
+            &LINEAR,
+            Mode::Cost,
+            rule,
+        );
+        r.run(600);
+        let c = r.choosing();
+        assert_eq!(c.width(), 2);
+        assert!(c.warm.is_empty());
+        c.read_at[3] = 0;
+        c.since_probe = rule.probe_every;
+        let calls = r.rows().len();
+        r.run(2);
+        assert_eq!(&r.rows()[calls..], &[4, 3], "the losing probe ran again");
+        assert!(r.choosing().warm.is_empty());
     }
 
     /// Width 3's verify 20 % slow while `on`, the rig's walls otherwise.
