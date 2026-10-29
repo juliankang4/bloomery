@@ -1718,7 +1718,7 @@ mod native {
             } else {
                 [0.0; 4]
             };
-            let (word, sum, dv, refused) = super::crate::gemm::act32::quant32_lane(v, lane);
+            let (word, sum, dv, refused) = super::super::act32::quant32_lane(v, lane);
             if let Some(slot) = slot {
                 let b = 2 * rt + blk;
                 // SAFETY: one lane owns word i of block b < 2·osteps of this live slot's column.
