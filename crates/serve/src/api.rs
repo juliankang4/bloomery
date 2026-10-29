@@ -117,6 +117,10 @@ pub(crate) mod logprobs;
 /// module so they run the completion and chat paths' own steps.
 #[path = "oaicompl.rs"]
 mod oaicompl;
+/// The responses the Responses API keeps, a child of this module so it holds
+/// a background response's client.
+#[path = "response_store.rs"]
+mod response_store;
 /// OpenAI's Responses API, a child of this module so it runs the chat path's
 /// own steps.
 #[path = "responses.rs"]
@@ -463,6 +467,7 @@ impl Server {
             api_keys: config.api_keys,
             info,
             start_unix: unix_now(),
+            responses: response_store::Store::default(),
         };
         Ok(Server {
             listener,
@@ -755,6 +760,8 @@ struct State {
     api_keys: ApiKeys,
     info: ModelInfo,
     start_unix: u64,
+    /// The responses `/v1/responses` keeps.
+    responses: response_store::Store,
 }
 
 pub(crate) fn relock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1518,12 +1525,12 @@ fn send_error(w: &mut TcpStream, req: &Request, e: &ApiError) -> io::Result<bool
 }
 
 /// The headers of the 204 an `OPTIONS` request gets: any origin may send
-/// `GET`, `POST` and `OPTIONS` with any header.
+/// `GET`, `POST`, `DELETE` and `OPTIONS` with any header.
 pub(crate) fn cors_preflight() -> [(&'static str, String); 2] {
     [
         (
             "Access-Control-Allow-Methods",
-            "GET, POST, OPTIONS".to_owned(),
+            "GET, POST, DELETE, OPTIONS".to_owned(),
         ),
         ("Access-Control-Allow-Headers", "*".to_owned()),
     ]
@@ -1601,7 +1608,7 @@ pub(crate) const LISTED: [(&str, &str); 13] = [
 ];
 
 /// Dispatches one request; `Ok(true)` when the connection may carry another.
-fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+fn route(state: &Arc<State>, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let r = match (req.method.as_str(), req.path.as_str()) {
         ("GET", path::HEALTH | "/v1/health") => return health(state, req, w),
         ("GET", path::MODELS | "/models") => Ok(models(state)),
@@ -1625,6 +1632,9 @@ fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         ("POST", path::RESPONSES | "/responses") => return responses::create(state, req, w),
         ("POST", "/v1/responses/input_tokens" | "/responses/input_tokens") => {
             return responses::input_tokens(state, req, w);
+        }
+        ("GET" | "DELETE" | "POST", p) if responses::stored_id(p).is_some() => {
+            return responses::stored(state, req, w);
         }
         ("POST", path::EMBEDDINGS) => return embeddings::post(state, req, w, true),
         ("POST", "/embeddings" | "/embedding") => return embeddings::post(state, req, w, false),
@@ -3474,7 +3484,7 @@ fn run_gen(
     input: &Prompt,
     prompt: Value,
     p: &GenParams,
-    peer: TcpStream,
+    client: Arc<Client>,
     sink: &mut dyn FnMut(Event<'_>, usize) -> io::Result<()>,
 ) -> Result<Result<(Outcome, usize), GenError>, ApiError> {
     let ran = run_choices(
@@ -3482,7 +3492,7 @@ fn run_gen(
         input,
         prompt,
         std::slice::from_ref(p),
-        peer,
+        client,
         &mut |ev, _, slot| sink(ev, slot),
     )?;
     Ok(ran.map(|mut all| all.swap_remove(0)))
@@ -3496,15 +3506,15 @@ fn run_gen(
 /// fed: the ids, and the images' spans and feeds of a chat that carries any.
 /// Returns every choice's outcome and slot, in the choices' order, once each
 /// one is done; an error before any event is the request's answer. The first
-/// choice that fails, and a sink that fails, end the request: the choices
-/// still queued leave the queue, and the running ones end at their next
-/// event, the channel they send on closed.
+/// choice that fails, a sink that fails, and a `client` gone end the
+/// request: the choices still queued leave the queue, and the running ones
+/// end at their next event, the channel they send on closed.
 fn run_choices(
     state: &State,
     input: &Prompt,
     prompt: Value,
     ps: &[GenParams],
-    peer: TcpStream,
+    client: Arc<Client>,
     sink: &mut dyn FnMut(Event<'_>, usize, usize) -> io::Result<()>,
 ) -> Result<Result<Vec<(Outcome, usize)>, GenError>, ApiError> {
     if let Some(reason) = state.fatal() {
@@ -3531,10 +3541,6 @@ fn run_choices(
             ),
         });
     }
-    let client = Arc::new(Client {
-        stream: peer,
-        gone: Mutex::new(false),
-    });
     let (events, rx) = mpsc::channel();
     // A sampler its factory refuses ends the request here, before it takes a
     // slot, as any refused sampling field does.
@@ -3651,17 +3657,43 @@ pub(crate) fn client_gone() -> io::Error {
 /// The response side's failure shared by the HTTP and engine threads. A socket
 /// error is consumed by `take_error`, so the first observer remembers it.
 pub(crate) struct Client {
-    stream: TcpStream,
+    /// The request's connection; `None` for a background response, which no
+    /// connection waits on.
+    stream: Option<TcpStream>,
     gone: Mutex<bool>,
 }
 
 impl Client {
+    /// The client on the request's connection `stream`.
+    fn of(stream: TcpStream) -> Arc<Client> {
+        Arc::new(Client {
+            stream: Some(stream),
+            gone: Mutex::new(false),
+        })
+    }
+
+    /// A client with no connection, which only [`Client::cancel`] ends.
+    fn detached() -> Client {
+        Client {
+            stream: None,
+            gone: Mutex::new(false),
+        }
+    }
+
+    /// Ends the request at its next check, as a client that went away does.
+    fn cancel(&self) {
+        *relock(&self.gone) = true;
+    }
+
     pub(crate) fn check(&self) -> io::Result<()> {
         let mut gone = relock(&self.gone);
         if *gone {
             return Err(client_gone());
         }
-        let result = probe_client(&self.stream);
+        let Some(stream) = &self.stream else {
+            return Ok(());
+        };
+        let result = probe_client(stream);
         #[cfg(test)]
         if result.is_err() {
             testserve::CLIENT_PROBE.with_borrow_mut(|pause| {
@@ -3717,9 +3749,14 @@ fn run_whole_choices(
     ps: &[GenParams],
     w: &TcpStream,
 ) -> io::Result<Result<Vec<(Outcome, usize)>, ApiError>> {
-    match run_choices(state, input, prompt, ps, w.try_clone()?, &mut |_, _, _| {
-        Ok(())
-    }) {
+    match run_choices(
+        state,
+        input,
+        prompt,
+        ps,
+        Client::of(w.try_clone()?),
+        &mut |_, _, _| Ok(()),
+    ) {
         Err(e) => Ok(Err(e)),
         Ok(Err(GenError::Client(e))) => Err(e),
         Ok(Err(e)) => Ok(Err(engine_error(&e))),
@@ -4234,7 +4271,14 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
             };
             sse(s, &v)
         };
-        run_gen(state, &input, prompt.clone(), &p, peer, &mut sink)
+        run_gen(
+            state,
+            &input,
+            prompt.clone(),
+            &p,
+            Client::of(peer),
+            &mut sink,
+        )
     };
     finish_stream(req, stream, w_opt, r, |s, (o, slot)| {
         sse(
@@ -4643,7 +4687,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 }
             }
         };
-        run_choices(state, &input, prompt, ps, peer, &mut sink)
+        run_choices(state, &input, prompt, ps, Client::of(peer), &mut sink)
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),
@@ -6405,7 +6449,8 @@ mod tests {
     /// llama-server's 401 (`Invalid API Key`, `authentication_error`, the
     /// JSON content type); a valid key answers 200 from either header, with
     /// or without the `Bearer ` prefix; `OPTIONS` passes with no key at all,
-    /// as llama-server's pre-routing handler answers it before the check.
+    /// as llama-server's pre-routing handler answers it before the check, and
+    /// allows every method a route takes, `DELETE` included.
     #[test]
     fn the_key_check_answers_llama_servers_401_and_lets_the_keyed_through() {
         assert_eq!(BEARER, format!("Bearer {KEY}"));
@@ -6421,6 +6466,10 @@ mod tests {
         let (status, head, _body) =
             super::testserve::roundtrip_head(addr, "OPTIONS", "/completion", &[], "");
         assert_eq!(status, 204, "OPTIONS passes with no key: {head}");
+        assert!(
+            head.contains("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS"),
+            "the preflight allows every routed method: {head}"
+        );
 
         let ask = r#"{"prompt":"I believe the meaning of life is","max_tokens":4}"#;
         let (status, head, body) =
@@ -7087,10 +7136,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let peer = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
             let (stream, _) = listener.accept().expect("accept");
-            let client = Arc::new(Client {
-                stream,
-                gone: Mutex::new(false),
-            });
+            let client = Client::of(stream);
             let (probed, consumed) = mpsc::channel();
             let (resume, resumed) = mpsc::channel();
             reset(peer);
@@ -7107,7 +7153,11 @@ mod tests {
                 &live,
                 &Arc::new(AtomicUsize::new(0)),
                 0,
-                client.stream.try_clone().expect("the checker's connection"),
+                client
+                    .stream
+                    .as_ref()
+                    .and_then(|s| s.try_clone().ok())
+                    .expect("the checker's connection"),
             );
             consumed
                 .recv_timeout(Duration::from_secs(3))

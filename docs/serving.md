@@ -22,6 +22,15 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   The choices queue together, so `n` is at most the slots plus the queue depth (64 with the defaults): under
   `--parallel N` up to N run at once, and on one slot they run one after another. `usage` counts the prompt once and
   every choice's completion tokens; `timings` are the first choice's. Other routes refuse `n` above 1.
+- **The OpenAI Responses API**: `POST /v1/responses` and `/v1/responses/input_tokens` on the chat path. A response
+  is kept unless the request sends `store: false`: `GET /v1/responses/{id}` reads it, `DELETE` drops it, and
+  `previous_response_id` continues its conversation (its input and output, not its `instructions`). `background: true`
+  answers `queued` at once; poll `GET` until the response finishes, or end it with `POST /v1/responses/{id}/cancel`.
+  The server keeps at most 1,024 responses and 256 MiB of JSON text, including conversations and running workers'
+  input items. This is a serialized size bound; JSON value trees allocate additional memory. The oldest finished
+  response goes first. A background request gets 503 with `Retry-After` while the running ones fill either bound;
+  an oversized background result stays pollable as `failed` with a named error. All responses are lost when the
+  server stops.
 - **Chat token counts**: `POST /chat/completions/input_tokens` (and its `/v1/` spelling) answers
   `{"input_tokens": N}` with the same chat request's prompt ids — the chat template's render, an image as its span;
   `max_tokens` is not needed.
@@ -308,7 +317,8 @@ A request field is read, refused or ignored:
   `/v1/chat/completions` and `/v1/completions` (and past the slots plus the queue depth on them), a non-empty
   `grammar`, probabilities on a route that renders none (`/completion` takes `n_probs`,
   `/v1/chat/completions` takes `logprobs` and `top_logprobs`), and the fields under "Refused by name" above.
-  `/v1/responses` also refuses a stored response (`previous_response_id`, `store: true`, `background: true`).
+  `/v1/responses` also refuses `conversation`, an `item_reference` item and `background: true` with `store: false`
+  or `stream: true`.
 - **`logit_bias`.** OpenAI's object from token ids to a number in -100 to 100, which is added to that id's logit
   before every pick, on `/completion`, `/v1/completions`, `/v1/chat/completions` and `/v1/responses` (also `/responses`):
   -100 keeps an id out in practice, +100 makes it the pick. It applies to greedy, sampled and structured-output requests,

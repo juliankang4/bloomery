@@ -52,7 +52,7 @@ use std::net::TcpStream;
 use serde_json::{Map, Value, json};
 
 use super::{
-    ApiError, CompletionPlan, State, body, chat_input, choice_params, completion_plan,
+    ApiError, Client, CompletionPlan, State, body, chat_input, choice_params, completion_plan,
     finish_stream, gen_body, get_i, invalid, progress, run_choices, run_whole_choices, send_error,
     send_json, sse, take_choices, unix_now, usage,
 };
@@ -122,7 +122,7 @@ pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io
             };
             sse(s, &v)
         };
-        run_choices(state, &input, prompt, &ps, peer, &mut sink)
+        run_choices(state, &input, prompt, &ps, Client::of(peer), &mut sink)
     };
     finish_stream(req, stream, w_opt, r, |s, all| {
         // One frame a choice with its `finish_reason` (its text already

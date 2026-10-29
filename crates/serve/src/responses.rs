@@ -2,7 +2,9 @@
 //! `POST /responses` generate, `POST /v1/responses/input_tokens` and
 //! `POST /responses/input_tokens` count, as llama-server serves them
 //! (`server_chat_convert_responses_to_chatcmpl`, `to_json_oaicompat_resp`,
-//! `to_json_oaicompat_resp_stream`, `handle_count_tokens`).
+//! `to_json_oaicompat_resp_stream`, `handle_count_tokens`); `GET`, `DELETE`
+//! and `POST …/cancel` on `/v1/responses/{id}` read the responses it keeps
+//! (# The store).
 //!
 //! A request converts into the OpenAI chat body `/v1/chat/completions` reads
 //! and runs the chat path's own steps on it ([`chat_plan`]): the sampling
@@ -52,7 +54,7 @@
 //!   does, so the field is read as part of the protocol and ignored.
 //!
 //! Ignored, as bookkeeping or as a request this answer already meets:
-//! `model` (echoed), `store: false`, `include` (but its logprobs),
+//! `model` (echoed), `include` (but its logprobs),
 //! `metadata`, `user`, `safety_identifier`, `prompt_cache_key`,
 //! `prompt_cache_retention`, `service_tier`, `client_metadata`,
 //! `stream_options`, `max_tool_calls` (it counts built-in tools, which this
@@ -61,14 +63,38 @@
 //! (`auto` asks to drop input that overflows the context; a prompt that does
 //! not fit is the chat path's 400, never a quiet cut).
 //!
+//! # The store
+//!
+//! `store` (`true` when absent, as OpenAI's default), `background` and
+//! `previous_response_id` are read; the answer echoes the three.
+//! - A stored response is kept with its conversation: the input items (a
+//!   previous response's conversation first), then its output items.
+//!   `GET /v1/responses/{id}` answers it as it was sent, `DELETE` drops it.
+//! - `previous_response_id` names a stored `completed` or `incomplete`
+//!   response; its conversation goes before the request's `input`, so the
+//!   request renders as one that sent the whole conversation. Its
+//!   `instructions` are not carried over, as OpenAI does not carry them.
+//! - `background: true` (with the store) answers the response `queued` at
+//!   once and generates it on a thread of its own; `GET` reads it
+//!   `in_progress` and then finished, or `failed` with its `error`.
+//!   `POST /v1/responses/{id}/cancel` ends a running one `cancelled`, as a
+//!   client gone ends a request, and a `DELETE` cancels it too.
+//! - The store is bounded ([`super::response_store`]): past 1,024 responses
+//!   or 256 MiB of their JSON the oldest finished one is dropped. A dropped
+//!   response is a 404, and a 400 as `previous_response_id`. A background
+//!   request the running ones leave no room for is a 503 with `Retry-After`.
+//!   Its worker's input items count toward the JSON bound. A background
+//!   result that alone exceeds it stays pollable as a named `failed` response.
+//!
 //! # The answer
 //!
 //! `{id, object: "response", created_at, completed_at, status, model, output,
-//! usage}`. `output` holds a `reasoning` item (the think span as one
-//! `reasoning_text` content part, `summary` empty, `encrypted_content` empty),
-//! a `message` item (one `output_text` part), then one `function_call` item per
-//! parsed call (`call_id`, `name`, `arguments`), each present only when it
-//! has something. `usage` is the chat path's: `input_tokens` the whole
+//! usage, background, store, previous_response_id}`. `output` holds a
+//! `reasoning` item (the think span as one `reasoning_text` content part,
+//! `summary` empty, `encrypted_content` empty), a `message` item (one
+//! `output_text` part), then one `function_call` item per parsed call
+//! (`call_id`, `name`, `arguments`), each present only when it has
+//! something. `usage` is the chat path's: `input_tokens` the whole
 //! prompt, `input_tokens_details.cached_tokens` what the prompt cache kept,
 //! `output_tokens` the generated ids, `total_tokens` their sum. `status` is
 //! `completed`, or `incomplete` with `incomplete_details.reason`
@@ -106,9 +132,11 @@
 //! # Refusals and errors
 //!
 //! Refused by name with a 400, where llama-server drops or defaults:
-//! `previous_response_id`, `conversation`, `store: true`, `background: true`,
-//! a stored `prompt` and an `item_reference` item (this server keeps no
-//! responses); `logprobs`, `top_logprobs` above 0 and `include` of
+//! `conversation`, a stored `prompt` and an `item_reference` item (this server
+//! keeps responses, not conversations, prompts or items); a
+//! `previous_response_id` the store does not hold or that has not finished;
+//! `background: true` with `store: false` or `stream: true` (a background
+//! response is polled); `logprobs`, `top_logprobs` above 0 and `include` of
 //! `message.output_text.logprobs` (the answer carries no probabilities);
 //! `n` above 1; `text.format` other than `text` or `json_schema`; `input_file`, an
 //! `input_image` by `file_id`, and an assistant's `refusal` part; a tool that
@@ -121,6 +149,8 @@
 //!
 //! - An unserved field is refused by name (above) where llama-server ignores
 //!   it or reads the wrong type as empty.
+//! - `store`, `background` and `previous_response_id` are served (# The
+//!   store); llama-server keeps no responses and ignores them.
 //! - An assistant message with no `type` is read as a `message`, as OpenAI
 //!   reads it; llama-server refuses it.
 //! - Each message is built from its role and content alone; llama-server
@@ -143,16 +173,18 @@
 
 use std::io;
 use std::net::TcpStream;
+use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 
+use super::response_store::Refusal;
 use super::{
-    ApiError, ChatPlan, State, body, chat_input, chat_plan, check_effort, error_body,
-    finish_stream, gen_body, get_i, get_i_in, invalid, json_type, progress, run_gen, run_whole,
-    send_error, send_json, sse, tool_markup_error, unix_now,
+    ApiError, ChatPlan, Client, State, body, chat_input, chat_plan, check_effort, engine_error,
+    error_body, finish_stream, gen_body, get_b, get_i, get_i_in, invalid, json_type, progress,
+    run_gen, run_whole, send_error, send_json, sse, tool_markup_error, unix_now,
 };
-use crate::dsml::{Message, ToolCall};
-use crate::genloop::{Event, Outcome, StopKind, Timings};
+use crate::dsml::{ChatParser, Message, ToolCall};
+use crate::genloop::{Event, GenError, Outcome, StopKind, Timings};
 use crate::http::{EventStream, Request};
 
 /// The request's fields the conversion replaces; the rest of the body goes to
@@ -169,20 +201,22 @@ const CONVERTED: [&str; 5] = [
 const INCLUDE_LOGPROBS: &str = "message.output_text.logprobs";
 
 /// `POST /v1/responses` and `POST /responses`.
-pub(super) fn create(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+pub(super) fn create(state: &Arc<State>, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let parsed = gen_body(req).and_then(|b| {
-        let chat = to_chat(&b)?;
-        let plan = chat_plan(state, &chat, chat.get("reasoning_format"))?;
-        Ok((Ids::new(state, &b), plan))
+        let r = request(state, &b)?;
+        let plan = chat_plan(state, &r.chat, r.chat.get("reasoning_format"))?;
+        Ok((Ids::new(state, &b, r.keep), r.conversation, plan))
     });
-    let (ids, plan) = match parsed {
+    let (ids, conversation, plan) = match parsed {
         Ok(x) => x,
         Err(e) => return send_error(w, req, &e),
     };
-    if plan.p.stream {
-        stream(state, req, w, &ids, plan)
+    if ids.keep.background {
+        background(state, req, w, ids, conversation, plan)
+    } else if plan.p.stream {
+        stream(state, req, w, &ids, conversation, plan)
     } else {
-        whole(state, req, w, &ids, plan)
+        whole(state, req, w, &ids, conversation, plan)
     }
 }
 
@@ -192,8 +226,8 @@ pub(super) fn create(state: &State, req: &Request, w: &mut TcpStream) -> io::Res
 /// generation uses.
 pub(super) fn input_tokens(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let counted = body(req)
-        .and_then(|b| to_chat(&b))
-        .and_then(|chat| chat_input(state, &chat));
+        .and_then(|b| request(state, &b))
+        .and_then(|r| chat_input(state, &r.chat));
     match counted {
         Ok((_, prompt)) => send_json(
             w,
@@ -219,10 +253,102 @@ fn text_of<'a>(o: &'a Map<String, Value>, k: &str, what: &str) -> Result<&'a str
         .ok_or_else(|| invalid(format!("{what} needs a string '{k}'")))
 }
 
-/// The OpenAI chat body a Responses request converts to, or the first field it
-/// refuses, by name.
-fn to_chat(b: &Map<String, Value>) -> Result<Map<String, Value>, ApiError> {
+/// What a request asks of the store.
+struct Keep {
+    /// `store`: the finished response is kept; `true` when absent, as OpenAI
+    /// keeps it.
+    store: bool,
+    /// `background`: the response is answered `queued` and generated on a
+    /// thread of its own.
+    background: bool,
+    /// `previous_response_id`: the stored response whose conversation the
+    /// request continues; `""` is none.
+    previous: Option<String>,
+}
+
+impl Keep {
+    fn of(b: &Map<String, Value>) -> Result<Keep, ApiError> {
+        let store = get_b(b, "store")?.unwrap_or(true);
+        let background = get_b(b, "background")?.unwrap_or(false);
+        let previous = match set(b, "previous_response_id") {
+            None => None,
+            Some(Value::String(s)) => Some(s.clone()).filter(|s| !s.is_empty()),
+            Some(v) => {
+                return Err(invalid(format!(
+                    "previous_response_id must be a string, not {}",
+                    json_type(v)
+                )));
+            }
+        };
+        if background && !store {
+            return Err(invalid(
+                "background: true needs store: true: a background response is read back from the \
+                 store",
+            ));
+        }
+        if background && get_b(b, "stream")? == Some(true) {
+            return Err(invalid(
+                "background: true with stream: true is not supported by this server: poll GET \
+                 /v1/responses/{id} for the response",
+            ));
+        }
+        Ok(Keep {
+            store,
+            background,
+            previous,
+        })
+    }
+}
+
+/// A request as this module reads it.
+struct Converted {
+    keep: Keep,
+    /// The conversation's input items: the previous response's conversation,
+    /// then the request's own `input`.
+    conversation: Vec<Value>,
+    /// The OpenAI chat body the request converts to.
+    chat: Map<String, Value>,
+}
+
+/// The request `b` read, or the first field it refuses, by name.
+fn request(state: &State, b: &Map<String, Value>) -> Result<Converted, ApiError> {
     unserved(b)?;
+    let keep = Keep::of(b)?;
+    let mut items = match &keep.previous {
+        None => Vec::new(),
+        Some(id) => state.responses.conversation(id).map_err(|r| match r {
+            Refusal::Missing => invalid(format!(
+                "previous_response_id {id} names no stored response: it was not stored, was \
+                 deleted, or the store dropped it as the oldest"
+            )),
+            Refusal::Status(s) => invalid(format!(
+                "previous_response_id {id} is {s}: only a completed or incomplete response \
+                 can be continued"
+            )),
+        })?,
+    };
+    match set(b, "input") {
+        Some(Value::String(s)) => items.push(json!({ "role": "user", "content": s })),
+        Some(Value::Array(a)) => items.extend(a.iter().cloned()),
+        Some(v) => {
+            return Err(invalid(format!(
+                "input must be a string or an array of items, not {}",
+                json_type(v)
+            )));
+        }
+        None => return Err(invalid("input is required")),
+    }
+    let chat = to_chat(b, &items)?;
+    Ok(Converted {
+        keep,
+        conversation: items,
+        chat,
+    })
+}
+
+/// The OpenAI chat body of a Responses request whose conversation is `items`,
+/// or the first field it refuses, by name.
+fn to_chat(b: &Map<String, Value>, items: &[Value]) -> Result<Map<String, Value>, ApiError> {
     let mut messages = Vec::new();
     if let Some(v) = set(b, "instructions") {
         let Value::String(s) = v else {
@@ -233,20 +359,8 @@ fn to_chat(b: &Map<String, Value>) -> Result<Map<String, Value>, ApiError> {
         };
         messages.push(json!({ "role": "system", "content": s }));
     }
-    match set(b, "input") {
-        Some(Value::String(s)) => messages.push(json!({ "role": "user", "content": s })),
-        Some(Value::Array(items)) => {
-            for it in items {
-                item(it, &mut messages)?;
-            }
-        }
-        Some(v) => {
-            return Err(invalid(format!(
-                "input must be a string or an array of items, not {}",
-                json_type(v)
-            )));
-        }
-        None => return Err(invalid("input is required")),
+    for it in items {
+        item(it, &mut messages)?;
     }
     let mut chat: Map<String, Value> = b
         .iter()
@@ -290,24 +404,9 @@ fn to_chat(b: &Map<String, Value>) -> Result<Map<String, Value>, ApiError> {
 fn unserved(b: &Map<String, Value>) -> Result<(), ApiError> {
     let refused = [
         (
-            "previous_response_id",
-            set(b, "previous_response_id").is_some_and(|v| v.as_str() != Some("")),
-            "it keeps no responses",
-        ),
-        (
             "conversation",
             set(b, "conversation").is_some(),
-            "it keeps no conversations",
-        ),
-        (
-            "store: true",
-            set(b, "store").is_some_and(|v| v.as_bool() != Some(false)),
-            "it keeps no responses (send store: false or leave it out)",
-        ),
-        (
-            "background: true",
-            set(b, "background").is_some_and(|v| v.as_bool() != Some(false)),
-            "it keeps no responses to poll",
+            "it keeps no conversations (previous_response_id continues a stored response)",
         ),
         (
             "prompt",
@@ -432,7 +531,7 @@ fn item(it: &Value, out: &mut Vec<Value>) -> Result<(), ApiError> {
         "reasoning" => reasoning(it, out),
         "item_reference" => Err(invalid(
             "input item type item_reference is not supported by this server: it keeps no items \
-             to refer to",
+             to refer to (previous_response_id continues a stored response)",
         )),
         other => Err(invalid(format!(
             "input item type \"{other}\" is not supported (message, function_call, \
@@ -713,17 +812,19 @@ fn function_tool(t: &Map<String, Value>) -> Result<Value, ApiError> {
 
 // ---------------------------------------------------------------- the answer
 
-/// The answer's names: the response's id, its creation time and the request's
-/// `model` (the server's alias when it names none), as the chat path echoes it.
+/// The answer's names: the response's id, its creation time, the request's
+/// `model` (the server's alias when it names none), as the chat path echoes it,
+/// and what the request asks of the store, which the answer echoes.
 struct Ids {
     /// `resp_<32 hex>`.
     id: String,
     created_at: u64,
     model: String,
+    keep: Keep,
 }
 
 impl Ids {
-    fn new(state: &State, b: &Map<String, Value>) -> Self {
+    fn new(state: &State, b: &Map<String, Value>, keep: Keep) -> Self {
         Ids {
             id: format!("resp_{}", state.random_id()),
             created_at: unix_now(),
@@ -731,6 +832,7 @@ impl Ids {
                 .get("model")
                 .and_then(Value::as_str)
                 .map_or_else(|| state.alias.clone(), str::to_owned),
+            keep,
         }
     }
 
@@ -959,36 +1061,63 @@ fn status(o: &Outcome) -> &'static str {
     }
 }
 
-/// The response in progress: `response.created`'s and
-/// `response.in_progress`'s.
-fn in_progress(ids: &Ids) -> Value {
+/// The response in `status` with no output yet: one in progress, a
+/// background response's until it finishes, and the start of a finished one
+/// ([`finished`]).
+fn unfinished(ids: &Ids, status: &str) -> Value {
     json!({
         "id": ids.id,
         "object": "response",
         "created_at": ids.created_at,
-        "status": "in_progress",
+        "status": status,
         "model": ids.model,
         "output": [],
+        "background": ids.keep.background,
+        "store": ids.keep.store,
+        "previous_response_id": ids.keep.previous,
     })
 }
 
 /// The finished response: llama-server's `to_json_oaicompat_resp`, its
 /// `status` the generation's.
 fn finished(ids: &Ids, o: &Outcome, output: Vec<Value>) -> Value {
-    let mut v = json!({
-        "id": ids.id,
-        "object": "response",
-        "created_at": ids.created_at,
-        "completed_at": unix_now(),
-        "status": status(o),
-        "model": ids.model,
-        "output": output,
-        "usage": usage(&o.timings),
-    });
+    let mut v = unfinished(ids, status(o));
+    v["completed_at"] = json!(unix_now());
+    v["output"] = Value::Array(output);
+    v["usage"] = usage(&o.timings);
     if o.stop == StopKind::Limit {
         v["incomplete_details"] = json!({ "reason": "max_output_tokens" });
     }
     v
+}
+
+/// The conversation a finished `response` ends: the request's input items,
+/// then its output items.
+fn with_output(mut conversation: Vec<Value>, response: &Value) -> Vec<Value> {
+    conversation.extend(response["output"].as_array().into_iter().flatten().cloned());
+    conversation
+}
+
+/// Keeps the finished `response` when the request stores it.
+fn keep(state: &State, ids: &Ids, response: &Value, conversation: Vec<Value>) {
+    if ids.keep.store {
+        state
+            .responses
+            .keep(response.clone(), with_output(conversation, response));
+    }
+}
+
+/// The finished response of the whole generation `o`.
+fn answer(ids: &Ids, o: &Outcome, mut parser: ChatParser) -> Result<Value, ApiError> {
+    parser
+        .try_push(&o.content)
+        .and_then(|_| parser.try_finish_at(o.cut()))
+        .map_err(|e| tool_markup_error(&e))?;
+    let mut items = Items::new(ids);
+    let mut events = Vec::new();
+    items.push(parser.message(), &mut events);
+    let output = items.finish(&mut events);
+    Ok(finished(ids, o, output))
 }
 
 /// The non-stream answer.
@@ -997,29 +1126,159 @@ fn whole(
     req: &Request,
     w: &mut TcpStream,
     ids: &Ids,
+    conversation: Vec<Value>,
     plan: ChatPlan,
 ) -> io::Result<bool> {
     let ChatPlan {
         p,
         input,
         prompt,
-        mut parser,
+        parser,
     } = plan;
-    let (o, _) = match run_whole(state, &input, prompt, &p, w)? {
-        Err(e) => return send_error(w, req, &e),
-        Ok(done) => done,
-    };
-    if let Err(e) = parser
-        .try_push(&o.content)
-        .and_then(|_| parser.try_finish_at(o.cut()))
+    let response =
+        match run_whole(state, &input, prompt, &p, w)?.and_then(|(o, _)| answer(ids, &o, parser)) {
+            Err(e) => return send_error(w, req, &e),
+            Ok(v) => v,
+        };
+    keep(state, ids, &response, conversation);
+    send_json(w, req, 200, &response)
+}
+
+// ---------------------------------------------------------------- the store
+
+/// A background response: kept `queued` and answered at once, its generation
+/// run on a thread of its own, whose end the store keeps in its place. No
+/// connection waits on it: only a cancel or a delete ends it early.
+fn background(
+    state: &Arc<State>,
+    req: &Request,
+    w: &mut TcpStream,
+    ids: Ids,
+    conversation: Vec<Value>,
+    plan: ChatPlan,
+) -> io::Result<bool> {
+    let job = Arc::new(Client::detached());
+    let queued = unfinished(&ids, "queued");
+    if !state
+        .responses
+        .start(queued.clone(), &conversation, Arc::clone(&job))
     {
-        return send_error(w, req, &tool_markup_error(&e));
+        let e = ApiError {
+            retry_after: true,
+            code: 503,
+            kind: "unavailable_error",
+            message: "the running background responses fill the response store".to_owned(),
+        };
+        return send_error(w, req, &e);
     }
-    let mut items = Items::new(ids);
-    let mut events = Vec::new();
-    items.push(parser.message(), &mut events);
-    let output = items.finish(&mut events);
-    send_json(w, req, 200, &finished(ids, &o, output))
+    let id = ids.id.clone();
+    let runner = Arc::clone(state);
+    let spawned = std::thread::Builder::new()
+        .name("serve-background".to_owned())
+        .spawn(move || run_background(&runner, &ids, conversation, plan, job));
+    if let Err(e) = spawned {
+        state.responses.delete(&id);
+        let e = engine_error(&format!(
+            "cannot start the background response's thread: {e}"
+        ));
+        return send_error(w, req, &e);
+    }
+    send_json(w, req, 200, &queued)
+}
+
+/// A background response's generation, its first event turning it
+/// `in_progress` and its end, or its error as `failed`, kept in the store.
+fn run_background(
+    state: &State,
+    ids: &Ids,
+    conversation: Vec<Value>,
+    plan: ChatPlan,
+    job: Arc<Client>,
+) {
+    let ChatPlan {
+        p,
+        input,
+        prompt,
+        parser,
+    } = plan;
+    let mut started = false;
+    let mut sink = |_: Event<'_>, _slot: usize| -> io::Result<()> {
+        if !std::mem::replace(&mut started, true) {
+            state.responses.progress(&ids.id);
+        }
+        Ok(())
+    };
+    let answered = match run_gen(state, &input, prompt, &p, job, &mut sink) {
+        // Cancelled or deleted: the store holds what the cancel left.
+        Ok(Err(GenError::Client(_))) => return,
+        Ok(Err(e)) => Err(engine_error(&e)),
+        Ok(Ok((o, _))) => answer(ids, &o, parser),
+        Err(e) => Err(e),
+    };
+    match answered {
+        Ok(v) => {
+            let conversation = with_output(conversation, &v);
+            state.responses.finish(&ids.id, v, conversation);
+        }
+        Err(e) => {
+            let mut v = unfinished(ids, "failed");
+            v["error"] = json!({ "code": e.kind, "message": e.message });
+            state.responses.finish(&ids.id, v, Vec::new());
+        }
+    }
+}
+
+/// The id of a stored response's path: `/v1/responses/{id}` (or
+/// `/responses/{id}`), with `/cancel` after it for a cancel.
+pub(super) fn stored_id(path: &str) -> Option<&str> {
+    path.strip_prefix("/v1/responses/")
+        .or_else(|| path.strip_prefix("/responses/"))
+        .filter(|rest| !rest.is_empty())
+}
+
+/// `GET /v1/responses/{id}`: the stored response as it stands (a background
+/// one `queued`, `in_progress`, then finished, `failed` or `cancelled`).
+/// `DELETE /v1/responses/{id}`: drops it, cancelling it when it runs.
+/// `POST /v1/responses/{id}/cancel`: cancels a running background response
+/// and answers it `cancelled`. An id the store does not hold is a 404.
+pub(super) fn stored(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+    let rest = stored_id(&req.path).unwrap_or_default();
+    let missing = |id: &str| ApiError {
+        retry_after: false,
+        code: 404,
+        kind: "not_found_error",
+        message: format!(
+            "no stored response {id}: it was not stored, was deleted, or the store dropped it as \
+             the oldest"
+        ),
+    };
+    let r = match (req.method.as_str(), rest.split_once('/')) {
+        ("GET", None) if req.query_value("stream") == Some("true") => Err(invalid(
+            "stream=true is not supported by this server: GET answers the stored response whole",
+        )),
+        ("GET", None) => state.responses.get(rest).ok_or_else(|| missing(rest)),
+        ("DELETE", None) if state.responses.delete(rest) => {
+            Ok(json!({ "id": rest, "object": "response", "deleted": true }))
+        }
+        ("DELETE", None) => Err(missing(rest)),
+        ("POST", Some((id, "cancel"))) => state.responses.cancel(id).map_err(|r| match r {
+            Refusal::Missing => missing(id),
+            Refusal::Status(s) => invalid(format!(
+                "response {id} is {s}: only a queued or in-progress background response can be \
+                 cancelled"
+            )),
+        }),
+        (method, _) => Err(ApiError {
+            retry_after: false,
+            code: 404,
+            kind: "not_found_error",
+            message: format!("File Not Found: {method} {}", req.path),
+        }),
+    };
+    match r {
+        Ok(v) => send_json(w, req, 200, &v),
+        Err(e) => send_error(w, req, &e),
+    }
 }
 
 // ---------------------------------------------------------------- the stream
@@ -1040,8 +1299,8 @@ impl Frames {
             return Vec::new();
         }
         vec![
-            json!({ "type": "response.created", "response": in_progress(ids) }),
-            json!({ "type": "response.in_progress", "response": in_progress(ids) }),
+            json!({ "type": "response.created", "response": unfinished(ids, "in_progress") }),
+            json!({ "type": "response.in_progress", "response": unfinished(ids, "in_progress") }),
         ]
     }
 
@@ -1066,6 +1325,7 @@ fn stream(
     req: &Request,
     w: &mut TcpStream,
     ids: &Ids,
+    conversation: Vec<Value>,
     plan: ChatPlan,
 ) -> io::Result<bool> {
     let ChatPlan {
@@ -1099,7 +1359,7 @@ fn stream(
                 Event::Prompt(t) => {
                     if events.is_empty() {
                         events.push(
-                            json!({ "type": "response.in_progress", "response": in_progress(ids) }),
+                            json!({ "type": "response.in_progress", "response": unfinished(ids, "in_progress") }),
                         );
                     }
                     if let Some(last) = events.last_mut() {
@@ -1119,7 +1379,7 @@ fn stream(
             }
             frames.send(s, events)
         };
-        run_gen(state, &input, prompt, &p, peer, &mut sink).map(|r| r.map(|(o, _)| o))
+        run_gen(state, &input, prompt, &p, Client::of(peer), &mut sink).map(|r| r.map(|(o, _)| o))
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),
@@ -1139,9 +1399,11 @@ fn stream(
             }
         }
         let output = items.finish(&mut events);
+        let response = finished(ids, o, output);
+        keep(state, ids, &response, conversation);
         let mut end = json!({
             "type": format!("response.{}", status(o)),
-            "response": finished(ids, o, output),
+            "response": response,
         });
         end["timings"] = o.timings.to_json();
         events.push(end);
@@ -1152,10 +1414,13 @@ fn stream(
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use serde_json::{Value, json};
 
     use super::super::testserve;
+    use crate::mock::{DraftMock, Hold};
     use crate::{Engine, MockEngine, ScriptedEngine};
 
     /// The tests' chat template: the mock's, with each message's reasoning
@@ -1361,6 +1626,7 @@ mod tests {
                     "input_tokens": input, "input_tokens_details": {"cached_tokens": 0},
                     "output_tokens": 8, "total_tokens": input + 8,
                 },
+                "background": false, "store": true, "previous_response_id": null,
                 "incomplete_details": {"reason": "max_output_tokens"},
             })
         );
@@ -1423,6 +1689,7 @@ mod tests {
                 json!({
                     "id": id, "object": "response", "created_at": f[0]["response"]["created_at"],
                     "status": "in_progress", "model": "gpt-4.1", "output": [],
+                    "background": false, "store": true, "previous_response_id": null,
                 }),
                 "{opening}"
             );
@@ -1854,19 +2121,17 @@ mod tests {
         );
     }
 
-    /// What needs a store is refused by name — `previous_response_id`,
-    /// `conversation`, `store: true`, `background: true`, a stored `prompt`,
-    /// an `item_reference` item — on both routes; `store: false`, an empty or
-    /// `null` `previous_response_id` and `background: false` pass.
+    /// What the store does not serve is refused by name on both routes: a
+    /// `conversation`, a stored `prompt`, an `item_reference` item, a
+    /// `previous_response_id` the store does not hold, `background: true`
+    /// without the store or with a stream, and a store field of the wrong
+    /// type. `store: false`, an empty or `null` `previous_response_id` and
+    /// `background: false` pass.
     #[test]
-    fn stored_state_is_refused_by_name() {
+    fn what_the_store_does_not_serve_is_refused_by_name() {
         let addr = scripted("ok");
         let with = |k: &str, v: Value| json!({"input": "hi", k: v});
         for (body, part) in [
-            (
-                with("previous_response_id", json!("resp_1")),
-                "previous_response_id is not supported",
-            ),
             (
                 with("conversation", json!("conv_1")),
                 "conversation is not supported",
@@ -1875,11 +2140,6 @@ mod tests {
                 with("conversation", json!({"id": "conv_1"})),
                 "conversation is not supported",
             ),
-            (with("store", json!(true)), "store: true is not supported"),
-            (
-                with("background", json!(true)),
-                "background: true is not supported",
-            ),
             (
                 with("prompt", json!({"id": "pmpt_1"})),
                 "prompt is not supported",
@@ -1887,6 +2147,24 @@ mod tests {
             (
                 json!({"input": [{"type": "item_reference", "id": "msg_1"}]}),
                 "item_reference is not supported",
+            ),
+            (
+                with("previous_response_id", json!("resp_1")),
+                "previous_response_id resp_1 names no stored response",
+            ),
+            (
+                with("previous_response_id", json!(1)),
+                "previous_response_id must be a string",
+            ),
+            (with("store", json!("yes")), "store"),
+            (with("background", json!(1)), "background"),
+            (
+                json!({"input": "hi", "background": true, "store": false}),
+                "background: true needs store: true",
+            ),
+            (
+                json!({"input": "hi", "background": true, "stream": true}),
+                "background: true with stream: true is not supported",
             ),
         ] {
             for path in ["/v1/responses", "/v1/responses/input_tokens"] {
@@ -1901,6 +2179,161 @@ mod tests {
         ] {
             answered(addr, "/v1/responses", &body);
         }
+    }
+
+    /// A response is kept unless `store: false`: `GET` answers it as it was
+    /// sent, `previous_response_id` continues its conversation (its input
+    /// and output items, not its `instructions`) on both routes, and `DELETE`
+    /// drops it; an id the store does not hold is a 404 on each.
+    #[test]
+    fn a_stored_response_is_read_continued_and_deleted() {
+        let addr = scripted(CALL);
+        let first = answered(
+            addr,
+            "/v1/responses",
+            &json!({
+                "instructions": "Be brief", "input": "Weather in Seoul?", "max_output_tokens": 256,
+                "tools": [{"type": "function", "name": "get_weather"}],
+            }),
+        );
+        let id = first["id"].as_str().expect("an id");
+        assert_eq!(first["store"], true, "{first}");
+        assert_eq!(first["output"][0]["type"], "function_call", "{first}");
+        let (status, got) =
+            testserve::roundtrip(addr, "GET", &format!("/v1/responses/{id}"), &[], "");
+        assert_eq!(status, 200, "{got}");
+        assert_eq!(serde_json::from_str::<Value>(&got).expect("JSON"), first);
+        let call_id = &first["output"][0]["call_id"];
+        let output = json!({"type": "function_call_output", "call_id": call_id, "output": "Sunny"});
+        let next = json!({"previous_response_id": id, "input": [output]});
+        let v = answered(addr, "/v1/responses", &next);
+        assert_eq!(v["previous_response_id"], id, "{v}");
+        let continued = last_prompt(addr);
+        assert!(!continued.contains("Be brief"), "{continued}");
+        // The same conversation sent whole renders the same prompt.
+        let mut whole = vec![json!({"role": "user", "content": "Weather in Seoul?"})];
+        whole.extend(first["output"].as_array().expect("output").iter().cloned());
+        whole.push(output);
+        let whole = json!({"input": whole, "store": false});
+        answered(addr, "/v1/responses", &whole);
+        assert_eq!(last_prompt(addr), continued);
+        assert_eq!(
+            answered(addr, "/v1/responses/input_tokens", &next),
+            answered(addr, "/v1/responses/input_tokens", &whole)
+        );
+        let unkept = answered(
+            addr,
+            "/v1/responses",
+            &json!({"input": "hi", "store": false}),
+        );
+        let (deleted, body) =
+            testserve::roundtrip(addr, "DELETE", &format!("/responses/{id}"), &[], "");
+        assert_eq!(deleted, 200, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("JSON"),
+            json!({"id": id, "object": "response", "deleted": true})
+        );
+        for gone in [id, unkept["id"].as_str().expect("an id")] {
+            for method in ["GET", "DELETE"] {
+                let (status, body) =
+                    testserve::roundtrip(addr, method, &format!("/v1/responses/{gone}"), &[], "");
+                assert_eq!(status, 404, "{method} {gone}: {body}");
+                assert!(body.contains("no stored response"), "{body}");
+            }
+        }
+
+        let (status, body) = post_stream(
+            addr,
+            "/v1/responses",
+            &json!({"input": "hi", "stream": true}),
+        );
+        let events = frames(status, &body);
+        let final_response = &events.last().expect("a final frame")["response"];
+        assert_eq!(final_response["status"], "completed");
+        let id = final_response["id"].as_str().expect("an id");
+        let (status, got) =
+            testserve::roundtrip(addr, "GET", &format!("/v1/responses/{id}"), &[], "");
+        assert_eq!(status, 200, "{got}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&got).expect("JSON"),
+            *final_response
+        );
+    }
+
+    /// `background: true` answers `queued` at once; `GET` follows it to its
+    /// end; a cancel ends a running one `cancelled` and frees its slot, and a
+    /// finished one cannot be cancelled.
+    #[test]
+    fn a_background_response_is_polled_and_cancelled() {
+        let hold = Arc::new(Hold::default());
+        let addr = serve(Box::new(DraftMock::new(4096).holding(Arc::clone(&hold))));
+        let poll = |addr, id: &str, want: &str| {
+            for _ in 0..200 {
+                let (status, body) =
+                    testserve::roundtrip(addr, "GET", &format!("/v1/responses/{id}"), &[], "");
+                assert_eq!(status, 200, "{body}");
+                let v: Value = serde_json::from_str(&body).expect("JSON");
+                if v["status"] == want {
+                    return v;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("{id} never reached {want}");
+        };
+        let body = json!({"input": "hi", "background": true, "max_output_tokens": 4});
+        let queued = answered(addr, "/v1/responses", &body);
+        assert_eq!(queued["status"], "queued", "{queued}");
+        assert_eq!(queued["background"], true, "{queued}");
+        let id = queued["id"].as_str().expect("an id");
+        assert!(hold.reached(1, Duration::from_secs(10)));
+        let cancelled = answered(addr, &format!("/v1/responses/{id}/cancel"), &json!({}));
+        assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+        assert_eq!(poll(addr, id, "cancelled")["output"], json!([]));
+        hold.open();
+        let done = answered(addr, "/v1/responses", &body);
+        let done = poll(addr, done["id"].as_str().expect("an id"), "incomplete");
+        assert_eq!(done["usage"]["output_tokens"], 4, "{done}");
+        let id = done["id"].as_str().expect("an id");
+        assert_refused(
+            addr,
+            &format!("/v1/responses/{id}/cancel"),
+            &json!({}),
+            "only a queued or in-progress background response can be cancelled",
+        );
+        let v = answered(
+            addr,
+            "/v1/responses",
+            &json!({"previous_response_id": id, "input": "more", "max_output_tokens": 4}),
+        );
+        assert_eq!(v["previous_response_id"], id, "{v}");
+
+        for _ in 0..3 {
+            let queued = answered(addr, "/v1/responses", &body);
+            let id = queued["id"].as_str().expect("an id");
+            poll(addr, id, "incomplete");
+            let (status, deleted) =
+                testserve::roundtrip(addr, "DELETE", &format!("/v1/responses/{id}"), &[], "");
+            assert_eq!(status, 200, "{deleted}");
+        }
+        assert!(
+            threads::helper::helpers()
+                .iter()
+                .all(|h| h.name != "serve-background"),
+            "short-lived background workers must not enter the permanent helper registry"
+        );
+
+        let addr = serve(Box::new(MockEngine::failing_at(4096, 1)));
+        let queued = answered(addr, "/v1/responses", &body);
+        let id = queued["id"].as_str().expect("an id");
+        let failed = poll(addr, id, "failed");
+        assert_eq!(failed["error"]["code"], "server_error", "{failed}");
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .expect("an error")
+                .contains("mock: injected failure"),
+            "{failed}"
+        );
     }
 
     /// The answer carries no probabilities and one answer: `logprobs`,
