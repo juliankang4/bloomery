@@ -4,6 +4,7 @@
 # mistake (gh named the assets from temp filenames and every download URL 404'd).
 #
 #   tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a]
+#   tools/release/publish.sh <version> --tap-only   step 5 alone, on the release's own .sha256 assets (after a GB10 upload)
 #   tools/release/publish.sh --self-test     (the rotation's refusal on stub rotation.py exits, and step 3a's warnings; check-recipes runs it)
 #   tools/release/publish.sh --sitting-check <tarball> <name> <dir>...   step 3a alone, on the verdicts in each <dir>
 #
@@ -39,7 +40,10 @@
 #      it refuses to upload a file under any other name — then curls every URL for a 200;
 #   5. the Homebrew tap: bumps Formula/bloomery.rb's version and each platform's url and
 #      sha256 in ~/repo/homebrew-tap (the GB10 one where the formula has its url; the sm_120a
-#      archive is the installer's pick, never the formula's), commits and pushes;
+#      archive is the installer's pick, never the formula's), commits and pushes. A formula with a GB10 url and a
+#      release without a GB10 archive leaves the tap as it is, named: the GB10 archive is built on a Spark after the
+#      tag, and `--tap-only` bumps the tap once it is on the release (a bump without it would install an older GB10
+#      build under the new version);
 #   6. prints what is left to the lead: the release notes (gh release edit --notes-file)
 #      and the ghcr image — the v* tag push already triggered .github/workflows/container.yml.
 #
@@ -114,6 +118,39 @@ release_assets() {
     echo "bloomery-$1-macos-arm64-metal"
 }
 
+# formula_bump <formula> <version> <sha> <mac sha> <gb10 sha or ''>: the tap formula's version, urls and sha256s in place;
+# exit 3 and no write when the formula names a GB10 archive and the release carries none.
+formula_bump() {
+    python3 - "$@" <<'PY'
+import re, sys
+f, v, sha, mac_sha, gb10_sha = sys.argv[1:6]
+s = open(f).read()
+s, n = re.subn(r'version "[^"]*"', f'version "{v}"', s, count=1)
+assert n == 1, "no version line"
+# Each platform's url and the sha256 on the line after it. The GB10 url is the formula's choice: bumped where it has
+# one. A release without a GB10 archive leaves the formula alone (exit 3), since its GB10 url would keep naming an
+# older release under the new version.
+def bump(s, kind, digest):
+    return re.subn(r'(url "[^"]*/releases/download/)v[^/]*/bloomery-[^"/]*-' + re.escape(kind) +
+                   r'\.tar\.gz"(\s+)sha256 "[0-9a-f]{64}"',
+                   lambda m: f'{m.group(1)}v{v}/bloomery-{v}-{kind}.tar.gz"{m.group(2)}sha256 "{digest}"', s)
+for kind, digest in (("linux-x86_64-cuda-sm86", sha), ("macos-arm64-metal", mac_sha)):
+    s, n = bump(s, kind, digest)
+    assert n == 1, (kind, n)
+gb10 = "linux-aarch64-cuda-sm121a"
+if gb10_sha:
+    s, n = bump(s, gb10, gb10_sha)
+    assert n <= 1, (gb10, n)
+    if n == 0:
+        print(f"publish.sh: the tap's formula has no {gb10} url; Homebrew on a GB10 installs nothing until it has one", file=sys.stderr)
+elif gb10 in s:
+    print(f"publish.sh: the tap waits for the GB10 archive: its formula names {gb10}, which this release does not carry yet; "
+          f"once it is on the release, run tools/release/publish.sh {v} --tap-only", file=sys.stderr)
+    sys.exit(3)
+open(f, 'w').write(s)
+PY
+}
+
 # --self-test: a copy of this script in a temporary repository with no tag, beside a stub tools/rotation.py that exits with each
 # code. rc 1, 2 and 70 stop at the rotation with a message that names it; rc 0 passes it and stops at the tag check after it, so the
 # rotation is the first step and a green one lets the rest run.
@@ -171,6 +208,27 @@ if [ "${1:-}" = --self-test ]; then
         1:*"does not carry v0.0.0"*) ;;
         *) echo "publish.sh self-test: --no-sm120a: rc $rc, want rc 1 at the tag step; got: $got" >&2; fails=$((fails + 1)) ;;
     esac
+    # The tap formula (step 5): a formula with a GB10 url and a release with no GB10 archive is left unchanged with rc 3,
+    # never bumped with an older GB10 url under the new version; with a GB10 sum all three urls move.
+    z=0000000000000000000000000000000000000000000000000000000000000000
+    for k in linux-x86_64-cuda-sm86 linux-aarch64-cuda-sm121a macos-arm64-metal; do
+        printf '  url "https://github.com/midagedev/bloomery/releases/download/v0.0.1/bloomery-0.0.1-%s.tar.gz"\n  sha256 "%s"\n' "$k" "$z"
+    done > "$t/bloomery.rb.in"
+    { echo '  version "0.0.1"'; cat "$t/bloomery.rb.in"; } > "$t/bloomery.rb"; cp "$t/bloomery.rb" "$t/bloomery.rb.orig"
+    a=$(printf 'a%.0s' {1..64}); m=$(printf 'b%.0s' {1..64}); g=$(printf 'c%.0s' {1..64})
+    cases=$((cases + 1)); rc=0
+    got=$(formula_bump "$t/bloomery.rb" 0.0.2 "$a" "$m" "" 2>&1) || rc=$?
+    if [ "$rc" != 3 ] || ! cmp -s "$t/bloomery.rb" "$t/bloomery.rb.orig" || [[ "$got" != *"--tap-only"* ]]; then
+        echo "publish.sh self-test: tap without a GB10 archive: rc $rc, want rc 3, the formula unchanged and --tap-only named; got: $got" >&2
+        fails=$((fails + 1))
+    fi
+    cases=$((cases + 1)); rc=0
+    got=$(formula_bump "$t/bloomery.rb" 0.0.2 "$a" "$m" "$g" 2>&1) || rc=$?
+    if [ "$rc" != 0 ] || [ "$(grep -c 'download/v0.0.2/bloomery-0.0.2-' "$t/bloomery.rb")" != 3 ] \
+        || ! grep -q "version \"0.0.2\"" "$t/bloomery.rb" || [ "$(grep -c "sha256 \"[$a$m$g]\{64\}\"" "$t/bloomery.rb")" != 3 ]; then
+        echo "publish.sh self-test: tap with a GB10 archive: rc $rc, want rc 0 and three urls and sums at 0.0.2; got: $got" >&2
+        fails=$((fails + 1))
+    fi
     # The sitting step (3a): a verdict the tarball's member matches passes silently, anything else is a WARNING that names it, and
     # the status is 0 in every case — publishing is never refused for it.
     tn=bloomery-0.0.0-linux-x86_64-cuda-sm86
@@ -229,13 +287,14 @@ if [ "${1:-}" = --sitting-check ]; then
     exit 0
 fi
 
-VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a] | --self-test | --sitting-check <tarball> <name> <dir>...}
-DRY=0; TAP=1; BW=1
+VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a] | <version> --tap-only | --self-test | --sitting-check <tarball> <name> <dir>...}
+DRY=0; TAP=1; BW=1; TAP_ONLY=0
 for a in "${@:2}"; do
     case "$a" in
         --dry-run) DRY=1 ;;
         --no-tap) TAP=0 ;;
         --no-sm120a) BW=0 ;;
+        --tap-only) TAP_ONLY=1 ;;
         *) echo "publish.sh: unknown argument $a" >&2; exit 64 ;;
     esac
 done
@@ -250,6 +309,51 @@ MAC_NAME="bloomery-$VERSION-macos-arm64-metal"
 TAG="v$VERSION"
 
 fail() { echo "publish.sh: $*" >&2; exit 1; }
+
+# tap_bump: step 5 on SHA, MAC_SHA and GB10_SHA (GB10_SHA empty: the release carries no GB10 archive yet).
+tap_bump() {
+    TAPDIR="$HOME/repo/homebrew-tap"
+    if [ "$TAP" = 1 ]; then
+        if [ "$DRY" = 1 ]; then
+            echo "publish.sh: dry run: would bump $TAPDIR/Formula/bloomery.rb to $VERSION / $SHA (linux) / ${GB10_SHA:-none} (gb10) / $MAC_SHA (macos) and push"
+        else
+            [ -d "$TAPDIR/Formula" ] || fail "no tap checkout at $TAPDIR (clone midagedev/homebrew-tap)"
+            git -C "$TAPDIR" fetch -q origin && git -C "$TAPDIR" reset -q --hard origin/HEAD
+            [ -z "$(git -C "$TAPDIR" status --porcelain)" ] || fail "the tap checkout is dirty"
+            F="$TAPDIR/Formula/bloomery.rb"
+            rc=0
+            formula_bump "$F" "$VERSION" "$SHA" "$MAC_SHA" "$GB10_SHA" || rc=$?
+            [ "$rc" = 3 ] && return 0
+            [ "$rc" = 0 ] || fail "the formula bump failed (rc $rc)"
+            git -C "$TAPDIR" add Formula/bloomery.rb
+            git -C "$TAPDIR" commit -q -m "bloomery v$VERSION (linux sha256 $SHA, macos sha256 $MAC_SHA${GB10_SHA:+, gb10 sha256 $GB10_SHA})"
+            git -C "$TAPDIR" push -q origin HEAD
+            echo "publish.sh: tap bumped to $VERSION"
+        fi
+    fi
+}
+
+# --tap-only: step 5 alone, on the release's own .sha256 files, each held to GitHub's digest of its archive (an
+# upload from another machine, the GB10's, is read the way the tap will fetch it).
+if [ "$TAP_ONLY" = 1 ]; then
+    TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+    DIGESTS=$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.assets[] | "\(.name) \(.digest)"') || fail "no release $TAG"
+    asset_sha() { # asset_sha <name>: the archive's sha256 from its .sha256 asset, equal to GitHub's digest; empty when absent
+        local want got
+        want=$(awk -v n="$1.tar.gz" '$1 == n {sub(/^sha256:/, "", $2); print $2}' <<<"$DIGESTS")
+        [ -n "$want" ] || return 0
+        gh release download "$TAG" --repo "$REPO" -D "$TMP" -p "$1.tar.gz.sha256" --clobber >&2 || fail "no $1.tar.gz.sha256 on $TAG"
+        got=$(grep -o '[0-9a-f]\{64\}' "$TMP/$1.tar.gz.sha256" | head -1)
+        [ "$got" = "$want" ] || fail "$1.tar.gz.sha256 names $got, GitHub's digest of the archive is $want"
+        echo "$got"
+    }
+    SHA=$(asset_sha "$NAME"); MAC_SHA=$(asset_sha "$MAC_NAME"); GB10_SHA=$(asset_sha "$GB10_NAME")
+    [ -n "$SHA" ] || fail "$TAG carries no $NAME.tar.gz"
+    [ -n "$MAC_SHA" ] || fail "$TAG carries no $MAC_NAME.tar.gz"
+    TAP=1
+    tap_bump
+    exit 0
+fi
 
 # 0. the rotation
 rotation_gate || exit 1
@@ -349,46 +453,7 @@ else
 fi
 
 # 5. the tap
-TAPDIR="$HOME/repo/homebrew-tap"
-if [ "$TAP" = 1 ]; then
-    if [ "$DRY" = 1 ]; then
-        echo "publish.sh: dry run: would bump $TAPDIR/Formula/bloomery.rb to $VERSION / $SHA (linux) / ${GB10_SHA:-none} (gb10) / $MAC_SHA (macos) and push"
-    else
-        [ -d "$TAPDIR/Formula" ] || fail "no tap checkout at $TAPDIR (clone midagedev/homebrew-tap)"
-        git -C "$TAPDIR" fetch -q origin && git -C "$TAPDIR" reset -q --hard origin/HEAD
-        [ -z "$(git -C "$TAPDIR" status --porcelain)" ] || fail "the tap checkout is dirty"
-        F="$TAPDIR/Formula/bloomery.rb"
-        python3 - "$F" "$VERSION" "$SHA" "$MAC_SHA" "$GB10_SHA" <<'PY'
-import re, sys
-f, v, sha, mac_sha, gb10_sha = sys.argv[1:6]
-s = open(f).read()
-s, n = re.subn(r'version "[^"]*"', f'version "{v}"', s, count=1)
-assert n == 1, "no version line"
-# Each platform's url and the sha256 on the line after it. The GB10 url is the formula's choice: bumped where it has
-# one, and a release without a GB10 archive is refused there, since its url would keep naming an older release.
-def bump(s, kind, digest):
-    return re.subn(r'(url "[^"]*/releases/download/)v[^/]*/bloomery-[^"/]*-' + re.escape(kind) +
-                   r'\.tar\.gz"(\s+)sha256 "[0-9a-f]{64}"',
-                   lambda m: f'{m.group(1)}v{v}/bloomery-{v}-{kind}.tar.gz"{m.group(2)}sha256 "{digest}"', s)
-for kind, digest in (("linux-x86_64-cuda-sm86", sha), ("macos-arm64-metal", mac_sha)):
-    s, n = bump(s, kind, digest)
-    assert n == 1, (kind, n)
-gb10 = "linux-aarch64-cuda-sm121a"
-if gb10_sha:
-    s, n = bump(s, gb10, gb10_sha)
-    assert n <= 1, (gb10, n)
-    if n == 0:
-        print(f"publish.sh: the tap's formula has no {gb10} url; Homebrew on a GB10 installs nothing until it has one", file=sys.stderr)
-elif gb10 in s:
-    sys.exit(f"publish.sh: the tap's formula names a {gb10} archive and this release has none (BLOOMERY_GB10_BOX)")
-open(f, 'w').write(s)
-PY
-        git -C "$TAPDIR" add Formula/bloomery.rb
-        git -C "$TAPDIR" commit -q -m "bloomery v$VERSION (linux sha256 $SHA, macos sha256 $MAC_SHA)"
-        git -C "$TAPDIR" push -q origin HEAD
-        echo "publish.sh: tap bumped to $VERSION"
-    fi
-fi
+tap_bump
 
 # 6. the lead's remainder
 echo "publish.sh: left to the lead:"
