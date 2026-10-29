@@ -288,24 +288,23 @@ pub struct Slot38 {
     rope: Option<SeqRope>,
 }
 
-/// The host bytes a sequence state of `positions` positions holds on a load
-/// of `gdn` delta and `qsa` selecting layers, its K/V rows in the cache
-/// format `kv`, with the draft's side when the load carries it
-/// ([`Seq38::bytes`]'s terms at plan time, for a seat's park budget): the
-/// positional rows and two recurrent copies ([`seq_positional_bytes`],
-/// [`checkpoint_bytes`]), the draft's store rows below the same positions
-/// (in the same format), the step's and the pass's arena rows (the most a
-/// parked refresh reads), and the hidden row of the one point whose
-/// recurrent copy the shared part counts ([`POINT_ROW_BYTES`]).
+/// The most host bytes a sequence state of `positions` positions holds on
+/// a load of `gdn` delta and `qsa` selecting layers, its K/V rows in cache
+/// format `kv`, with the draft's side when loaded: the positional rows and
+/// current recurrent copy plus saved points bounded by the context and
+/// checkpoint budget, the draft's store in the same format, the step and
+/// pass arena rows, and one hidden row per saved inner point.
 #[must_use]
 pub fn seq38_bytes(gdn: usize, qsa: usize, positions: usize, drafts: bool, kv: KvQ8) -> u64 {
-    let shared = seq_positional_bytes(qsa, positions, kv) + 2 * checkpoint_bytes(gdn, qsa);
+    let points = checkpoint_price38(gdn, qsa).saved_points(positions as u64);
+    let shared =
+        seq_positional_bytes(qsa, positions, kv) + (1 + points) * checkpoint_bytes(gdn, qsa);
     if !drafts {
         return shared;
     }
     let store = kv_rows_bytes(positions, kv);
     let rows = ((1 + PASS_ROWS) * geo::STREAMS * geo::HIDDEN * size_of::<f32>()) as u64;
-    shared + store + rows + POINT_ROW_BYTES
+    shared + store + rows + points * POINT_ROW_BYTES
 }
 
 /// The host bytes of the target's final hidden row a checkpoint keeps for
@@ -329,6 +328,10 @@ pub fn point_row_budget38(gdn: usize, qsa: usize, ctx: u64) -> Result<u64, GpuEr
 /// 15 inner marks against the host budget's 29 slots of one copy
 /// ([`checkpoint_bytes`]).
 pub const CHECKPOINT_EVERY: u32 = UBATCH_MOST as u32;
+
+// The plan prices a Qwen3.8 load's saved states at this spacing
+// (`KvLayout::checkpoint_price`).
+const _: () = assert!(CHECKPOINT_EVERY as u64 == model::arch::qwen35moe::place::UBATCH_PLANNED);
 
 /// The f32s of each store one checkpoint of a load of `gdn` delta layers
 /// and `qsa` selecting layers copies, in the layers' order: each delta
@@ -1978,7 +1981,8 @@ impl Body38 {
         )?;
         let wr = WideRecord::new(stream, ub)?;
         let wide_hsum = DeviceBuffer::zeroed(stream, ub * geo::HIDDEN)?;
-        let host_cols = ub.max(PASS_ROWS);
+        let host_cols = usize::try_from(runtime::stores::reader_columns(ub as u64))
+            .map_err(|_| GpuError::shape(WHAT, "the reader's columns pass usize"))?;
         let run = 0..n;
         let tiers = TierOpen::of_machine(plan.machine)?;
         let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
@@ -4863,7 +4867,7 @@ impl GpuModel<Body38> {
     /// The sequence state on the host ([`Seq38`], `checkpoint::saved`): the
     /// positional rows below the model's position (on a load with the draft,
     /// its store's rows among them), the recurrent stores there and at the
-    /// last checkpoint below it, each with its PLE history.
+    /// selected checkpoints below it, each with its PLE history.
     /// A waiting cut is carried out first. Refused by name on a poisoned
     /// model, while a verify waits for its commit, and after a call failed
     /// past its launch.

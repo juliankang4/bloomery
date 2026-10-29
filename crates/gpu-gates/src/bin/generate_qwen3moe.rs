@@ -1387,7 +1387,8 @@ mod cli {
         let plan_levers = PlanLevers::from_levers(levers)?;
         if !mtp {
             let machine = machine38(place, &inputs, ub, experts, None)?;
-            let plan = inputs.plan_with_slots(&machine, ctx_max, &plan_levers, experts, slots)?;
+            let plan =
+                inputs.plan_with_slots(&machine, (ctx_max, ub), &plan_levers, experts, slots)?;
             return Ok(plan.host.nvme_arena_bytes);
         }
         let mtp = mtp_inputs38(levers, file, &inputs)?;
@@ -1397,7 +1398,7 @@ mod cli {
             None
         };
         let machine = machine38(place, &inputs, ub, experts, reserve)?;
-        let plan = inputs.plan_mtp_with(&machine, ctx_max, &plan_levers, &mtp, experts)?;
+        let plan = inputs.plan_mtp_with(&machine, (ctx_max, ub), &plan_levers, &mtp, experts)?;
         Ok(plan.plan.host.nvme_arena_bytes)
     }
 
@@ -2902,7 +2903,7 @@ mod cli {
         // One slot is `plan_with` itself.
         let plan = inputs.plan_with_slots(
             &machine,
-            u64::try_from(ctx)?,
+            (u64::try_from(ctx)?, u64::try_from(ub)?),
             &PlanLevers::from_levers(levers)?,
             experts,
             slots,
@@ -3012,7 +3013,7 @@ mod cli {
         let machine = machine38(place, &inputs, u64::try_from(ub)?, experts, reserve)?;
         let plan = inputs.plan_mtp_with(
             &machine,
-            ctx_max,
+            (ctx_max, u64::try_from(ub)?),
             &PlanLevers::from_levers(levers)?,
             &mtp,
             experts,

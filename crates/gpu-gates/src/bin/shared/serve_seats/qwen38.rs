@@ -720,7 +720,7 @@ impl Place38 {
             ub,
             |m, on| {
                 inputs
-                    .plan_target(m, ctx, levers, experts, mtp, slots)
+                    .plan_target(m, (ctx, ub), levers, experts, mtp, slots)
                     .map(|p| on(&p))
             },
             read,
@@ -1221,8 +1221,8 @@ impl Plans<'_> {
     }
 }
 
-/// The host bytes a sequence state of `positions` positions holds on the
-/// file `inputs` describes ([`Seq38`]: its positional rows and two recurrent
+/// The most host bytes a sequence state of `positions` positions holds on the
+/// file `inputs` describes ([`Seq38`]: its positional rows and bounded recurrent
 /// copies, the draft's side under `drafts`, [`seq38_bytes`]) — at one
 /// position the least one saved state of the prompt cache holds.
 fn seq38_state(inputs: &PlanInputs, positions: usize, drafts: bool) -> u64 {
@@ -1841,7 +1841,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         let at = u64::try_from(ctx)?;
         let ub = u64::try_from(ubatch.min(ctx))?;
         let machine = place.machine(&inputs, (at, ub), experts, &plan_levers, None, slots)?;
-        let plan = inputs.plan_with_slots(&machine, at, &plan_levers, experts, slots)?;
+        let plan = inputs.plan_with_slots(&machine, (at, ub), &plan_levers, experts, slots)?;
         Ok(vision_seat::Cost::of(&plan, at))
     })?;
     let (media, image) = vision_seat::images_of(vision.as_ref());
@@ -2062,13 +2062,19 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     })?;
     let (plan, draft_bytes) = match &mtp_inputs {
         None => (
-            inputs.plan_with_slots(&machine, u64::try_from(ctx)?, &plan_levers, experts, slots)?,
+            inputs.plan_with_slots(
+                &machine,
+                (u64::try_from(ctx)?, u64::try_from(ubatch.min(ctx))?),
+                &plan_levers,
+                experts,
+                slots,
+            )?,
             0,
         ),
         Some(mi) => {
             let with = inputs.plan_mtp_with_slots(
                 &machine,
-                u64::try_from(ctx)?,
+                (u64::try_from(ctx)?, u64::try_from(ubatch.min(ctx))?),
                 &plan_levers,
                 mi,
                 experts,
@@ -2538,13 +2544,8 @@ impl Q38 {
                     a.place
                         .machine(&inputs, ctx_ub, a.experts, &a.plan_levers, None, a.slots)?;
                 check_reserve(&machine, a.slots, ckpt)?;
-                let plan = inputs.plan_with_slots(
-                    &machine,
-                    u64::try_from(a.ctx)?,
-                    &a.plan_levers,
-                    a.experts,
-                    a.slots,
-                )?;
+                let plan =
+                    inputs.plan_with_slots(&machine, ctx_ub, &a.plan_levers, a.experts, a.slots)?;
                 a.plan.hold(&PlanKey::of(&plan)?)?;
                 opened = t.elapsed();
                 Body38::open_placed_residency(
@@ -2580,7 +2581,7 @@ impl Q38 {
                 check_reserve(&machine, a.slots, ckpt)?;
                 let plan = inputs.plan_mtp_with_slots(
                     &machine,
-                    u64::try_from(a.ctx)?,
+                    ctx_ub,
                     &a.plan_levers,
                     &mtp,
                     a.experts,
@@ -3781,7 +3782,7 @@ mod tests {
             .machine(&inputs, (TRAINED / 2, 1), Experts::Host, &levers, None, 1)
             .expect("the machine");
         let plan = inputs
-            .plan_target(&machine, TRAINED / 2, &levers, Experts::Host, None, 1)
+            .plan_target(&machine, (TRAINED / 2, 1), &levers, Experts::Host, None, 1)
             .expect("the half-context plan");
         let reads = folder
             .least_reads(&plan, super::CARD38)

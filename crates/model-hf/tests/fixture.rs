@@ -2749,7 +2749,13 @@ fn hw_fixture_q38_budget() {
             card_budget_bytes: budget.into(),
         };
         inputs
-            .plan_with_slots(&machine, q38::BUDGET_CTX, &levers, Experts::Card, 1)
+            .plan_with_slots(
+                &machine,
+                (q38::BUDGET_CTX, UBATCH_PLANNED.min(q38::BUDGET_CTX)),
+                &levers,
+                Experts::Card,
+                1,
+            )
             .unwrap()
             .n_l
     };

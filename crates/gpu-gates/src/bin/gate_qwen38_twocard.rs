@@ -710,7 +710,12 @@ mod gate {
         let levers = PlanLevers {
             card_budget_bytes: Some(gib << 30).into(),
         };
-        match inputs.plan_with(bp, ctx as u64, &levers, Experts::Card) {
+        match inputs.plan_with(
+            bp,
+            (ctx as u64, u64::try_from(ubatch_for(ctx)?)?),
+            &levers,
+            Experts::Card,
+        ) {
             Ok(plan) => {
                 let why = unfit(&plan);
                 Ok((Some(plan), why))
@@ -1119,9 +1124,13 @@ mod gate {
             let levers = PlanLevers {
                 card_budget_bytes: Some(self.gib << 30).into(),
             };
-            Ok(self
-                .inputs
-                .plan_with_slots(self.bp, CTX as u64, &levers, Experts::Card, slots)?)
+            Ok(self.inputs.plan_with_slots(
+                self.bp,
+                (CTX as u64, u64::try_from(ubatch_for(CTX)?)?),
+                &levers,
+                Experts::Card,
+                slots,
+            )?)
         }
 
         /// The ids stream `s` fills its wide passes' rows from.

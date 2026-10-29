@@ -156,7 +156,9 @@
 //!   from a model whose planes hold [`PLANE_FILL`] (`fresh`: a row the
 //!   restore did not move reads the pattern), and the prefix once more from
 //!   a state whose copy ran on a save lane (`seq_save_async`); the state's
-//!   bytes equal their derivation ([`seq38_bytes`]); each way's model stands
+//!   bytes equal their derivation (the positional rows and two checkpoint
+//!   copies: the current state and the first call's end) and fit the planned
+//!   bound ([`seq38_bytes`]); each way's model stands
 //!   at the point, and after the rest's call every live row of every store
 //!   (the delta states and rings, the K/V planes, the raw key rings and the
 //!   pooled keys)
@@ -358,7 +360,7 @@ mod gate {
 
     use bloomery_gpu::arch::qwen3moe::{
         Body38, KvQ8, LayerKind38, Prompt38, Qwen38Model, RouteTap, Seq38, SplitWalk, Store38Host,
-        TargetRows, seq38_bytes,
+        TargetRows, checkpoint_bytes, seq_positional_bytes, seq38_bytes,
     };
     use bloomery_gpu::head::Head;
     use bloomery_gpu::host::PassKind;
@@ -4454,7 +4456,10 @@ mod gate {
         m.prompt38(&ids[..k], Prompt38::Pass)?;
         m.prompt38(&ids[k..n], Prompt38::Pass)?;
         let state = m.seq_save()?;
-        let derived = seq38_bytes(n_gdn(), n_qsa(), n, false, KvQ8::F16);
+        // PIN(2026-10-30): the bound allows two inner points; this split save keeps one.
+        let bound = seq38_bytes(n_gdn(), n_qsa(), n, false, KvQ8::F16);
+        let derived =
+            seq_positional_bytes(n_qsa(), n, KvQ8::F16) + 2 * checkpoint_bytes(n_gdn(), n_qsa());
         let lane = m.seq_lane(2 * derived)?;
         let (on_lane, pending) = m.seq_save_async(&lane)?.map_err(GateError::from)?;
         pending.land()?;
@@ -4485,8 +4490,10 @@ mod gate {
         m.body_parts("(kp)")?.2.set_checkpoints(false);
         m.reset()?;
         let keep = state.keep_point(ask);
-        let mut ok =
-            state.bytes() as u64 == derived && state.positions() as usize == n && keep == at;
+        let mut ok = state.bytes() as u64 == derived
+            && derived <= bound
+            && state.positions() as usize == n
+            && keep == at;
         let mut said = format!(
             "a state of {} positions, {} bytes (derived {derived}), kept {keep} of {ask} asked",
             state.positions(),
@@ -4788,10 +4795,11 @@ mod gate {
             experts,
         );
         let ctx = CTX as u64;
+        let shape = (ctx, u64::try_from(ub)?);
         let plan_levers = &cfg().plan_levers;
-        let plain = inputs.plan_with(&machine, ctx, plan_levers, experts)?;
-        let one = inputs.plan_with_slots(&machine, ctx, plan_levers, experts, 1)?;
-        let two = inputs.plan_with_slots(&machine, ctx, plan_levers, experts, 2)?;
+        let plain = inputs.plan_with(&machine, shape, plan_levers, experts)?;
+        let one = inputs.plan_with_slots(&machine, shape, plan_levers, experts, 1)?;
+        let two = inputs.plan_with_slots(&machine, shape, plan_levers, experts, 2)?;
         let totals = |p: &model::placement::Plan| {
             let c = &p.cards[0];
             (

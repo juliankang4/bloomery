@@ -3074,7 +3074,12 @@ mod gate {
         let (file, draft) = (open_target()?, open_draft()?);
         let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
         let extra = mtp.card_bytes(CTX_LONG)?;
-        let plan = inputs.plan_mtp(&machine, CTX_LONG, &plan_levers(extra)?, mtp)?;
+        let plan = inputs.plan_mtp(
+            &machine,
+            (CTX_LONG, u64::try_from(ub)?),
+            &plan_levers(extra)?,
+            mtp,
+        )?;
         let mut m = Body38::open_placed_mtp(file, &plan, inputs, 0, cfg().host, ub, &draft, mtp)?;
         let vocab = u32::try_from(m.body("(kp-draft)")?.vocab())?;
         let ids: Vec<u32> = (0..p + prompt.len())
@@ -3148,7 +3153,7 @@ mod gate {
         prompt: &[u32],
     ) -> Result<(Qwen38Model, bool), GateError> {
         let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
-        let plain_plan = inputs.plan(&machine, CTX, &plan_levers(0)?)?;
+        let plain_plan = inputs.plan(&machine, (CTX, u64::try_from(ub)?), &plan_levers(0)?)?;
         let mut b = Body38::open_placed(open_target()?, &plain_plan, inputs, 0, cfg().host, ub)?;
         // Other ids over the same length: the state's rows differ from
         // whatever this model's stores hold, so a copy that should not
@@ -3943,7 +3948,12 @@ mod gate {
         let (file, draft) = (open_target()?, open_draft()?);
         let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
         let extra = mtp.card_bytes(CTX)?;
-        let plan = inputs.plan_mtp(&machine, CTX, &plan_levers(extra)?, mtp)?;
+        let plan = inputs.plan_mtp(
+            &machine,
+            (CTX, u64::try_from(ub)?),
+            &plan_levers(extra)?,
+            mtp,
+        )?;
         let small = n.div_ceil(3);
         let m = Body38::open_placed_mtp(file, &plan, inputs, 0, cfg().host, small, &draft, mtp)?;
         let (m, cut) = drafted_store(m, prompt, Prompt38::Gemm, SplitWalk::Off)?;
@@ -4808,7 +4818,7 @@ mod gate {
         let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
         let plan = inputs.plan_mtp_with_slots(
             &machine,
-            CTX,
+            (CTX, u64::try_from(ub)?),
             &plan_levers(mtp.card_bytes_of(CTX, 2)?)?,
             mtp,
             Experts::Host,
@@ -6048,10 +6058,20 @@ mod gate {
             u64::try_from(ub)?,
             Experts::Card,
         );
-        let alone = inputs.plan_with(&machine, CTX, &plan_levers(0)?, Experts::Card)?;
+        let alone = inputs.plan_with(
+            &machine,
+            (CTX, u64::try_from(ub)?),
+            &plan_levers(0)?,
+            Experts::Card,
+        )?;
         let extra = mtp.card_bytes(CTX)?;
-        let drafted =
-            inputs.plan_mtp_with(&machine, CTX, &plan_levers(extra)?, mtp, Experts::Card)?;
+        let drafted = inputs.plan_mtp_with(
+            &machine,
+            (CTX, u64::try_from(ub)?),
+            &plan_levers(extra)?,
+            mtp,
+            Experts::Card,
+        )?;
         let fixture = Tier::from_env()? == Tier::Fixture;
         let want = (cfg().n_expert / 2) as u64;
         let (a, d) = (&alone.n_l, &drafted.plan.n_l);
@@ -6122,7 +6142,7 @@ mod gate {
                 paged_inputs.room = (room, HostRead::Given);
                 match paged_inputs.plan_mtp_with(
                     &machine,
-                    CTX,
+                    (CTX, u64::try_from(ub)?),
                     &plan_levers(extra)?,
                     mtp,
                     Experts::Card,
@@ -6176,7 +6196,12 @@ mod gate {
             );
             return Ok(false);
         };
-        let plain = paged_inputs.plan_with(&machine, CTX, &plan_levers(extra)?, Experts::Card)?;
+        let plain = paged_inputs.plan_with(
+            &machine,
+            (CTX, u64::try_from(ub)?),
+            &plan_levers(extra)?,
+            Experts::Card,
+        )?;
         // The fit: the drafted plan's room is `MtpPlan::headroom_bytes`, the field that
         // subtracts the draft's reserve R — its card bytes with its program's arena, the lever's
         // `extra` (the stage card's own headroom does not see R);
@@ -6334,7 +6359,12 @@ mod gate {
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(usize::try_from(CTX)?)?;
         let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
         let extra = mtp.card_bytes(CTX)?;
-        let plan = inputs.plan_mtp(&machine, CTX, &plan_levers(extra)?, &mtp)?;
+        let plan = inputs.plan_mtp(
+            &machine,
+            (CTX, u64::try_from(ub)?),
+            &plan_levers(extra)?,
+            &mtp,
+        )?;
         let d = &plan.draft.cards[0];
         let draft_kv = d.kv_bytes;
         println!(

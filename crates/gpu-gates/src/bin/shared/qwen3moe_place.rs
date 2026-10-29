@@ -164,7 +164,12 @@ fn plan_inputs<'a>(
                     .into(),
             );
         }
-        Inputs::Qwen35(i) => i.plan_rule(machine, ctx, levers, routed_rule(Program::Qwen35Body))?,
+        Inputs::Qwen35(i) => i.plan_rule(
+            machine,
+            (ctx, ctx.min(q35::UBATCH_PLANNED)),
+            levers,
+            routed_rule(Program::Qwen35Body),
+        )?,
     })
 }
 

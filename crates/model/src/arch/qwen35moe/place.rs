@@ -208,6 +208,12 @@ pub enum PlaceError {
     /// The placement could not be built.
     #[error(transparent)]
     Placement(#[from] PlacementError),
+    /// A load whose ubatch is outside its context or supported width.
+    #[error("ubatch {ubatch}: expected 1..=min({ctx_max}, {UBATCH_PLANNED})")]
+    Ubatch { ctx_max: u64, ubatch: u64 },
+    /// A planning callback returned without handing on its plan.
+    #[error("widen_card_route: the planning callback returned no plan")]
+    MissingPlan,
     /// The plan was built and breaks these invariants, every one of them.
     #[error("the plan breaks its invariants: {}", joined(.0))]
     Broken(Vec<Violation>),
@@ -472,17 +478,17 @@ impl PlanInputs {
         coverage::check(&self.spec, &self.model)
     }
 
-    /// The placement of the file on `machine` at `ctx_max` positions under
-    /// the placement's `levers`, every routed expert on the host and the PLE
+    /// The placement of the file on `machine` at `ctx_max` positions with
+    /// prompt calls of up to `ubatch` positions under the placement's `levers`, every routed expert on the host and the PLE
     /// table where [`PlanInputs::room`] says ([`PlanInputs::plan_with`] under
     /// [`Experts::Host`]).
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
     ) -> Result<Plan<'a>, PlaceError> {
-        self.plan_with(machine, ctx_max, levers, Experts::Host)
+        self.plan_with(machine, (ctx_max, ubatch), levers, Experts::Host)
     }
 
     /// The placement of the file on `machine` at `ctx_max` positions under
@@ -497,15 +503,13 @@ impl PlanInputs {
     pub fn plan_with<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         experts: Experts,
     ) -> Result<Plan<'a>, PlaceError> {
-        if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
-            return Err(PlaceError::Positions { ctx_max });
-        }
+        check_shape(ctx_max, ubatch)?;
         check_draft_reserve(machine, None)?;
-        let plan = self.target(machine, ctx_max, levers, experts, Beside::none())?;
+        let plan = self.target(machine, (ctx_max, ubatch), levers, experts, Beside::none())?;
         checked(plan).map_err(PlaceError::Broken)
     }
 
@@ -515,13 +519,11 @@ impl PlanInputs {
     pub fn plan_nodes<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         owned: &[u64],
     ) -> Result<Plan<'a>, PlaceError> {
-        if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
-            return Err(PlaceError::Positions { ctx_max });
-        }
+        check_shape(ctx_max, ubatch)?;
         check_draft_reserve(machine, None)?;
         let plan = placement::plan_in_pool(machine, levers, |levers| {
             let mut plan = placement::nodes::loaded_routed(
@@ -537,7 +539,7 @@ impl PlanInputs {
             let room = plan.plan_at(&self.room);
             let floor = 2 * self.seq_state_bytes(ctx_max, None);
             let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
-            self.place_rows(&mut plan, room, floor, page)?;
+            self.place_rows(&mut plan, room, floor, ubatch, page)?;
             plan.host.step_slots(1, placement::STEP_PORT_COLUMNS)?;
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
             Ok(plan)
@@ -561,17 +563,15 @@ impl PlanInputs {
     pub fn plan_with_slots<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         experts: Experts,
         slots: usize,
     ) -> Result<Plan<'a>, PlaceError> {
         if slots == 1 {
-            return self.plan_with(machine, ctx_max, levers, experts);
+            return self.plan_with(machine, (ctx_max, ubatch), levers, experts);
         }
-        if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
-            return Err(PlaceError::Positions { ctx_max });
-        }
+        check_shape(ctx_max, ubatch)?;
         if slots == 0 {
             return Err(PlaceError::Slots { slots });
         }
@@ -581,7 +581,7 @@ impl PlanInputs {
         let kv = terms.slots_of(slots as u64);
         let mut plan = self.target_of(
             machine,
-            ctx_max,
+            (ctx_max, ubatch),
             levers,
             experts,
             Beside::reserve(rows).slots(slots),
@@ -620,20 +620,21 @@ impl PlanInputs {
         }
     }
 
-    /// The host bytes one saved sequence state of `positions` positions
+    /// The most host bytes one saved sequence state of `positions` positions
     /// holds — the prompt cache's entry: every attention layer's positional
-    /// bytes, two copies of a checkpoint ([`KvLayout::state_bytes`]) and, on
+    /// bytes and a budget-bounded set of checkpoints ([`KvLayout::state_bytes`]) and, on
     /// a load that carries `mtp`, the draft's store below the same positions,
-    /// the step's and the pass's arena rows and the hidden row of the one
-    /// point the checkpoint term counts. The engine's own owner is `Body38`'s
+    /// the step's and the pass's arena rows and one hidden row per saved
+    /// inner checkpoint. The engine's own owner is `Body38`'s
     /// `seq38_bytes`; the gate holds the two equal.
     #[must_use]
     pub fn seq_state_bytes(&self, positions: u64, mtp: Option<&MtpInputs>) -> u64 {
+        let points = self.kv.checkpoint_price().saved_points(positions);
         let draft = mtp.map_or(0, |m| {
             let point_row = streams(&self.spec) * hidden(&self.spec) * std::mem::size_of::<f32>();
             m.kv.layer_bytes(0, positions) + slot_resident_bytes(&self.spec)
                 - runtime::stores::U32_BYTES
-                + point_row as u64
+                + points * point_row as u64
         });
         self.kv.state_bytes(positions) + draft
     }
@@ -650,7 +651,7 @@ impl PlanInputs {
     fn target<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         experts: Experts,
         beside: Beside<'_>,
@@ -659,7 +660,7 @@ impl PlanInputs {
             Experts::Host => None,
             Experts::Card => Some(routed_rule(PROGRAM)),
         };
-        self.target_rule(machine, ctx_max, levers, rule, beside)
+        self.target_rule(machine, (ctx_max, ubatch), levers, rule, beside)
     }
 
     fn place_rows(
@@ -667,9 +668,17 @@ impl PlanInputs {
         plan: &mut Plan<'_>,
         room: u64,
         floor: u64,
+        ubatch: u64,
         page: u64,
     ) -> Result<(), PlacementError> {
-        placement::row_table_tier(plan, room, floor, UBATCH_PLANNED, page, self.row_source)
+        placement::row_table_tier(
+            plan,
+            room,
+            floor,
+            runtime::stores::reader_columns(ubatch),
+            page,
+            self.row_source,
+        )
     }
 
     /// [`PlanInputs::target`] over `kv`'s per-layer bytes instead of the
@@ -677,7 +686,7 @@ impl PlanInputs {
     fn target_of<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         experts: Experts,
         beside: Beside<'_>,
@@ -687,7 +696,7 @@ impl PlanInputs {
             Experts::Host => None,
             Experts::Card => Some(routed_rule(PROGRAM)),
         };
-        self.target_rule_of(machine, ctx_max, levers, rule, beside, kv)
+        self.target_rule_of(machine, (ctx_max, ubatch), levers, rule, beside, kv)
     }
 
     /// The target's plan, unchecked, under the card rule `rule` over `kv`'s
@@ -711,7 +720,7 @@ impl PlanInputs {
     fn target_rule_of<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         rule: Option<RoutedRule>,
         beside: Beside<'_>,
@@ -740,7 +749,7 @@ impl PlanInputs {
             let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
             let room = plan.plan_at(&self.room);
             let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
-            self.place_rows(&mut plan, room, floor, page)?;
+            self.place_rows(&mut plan, room, floor, ubatch, page)?;
             plan.host.step_slots(
                 if beside.mtp.is_some() {
                     beside.slots.saturating_mul(DELTA_LANES)
@@ -766,12 +775,12 @@ impl PlanInputs {
     fn target_rule<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         rule: Option<RoutedRule>,
         beside: Beside<'_>,
     ) -> Result<Plan<'a>, PlaceError> {
-        self.target_rule_of(machine, ctx_max, levers, rule, beside, &self.kv)
+        self.target_rule_of(machine, (ctx_max, ubatch), levers, rule, beside, &self.kv)
     }
     /// `levers`, the routed experts by the expert rule over the layers whose
     /// three routed stacks `rule` loads — the card rule of the program that
@@ -783,15 +792,19 @@ impl PlanInputs {
     pub fn plan_rule<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         rule: RoutedRule,
     ) -> Result<Plan<'a>, PlaceError> {
-        if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
-            return Err(PlaceError::Positions { ctx_max });
-        }
+        check_shape(ctx_max, ubatch)?;
         check_draft_reserve(machine, None)?;
-        let plan = self.target_rule(machine, ctx_max, levers, Some(rule), Beside::none())?;
+        let plan = self.target_rule(
+            machine,
+            (ctx_max, ubatch),
+            levers,
+            Some(rule),
+            Beside::none(),
+        )?;
         checked(plan).map_err(PlaceError::Broken)
     }
 
@@ -807,11 +820,11 @@ impl PlanInputs {
     pub fn plan_mtp<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         mtp: &'a MtpInputs,
     ) -> Result<MtpPlan<'a>, PlaceError> {
-        self.plan_mtp_with(machine, ctx_max, levers, mtp, Experts::Host)
+        self.plan_mtp_with(machine, (ctx_max, ubatch), levers, mtp, Experts::Host)
     }
 
     /// [`PlanInputs::plan_mtp`] with the target's routed experts where
@@ -828,14 +841,12 @@ impl PlanInputs {
     pub fn plan_mtp_with<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         mtp: &'a MtpInputs,
         experts: Experts,
     ) -> Result<MtpPlan<'a>, PlaceError> {
-        if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
-            return Err(PlaceError::Positions { ctx_max });
-        }
+        check_shape(ctx_max, ubatch)?;
         let [card] = machine.cards.as_slice() else {
             return Err(PlaceError::DraftCards {
                 cards: machine.cards.len(),
@@ -845,7 +856,13 @@ impl PlanInputs {
         let arena = mtp.arena_bytes();
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
-            let plan = self.target(machine, ctx_max, levers, experts, Beside::draft(0, mtp))?;
+            let plan = self.target(
+                machine,
+                (ctx_max, ubatch),
+                levers,
+                experts,
+                Beside::draft(0, mtp),
+            )?;
             let broken: Vec<Violation> = plan
                 .violations()
                 .into_iter()
@@ -865,7 +882,7 @@ impl PlanInputs {
         check_draft_reserve(machine, None)?;
         let plan = self.target(
             machine,
-            ctx_max,
+            (ctx_max, ubatch),
             levers,
             experts,
             Beside::draft(reserve, mtp),
@@ -919,18 +936,16 @@ impl PlanInputs {
     pub fn plan_mtp_with_slots<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         mtp: &'a MtpInputs,
         experts: Experts,
         slots: usize,
     ) -> Result<MtpPlan<'a>, PlaceError> {
         if slots == 1 {
-            return self.plan_mtp_with(machine, ctx_max, levers, mtp, experts);
+            return self.plan_mtp_with(machine, (ctx_max, ubatch), levers, mtp, experts);
         }
-        if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
-            return Err(PlaceError::Positions { ctx_max });
-        }
+        check_shape(ctx_max, ubatch)?;
         if slots == 0 {
             return Err(PlaceError::Slots { slots });
         }
@@ -948,7 +963,7 @@ impl PlanInputs {
             check_draft_reserve(machine, Some(reserve))?;
             let mut plan = self.target_of(
                 machine,
-                ctx_max,
+                (ctx_max, ubatch),
                 levers,
                 experts,
                 Beside::draft(rows, mtp).slots(slots),
@@ -974,7 +989,7 @@ impl PlanInputs {
         check_draft_reserve(machine, None)?;
         let mut plan = self.target_of(
             machine,
-            ctx_max,
+            (ctx_max, ubatch),
             levers,
             experts,
             Beside::draft(reserve + rows, mtp).slots(slots),
@@ -1026,19 +1041,29 @@ impl PlanInputs {
     pub fn plan_target<'a>(
         &'a self,
         machine: &'a Machine,
-        ctx_max: u64,
+        (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         experts: Experts,
         mtp: Option<&'a MtpInputs>,
         slots: usize,
     ) -> Result<Plan<'a>, PlaceError> {
         match mtp {
-            None => self.plan_with_slots(machine, ctx_max, levers, experts, slots),
+            None => self.plan_with_slots(machine, (ctx_max, ubatch), levers, experts, slots),
             Some(mi) => Ok(self
-                .plan_mtp_with_slots(machine, ctx_max, levers, mi, experts, slots)?
+                .plan_mtp_with_slots(machine, (ctx_max, ubatch), levers, mi, experts, slots)?
                 .plan),
         }
     }
+}
+
+fn check_shape(ctx_max: u64, ubatch: u64) -> Result<(), PlaceError> {
+    if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
+        return Err(PlaceError::Positions { ctx_max });
+    }
+    if ubatch == 0 || ubatch > ctx_max.min(UBATCH_PLANNED) {
+        return Err(PlaceError::Ubatch { ctx_max, ubatch });
+    }
+    Ok(())
 }
 
 /// A draft plan's card terms: its granules (dense, experts, rounding), its
@@ -1340,7 +1365,8 @@ pub fn tensor_places(plan: &Plan<'_>) -> TensorPlaces {
 /// returned again: the plan of `machine` is read, and the plan of the widened
 /// one only when its places equal those, the one case that machine is
 /// returned. Returns the machine and the read of its plan. Refused as `plan`
-/// refuses `machine`.
+/// refuses `machine`, or as [`PlaceError::MissingPlan`] when a successful
+/// callback returns without handing on a plan.
 pub fn widen_card_route<T>(
     mut machine: Machine,
     ubatch: u64,
@@ -1349,7 +1375,7 @@ pub fn widen_card_route<T>(
 ) -> Result<(Machine, T), PlaceError> {
     let mut first = None;
     plan(&machine, &mut |p| first = Some((tensor_places(p), read(p))))?;
-    let (held, held_read) = first.expect("widen_card_route: `plan` hands on the plan it made");
+    let (held, held_read) = first.ok_or(PlaceError::MissingPlan)?;
     let bytes = route_unit_bytes(ubatch, !machine.tiers.is_empty());
     let stage_expert = held.iter().flatten().any(|(device, _, experts)| {
         *device == Device::Card(0) && experts.as_ref().is_some_and(|e| !e.is_empty())
@@ -1362,11 +1388,16 @@ pub fn widen_card_route<T>(
     };
     stage.reserves.push((ROUTE_UNIT_RESERVE.to_string(), bytes));
     let mut wide = None;
+    let mut seen = false;
     let widened = plan(&machine, &mut |p| {
+        seen = true;
         if tensor_places(p) == held {
             wide = Some(read(p));
         }
     });
+    if widened.is_ok() && !seen {
+        return Err(PlaceError::MissingPlan);
+    }
     match (widened, wide) {
         (Ok(()), Some(wide_read)) => Ok((machine, wide_read)),
         _ => {
@@ -2006,17 +2037,35 @@ impl KvLayout {
     }
 
     /// The host bytes one saved sequence state of `positions` positions holds
-    /// of the file's own layers: every attention layer's positional rows and
-    /// two copies of a checkpoint — each GDN layer's committed lane and conv
-    /// ring, the PLE ring, and each selecting layer's raw key ring.
+    /// of the file's own layers: every attention layer's positional rows
+    /// and the current recurrent state plus saved points bounded by the
+    /// context and checkpoint budget: each GDN layer's committed lane and
+    /// conv ring, the PLE ring and each selecting layer's raw key ring.
     fn state_bytes(&self, positions: u64) -> u64 {
-        let (rows, rings) = (0..self.kinds.len())
+        let rows: u64 = (0..self.kinds.len())
             .filter(|&l| self.kinds[l] == Kind::Attention)
-            .map(|l| self.attention_bytes(l, positions))
-            .fold((0, 0), |(r, k), (lr, lk)| (r + lr, k + lk));
+            .map(|l| self.attention_bytes(l, positions).0)
+            .sum();
+        let price = self.checkpoint_price();
+        rows + (1 + price.saved_points(positions)) * price.point_bytes
+    }
+
+    /// One checkpoint's bytes and spacing: each GDN layer's copy, the PLE
+    /// ring and each selecting layer's raw key ring, taken every
+    /// [`UBATCH_PLANNED`] positions, the Qwen3.8 body's spacing. A Qwen3.5
+    /// or Qwen3.6 body spaces its points by the load's ubatch instead; their
+    /// files carry no PLE table, and this price reaches only the row table's
+    /// host floor, which a load without one never reads.
+    fn checkpoint_price(&self) -> runtime::seqstate::Price {
         let gdn = self.kinds.iter().filter(|&&k| k == Kind::DeltaRule).count() as u64;
-        let checkpoint = gdn * self.copy + self.ple.map_or(0, |(_, bytes)| bytes) + rings;
-        rows + 2 * checkpoint
+        let rings = (0..self.kinds.len())
+            .filter(|&l| self.kinds[l] == Kind::Attention)
+            .map(|l| self.attention_bytes(l, 0).1)
+            .sum::<u64>();
+        runtime::seqstate::Price {
+            point_bytes: gdn * self.copy + self.ple.map_or(0, |(_, bytes)| bytes) + rings,
+            every: UBATCH_PLANNED as u32,
+        }
     }
 }
 
@@ -2830,29 +2879,37 @@ mod tests {
         let levers = PlanLevers {
             card_budget_bytes: bloomery_levers::CardBudget::default(),
         };
-        for (input, tier) in [
-            (&inputs, placement::Device::Host),
-            (&source, placement::Device::Nvme),
-        ] {
-            for plan in [
-                input.plan_with(&machine, 4096, &levers, super::Experts::Card),
-                input.plan_nodes(&machine, 4096, &levers, &[8]),
-                input.plan_with_slots(&machine, 4096, &levers, super::Experts::Card, 2),
+        for ubatch in [1, 8, 512, 4096] {
+            for (input, tier) in [
+                (&inputs, placement::Device::Host),
+                (&source, placement::Device::Nvme),
             ] {
-                let plan = plan.unwrap();
-                assert_eq!(plan.row_tier().unwrap(), Some(tier));
-                if tier == placement::Device::Nvme {
-                    assert_eq!(plan.host.table_bytes, 0);
-                    assert_eq!(
-                        plan.host.row_reserve_bytes,
-                        placement::row_room(
-                            &input.model,
-                            super::UBATCH_PLANNED,
-                            os::page_bytes().unwrap(),
-                            input.row_source,
-                        )
-                        .unwrap()
-                    );
+                for plan in [
+                    input.plan_with(&machine, (4096, ubatch), &levers, super::Experts::Card),
+                    input.plan_nodes(&machine, (4096, ubatch), &levers, &[8]),
+                    input.plan_with_slots(
+                        &machine,
+                        (4096, ubatch),
+                        &levers,
+                        super::Experts::Card,
+                        2,
+                    ),
+                ] {
+                    let plan = plan.unwrap();
+                    assert_eq!(plan.row_tier().unwrap(), Some(tier));
+                    if tier == placement::Device::Nvme {
+                        assert_eq!(plan.host.table_bytes, 0);
+                        assert_eq!(
+                            plan.host.row_reserve_bytes,
+                            placement::row_room(
+                                &input.model,
+                                runtime::stores::reader_columns(ubatch),
+                                os::page_bytes().unwrap(),
+                                input.row_source,
+                            )
+                            .unwrap()
+                        );
+                    }
                 }
             }
         }
@@ -2875,7 +2932,7 @@ mod tests {
     /// One saved sequence state of Qwen3.8's 48 layers (36 GDN, every fourth
     /// one attention, the PLE ring on layer 1) at a context of whole pools
     /// [derived]: twelve attention layers' 2,048 B a position and 256 B a
-    /// pool of four, and two checkpoints of 36 · 4,093,584 B (the committed
+    /// pool of four, and checkpoint copies of 36 · 4,093,584 B (the committed
     /// lane, conv ring and carry, not the four lanes a layer holds), the
     /// PLE ring's 696,320 B and twelve raw key rings of 2,816 B.
     #[test]
@@ -2905,16 +2962,19 @@ mod tests {
             rope_row: 64 * 4,
         };
         let checkpoint = 36 * 4_093_584 + 696_320 + 12 * 2816;
-        assert_eq!(kv.state_bytes(0), 2 * checkpoint);
+        assert_eq!(kv.state_bytes(0), checkpoint);
         assert_eq!(
             kv.state_bytes(262_144),
-            12 * (262_144 * 2048 + 65_536 * 256) + 2 * checkpoint
+            12 * (262_144 * 2048 + 65_536 * 256) + 9 * checkpoint
         );
-        assert_eq!(kv.state_bytes(262_144), 6_939_975_808);
+        assert_eq!(kv.state_bytes(262_144), 7_976_669_760);
         assert_eq!(
             kv.state_bytes(4097),
-            12 * (4097 * 2048 + 1025 * 256) + 2 * checkpoint
+            12 * (4097 * 2048 + 1025 * 256) + 4 * checkpoint
         );
+        let rows = 12 * (16_384 * 2048 + 4096 * 256);
+        // PIN(2026-10-30): the Qwen3.5 spacing clause is removed; its files have no PLE table.
+        assert_eq!(kv.state_bytes(16_384), rows + 5 * checkpoint);
     }
 
     /// The lane term ([`gdn_bytes`], the layout's one rule): Qwen3.6's 30 GDN
@@ -3838,8 +3898,8 @@ mod tests {
 
         use super::super::{
             Beside, Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, ROUTE_UNIT_RESERVE,
-            card_route_run, draft_card_bytes, machine_bp, route_unit_bytes, slot_resident_bytes,
-            tier_batch_of, widen_card_route,
+            UBATCH_PLANNED, card_route_run, draft_card_bytes, machine_bp, route_unit_bytes,
+            slot_resident_bytes, tier_batch_of, widen_card_route,
         };
         use super::mtp::{draft, file};
         use crate::placement::workstation::HostRead;
@@ -4087,7 +4147,7 @@ mod tests {
             let mut plan = inputs
                 .target_of(
                     machine,
-                    CTX,
+                    (CTX, UBATCH_PLANNED),
                     &levers,
                     Experts::Host,
                     Beside::reserve(reserve + rows).slots(slots as usize),
@@ -4151,12 +4211,25 @@ mod tests {
             for (n, columns) in [(1, 4), (2, 8), (4, 8)] {
                 let slots = n as u64;
                 let plain = inputs
-                    .plan_with_slots(&machine, CTX, &levers, Experts::Host, n)
+                    .plan_with_slots(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        Experts::Host,
+                        n,
+                    )
                     .expect("the plan");
                 let want = target(&inputs, &machine, slots, 0);
                 assert_eq!(view(&plain), view(&want), "{n} slots");
                 let got = inputs
-                    .plan_target(&machine, CTX, &levers, Experts::Host, None, n)
+                    .plan_target(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        Experts::Host,
+                        None,
+                        n,
+                    )
                     .expect("the target plan");
                 assert_eq!(view(&got), view(&want), "{n} slots: the target plan");
                 assert_eq!(
@@ -4165,7 +4238,14 @@ mod tests {
                     "{n} slots"
                 );
                 let drafted = inputs
-                    .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n)
+                    .plan_mtp_with_slots(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        &mtp,
+                        Experts::Host,
+                        n,
+                    )
                     .expect("the drafted plan");
                 let (draft_want, reserve) = draft_of(&mtp, slots);
                 assert_eq!(view(&drafted.draft), view(&draft_want), "{n} slots");
@@ -4173,7 +4253,14 @@ mod tests {
                 want.host.arena_columns = columns;
                 assert_eq!(view(&drafted.plan), view(&want), "{n} slots");
                 let got = inputs
-                    .plan_target(&machine, CTX, &levers, Experts::Host, Some(&mtp), n)
+                    .plan_target(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        Experts::Host,
+                        Some(&mtp),
+                        n,
+                    )
                     .expect("the drafted target plan");
                 assert_eq!(
                     view(&got),
@@ -4239,7 +4326,14 @@ mod tests {
                     let mut inputs = routed(inputs());
                     let (room, slot_set, lane_slots) = {
                         let drafted = inputs
-                            .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, experts, n)
+                            .plan_mtp_with_slots(
+                                &machine,
+                                (CTX, UBATCH_PLANNED.min(CTX)),
+                                &levers,
+                                &mtp,
+                                experts,
+                                n,
+                            )
                             .expect("the resident plan");
                         let plan = &drafted.plan;
                         let floor = placement::ArenaFloor::of(plan).expect("the arena floor");
@@ -4259,7 +4353,14 @@ mod tests {
                     let slots = 10 * columns + lane_slots;
                     let arena = slots * slot_set;
                     inputs.arena = Some(old_arena);
-                    match inputs.plan_mtp_with_slots(&machine, CTX, &levers, &mtp, experts, n) {
+                    match inputs.plan_mtp_with_slots(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        &mtp,
+                        experts,
+                        n,
+                    ) {
                         Err(PlaceError::Placement(PlacementError::NvTierArenaUnder {
                             arena: got,
                             least,
@@ -4277,7 +4378,14 @@ mod tests {
                     }
                     inputs.arena = Some(arena);
                     let drafted = inputs
-                        .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, experts, n)
+                        .plan_mtp_with_slots(
+                            &machine,
+                            (CTX, UBATCH_PLANNED.min(CTX)),
+                            &levers,
+                            &mtp,
+                            experts,
+                            n,
+                        )
                         .expect("the exact arena floor fits");
                     assert_eq!(drafted.plan.host.nvme_arena_bytes, arena);
                     assert!(drafted.plan.host.nvme_expert_bytes > 0);
@@ -4301,7 +4409,14 @@ mod tests {
             let levers = PlanLevers::default();
             for n in [1usize, 2] {
                 let drafted = inputs
-                    .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n)
+                    .plan_mtp_with_slots(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        &mtp,
+                        Experts::Host,
+                        n,
+                    )
                     .expect("the drafted plan");
                 let (_, reserve) = draft_of(&mtp, n as u64);
                 let t = &drafted.plan.cards[0];
@@ -4331,7 +4446,14 @@ mod tests {
                 let reserve = crate::arch::qwen35moe::place::ACT_FORMS_RESERVE.to_string();
                 machine.cards[0].reserves = vec![(reserve.clone(), 0)];
                 let others = inputs
-                    .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n)
+                    .plan_mtp_with_slots(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        &mtp,
+                        Experts::Host,
+                        n,
+                    )
                     .expect("the plan")
                     .plan
                     .cards[0]
@@ -4339,7 +4461,14 @@ mod tests {
                 machine.cards[0].reserves = vec![(reserve, u64::MAX - others)];
                 assert!(
                     matches!(
-                        inputs.plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n),
+                        inputs.plan_mtp_with_slots(
+                            &machine,
+                            (CTX, UBATCH_PLANNED.min(CTX)),
+                            &levers,
+                            &mtp,
+                            Experts::Host,
+                            n
+                        ),
                         Err(PlaceError::Placement(
                             PlacementError::CardBytesPastU64 { .. }
                         ))
@@ -4364,19 +4493,39 @@ mod tests {
             let batch = tier_batch_of(2560, 10, 4096);
             for n in [2, 4] {
                 let plain = inputs
-                    .plan_with_slots(&machine, CTX, &levers, Experts::Host, n)
+                    .plan_with_slots(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        Experts::Host,
+                        n,
+                    )
                     .expect("the plan");
                 let (got, want) = headroom(&plain);
                 assert_eq!(got, want, "{n} slots: the plain plan");
                 let drafted = inputs
-                    .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n)
+                    .plan_mtp_with_slots(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        &mtp,
+                        Experts::Host,
+                        n,
+                    )
                     .expect("the drafted plan");
                 let (got, want) = headroom(&drafted.plan);
                 assert_eq!(got, want, "{n} slots: the drafted plan on one card");
                 let reserve = mtp.card_bytes_of(CTX, n).expect("the draft's card bytes");
                 let bp = machine_bp(LAYERS, 4096, Some(reserve), batch);
                 let drafted = tiered
-                    .plan_mtp_with_slots(&bp, CTX, &levers, &mtp, Experts::Card, n)
+                    .plan_mtp_with_slots(
+                        &bp,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        &mtp,
+                        Experts::Card,
+                        n,
+                    )
                     .expect("the drafted plan (b′)");
                 assert!(
                     drafted.plan.tier_n_l[0].iter().sum::<u64>() > 0
@@ -4417,7 +4566,13 @@ mod tests {
                 card_budget_bytes: Some(u64::MAX).into(),
             };
             for n in [1, 2] {
-                match inputs.plan_with_slots(&machine, CTX, &whole, Experts::Card, n) {
+                match inputs.plan_with_slots(
+                    &machine,
+                    (CTX, UBATCH_PLANNED.min(CTX)),
+                    &whole,
+                    Experts::Card,
+                    n,
+                ) {
                     Err(PlaceError::Placement(PlacementError::HostRoomFloor {
                         room,
                         floor,
@@ -4426,7 +4581,13 @@ mod tests {
                     other => panic!("{n} slot(s): not the floor's refusal: {:?}", other.err()),
                 }
                 let plan = inputs
-                    .plan_with_slots(&machine, CTX, &PlanLevers::default(), Experts::Card, n)
+                    .plan_with_slots(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &PlanLevers::default(),
+                        Experts::Card,
+                        n,
+                    )
                     .unwrap_or_else(|e| panic!("{n} slot(s): {e}"));
                 let budget = plan.card_budget.every().expect("a card budget");
                 assert!(
@@ -4439,7 +4600,13 @@ mod tests {
                 );
             }
             inputs.room = (32 << 30, HostRead::Given);
-            match inputs.plan_with_slots(&machine, CTX, &PlanLevers::default(), Experts::Host, 1) {
+            match inputs.plan_with_slots(
+                &machine,
+                (CTX, UBATCH_PLANNED.min(CTX)),
+                &PlanLevers::default(),
+                Experts::Host,
+                1,
+            ) {
                 Err(PlaceError::Placement(PlacementError::HostRoomFloor {
                     room, floor, ..
                 })) => {
@@ -4465,7 +4632,13 @@ mod tests {
                 *machine.unified_mut() = Some(UnifiedPool { bytes: ample });
                 inputs.room = (ample, HostRead::Given);
                 let whole = inputs
-                    .plan_with_slots(&machine, CTX, &levers, Experts::Card, slots)
+                    .plan_with_slots(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        Experts::Card,
+                        slots,
+                    )
                     .unwrap();
                 let pool = placement::workstation::HostNeed::of(&whole, 0).bytes() - 1;
                 machine.cards[0].free_bytes = Some(pool);
@@ -4473,14 +4646,26 @@ mod tests {
                 *machine.unified_mut() = Some(UnifiedPool { bytes: pool });
                 inputs.room = (pool, HostRead::Given);
                 let expected = inputs
-                    .plan_with_slots(&machine, CTX, &levers, Experts::Card, slots)
+                    .plan_with_slots(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        Experts::Card,
+                        slots,
+                    )
                     .expect("the pool fits with NVMe");
                 let expected_rows = format!("{:?}", expected.rows);
                 let expected_counts = expected.n_l.clone();
                 let expected_headroom = expected.host.headroom_bytes;
                 inputs.room = (ample, HostRead::Given);
                 let plan = inputs
-                    .plan_with_slots(&machine, CTX, &levers, Experts::Card, slots)
+                    .plan_with_slots(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        Experts::Card,
+                        slots,
+                    )
                     .expect("a larger host reading keeps the same pool budget");
                 assert!(plan.host.nvme_expert_bytes > 0);
                 assert_eq!(plan.n_l, expected_counts);
@@ -4510,19 +4695,21 @@ mod tests {
                     m.nodes.push(m.nodes[0].clone());
                 }
                 inputs.room = (ample, HostRead::Given);
-                let whole = inputs.plan_nodes(&m, CTX, &levers, &owned).unwrap();
+                let whole = inputs
+                    .plan_nodes(&m, (CTX, UBATCH_PLANNED.min(CTX)), &levers, &owned)
+                    .unwrap();
                 let pool = placement::workstation::HostNeed::of(&whole, 0).bytes() - 1;
                 m.cards[0].free_bytes = Some(pool);
                 m.host_mut().usable_bytes = pool;
                 *m.unified_mut() = Some(UnifiedPool { bytes: pool });
                 inputs.room = (pool, HostRead::Given);
                 let expected = inputs
-                    .plan_nodes(&m, CTX, &levers, &owned)
+                    .plan_nodes(&m, (CTX, UBATCH_PLANNED.min(CTX)), &levers, &owned)
                     .expect("the node-owned experts fit with NVMe");
                 let expected_rows = format!("{:?}", expected.rows);
                 inputs.room = (ample, HostRead::Given);
                 let plan = inputs
-                    .plan_nodes(&m, CTX, &levers, &owned)
+                    .plan_nodes(&m, (CTX, UBATCH_PLANNED.min(CTX)), &levers, &owned)
                     .expect("each rank keeps the same local pool budget");
                 assert!(plan.host.nvme_expert_bytes > 0, "{ranks} ranks");
                 assert_eq!(plan.tier_n_l.len(), ranks as usize - 1);
@@ -4560,7 +4747,12 @@ mod tests {
             roomy.cards[0].free_bytes = None;
             roomy.nodes[0].unified = None;
             let plan = inputs
-                .plan_nodes(&roomy, CTX, &PlanLevers::default(), &[256, 256])
+                .plan_nodes(
+                    &roomy,
+                    (CTX, UBATCH_PLANNED.min(CTX)),
+                    &PlanLevers::default(),
+                    &[256, 256],
+                )
                 .unwrap();
             assert_eq!(plan.n_l, vec![256; LAYERS]);
             assert_eq!(plan.tier_n_l, vec![vec![256; LAYERS]]);
@@ -4569,7 +4761,12 @@ mod tests {
                     card_budget_bytes: budget.into(),
                 };
                 for owned in [[0, 512], [256, 256], [511, 1]] {
-                    let result = inputs.plan_nodes(&machine, CTX, &levers, &owned);
+                    let result = inputs.plan_nodes(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &levers,
+                        &owned,
+                    );
                     if budget == Some(u64::MAX) && owned[0] == 511 {
                         assert!(matches!(
                             result,
@@ -4584,7 +4781,7 @@ mod tests {
                         plan.host.row_reserve_bytes,
                         placement::row_room(
                             &inputs.model,
-                            super::super::UBATCH_PLANNED,
+                            UBATCH_PLANNED,
                             os::page_bytes().expect("the base page reads"),
                             inputs.row_source,
                         )
@@ -4614,7 +4811,7 @@ mod tests {
                 inputs
                     .plan_nodes(
                         &machine,
-                        CTX,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
                         &PlanLevers {
                             card_budget_bytes: Some(0).into(),
                         },
@@ -4624,23 +4821,42 @@ mod tests {
             );
             let levers = PlanLevers::default();
             for owned in [&[512, 0][..], &[256, 257], &[512], &[u64::MAX, 513]] {
-                assert!(inputs.plan_nodes(&machine, CTX, &levers, owned).is_err());
+                assert!(
+                    inputs
+                        .plan_nodes(&machine, (CTX, UBATCH_PLANNED.min(CTX)), &levers, owned)
+                        .is_err()
+                );
             }
             for ctx in [0, super::super::KERNEL_POSITIONS + 1] {
                 assert!(matches!(
-                    inputs.plan_nodes(&machine, ctx, &levers, &[256, 256]),
+                    inputs.plan_nodes(
+                        &machine,
+                        (ctx, UBATCH_PLANNED.min(ctx)),
+                        &levers,
+                        &[256, 256]
+                    ),
                     Err(PlaceError::Positions { .. })
                 ));
             }
             machine.tiers[0].head = true;
             assert!(matches!(
-                inputs.plan_nodes(&machine, CTX, &levers, &[256, 256]),
+                inputs.plan_nodes(
+                    &machine,
+                    (CTX, UBATCH_PLANNED.min(CTX)),
+                    &levers,
+                    &[256, 256]
+                ),
                 Err(PlaceError::Placement(PlacementError::Tier { .. }))
             ));
             machine.tiers[0].head = false;
             machine.tiers[0].name = machine.cards[0].name.clone();
             assert!(matches!(
-                inputs.plan_nodes(&machine, CTX, &levers, &[256, 256]),
+                inputs.plan_nodes(
+                    &machine,
+                    (CTX, UBATCH_PLANNED.min(CTX)),
+                    &levers,
+                    &[256, 256]
+                ),
                 Err(PlaceError::Placement(PlacementError::DeviceTwice { .. }))
             ));
             machine.tiers[0].name = "remote".into();
@@ -4648,7 +4864,7 @@ mod tests {
             assert!(matches!(
                 inputs.plan_nodes(
                     &machine,
-                    CTX,
+                    (CTX, UBATCH_PLANNED.min(CTX)),
                     &PlanLevers {
                         card_budget_bytes: Some(u64::MAX).into(),
                     },
@@ -4741,7 +4957,14 @@ mod tests {
             for n in [1, 2, 4] {
                 let reserve = mtp.card_bytes_of(CTX, n).expect("the draft's card bytes");
                 let machine = machine_bp(LAYERS, 4096, Some(reserve), batch);
-                let r = inputs.plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Card, n);
+                let r = inputs.plan_mtp_with_slots(
+                    &machine,
+                    (CTX, UBATCH_PLANNED.min(CTX)),
+                    &levers,
+                    &mtp,
+                    Experts::Card,
+                    n,
+                );
                 assert!(
                     !matches!(r, Err(PlaceError::DraftReserve { .. })),
                     "{n} slots: {:?}",
@@ -4754,7 +4977,14 @@ mod tests {
                 .expect("two sequences' card bytes");
             assert!(two > one, "{two} B for two sequences, {one} B for one");
             let machine = machine_bp(LAYERS, 4096, Some(one), batch);
-            match inputs.plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Card, 2) {
+            match inputs.plan_mtp_with_slots(
+                &machine,
+                (CTX, UBATCH_PLANNED.min(CTX)),
+                &levers,
+                &mtp,
+                Experts::Card,
+                2,
+            ) {
                 Err(PlaceError::DraftReserve { got, want, .. }) => {
                     assert_eq!((got, want), (vec![one], Some(two)));
                 }
@@ -4782,16 +5012,49 @@ mod tests {
         fn the_card_route_runs_the_whole_ubatch_where_nothing_moves_for_it() {
             let inputs = routed(inputs());
             let levers = PlanLevers::default();
+            assert!(matches!(
+                widen_card_route(machine(), 4096, |_, _| Ok(()), |_| ()),
+                Err(super::super::PlaceError::MissingPlan)
+            ));
+            let calls = std::cell::Cell::new(0);
+            assert!(matches!(
+                widen_card_route(
+                    machine(),
+                    4096,
+                    |m, on| {
+                        calls.set(calls.get() + 1);
+                        if calls.get() == 1 {
+                            inputs
+                                .plan_with(m, (CTX, UBATCH_PLANNED), &levers, Experts::Card)
+                                .map(|p| on(&p))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    |_| ()
+                ),
+                Err(super::super::PlaceError::MissingPlan)
+            ));
+            for (ctx, ubatch) in [(CTX, 0), (CTX, 4097), (8, 9)] {
+                assert!(matches!(
+                    inputs.plan_with(&machine(), (ctx, ubatch), &levers, Experts::Card),
+                    Err(super::super::PlaceError::Ubatch { .. })
+                ));
+            }
             let widen_by = |inputs: &PlanInputs, machine: Machine, ub: u64, experts: Experts| {
                 let (machine, read) = widen_card_route(
                     machine,
                     ub,
-                    |m, on| inputs.plan_with(m, CTX, &levers, experts).map(|p| on(&p)),
+                    |m, on| {
+                        inputs
+                            .plan_with(m, (CTX, UBATCH_PLANNED.min(CTX)), &levers, experts)
+                            .map(|p| on(&p))
+                    },
                     |p| p.cards[0].reserve_bytes,
                 )
                 .expect("the plan");
                 let returned = inputs
-                    .plan_with(&machine, CTX, &levers, experts)
+                    .plan_with(&machine, (CTX, UBATCH_PLANNED.min(CTX)), &levers, experts)
                     .expect("the plan")
                     .cards[0]
                     .reserve_bytes;
@@ -4812,7 +5075,12 @@ mod tests {
                 vec![(ROUTE_UNIT_RESERVE.to_string(), unit)]
             );
             let plan = inputs
-                .plan_with(&whole, CTX, &levers, Experts::Card)
+                .plan_with(
+                    &whole,
+                    (CTX, UBATCH_PLANNED.min(CTX)),
+                    &levers,
+                    Experts::Card,
+                )
                 .expect("the widened plan");
             assert_eq!(plan.n_l, vec![512; LAYERS]);
             assert_eq!(
@@ -4822,7 +5090,12 @@ mod tests {
             let mut filled = machine();
             filled.cards[0].usable_bytes = 40 << 30;
             let n_l = inputs
-                .plan_with(&filled, CTX, &levers, Experts::Card)
+                .plan_with(
+                    &filled,
+                    (CTX, UBATCH_PLANNED.min(CTX)),
+                    &levers,
+                    Experts::Card,
+                )
                 .expect("the plan")
                 .n_l;
             assert!(n_l.iter().all(|&n| 0 < n && n < 512), "{n_l:?}");
@@ -4859,7 +5132,7 @@ mod tests {
             *pooled.unified_mut() = Some(UnifiedPool { bytes: pool });
             let table_on_host = |inputs: &PlanInputs, m: &Machine| {
                 inputs
-                    .plan_with(m, CTX, &levers, Experts::Card)
+                    .plan_with(m, (CTX, UBATCH_PLANNED.min(CTX)), &levers, Experts::Card)
                     .is_ok_and(|p| {
                         p.n_l == vec![512; LAYERS]
                             && p.row_tier().ok() == Some(Some(placement::Device::Host))

@@ -116,7 +116,7 @@ fn probe(inputs: &PlanInputs, place: Place, seqs: Seqs, c: u64) -> Result<(), Ga
     let machine = machine(place, inputs, (c, ub), seqs).map_err(text_of)?;
     inputs.plan_with_slots(
         &machine,
-        c,
+        (c, ub),
         &PlanLevers::default(),
         Experts::Card,
         seqs.slots,
@@ -226,7 +226,16 @@ fn plan_of<'a>(
     slots: usize,
 ) -> Result<Plan<'a>, Outcome> {
     inputs
-        .plan_with_slots(machine, ctx, levers, Experts::Card, slots)
+        .plan_with_slots(
+            machine,
+            (
+                ctx,
+                ub_of(usize::try_from(ctx).map_err(|e| Outcome::Red(e.to_string()))?)?,
+            ),
+            levers,
+            Experts::Card,
+            slots,
+        )
         .map_err(|e| outcome_of(&e))
 }
 

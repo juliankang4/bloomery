@@ -525,7 +525,7 @@ fn qwen36_tier(stage: CardSpec, tier: CardSpec) -> Result<(u64, u64, u64), Place
     let machine = tiered(Q36_LAYERS, stage, tier, q35::leg_tier_batch(&inputs)?);
     let plan = inputs.plan_rule(
         &machine,
-        CTX,
+        (CTX, q35::UBATCH_PLANNED.min(CTX)),
         &PlanLevers::default(),
         routed_rule(Program::Qwen35Body),
     )?;

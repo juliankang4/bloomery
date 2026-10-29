@@ -30,6 +30,12 @@
 //! - Recorded, not judged: the batch run and the D3K step against the other pair of sets, the Q8_0
 //!   rounding's share of the distance.
 //!
+//! `--placement` runs only the saved-state and reader-sizing contract on a
+//! checkpoint folder or split: ubatch 512, checkpoints enabled, no draft,
+//! one short prompt and 16,384 ids. The measured save bytes must equal the
+//! actual arrays and fit the planned bound; the row reserve must equal the
+//! reader's columns, including both NVFP4 planes.
+//!
 //! Real-only: the fixture holds no NVFP4 stack. Loads the whole file on the card.
 //! `BLOOMERY_REF_MODEL` selects a split outside the recipe's model folder, or the checkpoint folder
 //! itself, which the load reads as stored (`qwen38_folder::open`, a build with the `checkpoint` feature).
@@ -198,7 +204,7 @@ mod gate {
             );
             let plan = inputs.plan_mtp_with_slots(
                 &machine,
-                CTX as u64,
+                (CTX as u64, u64::try_from(ub)?),
                 &plan_levers,
                 &mtp,
                 Experts::Card,
@@ -658,6 +664,83 @@ mod gate {
         Ok(ok && same)
     }
 
+    fn placement(path: &Path, levers: &bloomery_levers::Levers) -> Result<(), GateError> {
+        use bloomery_gpu::arch::qwen3moe::{checkpoint_bytes, seq_positional_bytes};
+        use model::placement::{RowTableSource, row_room};
+        const LONG: usize = 16_384;
+        const UB: usize = 512;
+        let file = model_of(path)?;
+        let kv = KvQ8::of(path.is_dir());
+        let mut inputs = PlanInputs::describe(file.header())?;
+        inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
+        let gdn = inputs
+            .spec
+            .layers
+            .iter()
+            .filter(|l| matches!(l.mixer, model::arch::models::Mixer::DeltaRule(_)))
+            .count();
+        let qsa = inputs.spec.layers.len() - gdn;
+        let short_bound = inputs.seq_state_bytes(1, None);
+        let long_bound = inputs.seq_state_bytes(LONG as u64, None);
+        let specs = Place::A.on_host()?.card_specs()?;
+        let [card] = specs[..] else {
+            return Err("placement needs one visible card".into());
+        };
+        let plan_levers = PlanLevers::default();
+        let planned = Open38 {
+            card,
+            ctx: LONG + 1,
+            ub: UB,
+            experts: Experts::Card,
+            slots: 1,
+            plan_levers: &plan_levers,
+            host: levers.host(),
+            room: None,
+            residency: Residency::Off,
+            kv,
+        }
+        .plan(file)?;
+        let page = os::page_bytes()?;
+        let want = if planned.facts().ple_tier == Some(model::placement::Device::Nvme) {
+            row_room(
+                &inputs.model,
+                runtime::stores::reader_columns(UB as u64),
+                page,
+                inputs.row_source,
+            )?
+        } else {
+            0
+        };
+        let reserve = planned.facts().row_reserve_bytes;
+        let parts = inputs.row_source == RowTableSource::Parts;
+        println!(
+            "(placement) ubatch={UB} reader_columns={} parts={parts} q8={} row_reserve_bytes={reserve} expected={want} {}",
+            runtime::stores::reader_columns(UB as u64),
+            kv == KvQ8::Q8,
+            verdict(reserve == want)
+        );
+        let mut ok = reserve == want;
+        let mut m = planned.open()?.model;
+        m.body_parts("placement")?.2.set_checkpoints(true);
+        for n in [1, LONG] {
+            m.reset()?;
+            m.prompt38(&vec![1; n], Prompt38::Gemm)?;
+            let bytes = m.seq_save_bytes()?;
+            let saved = m.seq_save()?;
+            let copies = if n == 1 { 1 } else { 4 };
+            let expected = seq_positional_bytes(qsa, n, kv) + copies * checkpoint_bytes(gdn, qsa);
+            let bound = if n == 1 { short_bound } else { long_bound };
+            let good = bytes == expected && saved.bytes() as u64 == bytes && bytes <= bound;
+            println!(
+                "(placement) positions={n} checkpoint_copies={copies} seq_save_bytes={bytes} arrays_bytes={} planned_bound={bound} expected={expected} {}",
+                saved.bytes(),
+                verdict(good)
+            );
+            ok &= good;
+        }
+        if ok { Ok(()) } else { Err(checks_failed()) }
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[
             bloomery_levers::DRAFT,
@@ -671,6 +754,13 @@ mod gate {
             );
         }
         let path = ref_model_path()?;
+        let args: Vec<_> = std::env::args().skip(1).collect();
+        if args == ["--placement"] {
+            return placement(&path, &levers);
+        }
+        if !args.is_empty() {
+            return Err("expected no arguments or --placement".into());
+        }
         println!("model {}", path.display());
         let d = dims(&path)?;
         if levers.draft() == Some("mtp") {

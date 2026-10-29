@@ -916,8 +916,12 @@ mod gate {
         let (card_bytes, host_bytes, kv, draft_bytes) = match mtp {
             false => {
                 let levers_plan = PlanLevers::from_levers(levers)?;
-                let plan =
-                    inputs.plan_with(&machine, u64::try_from(CTX)?, &levers_plan, experts)?;
+                let plan = inputs.plan_with(
+                    &machine,
+                    (u64::try_from(CTX)?, u64::try_from(ub)?),
+                    &levers_plan,
+                    experts,
+                )?;
                 let c = plan.cards.first().ok_or("the gate's plan has no card")?;
                 terms(
                     c.dense_bytes,
@@ -932,7 +936,7 @@ mod gate {
                 let (mtp, levers_plan) = drafted_plan_inputs(levers, &path, &split, &inputs, 1)?;
                 let with = inputs.plan_mtp_with(
                     &machine,
-                    u64::try_from(CTX)?,
+                    (u64::try_from(CTX)?, u64::try_from(ub)?),
                     &levers_plan,
                     &mtp,
                     experts,
@@ -3526,15 +3530,11 @@ mod gate {
         free: Option<u64>,
         slots: usize,
     ) -> Result<Option<(u64, u64)>, GateError> {
-        let mut machine = machine_for_experts(
-            RTX_3090,
-            inputs.spec.layers.len(),
-            u64::try_from(ubatch_for(ctx)?)?,
-            experts,
-        );
+        let ub = u64::try_from(ubatch_for(ctx)?)?;
+        let mut machine = machine_for_experts(RTX_3090, inputs.spec.layers.len(), ub, experts);
         machine.cards[0].free_bytes = free;
         Ok(inputs
-            .plan_with_slots(&machine, u64::try_from(ctx)?, levers, experts, slots)
+            .plan_with_slots(&machine, (u64::try_from(ctx)?, ub), levers, experts, slots)
             .ok()
             .and_then(|p| {
                 p.cards
@@ -3561,16 +3561,12 @@ mod gate {
         let mut inputs = PlanInputs::describe(&split)?;
         inputs.room = (room, HostRead::Given);
         let experts = experts38(levers)?;
-        let mut machine = machine_for_experts(
-            RTX_3090,
-            inputs.spec.layers.len(),
-            u64::try_from(ubatch_for(ctx)?)?,
-            experts,
-        );
+        let ub = u64::try_from(ubatch_for(ctx)?)?;
+        let mut machine = machine_for_experts(RTX_3090, inputs.spec.layers.len(), ub, experts);
         machine.cards[0].free_bytes = Some(free);
         then(inputs.plan_with_slots(
             &machine,
-            u64::try_from(ctx)?,
+            (u64::try_from(ctx)?, ub),
             &PlanLevers::from_levers(levers)?,
             experts,
             slots,
@@ -3712,11 +3708,11 @@ mod gate {
         let parallel_ok = parallel_agrees(&parallel, None).unwrap_or(false)
             && pfield("slots") == Some(1)
             && pfield("slot_ctx") == Some(ctx);
-        // The plan's floor for the PLE table's tier counts the state the cache
+        // The plan's floor for the PLE table's tier bounds the state the cache
         // saves ([`PlanInputs::seq_state_bytes`]): the engine's `seq38_bytes`,
         // plain and with the draft the seat's unset default carries. FAIL-first:
-        // a term of the plan's state off by a byte (the checkpoint's second
-        // copy, the draft's rows) turns this red.
+        // a term of the plan's state off by a byte (the saved checkpoint
+        // copies, the draft's rows) turns this red.
         let gdn = inputs
             .spec
             .layers
@@ -4810,12 +4806,8 @@ mod gate {
         let rows = head_rows_of(None, &split, inputs.spec.vocab)?.rows;
         let mtp = MtpInputs::read(&draft, &split, &inputs, rows)?;
         let holds = |budget: u64, c: u64, drafted: bool| -> Result<bool, GateError> {
-            let mut machine = machine_for_experts(
-                RTX_3090,
-                inputs.spec.layers.len(),
-                u64::try_from(ubatch_for(usize::try_from(c)?)?)?,
-                experts,
-            );
+            let ub = u64::try_from(ubatch_for(usize::try_from(c)?)?)?;
+            let mut machine = machine_for_experts(RTX_3090, inputs.spec.layers.len(), ub, experts);
             machine.cards[0].free_bytes = Some(free);
             let plan_levers = PlanLevers {
                 card_budget_bytes: Some(budget).into(),
@@ -4823,7 +4815,7 @@ mod gate {
             Ok(inputs
                 .plan_target(
                     &machine,
-                    c,
+                    (c, ub),
                     &plan_levers,
                     experts,
                     drafted.then_some(&mtp),

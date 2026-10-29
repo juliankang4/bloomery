@@ -371,6 +371,11 @@ fn main() -> std::process::ExitCode {
     exit_with(NAME, run())
 }
 
+/// The plans' context and prompt ubatch: [`CTX`] and the load's ubatch at it.
+fn plan_shape() -> Result<(u64, u64), GateError> {
+    Ok((CTX as u64, u64::try_from(ubatch_for(CTX)?)?))
+}
+
 /// The first `n` ids of `$BLOOMERY_DATA/qwen4exp/corpus-prose.ids`, the
 /// Qwen3.8 tokenizer's prose corpus.
 fn prose38(n: usize) -> Result<Vec<u32>, GateError> {
@@ -747,7 +752,12 @@ fn arm(
 ) -> Result<ArmRun, GateError> {
     let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = inputs_of(&file, room)?;
-    let plan = inputs.plan_with(machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
+    let plan = inputs.plan_with(
+        machine,
+        plan_shape()?,
+        &PlanLevers::default(),
+        Experts::Card,
+    )?;
     let card = plan.n_l.clone();
     let mut s = open_arm(file, &inputs, &plan, room, residency, host)?;
     // `split`: the load's cut, then the rule's split asked of it, the cut set
@@ -1128,7 +1138,7 @@ fn stepunion_arm(
     let inputs = inputs_of(&file, Some(ROOM))?;
     let plan = inputs.plan_with_slots(
         machine,
-        CTX as u64,
+        plan_shape()?,
         &PlanLevers::default(),
         Experts::Card,
         2,
@@ -1336,7 +1346,12 @@ fn floor_arm(
     let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = inputs_of(&file, Some(ROOM))?;
     let ub = ubatch_for(CTX)?;
-    let mut plan = inputs.plan_with(machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
+    let mut plan = inputs.plan_with(
+        machine,
+        plan_shape()?,
+        &PlanLevers::default(),
+        Experts::Card,
+    )?;
     if plan.host.nvme_expert_bytes == 0 {
         return Err("the floor arm's plan pages no routed expert on the NVMe tier".into());
     }
@@ -1393,7 +1408,7 @@ fn slots_mid_arm(
     let inputs = inputs_of(&file, room)?;
     let plan = inputs.plan_with_slots(
         machine,
-        CTX as u64,
+        plan_shape()?,
         &PlanLevers::default(),
         Experts::Card,
         2,
@@ -2027,7 +2042,12 @@ fn sitting_child(
 ) -> Result<(), GateError> {
     let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = inputs_of(&file, Some(ROOM))?;
-    let plan = inputs.plan_with(machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
+    let plan = inputs.plan_with(
+        machine,
+        plan_shape()?,
+        &PlanLevers::default(),
+        Experts::Card,
+    )?;
     let mut s = open_arm(file, &inputs, &plan, Some(ROOM), residency, host)?;
     let (gpu, _, body) = s.model_mut().body_parts(NAME)?;
     let line = xstream_rule(gpu, body, None, Stage::A, residency)?;
@@ -2174,7 +2194,12 @@ fn run() -> Result<(), GateError> {
         ubatch_for(CTX)? as u64,
         Experts::Card,
     );
-    let plan = inputs.plan_with(&machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
+    let plan = inputs.plan_with(
+        &machine,
+        plan_shape()?,
+        &PlanLevers::default(),
+        Experts::Card,
+    )?;
     if let Some(role) = &role {
         let (residency, _) = residency38(
             <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
@@ -3232,7 +3257,12 @@ fn refuse_clauses(
 ) -> Result<bool, GateError> {
     let mut low = inputs_of(&Split::open(path)?, Some(1 << 30))?;
     low.room = (1 << 30, HostRead::Given);
-    let floor = match low.plan_with(machine, CTX as u64, &PlanLevers::default(), Experts::Card) {
+    let floor = match low.plan_with(
+        machine,
+        plan_shape()?,
+        &PlanLevers::default(),
+        Experts::Card,
+    ) {
         Err(e) => e.to_string().contains("the NVMe expert tier's floor"),
         Ok(_) => false,
     };

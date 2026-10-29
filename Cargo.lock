@@ -247,6 +247,7 @@ dependencies = [
  "bloomery-levers",
  "bloomery-model",
  "bloomery-model-hf",
+ "bloomery-os",
  "bloomery-qdot",
  "bloomery-record",
  "bloomery-refset",

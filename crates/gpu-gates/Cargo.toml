@@ -9,6 +9,7 @@ license = "MIT"
 workspace = true
 
 [dependencies]
+bloomery-os.workspace = true
 # Host only: the engram row hash, which the V4.1 plan gate runs the plan's n-grams through.
 bloomery-engram = { path = "../engram" }
 bloomery-gguf = { path = "../gguf" }

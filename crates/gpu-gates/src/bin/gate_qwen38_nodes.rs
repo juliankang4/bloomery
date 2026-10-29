@@ -338,6 +338,11 @@ mod gate {
         }
     }
 
+    /// The plans' context and prompt ubatch: [`CTX`] and the load's ubatch at it.
+    fn plan_shape() -> Result<(u64, u64), GateError> {
+        Ok((CTX as u64, u64::try_from(ubatch_for(CTX)?)?))
+    }
+
     /// Plan (b′) on `machine` under `gib` GiB a card: the plan, or why it is
     /// not the gate's: budgets past the shared device's usable bytes, a
     /// layer with no tier expert, an idle tier, or no host leg before the
@@ -356,12 +361,12 @@ mod gate {
             let half = inputs.model.experts / 2;
             inputs.plan_nodes(
                 machine,
-                CTX as u64,
+                plan_shape()?,
                 &levers,
                 &[half, inputs.model.experts - half],
             )
         } else {
-            inputs.plan_with(machine, CTX as u64, &levers, Experts::Card)
+            inputs.plan_with(machine, plan_shape()?, &levers, Experts::Card)
         };
         match planned {
             Ok(plan) => {
@@ -687,7 +692,7 @@ mod gate {
         }
         let stage_plan = c.inputs.plan_with(
             &machines[0],
-            CTX as u64,
+            plan_shape()?,
             &PlanLevers::default(),
             Experts::Card,
         )?;
@@ -1123,7 +1128,7 @@ mod gate {
         let capacity = if c.node_host {
             let resident = c.inputs.plan_with(
                 plan.machine,
-                CTX as u64,
+                plan_shape()?,
                 &PlanLevers {
                     card_budget_bytes: Some(gib << 30).into(),
                 },
@@ -1560,7 +1565,7 @@ mod gate {
         let plan = if decode.is_some() {
             c.inputs.plan_with(
                 &machine,
-                CTX as u64,
+                plan_shape()?,
                 &PlanLevers {
                     card_budget_bytes: Some(gib << 30).into(),
                 },
