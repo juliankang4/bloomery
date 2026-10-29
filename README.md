@@ -15,6 +15,7 @@
   <a href="https://github.com/midagedev/bloomery/releases/tag/v0.3.11">0.3.11 release notes</a> ·
   <a href="docs/models.md">Models</a> ·
   <a href="docs/serving.md">Serving</a> ·
+  <a href="docs/agents.md">Agents</a> ·
   <a href="docs/evaluating.md">Evaluating</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
@@ -29,6 +30,16 @@ serve Qwen3-30B-A3B on port 8080; [Use](#use) sends it a first request. A DGX Sp
 archive or Docker image once a release carries them ([DGX Spark](#dgx-spark-and-other-gb10-machines)), and an Apple
 Silicon Mac runs `bloomery-serve-metal` ([Apple Silicon](#apple-silicon)). Homebrew, Docker and the plain tarball are
 under [Install](#install).
+
+**From an agent.** Hand Claude Code, Codex or a script [`docs/agents.md`](docs/agents.md). The agent asks the machine
+what fits, then starts the model by its name. stdout carries JSON, and every refusal ends with a named exit code and
+the command to run next:
+
+```sh
+bloomery-serve --recommend --json                           # what this machine serves, and the fastest variant of each
+bloomery-serve --model qwen3.8-flash-next --dry-run --json  # the start it would run; downloads nothing
+bloomery-serve --model qwen3.8-flash-next --port 0          # start it: one JSON event a line, then "ready" with the url
+```
 
 ## What it does
 
