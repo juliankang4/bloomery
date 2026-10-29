@@ -1012,14 +1012,14 @@ sampler 4 4 1
 # PIN(2026-10-24): serve 12 -> 14 blocks, new code, not old code relaxed: the orderly stop's _exit after a wait that
 # ran out (a driver call can still be running, so the exit's teardown is skipped) and its test's atexit handler,
 # each with its SAFETY line.
-# PIN(2026-10-29): serve 14 -> 53 blocks, new code, not old code relaxed: the live view's terminal (live/term.rs: the
+# PIN(2026-10-29): serve 14 -> 54 blocks, new code, not old code relaxed: the live view's terminal (live/term.rs: the
 # stderr copy and pipe, the settings read and set, the size, the key poll and read, the async-signal-safe restore with
 # SIGTTOU blocked, the stop handler's own stop; 29 blocks, one call each), its clock (view.rs: localtime_r, 2) and its
 # PTY test (mod.rs: openpty, the two fds, the settings read, the child's session and controlling terminal, its exit
 # report's registration and write; 8), each with its SAFETY line.
-# PIN(2026-10-29): serve 53 -> 57 blocks, new test code: the PTY test's child blocks SIGTSTP on the threads it starts
+# PIN(2026-10-29): serve 14 -> 54 blocks, new test code: the PTY test's child blocks SIGTSTP on the threads it starts
 # (the zeroed set, sigemptyset, sigaddset, pthread_sigmask), so the stop reaches a thread other than the key wait's.
-# PIN(2026-10-29): serve 57 -> 54 blocks: one window-size ioctl and one signal-set owner remove
+# PIN(2026-10-29): serve 14 -> 54 blocks: one window-size ioctl and one signal-set owner remove
 # seven blocks; the pipe's two owned fds have separate blocks, and signal-set and resize clauses add three.
 serve 54 0 0
 threads 3 0 1
