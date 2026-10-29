@@ -3015,6 +3015,13 @@ impl Body38 {
             let Some(row) = pos.checked_sub(first).filter(|&r| r < rows) else {
                 continue;
             };
+            let complete = self.wrote.final_of(walk);
+            if !pos
+                .checked_sub(complete.parts().0)
+                .is_some_and(|r| complete.holds(r as usize, 1, pos))
+            {
+                continue;
+            }
             let buf = self.final_streams(walk);
             let at = row as usize * wide;
             if at + wide > buf.len() {
@@ -3090,7 +3097,7 @@ impl Body38 {
             d.forget();
             return Err(e.into());
         }
-        wrote.step = Held::at(pos - 1, 1);
+        wrote.set(TargetRows::Step, pos - 1, 1, 1);
         Ok(())
     }
 
@@ -3342,6 +3349,10 @@ impl Body38 {
             held,
             step,
             pass,
+            final_rows: [
+                self.wrote.final_of(TargetRows::Step),
+                self.wrote.final_of(TargetRows::Pass),
+            ],
             point_rows,
         }))
     }
@@ -3457,6 +3468,7 @@ impl Body38 {
             step: d.step.0,
             pass: d.pass.0,
             ubatch: Held::NONE,
+            final_rows: [d.final_rows[0], d.final_rows[1], Held::NONE],
         };
         wrote.cut(at);
         if let Some((_, row)) = rejoin {
@@ -3585,12 +3597,20 @@ impl Body38 {
     }
 
     /// The staged call of `rows` from `pos` launched: the stores' count past
-    /// its rows, the PLE history past them, and a verify's commit waiting,
-    /// with the history as it stood before. Refused by name, moving nothing,
+    /// its rows, the PLE history past them, and a verify's commit waiting
+    /// with the history as it stood before. Only the last `read` rows are
+    /// recorded as final hidden rows. Refused by name, moving nothing,
     /// when no call of those rows from there is staged. A launch that fails
     /// after this is counted as run: the refusal that follows is named,
     /// where a count left behind would run the rows twice.
-    fn launch(&mut self, pos: u32, rows: usize) -> Result<(), GpuError> {
+    fn launch(&mut self, pos: u32, rows: usize, read: usize) -> Result<(), GpuError> {
+        if read > rows {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{read} final hidden rows of a call of {rows}"),
+            ));
+        }
+        let read = launch_u32(WHAT, "final hidden rows", read)?;
         let s = self
             .staged
             .take_if(|s| s.pos == pos && s.pos == self.held && s.rows as usize == rows);
@@ -3606,7 +3626,7 @@ impl Body38 {
         };
         let before = std::mem::replace(&mut self.ple.hist, s.hist);
         self.held = s.pos + s.rows;
-        self.wrote.set(self.last_walk, s.pos, s.rows);
+        self.wrote.set(self.last_walk, s.pos, s.rows, read);
         if let Some(tokens) = s.verify {
             self.pending = Some(Pending38 {
                 pos0: s.pos,
@@ -3714,7 +3734,8 @@ impl Body38 {
             ));
         }
         planted(&mut self.plant, Plant::BeforeLaunch)?;
-        self.launch(pos, m)?;
+        let read = if head.is_some() || finals { m } else { 0 };
+        self.launch(pos, m, read)?;
         let io = Io {
             lane: Some(self.lane.word()),
             ..self.rp.io(m)?
@@ -3878,7 +3899,7 @@ impl Body38 {
         }
         let dense = dense_rows(pos as usize, m, self.ctx)?;
         planted(&mut self.plant, Plant::BeforeLaunch)?;
-        self.launch(pos, m)?;
+        self.launch(pos, m, read)?;
         let late = std::mem::take(&mut self.ple_late);
         let io = Io {
             lane: Some(self.lane.word()),
@@ -4333,6 +4354,12 @@ impl GpuModel<Body38> {
         // its echo. A failed call's streaming ends with each layer back at
         // the set it started with too.
         let ended = self.stream_end(r.is_ok() && !history);
+        if r.is_err() {
+            // A unit that failed past its launch recorded rows its walk did
+            // not finish: no record from the model's position on stands.
+            let pos = self.pos();
+            self.body_parts(WHAT_P)?.2.wrote.cut(pos);
+        }
         let next = r?;
         ended?;
         Ok(next)
@@ -4568,30 +4595,36 @@ impl crate::host::xstream::XStreamBody for Body38 {
 
 /// Each target arena's [`Held`]: the body's record of where the step, the
 /// pass (a verify's rows too) and the ubatch walk left their rows — what a
-/// draft's walk checks its read positions against, and a sequence state
-/// carries of the two arenas a parked refresh reads.
+/// draft's walk checks its read positions and completion against, and a
+/// sequence state carries of the two arenas a parked refresh reads.
 #[derive(Clone, Copy, Debug, Default)]
 struct Wrote38 {
     step: Held,
     pass: Held,
     ubatch: Held,
+    /// Completed positions, separate from the arena's row-to-position mapping.
+    final_rows: [Held; 3],
 }
 
 impl Wrote38 {
     /// The arena `walk`'s rows hold `rows` rows at `pos ..`, as the call that
-    /// last wrote it left them.
-    fn set(&mut self, walk: TargetRows, pos: u32, rows: u32) {
-        let held = Held::at(pos, rows);
-        match walk {
-            TargetRows::Step => self.step = held,
-            TargetRows::Pass => self.pass = held,
-            TargetRows::Ubatch => self.ubatch = held,
-        }
+    /// last wrote it left them; only its last `read` rows are final streams.
+    fn set(&mut self, walk: TargetRows, pos: u32, rows: u32, read: u32) {
+        let (held, complete) = match walk {
+            TargetRows::Step => (&mut self.step, &mut self.final_rows[0]),
+            TargetRows::Pass => (&mut self.pass, &mut self.final_rows[1]),
+            TargetRows::Ubatch => (&mut self.ubatch, &mut self.final_rows[2]),
+        };
+        *held = Held::at(pos, rows);
+        *complete = Held::at(pos + rows - read, read);
     }
 
     /// Every arena's positions from `pos` on taken back.
     fn cut(&mut self, pos: u32) {
         for h in [&mut self.step, &mut self.pass, &mut self.ubatch] {
+            h.cut(pos);
+        }
+        for h in &mut self.final_rows {
             h.cut(pos);
         }
     }
@@ -4602,6 +4635,14 @@ impl Wrote38 {
             TargetRows::Pass => self.pass,
             TargetRows::Ubatch => self.ubatch,
         }
+    }
+
+    fn final_of(&self, walk: TargetRows) -> Held {
+        self.final_rows[match walk {
+            TargetRows::Step => 0,
+            TargetRows::Pass => 1,
+            TargetRows::Ubatch => 2,
+        }]
     }
 }
 
@@ -4655,6 +4696,7 @@ fn mtp_target<'b>(
         }) => Some(Target38 {
             buf: final_streams(plans, arenas, walk),
             held: wrote.of(walk),
+            final_rows: wrote.final_of(walk),
         }),
         _ => None,
     }
@@ -5182,7 +5224,7 @@ impl ChainBody for Body38 {
             .e
             .copy_from_host(stream, &self.ple.e[..geo::HIDDEN])?;
         self.sp.write(stream, input.token, input.pos)?;
-        self.launch(input.pos, 1)
+        self.launch(input.pos, 1, 1)
     }
 
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
@@ -5508,7 +5550,7 @@ impl Body38 {
         // sequence's prompt call may have written it since this one's, so
         // the sequence brought live holds no position there. A draft parked
         // with rows waiting in that arena skips them (`Policy::park`).
-        self.wrote.ubatch = Held::NONE;
+        self.wrote.set(TargetRows::Ubatch, 0, 0, 0);
         std::mem::swap(&mut self.last_walk, &mut seq.last_walk);
         // The arena rows a draft walk reads by position (the walk's graph
         // replays the shared arena's address, so the sequence's rows move as
@@ -5609,7 +5651,7 @@ impl Body38 {
         self.ple_arrival.clear(0)?;
         self.stage(pos, n, hist, Some(tokens.to_vec()))?;
         planted(&mut self.plant, Plant::BeforeLaunch)?;
-        self.launch(pos, n)?;
+        self.launch(pos, n, n)?;
         if let Some(p) = self.pending.as_mut() {
             p.ple_due = true;
         }
@@ -6050,7 +6092,7 @@ impl Body38 {
         WindowMut::<f32>::of_mut(&mut self.a.ple.e, byte, m * h)?
             .copy_from_host(stream, &self.ple.e[..m * h])?;
         self.stage(r.pos0, m, hist, Some(tokens.to_vec()))?;
-        self.launch(r.pos0, m)
+        self.launch(r.pos0, m, m)
     }
 
     /// Enqueue the pass of `rows` [`Body38::plan_slots`] planned into

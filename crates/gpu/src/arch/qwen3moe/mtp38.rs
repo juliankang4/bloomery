@@ -220,9 +220,12 @@ pub struct Mtp38 {
     a: Option<MtpArena>,
     /// The captured walks, by rows, feed and head.
     graphs: Vec<(MtpKey, Graph)>,
-    /// The rows of the last walk, which the readbacks and the next own row
-    /// read; `None` before a walk of the sequence and after a store walk.
+    /// The rows of the last walk, which the readbacks read; `None` before
+    /// a walk of the sequence and after a store walk.
     last: Option<(usize, DraftHead)>,
+    /// The next position of the own input in the shared arena; a slot exchange,
+    /// cut, store walk or state adoption requires a Rows refresh before Own.
+    own_at: Option<usize>,
     /// Positions of this sequence the store holds: the last walk's end. A
     /// walk may start at or below it, never past it.
     held: usize,
@@ -235,8 +238,8 @@ pub struct Mtp38 {
 /// it is alive. The program's arena stays the model's one — a walk's
 /// buffers are scratch, rewritten within the walk before anything reads
 /// them, save the own row a [`DraftFeed::Own`] walk reads, which no call
-/// reads across a select: a chain's refresh walk rewrites it before any own
-/// walk of the chain does.
+/// may read across a select: the exchange invalidates it, and a Rows refresh
+/// must rewrite it before an own walk.
 pub(super) struct DraftSeq38 {
     graphs: Vec<(MtpKey, Graph)>,
     store: KvPlanes,
@@ -381,6 +384,7 @@ impl Mtp38 {
             a: None,
             graphs: Vec::new(),
             last: None,
+            own_at: None,
             held: 0,
         };
         let c = &plan.draft.cards[0];
@@ -556,6 +560,7 @@ impl Mtp38 {
             ));
         }
         self.held = n;
+        self.own_at = None;
         Ok(())
     }
 
@@ -575,12 +580,13 @@ impl Mtp38 {
 
     /// Exchange the live sequence's side of the draft with `seq`'s: pointer
     /// moves only, so each sequence's captures keep addressing its own
-    /// store.
+    /// store. The shared own input is invalidated; a Rows refresh must precede Own.
     pub(super) fn swap_slot(&mut self, seq: &mut DraftSeq38) {
         std::mem::swap(&mut self.store, &mut seq.store);
         std::mem::swap(&mut self.graphs, &mut seq.graphs);
         std::mem::swap(&mut self.last, &mut seq.last);
         std::mem::swap(&mut self.held, &mut seq.held);
+        self.own_at = None;
     }
 
     /// Device bytes one sequence's side of the draft holds: its store.
@@ -805,8 +811,10 @@ pub fn walk_launches(m: usize, q6k_head: bool) -> usize {
 /// head's mix applies it over the rows it covers (a step, a verify, a
 /// prompt's last pass or ubatch, a split walk's last unit), and a prompt
 /// call with a tap applies it alone to every other row it walks. A prompt
-/// call without a tap leaves a ubatch's last row alone final where the
-/// last layer runs without a host leg (`wide38`'s `WideParts::kept`).
+/// call without a tap records only the rows its head or checkpoint requests
+/// as final: a ubatch's requested suffix (`wide38`'s `WideParts::kept`),
+/// every row of a pass with a head or finals, and none of a headless pass
+/// with no finals. MTP refuses any row outside that completed range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetRows {
     /// The step's one row.
@@ -831,6 +839,7 @@ pub struct DraftRows38 {
     pub(super) held: u32,
     pub(super) step: (Held, Vec<f32>),
     pub(super) pass: (Held, Vec<f32>),
+    pub(super) final_rows: [Held; 2],
     pub(super) point_rows: Vec<(u32, Vec<f32>)>,
 }
 
@@ -850,6 +859,7 @@ impl DraftRows38 {
 pub(super) struct Target38<'a> {
     pub(super) buf: &'a DeviceBuffer<f32>,
     pub(super) held: Held,
+    pub(super) final_rows: Held,
 }
 
 /// One sequence's rows of a store walk ([`Mtp38::store_rows`]): rows
@@ -1511,6 +1521,7 @@ impl Mtp38 {
     /// count.
     pub(super) fn forget(&mut self) {
         self.last = None;
+        self.own_at = None;
         self.held = 0;
     }
 
@@ -1519,6 +1530,7 @@ impl Mtp38 {
     /// writes its own rows' keys before its attention reads them.
     pub(super) fn cut(&mut self, pos: u32) {
         self.held = self.held.min(pos as usize);
+        self.own_at = None;
     }
 
     /// Positions of the current sequence the store holds: a walk may start
@@ -1603,6 +1615,7 @@ impl Mtp38 {
         }
         let w = self.checked(target, feed, mode)?;
         let (m, pos0) = (w.m, w.pos0);
+        self.own_at = None;
         if mode == WalkMode::Store {
             let b = StoreBlock { at: 0, m, pos0 };
             self.stage_hidden(stream, &w, b)?;
@@ -1644,6 +1657,7 @@ impl Mtp38 {
         }
         self.last = Some((m, head));
         self.held = pos0 as usize + m;
+        self.own_at = Some(self.held);
         Ok(m)
     }
 
@@ -1651,9 +1665,11 @@ impl Mtp38 {
     /// anything moves ([`Mtp38::run_walk`]'s refusals): rows outside the
     /// mode's 1..=rows, positions past the store, an own row before any
     /// walk of this sequence, a walk starting past the positions the store
-    /// holds, a token past the vocabulary, a host hidden slice of other than
+    /// holds, an own row at any position other than its recorded next position,
+    /// a token past the vocabulary, a host hidden slice of other than
     /// the rows' values, target rows that do not hold the positions before
-    /// the rows' ([`Held::check_read`]), media rows.
+    /// the rows' ([`Held::check_read`]) or were not completed by the last layer,
+    /// media rows.
     fn checked<'f, 't>(
         &self,
         target: Option<Target38<'t>>,
@@ -1670,12 +1686,21 @@ impl Mtp38 {
                 format!("{m} rows from position {pos0}, in a store of {ctx}"),
             ));
         }
-        let (vocab, held, walked) = {
+        let (vocab, held) = {
             let vocab = self.arena_ref()?.vocab;
-            (vocab, self.held, self.last.is_some())
+            (vocab, self.held)
         };
-        if own && !walked {
-            return Err(GpuError::state(WHAT, "a walk before the draft's own row"));
+        if own && self.own_at != Some(pos0 as usize) {
+            return Err(match self.own_at {
+                None => GpuError::state(
+                    WHAT,
+                    "a walk before the draft's own row (Rows refresh required)",
+                ),
+                Some(at) => GpuError::shape(
+                    WHAT,
+                    format!("the draft's own row is for position {at}, requested position {pos0}"),
+                ),
+            });
         }
         if pos0 as usize > held {
             return Err(GpuError::shape(
@@ -1702,6 +1727,21 @@ impl Mtp38 {
                     let t = target.ok_or(GpuError::state(WHAT, "the target's streams to copy"))?;
                     t.held
                         .check_read(WHAT, walk, t.buf.len() / WIDE, (first, m), pos0)?;
+                    let at = pos0 - 1;
+                    if !at
+                        .checked_sub(t.final_rows.parts().0)
+                        .is_some_and(|r| t.final_rows.holds(r as usize, m, at))
+                    {
+                        return Err(GpuError::shape(
+                            WHAT,
+                            format!(
+                                "the {walk:?} arena's final hidden rows hold {}, requested \
+                             positions {at}..{}",
+                                t.final_rows.shown(),
+                                u64::from(at) + m as u64
+                            ),
+                        ));
+                    }
                     src = Some((t.buf, first));
                 }
             }
@@ -2538,6 +2578,7 @@ impl Mtp38 {
             )?;
         }
         self.last = None;
+        self.own_at = None;
         self.held = b.pos0 as usize + b.m;
         Ok(())
     }
