@@ -4311,7 +4311,7 @@ mod tests {
         let line = width_gate(r, &state, 0).line();
         assert_eq!(
             line,
-            "mtp width windows=0 kept=0,0,0 widths=0,0,0 e=0.000 gate=1 costs=2.00,3.00,- a=0.800,0.600 rates=0.500000,0.600000,- walk_ms=0.125 closed=0"
+            "mtp width windows=0 kept=[0,0,0] widths=[0,0,0] e=0.000 gate=1 costs=[2.00,3.00,-] a=[0.800,0.600] rates=[0.500000,0.600000,-] walk_ms=0.125 closed=0"
         );
         let stats = runtime::width::Stats {
             gains: vec![1.0; 2],
@@ -4332,7 +4332,7 @@ mod tests {
             .f("tok/s(positions)", 0.0);
         let line = mtp_stats(r, Some(&stats), 0).unwrap().line();
         assert!(
-            line.ends_with("rates=0.500000,0.600000,- walk_ms=0.125 closed=0"),
+            line.ends_with("rates=[0.500000,0.600000,-] walk_ms=0.125 closed=0"),
             "{line}"
         );
     }
