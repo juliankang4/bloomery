@@ -46,6 +46,21 @@ struct Repo {
     cached: Vec<Entry>,
 }
 
+impl Repo {
+    /// The cached checkpoint index, only when it matches the revision being planned.
+    fn index(&self, row: &Row, root: &Path) -> Result<Option<PathBuf>, HfError> {
+        let entries = self.listed.as_deref().unwrap_or(&self.cached);
+        if row.kind == Kind::Folder
+            && entries.iter().any(|e| {
+                e.path == safetensors::Folder::INDEX && catalog::is_cached(e, &self.cached)
+            })
+        {
+            return hf::cache_path(root, row.repo, safetensors::Folder::INDEX).map(Some);
+        }
+        Ok(None)
+    }
+}
+
 /// What the pick has read of the hub and the cache.
 struct Reader<'a> {
     client: &'a Client,
@@ -97,10 +112,16 @@ impl Reader<'_> {
 
     /// What the listing and the cache hold of `row`.
     fn avail(&mut self, row: &Row) -> Result<Avail, HfError> {
+        let root = self.root;
         let repo = self.repo(row)?;
+        let index = repo.index(row, root)?;
         match &repo.listed {
-            Some(entries) => catalog::availability(row, entries, &repo.cached),
-            None => Ok(catalog::availability_offline(row, &repo.cached)),
+            Some(entries) => catalog::availability(row, entries, &repo.cached, index.as_deref()),
+            None => Ok(catalog::availability_offline(
+                row,
+                &repo.cached,
+                index.as_deref(),
+            )),
         }
     }
 
@@ -112,7 +133,8 @@ impl Reader<'_> {
         let repo = self.repo(row)?;
         // Where no listing could be read the verified files are all there is.
         let entries: &[Entry] = repo.listed.as_deref().unwrap_or(&repo.cached);
-        let files = catalog::row_files(row, entries)?
+        let index = repo.index(row, root)?;
+        let files = catalog::row_files(row, entries, index.as_deref())?
             .ok_or_else(|| format!("{}: the listing lacks {}", row.repo, row.variant))?;
         if files
             .iter()

@@ -688,6 +688,11 @@ mod tests {
             "model-00001-of-00002.safetensors",
             "model-00002-of-00002.safetensors",
         ] {
+            let body = if path == safetensors::Folder::INDEX {
+                br#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#.as_slice()
+            } else {
+                body.as_slice()
+            };
             let file = served.join(path);
             std::fs::write(&file, body).unwrap();
             let digest = hf::fetch::digest(&file, hf::Check::GitSha1, body.len() as u64).unwrap();

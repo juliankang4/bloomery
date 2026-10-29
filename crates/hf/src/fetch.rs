@@ -19,6 +19,9 @@
 //! again (`stale`); one longer, or a `.part` longer than the file, is not
 //! the listing's either: removed and fetched again (`stale`). A `.part`
 //! whose check fails is removed, and the refusal names both digests.
+//! Each destination has a persistent `.lock` file: an exclusive OS lock serializes the state
+//! check, hashing, download and publication across threads and processes. The verified marker
+//! is atomically replaced after the completed file, so an interrupted publication is rechecked.
 //!
 //! A resolve whose files are all on disk at their listed sizes reads the
 //! unmarked ones in parallel before the fetches, to mark the ones that match.
@@ -101,7 +104,7 @@ impl State {
 pub enum Event<'a> {
     /// The set a quant picked.
     Set { repo: &'a str, set: &'a GgufSet },
-    /// The safetensors checkpoint a repo with no GGUF set holds (`crate::checkpoint_files`):
+    /// The safetensors checkpoint a repo with no GGUF set holds (`crate::checkpoint_manifest`):
     /// its files and their bytes.
     Checkpoint {
         repo: &'a str,
@@ -430,6 +433,7 @@ impl Client {
         dest: &Path,
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<PathBuf, HfError> {
+        let _lock = lock_file(dest)?;
         let part = with_suffix(dest, ".part");
         let marker = with_suffix(dest, ".verified");
         let file = entry.path.as_str();
@@ -515,8 +519,11 @@ impl Client {
                 want: entry.digest.clone(),
             });
         }
-        write_marker(&marker, &got)?;
+        if size_of(&marker)?.is_some() {
+            remove(&marker)?;
+        }
         rename(&part, dest)?;
+        write_marker(&marker, &got)?;
         events(&Event::Done {
             file,
             fetched: entry.size - from,
@@ -639,7 +646,7 @@ impl Client {
 
     /// The set `r` picks in its repo, every file fetched and checked; the
     /// local paths in shard order (the first shard first). A repo with no
-    /// GGUF set and a safetensors checkpoint ([`crate::checkpoint_files`])
+    /// GGUF set and a safetensors checkpoint ([`crate::checkpoint_manifest`])
     /// gives the checkpoint's folder, its files fetched and checked, only when `sources`
     /// includes checkpoints. Otherwise it is refused before any file is fetched. `draft`, the MTP
     /// draft a model family runs beside its set, is fetched too when the
@@ -678,10 +685,13 @@ impl Client {
             Listed::Cache(why) => return self.offline_set(r, sources, &why, events),
         };
         let sets = gguf_sets(&id, &entries)?;
-        if sets.is_empty()
-            && let Some(files) = crate::checkpoint_files(&entries)
-        {
-            let dir = checkpoint(r, sources, &self.root, &files, events)?;
+        if sets.is_empty() && entries.iter().any(|e| e.path == safetensors::Folder::INDEX) {
+            let dir = checkpoint(r, sources, &self.root)?;
+            let index = exact(&id, &entries, &[safetensors::Folder::INDEX])?[0];
+            self.mark_snapshot_if_ready(&id, std::slice::from_ref(index))?;
+            let index_path = self.fetch(&id, index, &mut |_| {})?;
+            let files = crate::checkpoint_manifest(&id, &entries, &index_path)?;
+            checkpoint_event(&id, &files, events);
             self.mark_snapshot_if_ready(&id, &files)?;
             for e in &files {
                 self.fetch(&id, e, events)?;
@@ -744,11 +754,12 @@ impl Client {
         };
         let entries = verified_entries(&self.root, &id).map_err(offline)?;
         let sets = gguf_sets(&id, &entries).map_err(offline)?;
-        if sets.is_empty()
-            && let Some(files) = crate::checkpoint_files(&entries)
-        {
+        if sets.is_empty() && entries.iter().any(|e| e.path == safetensors::Folder::INDEX) {
+            let dir = checkpoint(r, sources, &self.root).map_err(offline)?;
+            let index = dir.join(safetensors::Folder::INDEX);
+            let files = crate::checkpoint_manifest(&id, &entries, &index).map_err(offline)?;
             events(&Event::Offline { repo: &id, why });
-            let dir = checkpoint(r, sources, &self.root, &files, events).map_err(offline)?;
+            checkpoint_event(&id, &files, events);
             self.offline_files(&id, &files, events)?;
             return Ok(vec![dir]);
         }
@@ -883,6 +894,7 @@ fn mark_from(
 /// digest is left as it is.
 fn mark_if_match(root: &Path, repo: &str, entry: &Entry) -> Result<(), HfError> {
     let path = cache_path(root, repo, &entry.path)?;
+    let _lock = lock_file(&path)?;
     let got = digest(&path, entry.check, entry.size)?;
     if got == entry.digest {
         write_marker(&with_suffix(&path, ".verified"), &got)?;
@@ -890,16 +902,10 @@ fn mark_if_match(root: &Path, repo: &str, entry: &Entry) -> Result<(), HfError> 
     Ok(())
 }
 
-/// The folder in `root`'s cache of the checkpoint `files` of `r`'s repo, which a resolve gives
-/// in place of a set's first shard, its event sent; a quant is refused by name, as the
+/// The folder in `root`'s cache of the checkpoint of `r`'s repo, which a resolve gives
+/// in place of a set's first shard; a quant is refused by name, as the
 /// checkpoint is the repo's one model. A caller that accepts only GGUF is refused before the event.
-fn checkpoint(
-    r: &RepoRef,
-    sources: Sources,
-    root: &Path,
-    files: &[Entry],
-    events: &mut dyn FnMut(&Event<'_>),
-) -> Result<PathBuf, HfError> {
+fn checkpoint(r: &RepoRef, sources: Sources, root: &Path) -> Result<PathBuf, HfError> {
     let id = r.id();
     if let Some(quant) = &r.quant {
         return Err(HfError::CheckpointQuant {
@@ -910,13 +916,16 @@ fn checkpoint(
     if sources == Sources::Gguf {
         return Err(HfError::CheckpointUnsupported { repo: id });
     }
+    let index = cache_path(root, &id, safetensors::Folder::INDEX)?;
+    Ok(index.parent().unwrap_or(root).to_path_buf())
+}
+
+fn checkpoint_event(repo: &str, files: &[Entry], events: &mut dyn FnMut(&Event<'_>)) {
     events(&Event::Checkpoint {
-        repo: &id,
+        repo,
         files: files.len(),
         bytes: files.iter().map(|f| f.size).sum(),
     });
-    let index = cache_path(root, &id, safetensors::Folder::INDEX)?;
-    Ok(index.parent().unwrap_or(root).to_path_buf())
 }
 
 /// The files under `repo`'s cache directory in `root` that a fetch checked:
@@ -935,13 +944,24 @@ pub fn verified_entries(root: &Path, repo: &str) -> Result<Vec<Entry>, HfError> 
             Err(e) => return Err(HfError::io(&d, e)),
         };
         for item in read {
-            let path = item.map_err(|e| HfError::io(&d, e))?.path();
-            let meta = fs::metadata(&path).map_err(|e| HfError::io(&path, e))?;
+            let item = item.map_err(|e| HfError::io(&d, e))?;
+            let path = item.path();
+            // A download can rename its partial between readdir and metadata.
+            let Some(meta) = metadata_of(&path)? else {
+                continue;
+            };
             if meta.is_dir() {
                 dirs.push(path);
                 continue;
             }
             let marker = with_suffix(&path, ".verified");
+            if !marker.is_file() {
+                continue;
+            }
+            let _lock = lock_file(&path)?;
+            let Some(size) = size_of(&path)? else {
+                continue;
+            };
             let Ok(text) = fs::read_to_string(&marker) else {
                 continue;
             };
@@ -961,7 +981,7 @@ pub fn verified_entries(root: &Path, repo: &str) -> Result<Vec<Entry>, HfError> 
                 .into_owned();
             out.push(Entry {
                 path: rel,
-                size: meta.len(),
+                size,
                 check,
                 digest,
             });
@@ -980,8 +1000,13 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 /// The size of the file at `path`, `None` when there is none.
 fn size_of(path: &Path) -> Result<Option<u64>, HfError> {
+    Ok(metadata_of(path)?.map(|m| m.len()))
+}
+
+/// Metadata of `path`, following symlinks; `None` when its target is absent.
+fn metadata_of(path: &Path) -> Result<Option<fs::Metadata>, HfError> {
     match fs::metadata(path) {
-        Ok(m) => Ok(Some(m.len())),
+        Ok(m) => Ok(Some(m)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(HfError::io(path, e)),
     }
@@ -996,7 +1021,53 @@ fn remove(path: &Path) -> Result<(), HfError> {
 }
 
 fn write_marker(path: &Path, digest: &str) -> Result<(), HfError> {
-    fs::write(path, format!("{digest}\n")).map_err(|e| HfError::io(path, e))
+    let part = with_suffix(path, ".part");
+    fs::write(&part, format!("{digest}\n")).map_err(|e| HfError::io(&part, e))?;
+    rename(&part, path)
+}
+
+/// A persistent lock file, never removed: replacing its inode could admit another writer. A cache
+/// this process cannot write and that has no lock file yet is read without one: this process
+/// cannot publish into it, and a writer publishes each file and its marker by rename.
+fn lock_file(dest: &Path) -> Result<Option<fs::File>, HfError> {
+    let bytes = dest.as_os_str().as_encoded_bytes();
+    if bytes.len() >= 5 && bytes[bytes.len() - 5..].eq_ignore_ascii_case(b".lock") {
+        return Err(HfError::io(
+            dest,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the .lock suffix is reserved for cache locks",
+            ),
+        ));
+    }
+    let path = with_suffix(dest, ".lock");
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| HfError::io(dir, e))?;
+    }
+    let file = match fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            match fs::File::open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(HfError::io(&path, e)),
+            }
+        }
+        Err(e) => return Err(HfError::io(&path, e)),
+    };
+    file.lock().map_err(|e| HfError::io(&path, e))?;
+    Ok(Some(file))
 }
 
 /// The bytes `--max-filesize` allows a range read of `len` bytes: curl holds the redirect the hub
@@ -1038,11 +1109,11 @@ pub fn digest(path: &Path, check: Check, size: u64) -> Result<String, HfError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A scratch directory under the target dir, fresh for `name`.
-    fn scratch(name: &str) -> PathBuf {
+    pub(crate) fn scratch(name: &str) -> PathBuf {
         let d = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/hf-tests")
             .join(name);
@@ -1172,6 +1243,285 @@ mod tests {
         r.expect("cached");
         assert_eq!(states(&seen), [format!("file cached {}", body.len())]);
         assert_eq!(seen.len(), 1, "a marked file was read again: {seen:?}");
+    }
+
+    #[test]
+    fn fetch_refuses_reserved_lock_destinations_before_touching_sidecars() {
+        let d = scratch("reserved-lock");
+        for suffix in [".lock", ".LOCK", ".Lock"] {
+            let name = format!("weights/x.safetensors{suffix}");
+            let (c, e) = served(&d, "a/b", &name, b"checkpoint bytes");
+            let dest = cache_path(&c.root, "a/b", &name).unwrap();
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::write(&dest, b"").unwrap();
+            let held = fs::File::open(&dest).unwrap();
+            let (result, events) = run(&c, "a/b", &e);
+            let err = result.expect_err("a cache entry cannot replace a lock");
+            assert!(
+                matches!(&err, HfError::Io { err, .. }
+                if err.kind() == std::io::ErrorKind::InvalidInput),
+                "{err}"
+            );
+            assert!(
+                err.to_string().contains(".lock suffix is reserved"),
+                "{err}"
+            );
+            assert!(events.is_empty(), "{events:?}");
+            assert_eq!(fs::read(&dest).unwrap(), b"");
+            assert_eq!(held.metadata().unwrap().len(), 0);
+            for sidecar in [".lock", ".part", ".verified", ".verified.part"] {
+                assert!(!with_suffix(&dest, sidecar).exists(), "{sidecar}");
+            }
+            let absent = d.join("absent").join(format!("x{suffix}"));
+            assert!(lock_file(&absent).is_err());
+            assert!(!absent.parent().unwrap().exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readable_cache_locks_need_no_write_access() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let d = scratch("readonly-locks");
+        let (mut c, e) = served(&d, "a/b", "sub/m-Q4_K_M.gguf", &content());
+        let dest = run(&c, "a/b", &e).0.unwrap();
+        let lock = with_suffix(&dest, ".lock");
+        let inode = fs::metadata(&lock).unwrap().ino();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).unwrap();
+        match fs::OpenOptions::new().write(true).open(&lock) {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+            Ok(_) => {
+                eprintln!("read-only lock regression needs an account without permission override");
+                return;
+            }
+        }
+        let (hit, seen) = run(&c, "a/b", &e);
+        assert_eq!(hit.unwrap(), dest);
+        assert_eq!(states(&seen), [format!("file cached {}", e.size)]);
+        c.offline = true;
+        let (resolved, seen) = offline_run(&c, "a/b:Q4_K_M");
+        assert_eq!(resolved.unwrap(), std::slice::from_ref(&dest));
+        assert!(
+            seen.iter().any(|s| s.contains("offline-cached")),
+            "{seen:?}"
+        );
+        assert_eq!(fs::metadata(&lock).unwrap().ino(), inode);
+
+        // A cache written before lock files existed, in a folder this account cannot write.
+        let dir = dest.parent().unwrap();
+        fs::remove_file(&lock).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let (resolved, seen) = offline_run(&c, "a/b:Q4_K_M");
+        c.offline = false;
+        let (hit, _) = run(&c, "a/b", &e);
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolved.unwrap(), std::slice::from_ref(&dest));
+        assert!(
+            seen.iter().any(|s| s.contains("offline-cached")),
+            "{seen:?}"
+        );
+        assert_eq!(hit.unwrap(), dest);
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn publishing_the_file_precedes_publishing_its_marker() {
+        let d = scratch("publish-order");
+        let (c, e) = served(&d, "a/b", "m.gguf", &content());
+        let dest = cache_path(&c.root, "a/b", &e.path).unwrap();
+        // A marker write fails after the verified bytes have taken their final name.
+        fs::create_dir_all(with_suffix(&dest, ".verified.part")).unwrap();
+        run(&c, "a/b", &e).0.expect_err("marker publication fails");
+        assert_eq!(digest(&dest, e.check, e.size).unwrap(), e.digest);
+        assert!(!with_suffix(&dest, ".verified").exists());
+    }
+
+    #[test]
+    fn publishing_a_marker_replaces_its_inode() {
+        let d = scratch("marker-replacement");
+        let marker = d.join("m.verified");
+        fs::write(&marker, "old\n").unwrap();
+        let mut earlier = fs::File::open(&marker).unwrap();
+        write_marker(&marker, "new").unwrap();
+        let mut old = String::new();
+        earlier.read_to_string(&mut old).unwrap();
+        assert_eq!(old, "old\n");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "new\n");
+        assert!(!with_suffix(&marker, ".part").exists());
+    }
+
+    #[test]
+    fn snapshot_marking_and_discovery_wait_for_the_file_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let d = scratch("snapshot-locking");
+        let (c, e) = served(&d, "a/b", "m.gguf", &content());
+        let dest = run(&c, "a/b", &e).0.unwrap();
+        for discover in [false, true] {
+            let guard = lock_file(&dest).unwrap();
+            let (started, ready) = mpsc::channel();
+            let (done, result) = mpsc::channel();
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    started.send(()).unwrap();
+                    let value = if discover {
+                        verified_entries(&c.root, "a/b").map(drop)
+                    } else {
+                        mark_if_match(&c.root, "a/b", &e)
+                    };
+                    done.send(value).unwrap();
+                });
+                ready.recv().unwrap();
+                let held = result.recv_timeout(Duration::from_millis(200));
+                drop(guard);
+                assert!(
+                    matches!(held, Err(mpsc::RecvTimeoutError::Timeout)),
+                    "discover={discover}: {held:?}"
+                );
+                result
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_fetches_share_one_download() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = std::env::current_dir().unwrap();
+        if d.join("curl").is_file() {
+            let (mut c, e) = served(&d, "a/b", "sub/m.gguf", &content());
+            c.curl = d.join("curl").into_os_string();
+            run(&c, "a/b", &e).0.expect("concurrent fetch");
+            return;
+        }
+        let d = scratch("concurrent-fetch");
+        let script = d.join("curl");
+        fs::write(
+            &script,
+            "#!/bin/sh\ncd -- \"$(dirname -- \"$0\")\" || exit 1\nprintf x >> calls\nsleep 1\nexec curl \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        // Both processes use the same partial file, including the same resume offset.
+        let (c, e) = served(&d, "a/b", "sub/m.gguf", &content());
+        let dest = cache_path(&c.root, "a/b", &e.path).unwrap();
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(with_suffix(&dest, ".part"), &content()[..100_000]).unwrap();
+        let spawn = || {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "fetch::tests::concurrent_fetches_share_one_download",
+                ])
+                .current_dir(&d)
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn();
+        let mut second = spawn();
+        let a = first.wait().unwrap();
+        let b = second.wait().unwrap();
+        assert!(a.success() && b.success(), "fetches: {a}, {b}");
+        assert_eq!(fs::read(d.join("calls")).unwrap(), b"x", "downloaded twice");
+        assert_eq!(digest(&dest, e.check, e.size).unwrap(), e.digest);
+        assert_eq!(
+            fs::read_to_string(with_suffix(&dest, ".verified"))
+                .unwrap()
+                .trim(),
+            e.digest
+        );
+    }
+
+    #[test]
+    fn checkpoint_manifest_requires_its_shards_online_and_offline() {
+        let d = scratch("checkpoint-manifest");
+        let index = br#"{"weight_map":{"a":"weights/a.safetensors","b":"weights/b.safetensors"}}"#;
+        let mut c = hub(
+            &d,
+            "a/b",
+            &[
+                (safetensors::Folder::INDEX, index),
+                ("weights/a.safetensors", b"one"),
+                ("weights/b.safetensors", b"two"),
+                ("unused.safetensors", b"unused"),
+                ("config.json", b"{}"),
+                ("chat_template.jinja", b"template"),
+                ("extra/config.json", b"unused config"),
+            ],
+        );
+        // The files reported after the checkpoint event make up its bytes, the index included.
+        let (mut total, mut after) = (None, 0);
+        let dir = open_checkpoint(&c, &mut |ev| match ev {
+            Event::Checkpoint { bytes, .. } => total = Some(*bytes),
+            Event::File { bytes, .. } if total.is_some() => after += bytes,
+            _ => {}
+        })
+        .unwrap()
+        .remove(0);
+        assert_eq!(total, Some(after));
+        assert_eq!(fs::read(dir.join("weights/a.safetensors")).unwrap(), b"one");
+        assert_eq!(fs::read(dir.join("weights/b.safetensors")).unwrap(), b"two");
+        assert!(!dir.join("unused.safetensors").exists());
+        assert_eq!(fs::read(dir.join("config.json")).unwrap(), b"{}");
+        assert_eq!(
+            fs::read(dir.join("chat_template.jinja")).unwrap(),
+            b"template"
+        );
+        assert!(!dir.join("extra/config.json").exists());
+        // The folder reader follows directory links; discovery must find the same shards.
+        #[cfg(unix)]
+        {
+            let stored = dir.join("stored-weights");
+            fs::rename(dir.join("weights"), &stored).unwrap();
+            std::os::unix::fs::symlink(stored, dir.join("weights")).unwrap();
+        }
+        c.offline = true;
+        open_checkpoint(&c, &mut |_| {}).expect("complete offline checkpoint");
+        for missing in ["weights/b.safetensors", "weights/b.safetensors.verified"] {
+            let path = dir.join(missing);
+            let saved = with_suffix(&path, ".saved");
+            fs::rename(&path, &saved).unwrap();
+            let err = open_checkpoint(&c, &mut |_| {}).expect_err("incomplete offline checkpoint");
+            assert!(matches!(err, HfError::Offline { .. }), "{err}");
+            assert!(err.to_string().contains("weights/b.safetensors"), "{err}");
+            fs::rename(saved, path).unwrap();
+        }
+        c.offline = false;
+        let tree = d.join("hub/api/models/a/b/tree/main");
+        let json = fs::read_to_string(&tree).unwrap();
+        fs::write(
+            &tree,
+            json.replace("weights/b.safetensors", "weights/c.safetensors"),
+        )
+        .unwrap();
+        let err = open_checkpoint(&c, &mut |_| {}).expect_err("shard absent from listing");
+        assert!(matches!(err, HfError::NoFile { .. }), "{err}");
+        assert!(err.to_string().contains("weights/b.safetensors"), "{err}");
+    }
+
+    #[test]
+    fn checkpoint_manifest_refuses_invalid_shard_paths_and_maps() {
+        let d = scratch("checkpoint-invalid-manifest");
+        for index in [
+            "not json",
+            "{}",
+            r#"{"weight_map":{}}"#,
+            r#"{"weight_map":{"a":1}}"#,
+            r#"{"weight_map":{"a":"../a.safetensors"}}"#,
+            r#"{"weight_map":{"a":"/a.safetensors"}}"#,
+            r#"{"weight_map":{"a":"weights//a.safetensors"}}"#,
+            r#"{"weight_map":{"a":"C:a.safetensors"}}"#,
+        ] {
+            let c = hub(&d, "a/b", &[(safetensors::Folder::INDEX, index.as_bytes())]);
+            let err = open_checkpoint(&c, &mut |_| {}).expect_err(index);
+            assert!(matches!(err, HfError::Listing { .. }), "{err}");
+        }
     }
 
     #[test]
@@ -1586,6 +1936,9 @@ mod tests {
     ) -> (Client, Vec<Vec<u8>>, Vec<PathBuf>) {
         let bodies: Vec<Vec<u8>> = (0..files.len())
             .map(|i| {
+                if files[i] == safetensors::Folder::INDEX {
+                    return checkpoint_index(files).into_bytes();
+                }
                 let mut body = content();
                 body[0] = i as u8;
                 body
@@ -1605,6 +1958,15 @@ mod tests {
             .map(|f| dir.join("cache/a/b").join(f))
             .collect();
         (c, bodies, paths)
+    }
+
+    fn checkpoint_index(files: &[&str]) -> String {
+        let map: serde_json::Map<String, serde_json::Value> = files
+            .iter()
+            .filter(|f| f.ends_with(".safetensors") && !f.starts_with("extra/"))
+            .map(|f| (f.to_string(), serde_json::Value::String(f.to_string())))
+            .collect();
+        serde_json::json!({"weight_map": map}).to_string()
     }
 
     /// A cached snapshot whose markers are gone is hashed by the check a resolve runs before its
@@ -1852,7 +2214,20 @@ mod tests {
             "extra/other.safetensors",
         ];
         let body = content();
-        let listed: Vec<(&str, &[u8])> = files.iter().map(|f| (*f, body.as_slice())).collect();
+        let index = checkpoint_index(&files);
+        let listed: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|f| {
+                (
+                    *f,
+                    if *f == safetensors::Folder::INDEX {
+                        index.as_bytes()
+                    } else {
+                        body.as_slice()
+                    },
+                )
+            })
+            .collect();
         let c = hub(&d, "a/b", &listed);
         let (got, seen) = offline_run(&c, "a/b");
         assert_eq!(got.expect("resolve"), [d.join("cache/a/b")], "{seen:?}");
@@ -1891,7 +2266,7 @@ mod tests {
             &d,
             "a/b",
             &[
-                ("model.safetensors.index.json", b"index"),
+                ("model.safetensors.index.json", br#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#),
                 ("model-00001-of-00002.safetensors", b"one"),
                 ("model-00002-of-00002.safetensors", b"two"),
             ],

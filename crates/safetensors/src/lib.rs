@@ -470,13 +470,15 @@ impl Folder {
     /// The index file's name in the folder.
     pub const INDEX: &str = "model.safetensors.index.json";
 
-    /// The model folder `dir`.
-    pub fn open(dir: &Path) -> Result<Folder, Error> {
-        let path = dir.join(Folder::INDEX);
+    /// The index at `path`: its nonempty `weight_map`, a tensor's name to its shard, every shard
+    /// a relative path inside the folder (`/`-separated parts, none empty, `.` or `..`, and no
+    /// `\` or `:`), refused by name otherwise.
+    pub fn weight_map(path: &Path) -> Result<BTreeMap<String, String>, Error> {
         let text =
-            std::fs::read_to_string(&path).map_err(|e| Error::Io(path.display().to_string(), e))?;
-        let index = parse_unique(&path.display().to_string(), &text)?;
-        let Some(Value::Object(map)) = index.get("weight_map") else {
+            std::fs::read_to_string(path).map_err(|e| Error::Io(path.display().to_string(), e))?;
+        let mut index = parse_unique(&path.display().to_string(), &text)?;
+        let Some(Value::Object(map)) = index.as_object_mut().and_then(|m| m.remove("weight_map"))
+        else {
             return Err(bad(format!("{}: no weight_map object", path.display())));
         };
         if map.is_empty() {
@@ -485,27 +487,36 @@ impl Folder {
                 path.display()
             )));
         }
+        map.into_iter()
+            .map(|(name, file)| {
+                let shard = file
+                    .as_str()
+                    .filter(|f| {
+                        !f.contains(['\\', ':'])
+                            && f.split('/')
+                                .all(|part| !part.is_empty() && part != "." && part != "..")
+                    })
+                    .ok_or_else(|| {
+                        bad(format!(
+                            "{}: {name}'s shard {file} is not a path inside the folder",
+                            Folder::INDEX
+                        ))
+                    })?;
+                Ok((name, shard.to_owned()))
+            })
+            .collect()
+    }
+
+    /// The model folder `dir`.
+    pub fn open(dir: &Path) -> Result<Folder, Error> {
         let mut files: Vec<String> = Vec::new();
         let mut by_name = BTreeMap::new();
-        for (name, file) in map {
-            let file = file
-                .as_str()
-                .filter(|f| {
-                    !f.contains(['\\', ':'])
-                        && f.split('/')
-                            .all(|part| !part.is_empty() && part != "." && part != "..")
-                })
-                .ok_or_else(|| {
-                    bad(format!(
-                        "{}: {name}'s shard {file} is not a path inside the folder",
-                        Folder::INDEX
-                    ))
-                })?;
-            let at = files.iter().position(|f| f == file).unwrap_or_else(|| {
-                files.push(file.to_string());
+        for (name, file) in Folder::weight_map(&dir.join(Folder::INDEX))? {
+            let at = files.iter().position(|f| *f == file).unwrap_or_else(|| {
+                files.push(file);
                 files.len() - 1
             });
-            by_name.insert(name.clone(), at);
+            by_name.insert(name, at);
         }
         let shards = files
             .into_iter()
