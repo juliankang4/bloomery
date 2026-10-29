@@ -36,7 +36,7 @@
 //! not carry the text the client sent is never built.
 
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 
 use jinja::ChatTemplate;
 use serde_json::{Map, Value};
@@ -50,12 +50,6 @@ const SYMBOLS: &[u8] = b"~^@#$%*+=;?!";
 /// Why a chat prompt could not be guarded.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum GuardError {
-    /// The request and the template together hold every symbol pair a mark could be made of.
-    #[error(
-        "the request carries every pair of the symbols {symbols:?} the guard of control strings \
-         marks text with, so it cannot be guarded"
-    )]
-    NoMark { symbols: &'static str },
     /// The template cut a marked string apart, or read it another way than it reads the text
     /// without the mark: the text it renders is not the text the client sent.
     #[error(
@@ -67,16 +61,24 @@ pub(crate) enum GuardError {
 }
 
 /// The symbol pairs the strings of a request and its template hold, as a bitmap.
-struct Pairs(Vec<bool>);
+struct Pairs {
+    seen: Vec<bool>,
+    longest_tilde_run: usize,
+}
 
 impl Pairs {
     fn new() -> Pairs {
-        Pairs(vec![false; 256 * 256])
+        Pairs {
+            seen: vec![false; 256 * 256],
+            longest_tilde_run: 0,
+        }
     }
 
     fn add(&mut self, text: &str) {
+        let longest = text.split(|c| c != '~').map(str::len).max().unwrap_or(0);
+        self.longest_tilde_run = self.longest_tilde_run.max(longest);
         for w in text.as_bytes().windows(2) {
-            self.0[usize::from(w[0]) << 8 | usize::from(w[1])] = true;
+            self.seen[usize::from(w[0]) << 8 | usize::from(w[1])] = true;
         }
     }
 
@@ -103,7 +105,7 @@ impl Pairs {
     }
 
     fn holds(&self, a: u8, b: u8) -> bool {
-        self.0[usize::from(a) << 8 | usize::from(b)]
+        self.seen[usize::from(a) << 8 | usize::from(b)]
     }
 
     /// The first two pairs of [`SYMBOLS`] none of the strings holds, in the order of the symbols.
@@ -114,12 +116,22 @@ impl Pairs {
             .filter(|&[a, b]| !self.holds(a, b));
         Some([free.next()?, free.next()?])
     }
+
+    /// Two absent pieces: short symbol pairs when available, otherwise runs longer than any input's.
+    fn mark(&self) -> String {
+        match self.free() {
+            Some(pairs) => pairs.into_iter().flatten().map(char::from).collect(),
+            None => "~".repeat(2 * (self.longest_tilde_run + 1)),
+        }
+    }
 }
 
 /// What a chat render needs to keep client text text: the mark and the vocabulary that guards by it.
 pub(crate) struct Guard<'a> {
     tok: &'a dyn Tokenizer,
-    mark: String,
+    mark: OnceCell<String>,
+    body: &'a Map<String, Value>,
+    strings: Vec<&'a str>,
     /// A string that carries one of these is left as it came ([`Guard::except`]).
     except: Vec<String>,
     /// How many strings came back with a mark in them.
@@ -128,32 +140,21 @@ pub(crate) struct Guard<'a> {
 
 impl<'a> Guard<'a> {
     /// A guard whose mark no string of `body` (the request), `strings` (the template's source and
-    /// the server's own texts) holds. The mark is two pairs of symbols, each held by none of them: the
-    /// whole mark is then in none of them, and neither is a piece of it two symbols long.
+    /// the server's own texts) holds. The mark is chosen only when client text needs guarding;
+    /// two absent symbol pairs are preferred, with a longer absent run when all pairs occur.
     pub(crate) fn new(
         tok: &'a dyn Tokenizer,
-        body: &Map<String, Value>,
-        strings: &[&str],
-    ) -> Result<Guard<'a>, GuardError> {
-        let mut seen = Pairs::new();
-        for s in strings {
-            seen.add(s);
-        }
-        for (k, v) in body {
-            seen.add(k);
-            seen.add_value(v);
-        }
-        let [first, last] = seen.free().ok_or(GuardError::NoMark {
-            symbols: std::str::from_utf8(SYMBOLS).expect("ASCII symbols"),
-        })?;
-        let pair = |p: [u8; 2]| p.iter().copied().map(char::from).collect::<String>();
-        let (first, last) = (pair(first), pair(last));
-        Ok(Guard {
+        body: &'a Map<String, Value>,
+        strings: &[&'a str],
+    ) -> Guard<'a> {
+        Guard {
             tok,
-            mark: format!("{first}{last}"),
+            mark: OnceCell::new(),
+            body,
+            strings: strings.to_vec(),
             except: Vec::new(),
             marked: Cell::new(0),
-        })
+        }
     }
 
     /// The same guard leaving alone every string that carries one of `markers`: a model's image
@@ -175,7 +176,26 @@ impl<'a> Guard<'a> {
         if self.except.iter().any(|m| text.contains(m.as_str())) {
             return Cow::Borrowed(text);
         }
-        let guarded = self.tok.guard(text, &self.mark);
+        let mark = match self.mark.get() {
+            Some(mark) => mark,
+            None => {
+                if matches!(self.tok.guard(text, "~"), Cow::Borrowed(_)) {
+                    return Cow::Borrowed(text);
+                }
+                self.mark.get_or_init(|| {
+                    let mut seen = Pairs::new();
+                    for s in &self.strings {
+                        seen.add(s);
+                    }
+                    for (k, v) in self.body {
+                        seen.add(k);
+                        seen.add_value(v);
+                    }
+                    seen.mark()
+                })
+            }
+        };
+        let guarded = self.tok.guard(text, mark);
         if matches!(guarded, Cow::Owned(_)) {
             self.marked.set(self.marked.get() + 1);
         }
@@ -297,7 +317,8 @@ impl<'a> Guard<'a> {
         if !self.any() {
             return Ok((marked, None));
         }
-        let text = marked.replace(&self.mark, "");
+        let mark = self.mark.get().expect("a marked string has a guard mark");
+        let text = marked.replace(mark, "");
         // What the template renders of the client's text without the mark: a template that cuts
         // a marked text apart, or that reads it another way, renders other text than the marked
         // render does without its marks.
@@ -305,12 +326,12 @@ impl<'a> Guard<'a> {
         let mut pending: Vec<&mut Value> = original.values_mut().collect();
         while let Some(value) = pending.pop() {
             match value {
-                Value::String(s) => *s = s.replace(&self.mark, ""),
+                Value::String(s) => *s = s.replace(mark, ""),
                 Value::Array(a) => pending.extend(a.iter_mut()),
                 Value::Object(o) => {
                     *o = std::mem::take(o)
                         .into_iter()
-                        .map(|(k, v)| (k.replace(&self.mark, ""), v))
+                        .map(|(k, v)| (k.replace(mark, ""), v))
                         .collect();
                     pending.extend(o.values_mut());
                 }
@@ -319,19 +340,15 @@ impl<'a> Guard<'a> {
         }
         let expected = template
             .render(&original)
-            .map_err(|_| GuardError::Severed {
-                mark: self.mark.clone(),
-            })?;
+            .map_err(|_| GuardError::Severed { mark: mark.clone() })?;
         if text != expected {
-            return Err(GuardError::Severed {
-                mark: self.mark.clone(),
-            });
+            return Err(GuardError::Severed { mark: mark.clone() });
         }
         Ok((
             text,
             Some(Guarded {
                 text: marked,
-                mark: self.mark.clone(),
+                mark: mark.clone(),
             }),
         ))
     }
