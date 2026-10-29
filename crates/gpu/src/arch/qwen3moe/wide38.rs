@@ -187,7 +187,7 @@ use super::image::MediaRows;
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
 use super::program38::{Ctx38, beta_alpha_mut, beta_alpha_rows};
 use super::router::gated;
-use super::scratch::{Io, KvPlanes, RecStore, cells_view, param_view};
+use super::scratch::{Append256, Io, KvPlanes, PrefillFlash, RecStore, cells_view, param_view};
 use super::scratch38::{Arena38, ROUTE_ROWS, Store38, final_res, no_carry};
 use super::tier38::TierSide38;
 use super::wide::{RingStacks, with_ring_windows};
@@ -196,7 +196,7 @@ use crate::card_leg::{RouteW, StackW};
 use crate::card_slots::{CardAcc, DownRows};
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaListArgs;
-use crate::flash_gqa_prefill::{GqaPrefillArgs, QueryNorm};
+use crate::flash_gqa_prefill::QueryNorm;
 use crate::gemm::{
     GateUp32Args, Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute,
     GemmWeight, MmaForm,
@@ -219,7 +219,6 @@ use crate::q38::{
     SharedAddArgs, W_PITCH,
 };
 use crate::qsa::{self, PoolArgs, SelectArgs};
-use crate::rope_neox::PartialNeoxArgs;
 use crate::site::{
     self, BY_NAME_COLS, ByName, Form, Gated, GatedIo, Out, SiteWeight, SwigluRows, WideIn,
     WideKernels,
@@ -2729,16 +2728,14 @@ fn qsa(
         },
     )?;
     dense_gemm(c, by, &qp.idx_q, act, table, &mut q.qi)?;
-    // The selecting store is f16 (the qwen38 family's stores carry no q8_0
-    // form), so the family's shared append runs its f16 arm, over the key
-    // heads alone: the flashes norm and turn the query heads they read
-    // (`QueryNorm`).
-    let (kcache, vcache) = kv.f16_mut("qwen38::wide")?;
+    // The append over the key heads alone: the flashes norm and turn the
+    // query heads they read (`QueryNorm`).
     // SAFETY: the per-sequence embedding supplies distinct cache-valid positions.
     unsafe {
-        c.k.neox.enqueue_head_norm_neox_append_256(
+        kv.append_256(
+            &c.k.neox,
             stream,
-            PartialNeoxArgs {
+            Append256 {
                 qg: &q.qg,
                 q: &mut q.q,
                 k: &mut q.k,
@@ -2753,12 +2750,9 @@ fn qsa(
                 ctx,
                 m,
                 fault: sink,
-                cache_k: kcache,
-                cache_v: vcache,
             },
         )
     }?;
-    let (kcache, vcache) = kv.f16("qwen38::wide")?;
     let gq = f32_gain(w, &qp.q_norm)?;
     // The arena's `[q | gate]` rows hold the unit's row `r` at their row
     // `r`; the cut unit's row `r` is the unit's row `t0 + r`, and the gated
@@ -2784,12 +2778,11 @@ fn qsa(
                 cells_view(attn, 0, dense * geo::ATTN),
             )
         };
-        c.k.prefill.enqueue_256_p4_gated(
+        kv.prefill_256_gated(
+            &c.k.prefill,
             stream,
-            GqaPrefillArgs {
+            PrefillFlash {
                 q: &gw,
-                kc: kcache,
-                vc: vcache,
                 n_keys: &nw,
                 scale: ATTN_SCALE_256,
                 n_head: geo::N_HEAD,
@@ -2846,8 +2839,7 @@ fn qsa(
             stream,
             GqaListArgs {
                 q: &gw,
-                kc: kcache,
-                vc: vcache,
+                kv: kv.planes(),
                 list: &q.sel.list,
                 n_sel: &q.sel.n_sel,
                 width,

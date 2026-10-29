@@ -252,19 +252,22 @@ pub const fn dense_kv_bytes(kv_heads: usize, head_dim: usize, ctx: usize) -> u64
 }
 
 /// A selecting attention layer's bytes at `ctx` positions: each position's
-/// K and V ([`kv_row_bytes`]) and raw index key of `idx_dim` f16, and one
-/// pooled key of `idx_dim` f16 a pool of `pool` positions
-/// ([`pooled_rows`]).
+/// K and V ([`kv_plane_bytes`] in the layout `q8` names) and raw index key of
+/// `idx_dim` f16, and one pooled key of `idx_dim` f16 a pool of `pool`
+/// positions ([`pooled_rows`]). The index keys stay f16 in either layout.
 #[must_use]
 pub const fn selecting_bytes(
     kv_heads: usize,
     head_dim: usize,
+    q8: bool,
     idx_dim: usize,
     pool: usize,
     ctx: usize,
 ) -> u64 {
     let raw = idx_dim as u64 * F16_BYTES;
-    ctx as u64 * (kv_row_bytes(kv_heads, head_dim) + raw) + pooled_rows(ctx, pool) as u64 * raw
+    kv_plane_bytes(kv_heads, head_dim, q8, ctx as u64)
+        + ctx as u64 * raw
+        + pooled_rows(ctx, pool) as u64 * raw
 }
 
 #[cfg(test)]
@@ -311,7 +314,7 @@ mod tests {
     /// eleven conv rows of 10,240 f32 channels and a carry of four words and
     /// fifteen rows of 64 heads of 128 f32 and 2 × 48 f32; the PLE ring 17
     /// rows of four 2,560-value streams; an attention position 2 × 2 × 256 f16 of K and V
-    /// and a 128-value raw index key, and a 128-value pooled key per four
+    /// (17/16 B a value in q8_0) and a 128-value raw index key, and a 128-value pooled key per four
     /// positions, the last pool whole.
     #[test]
     fn qwen38_sizes() {
@@ -322,12 +325,17 @@ mod tests {
         assert_eq!(ple_ring_bytes(4, 3, 4, 2560), 696_320);
         assert_eq!(kv_row_bytes(2, 256), 2048);
         assert_eq!(
-            selecting_bytes(2, 256, 128, 4, 4096),
+            selecting_bytes(2, 256, false, 128, 4, 4096),
             4096 * 2304 + 1024 * 256
         );
         assert_eq!(
-            selecting_bytes(2, 256, 128, 4, 4097),
+            selecting_bytes(2, 256, false, 128, 4, 4097),
             4097 * 2304 + 1025 * 256
+        );
+        // q8_0: 2 · 2 · 256 values at 17/16 B, the index keys unchanged.
+        assert_eq!(
+            selecting_bytes(2, 256, true, 128, 4, 4096),
+            4096 * (1088 + 256) + 1024 * 256
         );
     }
 

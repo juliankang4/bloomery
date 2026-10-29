@@ -515,7 +515,7 @@ mod gate {
     use app::mtp::MtpBody;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, CHECKPOINT_EVERY, checkpoint_budget38, seq38_bytes,
+        Body38, CHECKPOINT_EVERY, KvQ8, checkpoint_budget38, seq38_bytes,
     };
     use bloomery_gpu::host::xstream::XSTREAM_ROOM;
     use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, step_above};
@@ -3732,8 +3732,9 @@ mod gate {
         let mtp = MtpInputs::read(&draft, &split, &inputs, rows)?;
         let state_is_the_engines = [1usize, 4096, 252_416, 262_144].iter().all(|&n| {
             let p = n as u64;
-            inputs.seq_state_bytes(p, None) == seq38_bytes(gdn, qsa, n, false)
-                && inputs.seq_state_bytes(p, Some(&mtp)) == seq38_bytes(gdn, qsa, n, true)
+            inputs.seq_state_bytes(p, None) == seq38_bytes(gdn, qsa, n, false, KvQ8::F16)
+                && inputs.seq_state_bytes(p, Some(&mtp))
+                    == seq38_bytes(gdn, qsa, n, true, KvQ8::F16)
         });
         println!(
             "ctx: the gate's plans: at {ctx} {at_ctx:?}, at the step above {above:?} {at_above:?}; \

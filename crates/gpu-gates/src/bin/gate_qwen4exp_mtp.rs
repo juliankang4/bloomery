@@ -274,7 +274,7 @@ mod gate {
 
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, CHECKPOINT_EVERY, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
+        Body38, CHECKPOINT_EVERY, KvQ8, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
         MtpNode, MtpTaps, Prompt38, Qwen38Model, Seq38, SplitWalk, Store38Host, TargetRows,
         checkpoint_bytes, seq_positional_bytes, seq38_bytes,
     };
@@ -2969,11 +2969,11 @@ mod gate {
             .ctx();
         let before = store_of(m, n)?;
         let (gdn, qsa) = (cfg().shape.n_gdn(), cfg().shape.n_qsa());
-        let lane = m.seq_lane(2 * seq38_bytes(gdn, qsa, n, true))?;
+        let lane = m.seq_lane(2 * seq38_bytes(gdn, qsa, n, true, KvQ8::F16))?;
         let (state, pending) = m.seq_save_async(&lane)?.map_err(GateError::from)?;
         let cost = pending.land()?;
         let copies = 1 + pending.points().len() as u64;
-        let target = seq_positional_bytes(qsa, n) + copies * checkpoint_bytes(gdn);
+        let target = seq_positional_bytes(qsa, n, KvQ8::F16) + copies * checkpoint_bytes(gdn);
         let store = kv_bytes * n as u64 / store_ctx as u64;
         let derived = target + store;
         m.reset()?;
@@ -3006,7 +3006,7 @@ mod gate {
     fn past_refused(m: &mut Qwen38Model, prompt: &[u32], n: u32) -> Result<bool, GateError> {
         overwrite_store(m, prompt, n as usize + 1, 1)?;
         let (gdn, qsa) = (cfg().shape.n_gdn(), cfg().shape.n_qsa());
-        let lane = m.seq_lane(seq38_bytes(gdn, qsa, n as usize, true))?;
+        let lane = m.seq_lane(seq38_bytes(gdn, qsa, n as usize, true, KvQ8::F16))?;
         let want = format!(
             "a state at {n} of a draft store that holds {} positions",
             n + 1

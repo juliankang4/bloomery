@@ -8,11 +8,12 @@
 //!
 //! Every parameter is a value ([`Open38`]), so a gate that loads another way changes a value, not
 //! this code: the card a plan is made on, the cache rows, the ubatch, where the experts sit, the
-//! slots, the plan's levers, the host config, the host's room and the residency.
+//! slots, the plan's levers, the host config, the host's room, the residency and the KV cache's
+//! format.
 
 use std::path::Path;
 
-use bloomery_gpu::arch::qwen3moe::{Body38, Model38, Qwen38Model};
+use bloomery_gpu::arch::qwen3moe::{Body38, KvQ8, Model38, Qwen38Model};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
@@ -60,6 +61,8 @@ pub struct Open38<'a> {
     /// The residency machine over the card's routed stacks; [`Residency::Off`] is the load's slot
     /// map for the model's life.
     pub residency: Residency,
+    /// The KV cache's format: the plan counts its bytes and the load allocates it.
+    pub kv: KvQ8,
 }
 
 /// What the plan the load was made by holds, as a gate prints it.
@@ -111,6 +114,7 @@ impl<'a> Open38<'a> {
         if let Some(r) = self.room {
             inputs.room = (r, HostRead::Given);
         }
+        inputs.kv = inputs.kv.in_q8_if(self.kv == KvQ8::Q8);
         let ub = u64::try_from(self.ub)?;
         let (machine, ()) = widen_card_route(
             machine_for_experts(self.card, inputs.spec.layers.len(), ub, self.experts),

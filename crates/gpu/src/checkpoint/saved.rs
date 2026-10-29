@@ -113,31 +113,72 @@ impl fmt::Display for Identity {
     }
 }
 
-/// The rows of one positional f16 store a state carries, under one borrow
-/// of it: `planes` runs of `len` values, the first at value 0 and each
-/// `stride` values past the one before.
+/// The rows of one positional store a state carries, under one borrow of
+/// it: `planes` runs of `len` values, the first at value 0 and each `stride`
+/// values past the one before. A store of u32 words (a q8_0 cache's codes
+/// plane) is counted in its 16-bit halves, so every run of every store is in
+/// one unit, the host rows' u16.
 pub struct Spans<'a> {
-    buf: &'a mut DeviceBuffer<u16>,
+    buf: Plane<'a>,
     run: Run,
+}
+
+/// A positional store's device buffer, of 16-bit values or of u32 words.
+pub enum Plane<'a> {
+    U16(&'a mut DeviceBuffer<u16>),
+    U32(&'a mut DeviceBuffer<u32>),
+}
+
+impl<'a> From<&'a mut DeviceBuffer<u16>> for Plane<'a> {
+    fn from(b: &'a mut DeviceBuffer<u16>) -> Plane<'a> {
+        Plane::U16(b)
+    }
+}
+
+impl<'a> From<&'a mut DeviceBuffer<u32>> for Plane<'a> {
+    fn from(b: &'a mut DeviceBuffer<u32>) -> Plane<'a> {
+        Plane::U32(b)
+    }
+}
+
+impl Plane<'_> {
+    /// The 16-bit halves one of the buffer's values holds.
+    fn halves(&self) -> usize {
+        match self {
+            Plane::U16(_) => 1,
+            Plane::U32(_) => 2,
+        }
+    }
+
+    /// The buffer's length in 16-bit halves.
+    fn len(&self) -> usize {
+        match self {
+            Plane::U16(b) => b.len(),
+            Plane::U32(b) => 2 * b.len(),
+        }
+    }
 }
 
 impl<'a> Spans<'a> {
     /// The runs of `buf` (the type's doc), of no growth rule: only the whole
     /// runs are ever copied, so a state with such a store cannot be put back
     /// as a prefix ([`SeqState::load_prefix`]). Refused by name when one run
-    /// would leave the buffer or overlap the next.
+    /// would leave the buffer or overlap the next. `stride` and `len` count
+    /// the buffer's own values.
     pub fn planes(
-        buf: &'a mut DeviceBuffer<u16>,
+        buf: impl Into<Plane<'a>>,
         planes: usize,
         stride: usize,
         len: usize,
     ) -> Result<Spans<'a>, GpuError> {
+        let buf = buf.into();
+        let h = buf.halves();
         Spans::of(
             buf,
             Run {
                 planes,
-                stride,
-                len,
+                stride: stride * h,
+                len: len * h,
                 per: Per::Whole,
             },
         )
@@ -145,21 +186,24 @@ impl<'a> Spans<'a> {
 
     /// The runs of `n` positions of a store that holds `values` values a
     /// position in each plane: a prefix of `k` positions is the first
-    /// `k · values` of each plane.
+    /// `k · values` of each plane. `stride` and `values` count the buffer's
+    /// own values.
     pub fn by_position(
-        buf: &'a mut DeviceBuffer<u16>,
+        buf: impl Into<Plane<'a>>,
         planes: usize,
         stride: usize,
         n: usize,
         values: usize,
     ) -> Result<Spans<'a>, GpuError> {
-        let per = Per::Position { values };
+        let buf = buf.into();
+        let h = buf.halves();
+        let per = Per::Position { values: values * h };
         let len = per.len_at(n).map_err(|e| shape(e.to_string()))?;
         Spans::of(
             buf,
             Run {
                 planes,
-                stride,
+                stride: stride * h,
                 len,
                 per,
             },
@@ -169,28 +213,34 @@ impl<'a> Spans<'a> {
     /// The runs of `n` positions of a store that holds `values` values a pool
     /// of `every` positions in each plane, the last pool partial: a prefix of
     /// `k` positions is the first `ceil(k / every) · values` of each plane.
+    /// `stride` and `values` count the buffer's own values.
     pub fn by_pool(
-        buf: &'a mut DeviceBuffer<u16>,
+        buf: impl Into<Plane<'a>>,
         planes: usize,
         stride: usize,
         n: usize,
         pool: (usize, usize),
     ) -> Result<Spans<'a>, GpuError> {
+        let buf = buf.into();
+        let h = buf.halves();
         let (every, values) = pool;
-        let per = Per::Pool { every, values };
+        let per = Per::Pool {
+            every,
+            values: values * h,
+        };
         let len = per.len_at(n).map_err(|e| shape(e.to_string()))?;
         Spans::of(
             buf,
             Run {
                 planes,
-                stride,
+                stride: stride * h,
                 len,
                 per,
             },
         )
     }
 
-    fn of(buf: &'a mut DeviceBuffer<u16>, run: Run) -> Result<Spans<'a>, GpuError> {
+    fn of(buf: Plane<'a>, run: Run) -> Result<Spans<'a>, GpuError> {
         let end = run
             .planes
             .checked_sub(1)
@@ -527,14 +577,11 @@ unsafe fn read_into(
         // `dtoh_2d` against the length given); the memory's contract is this
         // fn's caller's.
         unsafe {
-            dtoh_2d(
-                stream,
-                &*lent.positional[s.run].buf,
-                0,
-                rows.add(at),
-                rows_len - at,
-                shape,
-            )?;
+            let (host, len) = (rows.add(at), rows_len - at);
+            match &lent.positional[s.run].buf {
+                Plane::U16(b) => dtoh_2d(stream, &**b, 0, host, len, shape)?,
+                Plane::U32(b) => dtoh_2d(stream, &**b, 0, host, len, shape)?,
+            }
         }
         calls += 1;
     }
@@ -577,14 +624,11 @@ unsafe fn put_from(
         // SAFETY: the host span lies in the rows (checked by `htod_2d`); the
         // memory's contract is this fn's caller's.
         unsafe {
-            htod_2d(
-                stream,
-                &mut *lent.positional[s.run].buf,
-                0,
-                rows.add(at),
-                rows_len - at,
-                shape,
-            )?;
+            let (host, len) = (rows.add(at), rows_len - at);
+            match &mut lent.positional[s.run].buf {
+                Plane::U16(b) => htod_2d(stream, &mut **b, 0, host, len, shape)?,
+                Plane::U32(b) => htod_2d(stream, &mut **b, 0, host, len, shape)?,
+            }
         }
         calls += 1;
     }

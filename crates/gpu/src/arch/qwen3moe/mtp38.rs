@@ -104,16 +104,19 @@
 //! apart from the plan's bytes ([`Mtp38::arena_bytes`]).
 
 use super::body::ATTN_SCALE_256;
+use super::body::KvQ8;
 use super::plan38::{HcSite, geo, router};
 use super::program38::{Ctx38, Kernels38, MMA};
 use super::router::{RouterDims, RouterOut, gated};
-use super::scratch::{IN_IDS, IN_POS0, Inbox, KvPlanes, cells_view, param_view, put_input};
+use super::scratch::{
+    Append256, IN_IDS, IN_POS0, Inbox, KvPlanes, cells_view, param_view, put_input,
+};
 use super::scratch38::{PASS_ROWS, VERIFY_ROWS};
 use crate::card_slots::CardAcc;
 use crate::checkpoint::saved::Spans;
 use crate::draft::{DraftFeed, DraftHead, Feed, Held, Hidden, WalkBounds, WalkMode, refuse_rows};
 use crate::fault::Fault;
-use crate::flash_gqa::{GqaArgs, partials_ms_len, partials_v_len_256};
+use crate::flash_gqa::{partials_ms_len, partials_v_len_256};
 use crate::gemm::{GemmAct32, GemmRoute};
 use crate::graph::Graph;
 use crate::hc_gated::{
@@ -128,7 +131,6 @@ use crate::q8f32::{
     Q8_0GemvIdsArgs, SelArgs,
 };
 use crate::q38::{EmbedArgs, EmbedRows, OutGateArgs, SLOTS, SharedAddArgs, W_PITCH};
-use crate::rope_neox::PartialNeoxArgs;
 use crate::site::{self, WideIn, WideKernels};
 use crate::tensor::{Q8Act, Window, WindowMut};
 use crate::weights::{DevWeight, Weights};
@@ -363,13 +365,9 @@ impl Mtp38 {
                 }
             }
         };
-        let n = geo::N_KV * ctx * geo::HEAD;
-        // The draft's store is f16: the qwen38 family's stores carry no q8_0
-        // form.
-        let store = KvPlanes::F16 {
-            k: DeviceBuffer::zeroed(stream, n)?,
-            v: DeviceBuffer::zeroed(stream, n)?,
-        };
+        // The draft's store in the target's cache format (the plan's).
+        let kv = KvQ8::of(mtp.kv_q8());
+        let store = KvPlanes::zeroed(stream, (geo::N_KV, ctx, geo::HEAD), kv)?;
         stream.synchronize()?;
         let body = Mtp38 {
             w,
@@ -541,15 +539,10 @@ impl Mtp38 {
     }
 
     /// The store's rows of the positions below `n` as a sequence state
-    /// carries them ([`Spans::by_position`]): the K and the V plane, each
-    /// `[n_kv][ctx][head]`, so a prefix of the state moves only its own rows.
-    pub(super) fn store_spans(&mut self, n: usize) -> Result<[Spans<'_>; 2], GpuError> {
-        let stride = self.ctx * geo::HEAD;
-        let (k, v) = self.store.f16_mut(WHAT)?;
-        Ok([
-            Spans::by_position(k, geo::N_KV, stride, n, geo::HEAD)?,
-            Spans::by_position(v, geo::N_KV, stride, n, geo::HEAD)?,
-        ])
+    /// carries them ([`KvPlanes::spans`]), in the store's format, so a prefix
+    /// of the state moves only its own rows.
+    pub(super) fn store_spans(&mut self, n: usize) -> Result<Vec<Spans<'_>>, GpuError> {
+        self.store.spans((geo::N_KV, self.ctx, geo::HEAD), n)
     }
 
     /// The store counted at `n` positions, whose rows a sequence state's
@@ -570,15 +563,11 @@ impl Mtp38 {
     /// [`Slots`](crate::model::Slots)): a zeroed store no walk has captured
     /// over, no positions held. Load-time allocation.
     pub(super) fn new_seq(&self, stream: &CudaStream) -> Result<DraftSeq38, GpuError> {
-        let n = geo::N_KV * self.ctx * geo::HEAD;
-        // The draft's store is f16: the qwen38 family's stores carry no q8_0
-        // form.
+        // The live store's format: the load's one choice.
+        let dims = (geo::N_KV, self.ctx, geo::HEAD);
         Ok(DraftSeq38 {
             graphs: Vec::new(),
-            store: KvPlanes::F16 {
-                k: DeviceBuffer::zeroed(stream, n)?,
-                v: DeviceBuffer::zeroed(stream, n)?,
-            },
+            store: KvPlanes::zeroed(stream, dims, self.store.format())?,
             last: None,
             held: 0,
         })
@@ -2023,14 +2012,12 @@ impl Mtp38 {
         cx.dense_gemv(&n.q, &a.mixed, m, &mut a.qg)?;
         cx.dense_gemv(&n.k, &a.mixed, m, &mut a.k)?;
         cx.dense_gemv(&n.v, &a.mixed, m, &mut a.v)?;
-        // The draft's store is f16: the family's shared append runs its f16
-        // arm.
-        let (kc, vc) = store.f16_mut("qwen38::mtp")?;
         // SAFETY: the per-sequence embedding supplies distinct cache-valid positions.
         unsafe {
-            k.neox.enqueue_head_norm_neox_append_256(
+            store.append_256(
+                &k.neox,
                 stream,
-                PartialNeoxArgs {
+                Append256 {
                     qg: &a.qg,
                     q: &mut a.q,
                     k: &mut a.k,
@@ -2045,18 +2032,14 @@ impl Mtp38 {
                     ctx: *ctx,
                     m,
                     fault: sink,
-                    cache_k: kc,
-                    cache_v: vc,
                 },
             )
         }?;
-        let (kc, vc) = store.f16("qwen38::mtp")?;
-        k.flash.enqueue_pass_256_p4(
+        store.flash_256(
+            &k.flash,
             stream,
-            GqaArgs {
+            super::scratch::FlashPass {
                 q: &a.q,
-                kc,
-                vc,
                 n_keys: &a.n_keys,
                 scale: ATTN_SCALE_256,
                 n_kv: geo::N_KV,
@@ -2068,6 +2051,7 @@ impl Mtp38 {
                 y: &mut a.flash,
             },
             geo::N_HEAD,
+            super::plan::Flash::Quads,
             MMA,
         )?;
         k.q38.enqueue_out_gate(
@@ -2527,17 +2511,15 @@ impl Mtp38 {
         let mut kw = WindowMut::<f32>::of_mut(&mut s.k, kv_at, kv_n)?;
         let v = Window::<f32>::of(&s.v, kv_at, kv_n)?;
         let pos = Window::<u32>::of(&s.pos, b.at * size_of::<u32>(), b.m)?;
-        // The draft's store is f16: the family's shared append runs its f16
-        // arm.
-        let (kc, vc) = store.f16_mut("qwen38::mtp")?;
         // No row of a store walk has its query read: the launch runs the key
         // heads alone (no query head) and reads and writes no query value,
         // so the live walk's query buffers stand in for its query arguments.
         // SAFETY: the per-sequence embedding supplies distinct cache-valid positions.
         unsafe {
-            k.neox.enqueue_head_norm_neox_append_256(
+            store.append_256(
+                &k.neox,
                 gpu.stream(),
-                PartialNeoxArgs {
+                Append256 {
                     qg: &a.qg,
                     q: &mut a.q,
                     k: &mut kw,
@@ -2552,8 +2534,6 @@ impl Mtp38 {
                     ctx: *ctx,
                     m: b.m,
                     fault: sink,
-                    cache_k: kc,
-                    cache_v: vc,
                 },
             )?;
         }

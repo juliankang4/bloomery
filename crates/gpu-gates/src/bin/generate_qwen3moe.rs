@@ -1308,7 +1308,7 @@ mod cli {
             }
         };
         let chosen = q38place::choose(flag, &gpu_census::census()?, |offer| {
-            let inputs = PlanInputs::describe(file)?;
+            let inputs = inputs38(file, levers)?;
             let (draft, _) = draft38(levers, offer, logits, arms, ctx)?;
             let mtp = match draft {
                 Draft38::Off | Draft38::Lookup => None,
@@ -1332,6 +1332,16 @@ mod cli {
         // The lane's rate, taken before the plan reads the room (`lane_of`).
         let lane = Some(lane_at(chosen.place)?);
         Ok((chosen.place, lane))
+    }
+
+    /// The plan inputs of the qwen4exp file `file`, its K/V planes in the format
+    /// `BLOOMERY_QWEN3_KV` sets (f16 unset): every plan of the run counts the
+    /// one format the load allocates.
+    fn inputs38(file: &Split, levers: &Levers) -> Result<PlanInputs, GateError> {
+        let mut inputs = PlanInputs::describe(file)?;
+        let kv = KvQ8::choose(None, levers.qwen3_kv_set(), KvQ8::F16)?;
+        inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
+        Ok(inputs)
     }
 
     /// The placement holds an expert tier card: plan (b′).
@@ -1370,7 +1380,7 @@ mod cli {
         (ctx, slots): (usize, usize),
         mtp: bool,
     ) -> Result<u64, GateError> {
-        let mut inputs = PlanInputs::describe(file)?;
+        let mut inputs = inputs38(file, levers)?;
         inputs.room = room.clone();
         let ub = u64::try_from(ubatch_for(ctx)?)?;
         let ctx_max = u64::try_from(ctx)?;
@@ -1631,8 +1641,7 @@ mod cli {
         // The K/V planes' format, read once here: the loads below carry it
         // and the plan's KV term counts it (the lever's kind holds the word
         // to the two spellings).
-        let kv = KvQ8::parse(levers.qwen3_kv_set().unwrap_or("f16"))
-            .ok_or("BLOOMERY_QWEN3_KV takes f16 or q8_0")?;
+        let kv = KvQ8::choose(None, levers.qwen3_kv_set(), KvQ8::F16)?;
         // Unset, the lever is a qwen4exp plan's card experts and nothing on
         // another family's file; only a set `card` is refused there.
         let card_set = levers.qwen38_experts_set() == Some("card");
@@ -1945,13 +1954,6 @@ mod cli {
                 family.name()
             )
             .into());
-        }
-        if family == Family::Qwen38 && kv == KvQ8::Q8 {
-            return Err(
-                "BLOOMERY_QWEN3_KV=q8_0 quantizes the qwen3 family's K/V planes; a qwen4exp \
-                 file's selecting stores carry no q8_0 form"
-                    .into(),
-            );
         }
         if family != Family::Qwen38 && levers.route_trace().is_some() {
             return Err(format!(
@@ -2892,7 +2894,7 @@ mod cli {
         lane: Lane,
         t: Instant,
     ) -> Result<(Qwen38Model, Residency), GateError> {
-        let mut inputs = PlanInputs::describe(&file)?;
+        let mut inputs = inputs38(&file, levers)?;
         inputs.room = room;
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.spec)?;
         let ub = ubatch_for(ctx)?;
@@ -2986,7 +2988,7 @@ mod cli {
         lane: Lane,
         t: Instant,
     ) -> Result<(Qwen38Model, Q38Cfg, Residency), GateError> {
-        let mut inputs = PlanInputs::describe(&file)?;
+        let mut inputs = inputs38(&file, levers)?;
         inputs.room = room;
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.spec)?;
         let ub = ubatch_for(ctx)?;

@@ -443,9 +443,7 @@ impl PlaceQ3 {
         let mut inputs = q35::PlanInputs::describe(file)?;
         let arch = Family::of_spec(&inputs.spec).map_or(Program::Qwen35Body.name(), Family::name);
         let place = PlaceQ3::resolve(place, census, arch)?;
-        if o.kv == KvQ8::Q8 {
-            inputs.kv = inputs.kv.in_q8();
-        }
+        inputs.kv = inputs.kv.in_q8_if(o.kv == KvQ8::Q8);
         let tables = if o.media {
             let head = inputs.spec.gqa().ok_or(
                 "the description holds no attention layer to rotate an image's positions by",

@@ -20,12 +20,13 @@ use super::plan::Flash;
 use super::router::{MAX_TOKENS, RouterDims, RouterOut};
 use super::wide::{GEMV_COLS, Wide};
 use crate::GpuError;
+use crate::checkpoint::saved::{Plane, Spans};
 use crate::fault::FaultSink;
 use crate::flash_gqa::{
-    FlashGqaKernels, GROUP, GqaArgs, GqaQ8Args, GqaRowsArgs, HEAD, HEAD_256, RowTable,
+    CachePlanes, FlashGqaKernels, GROUP, GqaArgs, GqaQ8Args, GqaRowsArgs, HEAD, HEAD_256, RowTable,
     partials_ms_len, partials_v_len, partials_v_len_256,
 };
-use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args};
+use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, QueryNorm};
 use crate::gemm::GEMM_MAX_SLOTS;
 use crate::linear::{self, LinearShape};
 use crate::site::WideForms;
@@ -365,16 +366,26 @@ impl KvPlanes {
 
     /// The layer's planes of `d`'s shape in the `kv` format. Load-time only.
     pub(super) fn new(stream: &CudaStream, d: &Dims, kv: KvQ8) -> Result<KvPlanes, GpuError> {
+        KvPlanes::zeroed(stream, (d.n_kv, d.ctx, d.head), kv)
+    }
+
+    /// Zeroed planes of `n_kv` key heads, `ctx` rows and `head` values in
+    /// the `kv` format. Load-time only.
+    pub(super) fn zeroed(
+        stream: &CudaStream,
+        (n_kv, ctx, head): (usize, usize, usize),
+        kv: KvQ8,
+    ) -> Result<KvPlanes, GpuError> {
         Ok(match kv {
             KvQ8::F16 => {
-                let n = d.n_kv * d.ctx * d.head;
+                let n = n_kv * ctx * head;
                 KvPlanes::F16 {
                     k: DeviceBuffer::zeroed(stream, n)?,
                     v: DeviceBuffer::zeroed(stream, n)?,
                 }
             }
             KvQ8::Q8 => {
-                let (words, scales) = q8_plane_lens(d.head, d.n_kv, d.ctx);
+                let (words, scales) = q8_plane_lens(head, n_kv, ctx);
                 KvPlanes::Q8 {
                     kq: DeviceBuffer::zeroed(stream, words)?,
                     kd: DeviceBuffer::zeroed(stream, scales)?,
@@ -428,9 +439,25 @@ impl KvPlanes {
         Ok(())
     }
 
+    /// The format these planes hold.
+    pub(super) fn format(&self) -> KvQ8 {
+        match self {
+            KvPlanes::F16 { .. } => KvQ8::F16,
+            KvPlanes::Q8 { .. } => KvQ8::Q8,
+        }
+    }
+
+    /// The planes as the listed flash reads them, in either format.
+    pub(super) fn planes(&self) -> CachePlanes<'_> {
+        match self {
+            KvPlanes::F16 { k, v } => CachePlanes::F16 { kc: k, vc: v },
+            KvPlanes::Q8 { kq, kd, vq, vd } => CachePlanes::Q8 { kq, kd, vq, vd },
+        }
+    }
+
     /// The f16 planes, or a named refusal on a q8_0 cache: the paths that
-    /// read K/V rows as f16 bits (the qwen38 family's stores and snapshots)
-    /// load in f16 only.
+    /// read K/V rows as f16 bits (the qwen3.5 family's host taps) load in f16
+    /// only.
     pub(super) fn f16(
         &self,
         what: &'static str,
@@ -902,7 +929,7 @@ impl KvPlanes {
 
     /// The head-256 decode flash of `s`'s rows over these planes, the pass
     /// `flash` names (the pairs' pass scalar only), the f16 launches or, on
-    /// the eight-head layout's tensor-core pass, its q8_0 twin's; any other
+    /// the eight-head or quad layout's tensor-core pass, its q8_0 twin's; any other
     /// pass on a q8_0 cache is refused by name.
     pub(super) fn flash_256(
         &mut self,
@@ -1000,6 +1027,26 @@ impl KvPlanes {
                     fault,
                     y,
                 },
+            ),
+            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Quads) if mma => k.enqueue_pass_256_p4_q8(
+                stream,
+                GqaQ8Args {
+                    q,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                    n_keys,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m,
+                    part_v,
+                    part_ms,
+                    fault,
+                    y,
+                },
+                n_head,
             ),
             (KvPlanes::Q8 { .. }, flash) => Err(q8_unserved(
                 "qwen3moe::KvPlanes::flash_256",
@@ -1168,6 +1215,67 @@ impl KvPlanes {
         }
     }
 
+    /// Qwen3.8's gated pack-of-four prompt flash of `s`'s `[q | gate]` rows
+    /// over these planes: `enqueue_256_p4_gated` on an f16 cache, its q8_0
+    /// twin on a q8_0 one.
+    pub(super) fn prefill_256_gated(
+        &self,
+        k: &FlashGqaPrefill,
+        stream: &CudaStream,
+        s: PrefillFlash<'_>,
+        query: QueryNorm<'_>,
+    ) -> Result<(), GpuError> {
+        let PrefillFlash {
+            q,
+            n_keys,
+            scale,
+            n_head,
+            n_kv,
+            ctx,
+            t,
+            fault,
+            y,
+        } = s;
+        match self {
+            KvPlanes::F16 { k: kc, v: vc } => k.enqueue_256_p4_gated(
+                stream,
+                GqaPrefillArgs {
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y,
+                },
+                query,
+            ),
+            KvPlanes::Q8 { kq, kd, vq, vd } => k.enqueue_256_p4_gated_q8(
+                stream,
+                GqaPrefillQ8Args {
+                    q,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                    n_keys,
+                    scale,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y,
+                },
+                query,
+            ),
+        }
+    }
+
     /// Whether the per-row launches over several sequences' planes
     /// ([`KvPlanes::append_128_rows`], [`KvPlanes::flash_128_rows`]) serve
     /// these planes under the flash pass `mma`: the f16 cache's tensor-core
@@ -1294,6 +1402,31 @@ impl KvPlanes {
                 y,
             },
         )
+    }
+
+    /// The planes' rows of the positions below `n` as a sequence state
+    /// carries them ([`Spans::by_position`]), each plane `[n_kv][ctx][·]`:
+    /// the K and the V plane of `head` f16 a row, or on a q8_0 cache the
+    /// codes and scales planes of each side ([`q8_plane_lens`]'s rows), so a
+    /// prefix of the state moves only its own rows in either format.
+    pub(super) fn spans(
+        &mut self,
+        (n_kv, ctx, head): (usize, usize, usize),
+        n: usize,
+    ) -> Result<Vec<Spans<'_>>, GpuError> {
+        let planes: Vec<(Plane<'_>, usize)> = match self {
+            KvPlanes::F16 { k, v } => vec![(k.into(), head), (v.into(), head)],
+            KvPlanes::Q8 { kq, kd, vq, vd } => vec![
+                (kq.into(), head / 4),
+                (kd.into(), head / 32),
+                (vq.into(), head / 4),
+                (vd.into(), head / 32),
+            ],
+        };
+        planes
+            .into_iter()
+            .map(|(plane, row)| Spans::by_position(plane, n_kv, ctx * row, n, row))
+            .collect()
     }
 
     pub(super) fn bytes(&self) -> usize {

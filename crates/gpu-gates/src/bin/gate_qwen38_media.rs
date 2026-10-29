@@ -89,7 +89,7 @@ mod gate {
     use crate::gate_card;
     use crate::qwen38_open::{self, Open38};
     use crate::vision_taps::{K_TAP, band_check, dist_f32, floor, nudge, sens};
-    use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model, TargetRows};
+    use bloomery_gpu::arch::qwen3moe::{Body38, KvQ8, Prompt38, Qwen38Model, TargetRows};
     use bloomery_gpu::host::served::prompt_pass;
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::media::{ImageShape, ImageSpan, MediaBody, MediaSpan};
@@ -463,6 +463,7 @@ mod gate {
                 // moves; the room is the workstation's own.
                 room: Some(PLAN_ROOM),
                 residency: Residency::Off,
+                kv: KvQ8::F16,
             }
             .plan(file)?;
             let p = planned.facts();

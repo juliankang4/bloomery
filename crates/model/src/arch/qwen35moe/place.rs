@@ -68,8 +68,8 @@ use crate::placement::{
 use gguf::digest::hex;
 
 use runtime::stores::{
-    DELTA_LANES, F32_BYTES, delta_carry_bytes, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes,
-    ple_ring_bytes, recurrent_bytes, selecting_bytes,
+    DELTA_LANES, F32_BYTES, delta_carry_bytes, delta_lane_bytes, kv_plane_bytes, ple_ring_bytes,
+    recurrent_bytes, selecting_bytes,
 };
 pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 
@@ -1697,9 +1697,9 @@ fn check_draft_reserve(machine: &Machine, want: Option<u64>) -> Result<(), Place
 ///   (`(taps − 1)·dilation + PASS_ROWS` rows of `streams · n_embd` f32);
 /// - an attention layer: a position's K and V (`2 · kv_heads · head_dim`
 ///   values — f16, or q8_0's two-plane layout when the load runs its cache
-///   in it ([`KvLayout::in_q8`], the cache lever's `q8_0`); a selecting
-///   layer's planes stay f16: the qwen38 family's stores carry no q8_0
-///   form); with the selector, also its raw indexer key (`idx_dim` f16) and
+///   in it ([`KvLayout::in_q8`], the cache lever's `q8_0`), a selecting
+///   layer's planes as well); with the selector, also its raw indexer key
+///   (`idx_dim` f16, in either layout) and
 ///   a pooled key (`idx_dim` f16) per pool of `ratio` positions, the last
 ///   pool counted whole (`runtime::stores::selecting_bytes`).
 #[derive(Clone, Debug)]
@@ -1720,7 +1720,7 @@ pub struct KvLayout {
     /// The selector's key width and each layer's pool (0 on a GDN layer);
     /// `None` on a qwen35moe file.
     select: Option<(usize, Vec<usize>)>,
-    /// A plain attention layer's planes in q8_0's layout.
+    /// An attention layer's K/V planes in q8_0's layout.
     q8: bool,
     /// The stage rope table, in bytes a position: `rope.dimension_count`
     /// f32. The body copies one table at load, not one per sequence. A media
@@ -1837,12 +1837,26 @@ impl KvLayout {
         })
     }
 
-    /// The same layout with a plain attention layer's planes in q8_0's
+    /// The same layout with an attention layer's K/V planes in q8_0's
     /// two-plane layout.
     #[must_use]
     pub const fn in_q8(mut self) -> KvLayout {
         self.q8 = true;
         self
+    }
+
+    /// [`KvLayout::in_q8`] when `q8`, else the same layout: the one place a
+    /// chosen cache format reaches the plan's layout.
+    #[must_use]
+    pub const fn in_q8_if(self, q8: bool) -> KvLayout {
+        if q8 { self.in_q8() } else { self }
+    }
+
+    /// Whether an attention layer's K/V planes are in q8_0's layout
+    /// ([`KvLayout::in_q8`]): the format the load's stores allocate.
+    #[must_use]
+    pub const fn is_q8(&self) -> bool {
+        self.q8
     }
 
     /// The bytes the whole trunk `spec` describes holds at `ctx_max` positions: every layer's
@@ -1854,8 +1868,7 @@ impl KvLayout {
     ///
     /// The layout's refusal of the description ([`KvLayout::of_spec_lanes`]).
     pub fn trunk_bytes(spec: &ModelSpec, ctx_max: u64, q8: bool) -> Result<u64, PlacementError> {
-        let layout = KvLayout::of_spec(spec)?;
-        let layout = if q8 { layout.in_q8() } else { layout };
+        let layout = KvLayout::of_spec(spec)?.in_q8_if(q8);
         Ok((0..spec.layers.len())
             .map(|layer| layout.layer_bytes(layer, ctx_max))
             .sum())
@@ -1970,7 +1983,7 @@ impl KvLayout {
                         "KvLayout: an attention layer's pool (of_spec_lanes refuses 0 there)",
                     );
                 let ctx = usize::try_from(ctx_max).expect("KvLayout: a context of usize");
-                selecting_bytes(self.kv_heads, self.head_dim, *idx_dim, pool, ctx)
+                selecting_bytes(self.kv_heads, self.head_dim, self.q8, *idx_dim, pool, ctx)
             }
             None => kv_plane_bytes(self.kv_heads, self.head_dim, self.q8, ctx_max),
         }
@@ -2297,7 +2310,8 @@ impl MtpInputs {
     }
 
     /// The MTP draft `draft` read against the target `target` that `inputs`
-    /// describes (`mtp::mtp_of`), its head scoring `rows`. Refused by name:
+    /// describes (`mtp::mtp_of`), its head scoring `rows`, its store in the
+    /// target's cache layout ([`KvLayout::is_q8`]). Refused by name:
     /// a target whose borrowed matrices are not the draft's format
     /// ([`PlanInputs::mtp_borrows`]); a draft file that carries its own
     /// `token_embd` or `output` (this load borrows the target's), before its
@@ -2375,7 +2389,8 @@ impl MtpInputs {
             target,
             inputs.spec.hidden,
             inputs.spec.vocab,
-        )?))
+        )?)
+        .with_kv_q8(inputs.kv.is_q8()))
     }
 
     /// The inputs of `draft` over `file`, the draft file's tensors in its
@@ -2501,6 +2516,7 @@ impl MtpInputs {
         let kv = MtpKv {
             kv_heads: g.kv_heads as usize,
             head_dim: g.head_dim as usize,
+            q8: false,
         };
         Ok(MtpInputs {
             draft,
@@ -2537,6 +2553,20 @@ impl MtpInputs {
         self.borrowed_head = head;
         self
     }
+
+    /// The same inputs with the draft's store in q8_0's two-plane layout
+    /// when `q8` (the target's cache layout, [`KvLayout::is_q8`]).
+    fn with_kv_q8(mut self, q8: bool) -> MtpInputs {
+        self.kv.q8 = q8;
+        self
+    }
+
+    /// Whether the draft's store is in q8_0's layout, the target's cache
+    /// layout ([`KvLayout::is_q8`]).
+    #[must_use]
+    pub fn kv_q8(&self) -> bool {
+        self.kv.q8
+    }
 }
 
 /// The draft's own machine: one card of no bound with the workstation's
@@ -2572,13 +2602,15 @@ fn draft_machine() -> Machine {
 }
 
 /// The MTP layer's store: every position's K and V
-/// (`runtime::stores::dense_kv_bytes`). The draft program reads the target's
-/// rope table and allocates none of its own, so the stage rows stay the
-/// trait's default.
+/// (`runtime::stores::kv_plane_bytes`), in the target's cache layout (`q8`,
+/// [`KvLayout::is_q8`]). The draft program reads the target's rope table
+/// and allocates none of its own, so the stage rows stay the trait's
+/// default.
 #[derive(Clone, Copy, Debug)]
 struct MtpKv {
     kv_heads: usize,
     head_dim: usize,
+    q8: bool,
 }
 
 impl KvBytes for MtpKv {
@@ -2586,8 +2618,7 @@ impl KvBytes for MtpKv {
         if layer != 0 {
             return 0;
         }
-        let ctx = usize::try_from(ctx_max).expect("MtpKv: a context of usize");
-        dense_kv_bytes(self.kv_heads, self.head_dim, ctx)
+        kv_plane_bytes(self.kv_heads, self.head_dim, self.q8, ctx_max)
     }
 }
 
@@ -2913,9 +2944,9 @@ mod tests {
         );
     }
 
-    /// The cache lever's q8_0 term ([`KvLayout::in_q8`]): a plain attention
-    /// layer's K/V at `17/16` bytes a value, a selecting layer's and a GDN
-    /// layer's stores untouched (the qwen38 family carries no q8_0 form).
+    /// The cache lever's q8_0 term ([`KvLayout::in_q8`]): an attention
+    /// layer's K/V at `17/16` bytes a value, plain or selecting, a selecting
+    /// layer's index keys untouched (f16 in either layout).
     #[test]
     fn q8_layer_bytes() {
         let plain = KvLayout {
@@ -2946,7 +2977,12 @@ mod tests {
             rope_row: 64 * 4,
         };
         let sel = selecting.layer_bytes(0, 4096);
-        assert_eq!(selecting.in_q8().layer_bytes(0, 4096), sel);
+        let idx = 4096 * 128 * 2 + 1024 * 128 * 2;
+        assert_eq!(sel, 4096 * 2 * 256 * 2 * 2 + idx);
+        assert_eq!(
+            selecting.in_q8().layer_bytes(0, 4096),
+            4096 * 2 * 256 * 2 * 17 / 16 + idx
+        );
     }
 
     #[test]

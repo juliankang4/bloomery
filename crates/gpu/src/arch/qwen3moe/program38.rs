@@ -63,7 +63,7 @@ use super::body::ATTN_SCALE_256;
 use super::card38::{CARD_LAUNCHES, Card38, TIER_CARD_LAUNCHES};
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, PlePlan, QsaPlan, geo, head_site};
 use super::router::gated;
-use super::scratch::{Io, cells_view};
+use super::scratch::{Append256, Io, cells_view};
 use super::scratch38::{Arena38, Store38, Taps38};
 use super::tier38::{STAGE_TIER, TierSide38};
 use crate::card_slots::CardSlotKernels;
@@ -90,7 +90,7 @@ use crate::q38::{
     CardSharedAddArgs, EmbedIo, KeyAppendArgs, OutGateArgs, Q38Kernels, SharedAddArgs,
 };
 use crate::qsa::{PoolArgs, QsaKernels, QsaScratch, SelectArgs};
-use crate::rope_neox::{PartialNeoxArgs, RopeNeoxKernels};
+use crate::rope_neox::RopeNeoxKernels;
 use crate::site::{self, ByName, ByNameKernels, Out};
 use crate::tensor::{DeviceTensor, Window, WindowMut};
 use crate::weights::Weights;
@@ -1569,14 +1569,12 @@ unsafe fn qsa_attend(
             scratch: &mut *sel,
         },
     )?;
-    // The selecting store is f16 (the qwen38 family's stores carry no q8_0
-    // form), so the family's shared append runs its f16 arm.
-    let (kc, vc) = kv.f16_mut("qwen38::attention")?;
     // SAFETY: the enclosing helper requires distinct cache-valid positions.
     unsafe {
-        c.k.neox.enqueue_head_norm_neox_append_256(
+        kv.append_256(
+            &c.k.neox,
             stream,
-            PartialNeoxArgs {
+            Append256 {
                 qg,
                 q: &mut *q,
                 k,
@@ -1591,20 +1589,16 @@ unsafe fn qsa_attend(
                 ctx,
                 m,
                 fault: sink,
-                cache_k: kc,
-                cache_v: vc,
             },
         )
     }?;
-    let (kc, vc) = kv.f16("qwen38::attention")?;
     let width = sel.width();
     c.k.flash.enqueue_pass_256_p12_sel(
         stream,
         GqaSelArgs {
             attn: GqaListArgs {
                 q,
-                kc,
-                vc,
+                kv: kv.planes(),
                 list: &sel.list,
                 n_sel: &sel.n_sel,
                 width,

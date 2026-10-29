@@ -66,7 +66,7 @@ pub mod rounds;
 // build in `bloomery-serve`, which includes it.
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
-    use bloomery_gpu::arch::qwen3moe::Prompt38;
+    use bloomery_gpu::arch::qwen3moe::{KvQ8, Prompt38};
     use bloomery_gpu_gates::GateError;
     use bloomery_levers::Draft38Off;
     use model::placement::workstation::{A6000, RTX_3090};
@@ -345,18 +345,36 @@ mod tests {
         };
         let y = RungCost::of(Reserve::Draft, 4096, 69_632, 2_842_413_228).expect("a yield");
         let off = Draft38Off::Yield(y);
+        let change = "--parallel N sets the slots, --ctx-size N their context and \
+                      --cache-type-k f16|q8_0 the KV cache";
         assert_eq!(
-            setup38((false, false, false), Some(&off), (1, 69_632, fitted)).line(),
-            "setup draft=off slots=1 ctx=69632 ctx_rule=fitted (the draft is off, unset: the \
-             draft's 2842413228 B on the card leave a slot 4096 positions; without the draft a \
-             slot takes 69632; BLOOMERY_DRAFT=mtp drafts with the MTP layer; --parallel N sets \
-             the slots and --ctx-size N their context)"
+            setup38(
+                (false, false, false),
+                Some(&off),
+                (1, 69_632, fitted),
+                KvQ8::F16
+            )
+            .line(),
+            format!(
+                "setup draft=off slots=1 ctx=69632 ctx_rule=fitted cache=f16 (the draft is off, \
+                 unset: the draft's 2842413228 B on the card leave a slot 4096 positions; \
+                 without the draft a slot takes 69632; BLOOMERY_DRAFT=mtp drafts with the MTP \
+                 layer; {change})"
+            )
         );
         assert_eq!(
-            setup38((true, false, true), None, (1, 262_144, Rule::Target)).line(),
-            "setup draft=mtp draft_from=folder slots=1 ctx=262144 ctx_rule=target \
-             (BLOOMERY_DRAFT=off serves without the draft, BLOOMERY_MTP_DRAFT=FILE drafts from a \
-             draft file; --parallel N sets the slots and --ctx-size N their context)"
+            setup38(
+                (true, false, true),
+                None,
+                (1, 262_144, Rule::Target),
+                KvQ8::Q8
+            )
+            .line(),
+            format!(
+                "setup draft=mtp draft_from=folder slots=1 ctx=262144 ctx_rule=target cache=q8_0 \
+                  (BLOOMERY_DRAFT=off serves without the draft, BLOOMERY_MTP_DRAFT=FILE drafts \
+                  from a draft file; {change})"
+            )
         );
     }
 
@@ -394,6 +412,7 @@ mod tests {
         ("pin_main", &[bloomery_levers::PIN_MAIN]),
         ("prefill", &[bloomery_levers::PREFILL]),
         ("qwen38_experts", &[bloomery_levers::QWEN38_EXPERTS]),
+        ("qwen3_kv_set", &[bloomery_levers::QWEN3_KV]),
         ("residency", &[bloomery_levers::RESIDENCY]),
         ("route_trace", &[bloomery_levers::ROUTE_TRACE]),
         ("schema_jump", &[bloomery_levers::SCHEMAJUMP]),

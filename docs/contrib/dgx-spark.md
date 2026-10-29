@@ -111,8 +111,11 @@ revision `b9ce18a6`; NVFP4 experts with compressed block scales, MXFP8 and FP8 d
 [#543](https://github.com/midagedev/bloomery/pull/543)). `bloomery-serve -m <folder>` (the GB10 archive or a build
 with the `checkpoint` feature, 2.1) holds every routed expert on the GB10 and reads the PLE table from the folder on
 the NVMe tier ([`serving.md`](../serving.md), the seats). On the `sm_121a` build the routed experts' prompt products run W4A4 and the
-MXFP8 sites W8A8 (2.1). The KV cache is f16: a Qwen3.8 load refuses the q8_0 cache by name
-(`crates/levers/src/registry.rs:1021-1022` at `c21e3b81`). The NVFP4 folder's gate, `gate-gpu-qwen4exp-nvfp4`, runs
+MXFP8 sites W8A8 (2.1). A checkpoint folder's KV cache is q8_0 unless `--cache-type-k f16` says otherwise
+(a GGUF file's stays f16 unless `--cache-type-k q8_0` asks): K and V take 17/16 B a value against f16's 2, and the
+attention store is 773,279,360 B against 967,921,280 B at 16,896 positions on FP4-Local (the index keys stay f16;
+the default context and slot count did not change there). `setup` names the format as `cache=`.
+The NVFP4 folder's gate, `gate-gpu-qwen4exp-nvfp4`, runs
 only on a card that holds every expert: set `BLOOMERY_CARD_ALL_EXPERTS=1` there; a smaller card defers it by name.
 
 The first run needs the folder alone:

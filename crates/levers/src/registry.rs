@@ -1008,19 +1008,21 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         name: QWEN3_KV,
         class: Class::A,
         kind: Kind::Words(&["f16", "q8_0"]),
-        default: Unset::Is("f16"),
-        doc: "Qwen3 and Qwen3.6 (`generate_qwen3moe`, `bloomery-serve --model qwen3`): the \
-              format the load holds its K/V cache planes in — `q8_0` the two-plane layout \
-              (17/16 B a value against f16's 2, both planes quantized together by the one \
-              choice), a cache half the bytes wide, so the default `--ctx` ladder can take a \
-              higher rung on the same card. Read once at load: the \
+        default: Unset::Means("`f16`, but `q8_0` on the Qwen3.8 seat's checkpoint folder"),
+        doc: "Qwen3, Qwen3.6 and Qwen3.8 (`generate_qwen3moe`, `bloomery-serve --model qwen3`, \
+              `bloomery-serve --model qwen38`): the format the load holds its K/V cache planes \
+              in — `q8_0` the two-plane layout (17/16 B a value against f16's 2, both planes quantized together by the one \
+              choice). On Qwen3 and Qwen3.6, a cache half the bytes wide lets the default \
+              `--ctx` ladder take a higher rung on the same card. Qwen3.8's index keys stay f16, \
+              so its attention store does not shrink by the same factor. Read once at load: the \
               append quantizes each row and the flash reads it through the format's \
               algebra, so a q8_0 run's bits are its own, never an f16 run's; every plan the \
               ladder probes counts the format's bytes. The seat's \
               `--cache-type-k` takes the same two words (llama-server's spelling) and \
               wins over the lever; `--cache-type-v` does not exist — both planes quantize \
-              together. Refused by name on a qwen4exp (Qwen3.8) file, whose stores carry \
-              no q8_0 form. The `load` line prints `cache=`.",
+              together. Unset on the Qwen3.8 seat, a checkpoint folder (FP4-Local) runs \
+              `q8_0` and a GGUF file `f16`; its MTP draft's store takes the same format. The \
+              qwen3 seat's `load` line prints `cache=`, the Qwen3.8 seat's `setup` line.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

@@ -93,7 +93,7 @@ mod gate {
     use crate::qwen38_open::{Open38, open_split};
 
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, Model38, Prompt38, Qwen38Model, RouteTap, TargetRows,
+        Body38, KvQ8, Model38, Prompt38, Qwen38Model, RouteTap, TargetRows,
     };
     use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkMode};
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader, TraceSet};
@@ -227,6 +227,7 @@ mod gate {
             host,
             room: None,
             residency: Residency::Off,
+            kv: KvQ8::F16,
         }
         .plan(file)?;
         let p = planned.facts();

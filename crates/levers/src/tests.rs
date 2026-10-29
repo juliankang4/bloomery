@@ -853,10 +853,12 @@ fn host_room_takes_bytes_and_refuses_the_rest() {
     }
 }
 
-/// `BLOOMERY_QWEN3_KV` takes the two cache-format words, and unset is the
-/// f16 default the load reads.
+/// `BLOOMERY_QWEN3_KV` takes the two cache-format words, and unset reads as
+/// unset: the seat, not the lever, picks the format then.
 #[test]
 fn qwen3_kv_takes_f16_and_q8_0() {
+    let unset = read(&[], Scope::Every).expect("nothing is set");
+    assert_eq!(unset.qwen3_kv_set(), None);
     for w in ["f16", "q8_0"] {
         let set = read(&env(&[(QWEN3_KV, w)]), Scope::Every).expect("a word the row takes");
         assert_eq!(set.qwen3_kv_set(), Some(w));
