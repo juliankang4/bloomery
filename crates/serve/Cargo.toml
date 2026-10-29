@@ -33,6 +33,7 @@ bloomery-models = { path = "../models" }
 # the server's sampler factory (`sampling::sampler_factory`): every seat's, the CUDA seats' and Metal's.
 bloomery-tokenizer = { path = "../tokenizer" }
 bloomery-sampler = { path = "../sampler" }
+bloomery-threads = { path = "../threads" }
 # The media part: the image decoders and a model's MediaModel (data plus one prepare) are the vision
 # crate's; an image's cache key is the sha256 of its file bytes.
 bloomery-vision = { path = "../vision" }

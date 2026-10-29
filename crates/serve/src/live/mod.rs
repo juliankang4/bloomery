@@ -14,7 +14,9 @@
 //! The terminal is the view's to put back on every way out ([`term`]):
 //! `q`, the orderly stop ([`restore`], first thing in its exit), an error that
 //! ends the server, a second interrupt ([`restore_from_signal`]), a stop and
-//! continue (`Ctrl+Z`, `fg`), and a panic.
+//! continue (`Ctrl+Z`, `fg`), and a panic. Any panic disables the view and
+//! its keys for the rest of the process, even when the server catches it
+//! and keeps serving.
 
 mod parts;
 mod ring;
@@ -117,10 +119,11 @@ pub(crate) fn start(
         stops: 0,
         seen: VecDeque::new(),
     };
-    std::thread::Builder::new()
-        .name("serve-live".to_owned())
-        .spawn(move || v.run())
-        .inspect_err(|_| restore())?;
+    threads::helper::spawn_helper("serve-live", threads::helper::Placement::Float, move || {
+        v.run();
+    })
+    .map_err(io::Error::other)
+    .inspect_err(|_| restore())?;
     Ok(())
 }
 
@@ -299,11 +302,11 @@ impl Live {
             }
         }
         let Some((columns, rows)) = term::size() else {
+            if let Err(e) = term::draw(b"\x1b[H\x1b[Jterminal size unavailable\r\n") {
+                eprintln!("bloomery-serve: live view: drawing: {e}");
+            }
             return;
         };
-        if columns < usize::from(screen::MIN_COLUMNS) || rows == 0 {
-            return;
-        }
         let (frame, scroll) = view::frame(
             &now,
             &self.fixed,
@@ -338,17 +341,13 @@ mod tests {
         // wait, so `SIGTSTP` goes to a thread other than the keys' one: the
         // parked thread takes it, and every thread the server starts
         // inherits the block below.
-        std::thread::spawn(|| {
+        threads::helper::spawn_helper("live-test-stop", threads::helper::Placement::Float, || {
             loop {
                 std::thread::park();
             }
-        });
-        // SAFETY: an all-zero sigset_t is a valid set for sigemptyset to clear.
-        let mut tstp: libc::sigset_t = unsafe { std::mem::zeroed() };
-        // SAFETY: tstp is a writable set.
-        unsafe { libc::sigemptyset(&mut tstp) };
-        // SAFETY: tstp is an initialized set.
-        unsafe { libc::sigaddset(&mut tstp, libc::SIGTSTP) };
+        })
+        .unwrap();
+        let tstp = super::term::only(libc::SIGTSTP);
         // SAFETY: tstp is read by the call; the old mask is not asked for.
         let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &tstp, std::ptr::null_mut()) };
         assert_eq!(rc, 0);
@@ -452,14 +451,19 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let mut reader = master.try_clone().unwrap();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
-                    return;
+        threads::helper::spawn_helper(
+            "live-test-read",
+            threads::helper::Placement::Float,
+            move || {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                        return;
+                    }
                 }
-            }
-        });
+            },
+        )
+        .unwrap();
         let mut seen = String::new();
         let mut wait_for = |what: &str, from: usize| -> usize {
             let until = Instant::now() + Duration::from_secs(20);
@@ -489,6 +493,16 @@ mod tests {
         let at = wait_for("\x1b[?1049h", at);
         let at = wait_for("Overview", at);
         wait_for("Decode", at);
+        size.ws_col = 3;
+        // SAFETY: slave is an open PTY and size is a readable winsize.
+        let rc = unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+        assert_eq!(rc, 0);
+        let at = wait_for("terminal too small", at);
+        size.ws_col = 100;
+        // SAFETY: slave is an open PTY and size is a readable winsize.
+        let rc = unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+        assert_eq!(rc, 0);
+        let at = wait_for("Overview", at);
         // The child leads its own session, so its group is orphaned and the
         // stop a Ctrl+Z asks for is discarded: the open view leaves and
         // enters again, and the closed one takes `d` without Enter.

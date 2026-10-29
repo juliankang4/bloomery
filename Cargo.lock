@@ -537,6 +537,7 @@ dependencies = [
  "bloomery-jinja",
  "bloomery-models",
  "bloomery-sampler",
+ "bloomery-threads",
  "bloomery-tokenizer",
  "bloomery-vision",
  "libc",
