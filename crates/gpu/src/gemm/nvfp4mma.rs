@@ -1052,6 +1052,7 @@ mod native {
         code: u32,
         limit: f32,
         k: u32,
+        write_q8: bool,
         q: DisjointSlice<u32>,
         d: DisjointSlice<f32>,
         sums: DisjointSlice<i32>,
@@ -1061,7 +1062,7 @@ mod native {
         fault: crate::fault::FaultSink,
     ) {
         fused_swiglu(
-            g, u, code, limit, k, true, q, d, sums, out, scales, global, fault,
+            g, u, code, limit, k, write_q8, q, d, sums, out, scales, global, fault,
         );
     }
 
@@ -1100,42 +1101,6 @@ mod native {
         }
         fused_swiglu(
             g, u, code, limit, k, true, q, d, sums, out, scales, global, fault,
-        );
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(64)]
-    #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (80, 24776))]
-    pub fn quantize_native_32(
-        x: &[f32],
-        k: u32,
-        write_q8: bool,
-        q: DisjointSlice<u32>,
-        d: DisjointSlice<f32>,
-        sums: DisjointSlice<i32>,
-        out: DisjointSlice<u32>,
-        scales: DisjointSlice<u32>,
-        global: DisjointSlice<f32>,
-        fault: crate::fault::FaultSink,
-    ) {
-        fused_swiglu(
-            x,
-            x,
-            u32::MAX,
-            0.0,
-            k,
-            write_q8,
-            q,
-            d,
-            sums,
-            out,
-            scales,
-            global,
-            fault,
         );
     }
 
@@ -2104,15 +2069,18 @@ impl Kernels {
         let shared = ((act.k / 4 + act.k / 32 + 2) * 4) as u32;
         let prep = self
             .module
-            .prepare_quantize_native_32(LaunchConfig1D::new(cols, 64, shared))?;
+            .prepare_swiglu_nvfp4_32(LaunchConfig1D::new(cols, 64, shared))?;
         let out = act
             .native
             .as_mut()
             .ok_or_else(|| GpuError::shape("NVFP4 activation", "native scratch required"))?;
-        self.module.quantize_native_32(
+        self.module.swiglu_nvfp4_32(
             stream,
             &prep,
             x,
+            x,
+            u32::MAX,
+            0.0,
             act.k as u32,
             act.q8_required,
             &mut act.q,
@@ -2188,6 +2156,7 @@ impl Kernels {
                 code,
                 limit,
                 k,
+                true,
                 &mut act.q,
                 &mut act.d,
                 &mut act.s,
