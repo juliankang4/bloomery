@@ -23,11 +23,11 @@
 //! draw is the row with the stop ids at -inf, then its sampler or the argmax)
 //! takes its passes through [`Engine::advance_sampled`] on an engine that
 //! drafts sampled requests ([`Engine::drafts_sampled`]), its draw taking each
-//! kept id from the verified rows, and only while its slot runs alone in the
-//! round: beside another busy slot, a pass's rows are not pinned to a step's,
-//! so it steps. On another drafting engine such a request reads the logits
-//! row every token, which a pass does not give, so it takes one
-//! [`Engine::next`] a token and carries no draft counts.
+//! kept id from the verified rows. Beside another busy slot its pass is a row
+//! of the round's [`Engine::advance_slots`] with its draw ([`Gen::pass_row`]),
+//! its ids the ones its pass alone draws. On another drafting engine such a
+//! request reads the logits row every token, which a pass does not give, so it
+//! takes one [`Engine::next`] a token and carries no draft counts.
 //!
 //! A request that asks for probabilities ([`GenParams::logprobs`]) reads the
 //! row every token too, so it also takes one [`Engine::next`] a token, greedy
@@ -94,7 +94,8 @@ use crate::api::logprobs::{Ask, Collector, RowError};
 use crate::constrain::{Constraint, StepError, Walk};
 use crate::engine::{
     CacheNote, Decoder, Drafted, Engine, EngineError, Landed, Pending, Sampler, SamplerFactory,
-    SamplerRefused, SamplingParams, SaveInFlight, Saved, SlotPass, SlotRow, StateError, Tokenizer,
+    SamplerRefused, SamplingParams, SaveInFlight, Saved, SlotDraw, SlotPass, SlotRow, StateError,
+    Tokenizer,
 };
 use crate::media::{Held, MediaFeed, MediaSpan, common_prefix, keep_whole_spans};
 use crate::promptcache::{PromptCache, Taken};
@@ -596,7 +597,8 @@ impl Slot {
     /// the call is in flight the rows' ids are empty, so a failed call leaves
     /// no claim about their caches. A row whose pass kept no token, more than
     /// the engine's rows, or other than one more than its draft's accepted
-    /// ids is the engine's error.
+    /// ids, or a sampled row whose sampler did not come back, is the engine's
+    /// error.
     pub(crate) fn advance_slots(&mut self, rows: &mut [SlotPass<'_>]) -> Result<(), EngineError> {
         let held: Vec<Held> = rows
             .iter()
@@ -609,6 +611,12 @@ impl Slot {
         self.engine.advance_slots(rows)?;
         let rows_n = self.engine.advance_rows();
         for r in rows.iter() {
+            if r.draw.as_ref().is_some_and(|d| d.sampler.is_none()) {
+                return Err(EngineError(format!(
+                    "slot {}: a sampled pass kept the request's sampler",
+                    r.slot
+                )));
+            }
             if r.out.is_empty()
                 || r.out.len() > rows_n
                 || r.out.len() != r.drafted.accepted + 1
@@ -1610,9 +1618,9 @@ pub(crate) enum Need {
     /// One drafted pass from this id ([`Engine::advance`] into
     /// [`Gen::kept_mut`]), whose count goes to [`Gen::advanced`].
     Advance(u32),
-    /// One drafted pass of a request that samples from this id
-    /// ([`Gen::advance_sampled`]) when its slot is the round's only busy
-    /// one; beside another, a [`Need::Step`] from it.
+    /// One drafted pass of a request that samples from this id:
+    /// [`Gen::advance_sampled`] when its slot is the round's only busy one,
+    /// beside another a row of [`Engine::advance_slots`] ([`Gen::pass_row`]).
     Sampled(u32),
     /// A run of ids the program fixes, fed as a call of [`Engine::prefill`]
     /// ([`Gen::fill`]): the engine thread runs it like a prompt's call, and
@@ -2535,6 +2543,29 @@ impl Gen {
         self.sampler = Some(sampler);
         self.advanced(d?);
         Ok(())
+    }
+
+    /// The row of a [`Need::Advance`] or a [`Need::Sampled`] pass from `last`
+    /// in a round of several slots ([`Slot::advance_slots`]): the kept ids
+    /// its `out`, and on a request that samples its draw, the history and
+    /// the sampler [`Gen::advance_sampled`] hands its pass. Its count goes
+    /// to [`Gen::advanced`].
+    pub(crate) fn pass_row(&mut self, slot: usize, last: u32) -> SlotPass<'_> {
+        let draw = if self.sampler.is_some() {
+            Some(SlotDraw {
+                history: &self.history,
+                sampler: &mut self.sampler,
+            })
+        } else {
+            None
+        };
+        SlotPass {
+            slot,
+            last,
+            out: &mut self.kept,
+            drafted: Drafted::default(),
+            draw,
+        }
     }
 
     /// The text still held, and the outcome. On a request that asks for

@@ -548,11 +548,11 @@ llama-server reads it, and the startup line says so). A count you set is never l
 inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
 token or one drafted pass. Where the body runs several slots' rows as one pass, the round reads the weights once for
 all of them: on a whole-card Qwen3-30B or Qwen3.6, on V4.1 and MiMo-V2.6-Flash (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
-request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows).
-Qwen3.8 also batches sampled steps on a drafting load, with every slot's draft brought up to date in one draft pass
+or sampled request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows).
+Qwen3.8 also batches plain steps on a drafting load, with every slot's draft brought up to date in one draft pass
 before the round's pass. A round that leaves slot 0 out runs as one pass too and keeps slot 0's waiting hidden rows
 intact. A
-placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 load, V4.1 with the
+placed Qwen3-30B or Qwen3.6 (`--place a`), V4.1 with the
 lookup draft, Qwen3.8 under `--place bp` and MiniMax-M3 step their slots in turn, a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
 the placement follows every stream's passes (see [Limits](#limits)). Under more slots than one the context splits as
@@ -632,15 +632,12 @@ by name.
 Unset, the MTP draft yields to the context: it goes off when the plan with it would leave a slot half the positions
 of the plan without it or fewer, a set `--ctx-size`/`--ctx` included, a `draft yield` record naming its
 card bytes and the positions a slot gets either way, and the context line that follows is the plain plan's.
-`BLOOMERY_DRAFT=mtp` keeps it on whatever the context. On Qwen3.8 an unset MTP draft also stays off under
-`--parallel` above 1, from a GGUF draft file and a checkpoint folder alike: a drafted server runs a round of sampled or
-id-banning requests as one pass, as a plain server does, but also walks every slot's draft over its row, one store
-walk beside the pass. `BLOOMERY_DRAFT=mtp` drafts on any slot count. The
-drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones
-(the default, temperature 0.8 as in llama-server) and on ones that ban an id (`ignore_eos`) while one request runs:
-each kept id is the request's own draw from its verified row (its sampler's, or the argmax, with every banned id's
-logit at -inf), as llama.cpp's speculative decoding takes it. A sampled or id-banning request beside another running
-one, and one under DSpark, decode one token a step.
+`BLOOMERY_DRAFT=mtp` keeps it on whatever the context. On Qwen3.8 the MTP draft runs on any slot count, set or unset.
+The drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones
+(the default, temperature 0.8 as in llama-server) and on ones that ban an id (`ignore_eos`), alone or beside other
+running requests: each kept id is the request's own draw from its verified row (its sampler's, or the argmax, with
+every banned id's logit at -inf), as llama.cpp's speculative decoding takes it, so a request of one seed takes the
+same ids alone and beside others. A request under DSpark decodes one token a step.
 
 **Adaptive residency.** V4.1, Qwen3.8 and GLM-5.3 count their own routing as they run and swap routed experts
 between the card and the host between steps; a prompt call streams its hottest host experts onto the card, so
@@ -752,7 +749,7 @@ and the model fits) states no need and consults no hook; a set hook is named on 
   one request there (`--parallel 1`, or a set `--ctx-size` with no `--parallel`).
 - One model a server; one expert tier card at most (`--place bp`).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, MiMo-V2.6-Flash, GLM-5.3 and Qwen3.8; a placed
-  Qwen3-30B or Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
+  Qwen3-30B or Qwen3.6 steps in turn. A new request's prompt runs whole while the other
   streams wait. The decide seat serves one request at a time, and the nemotron, raon1, solar2 and musespark seats one
   slot each; DSpark drafts never rejoin — `--parallel > 1` with
   `BLOOMERY_DRAFT=dspark` is refused by name.

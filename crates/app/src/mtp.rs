@@ -60,7 +60,8 @@
 //! joins it as the call after no switch would.
 //!
 //! The proposal changes which passes run, never a token: every kept token is
-//! the target's own argmax. The hidden rows never leave the card: a walk
+//! the target's own argmax, or the request's draw from that target row.
+//! The hidden rows never leave the card: a walk
 //! names them by the arena a target call left them in and the row they
 //! start at ([`Hidden::Target`]). [`runtime::Tapped`] on the session is the
 //! host's readback of the same rows, for the gates; the window does not read
@@ -755,14 +756,22 @@ pub const SLOT_DEPTH: usize = 1;
 /// One busy slot's drafted window in a pass of several slots
 /// ([`pass_slots`]): the slot, its own draft (the window's state for that
 /// slot's sequence: each slot holds one), the token at its position, the
-/// most ids its proposal holds, and where its kept ids are appended.
+/// most ids its proposal holds, where its kept ids are appended, and for a
+/// request that draws its draw: the id it takes from a row's logits, one
+/// call a taken id (`runtime::Sample`'s closure). `None` takes each row's
+/// argmax.
 pub struct SlotWindow<'a, B: MtpBody> {
     pub slot: usize,
     pub draft: &'a mut MtpDraft<B>,
     pub last: u32,
     pub depth: usize,
     pub out: &'a mut Vec<u32>,
+    pub draw: Option<Draw<'a>>,
 }
+
+/// A drawing window's draw ([`SlotWindow::draw`]): the id it takes from a
+/// row's logits.
+pub type Draw<'a> = &'a mut dyn FnMut(&[f32]) -> u32;
 
 /// One drafted round of several slots in passes of the target, each
 /// window's in turn as [`runtime::Speculative`]'s pass runs it for one
@@ -776,15 +785,18 @@ pub struct SlotWindow<'a, B: MtpBody> {
 ///   the pass that holds slot 0 last
 ///   (`round_passes`), each pass run as one
 ///   ([`Session::verify_slots`]), each row bit for bit its step;
-/// - each window's kept rows by the runtime's rule (row 0, then while the
-///   argmax is the next proposed id), recorded by its draft from the
-///   position its rows ran from ([`MtpDraft::record`]) before the commit of
-///   the pass's kept rows together ([`Session::commit_slots`]);
-/// - each window's kept ids appended to its `out`.
+/// - each window's ids taken row by row in position order — the argmax, or
+///   a drawing window's draw from that row's logits ([`Session::slots_row`])
+///   — up to the first that is not the proposal's next (runtime's
+///   `Speculative::pass_picking`), those rows kept, recorded by its draft
+///   from the position its rows ran from ([`MtpDraft::record`]) with the
+///   ids taken, and appended to its `out`, before the commit of the pass's
+///   kept rows together ([`Session::commit_slots`]).
 ///
 /// Each slot's proposals, kept rows and ids are bit for bit its own window
-/// run alone: its verify rows are its steps, and its draft walks its own
-/// store over the hidden rows its own rows left. The session stands with
+/// run alone: its verify rows are its steps, its draws the ones its pass
+/// alone draws from them, and its draft walks its own store over the
+/// hidden rows its own rows left. The session stands with
 /// slot 0 selected. A draft that proposes nothing is one that skips (an
 /// [`MtpDraft`] proposes at least one id otherwise): its row is a plain step
 /// the draft is told nothing of, as its [`Draft::stepped`] would do nothing.
@@ -840,10 +852,12 @@ where
         (<B as SlotRows>::MAX_ROWS, <B as SlotRows>::MAX_SLOTS),
     )?;
     let mut kept = vec![0; windows.len()];
+    let mut taken = Vec::new();
     for cut in &cuts {
         let (ws, rs) = (&mut windows[cut.clone()], &rows[cut.clone()]);
         let pass: Vec<(usize, &[u32])> = ws.iter().zip(rs).map(|(w, r)| (w.slot, &r[..])).collect();
         let argmax = t.verify_slots(&pass)?.ids;
+        let mut fetched = false;
         let mut at = 0;
         for (((w, r), &p0), k) in ws
             .iter_mut()
@@ -858,20 +872,34 @@ where
                     argmax.len()
                 ))
             })?;
-            *k = accepted_rows(r, got);
+            let ids = match w.draw.as_mut() {
+                None => {
+                    *k = accepted_rows(r, got);
+                    got
+                }
+                Some(draw) => {
+                    taken.clear();
+                    for i in 0..r.len() {
+                        let id = draw(t.slots_row(at + i, fetched)?);
+                        fetched = true;
+                        taken.push(id);
+                        if r.get(i + 1) != Some(&id) {
+                            break;
+                        }
+                    }
+                    *k = taken.len();
+                    &taken[..]
+                }
+            };
             if w.depth == 0 {
-                w.draft.passed_plain(p0, w.last, got[0])?;
+                w.draft.passed_plain(p0, w.last, ids[0])?;
             } else if r.len() > 1 {
-                w.draft.record(p0, r, got, *k)?;
+                w.draft.record(p0, r, ids, *k)?;
             }
+            w.out.extend_from_slice(&ids[..*k]);
             at += r.len();
         }
         t.commit_slots(&kept[cut.clone()])?;
-        let mut at = 0;
-        for ((w, r), &k) in ws.iter_mut().zip(rs).zip(&kept[cut.clone()]) {
-            w.out.extend_from_slice(&argmax[at..at + k]);
-            at += r.len();
-        }
     }
     let done = rows
         .iter()

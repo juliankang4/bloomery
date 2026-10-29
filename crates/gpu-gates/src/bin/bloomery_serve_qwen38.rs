@@ -72,8 +72,8 @@ mod tests {
     use model::placement::workstation::{A6000, RTX_3090};
 
     use super::qwen38::{
-        ACTS_ON, Feed38, Kind38, Place38, draft_for_slots, draft_off_for, folder_draft_for,
-        prompt_cuts, refuse_feed, refuse_lookup_feed, refuse_media_feed, setup38,
+        ACTS_ON, Feed38, Kind38, Place38, draft_off_for, folder_draft_for, prompt_cuts,
+        refuse_feed, refuse_lookup_feed, refuse_media_feed, setup38,
     };
 
     const STEPS: Feed38 = Feed38 {
@@ -353,18 +353,6 @@ mod tests {
              the slots and --ctx-size N their context)"
         );
         assert_eq!(
-            setup38(
-                (false, false, true),
-                Some(&Draft38Off::Slots { slots: 2 }),
-                (2, 262_144, Rule::Target)
-            )
-            .line(),
-            "setup draft=off slots=2 ctx=262144 ctx_rule=target (the draft is off, unset: \
-             --parallel 2; a drafted load also walks each slot's draft over every row of a \
-             sampled or id-banning request; set BLOOMERY_DRAFT=mtp to draft on 2 slots; \
-             --parallel N sets the slots and --ctx-size N their context)"
-        );
-        assert_eq!(
             setup38((true, false, true), None, (1, 262_144, Rule::Target)).line(),
             "setup draft=mtp draft_from=folder slots=1 ctx=262144 ctx_rule=target \
              (BLOOMERY_DRAFT=off serves without the draft, BLOOMERY_MTP_DRAFT=FILE drafts from a \
@@ -372,26 +360,10 @@ mod tests {
         );
     }
 
-    /// An unset draft, from a GGUF draft file or a checkpoint folder's MTP layer alike, drafts
-    /// on one slot and goes off naming the slots from the second on; a set `mtp` drafts on any
-    /// count, and a set `off` and an earlier reason stand.
-    #[test]
-    fn an_unset_draft_drafts_on_one_slot_only() {
-        assert_eq!(draft_for_slots(1, None, (true, None)), (true, None));
-        assert_eq!(
-            draft_for_slots(2, None, (true, None)),
-            (false, Some(Draft38Off::Slots { slots: 2 }))
-        );
-        assert_eq!(draft_for_slots(4, Some("mtp"), (true, None)), (true, None));
-        assert_eq!(
-            draft_for_slots(4, Some("off"), (false, Some(Draft38Off::Set))),
-            (false, Some(Draft38Off::Set))
-        );
-        assert_eq!(
-            draft_for_slots(4, None, (false, Some(Draft38Off::Gate))),
-            (false, Some(Draft38Off::Gate))
-        );
-    }
+    // PIN(2026-10-29): the unset draft drafts on any slot count (a sampled request's window
+    // rides the round's one pass), so the slot rule `draft_for_slots`, its `Draft38Off::Slots`
+    // and their test are gone; gate_qwen38_serve's `draft_unset_drafts_on_two_slots` holds the
+    // two-slot load.
 
     #[test]
     fn the_batch_feed_without_a_trace_refuses_nothing() {

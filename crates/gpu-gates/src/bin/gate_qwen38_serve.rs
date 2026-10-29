@@ -176,22 +176,27 @@
 //!   Then the drafted sampled clauses ([`slots_drafted_sampled`]): the
 //!   sampled rounds clauses' pair (below) banning the end ids
 //!   (`ignore_eos`), so each request draws in drafted passes alone and
-//!   steps beside the other on this drafted load: over the together run
-//!   every record is `cmd=step` of `passes=1` carrying both slots
-//!   (`slots_drafted_sampled_rounds_run_one_pass`: the seat runs a drafted
-//!   load's round of plain steps as one pass of its rows) and each
-//!   request's together ids are its alone ones
-//!   (`slots_drafted_sampled_together_alone`); then the pair with no ban,
-//!   the second asking 8 ids: the first steps beside it and then drafts
-//!   alone from the state its rows of the pass told its draft, its draft
+//!   beside the other on this drafted load: over the together run every
+//!   record is `cmd=pass` of `passes=1` carrying both slots
+//!   (`slots_drafted_sampled_rounds_run_one_pass`: the seat runs both
+//!   sampled windows as one pass) and each request's together ids are its
+//!   alone ones (`slots_drafted_sampled_together_alone`: each window's
+//!   draws its own); the same pair asking one probability a token, so each
+//!   steps: every together record `cmd=step` of `passes=1` carrying both
+//!   slots (`slots_drafted_probs_rounds_run_one_pass`: the seat runs a
+//!   drafted load's round of plain steps as one pass of its rows, each told
+//!   to its slot's draft) and the together ids the alone ones
+//!   (`slots_drafted_probs_together_alone`); then the pair with no ban,
+//!   the second asking 8 ids: the first drafts beside it and then alone
+//!   from the state the shared passes left its draft, its draft
 //!   proposals an id past the second's at least half its alone run's
 //!   (`slots_drafted_sampled_tail_drafts`) and some accepted
 //!   (`slots_drafted_sampled_tail_accepts`, deferred by name in the
 //!   fixture tier, whose target accepts no proposal).
 //!   Then one more server of `--parallel 2` under the seat's own defaults
 //!   but the draft (no `--place`, no `BLOOMERY_RESIDENCY`, no
-//!   `BLOOMERY_MTP_WIDTH`, and `BLOOMERY_DRAFT=mtp`, as the unset draft is
-//!   off on two slots, `draft_slot_share`'s clause): the unset rule picks
+//!   `BLOOMERY_MTP_WIDTH`, and `BLOOMERY_DRAFT=mtp`, so the clause holds the
+//!   drafted load whatever the unset draft's context rule picks): the unset rule picks
 //!   the placement, the adaptive residency runs, the draft runs behind the
 //!   width chooser; `BLOOMERY_STEP_STATS=1` for (v3)'s records. Its
 //!   residency and width clauses, like the `xstream=` clause's second line,
@@ -371,10 +376,9 @@
 //!   `load draft=off` record naming the ten positions of the two slots past
 //!   the eight (`draft_unset_yields_to_the_slot_share`), and a set one is
 //!   refused by name before its plan (`draft_set_is_refused_by_name`); at
-//!   the default context of `--parallel 2` the unset draft is off by the
-//!   slot count, on this split as on a checkpoint folder, so a server with
-//!   `BLOOMERY_MTP_WIDTH` set beside it is refused by name before its plan,
-//!   the refusal naming the two slots (`draft_unset_is_off_on_two_slots`);
+//!   the default context of `--parallel 2` the unset draft drafts, so a
+//!   server with `BLOOMERY_MTP_WIDTH` set beside it plans, no refusal
+//!   naming a draft that drafts nothing (`draft_unset_drafts_on_two_slots`);
 //!   the fixture tier defers the clause by name (the draft file is the real
 //!   file's);
 //! - `residency_loads_the_word` ([`residency_loads_the_word`]): a server of
@@ -468,8 +472,8 @@
 //! on the plain arm's main server and the plain clauses' own) and
 //! `BLOOMERY_RESIDENCY` (`off`; the residency word's server sets its word) —
 //! the slots clause's second server sets the draft `mtp` and leaves the
-//! residency unset: it is the seat under its own defaults but the draft,
-//! which the unset rule leaves off on two slots; the unhosted-pool clause's
+//! residency unset: it is the seat under its own defaults but the draft;
+//! the unhosted-pool clause's
 //! servers set the draft `off` and leave the residency unset. The drafted arm's main
 //! server also takes the drafting load's `BLOOMERY_CARD_BUDGET`
 //! (`tier::plan_levers`: in the fixture tier the header's budget plus the
@@ -1979,22 +1983,25 @@ mod gate {
 
     /// `/completion` of `ids` sampled at [`SAMPLED_TEMPERATURE`] with
     /// [`SAMPLED_SEED`], streamed ([`streamed_with`]), banning the end ids
-    /// when `ignore_eos`: its ids a function of its logits rows and the seed
-    /// alone (the server seeds each request's sampler from its own `seed`).
-    /// It steps on a load that drafts nothing; on a drafted load it drafts
-    /// while its slot runs alone in the round, banning or not.
+    /// when `ignore_eos`, asking `n_probs` probabilities a token (0 asks
+    /// none): its ids a function of its logits rows and the seed alone (the
+    /// server seeds each request's sampler from its own `seed`). It steps on
+    /// a load that drafts nothing, and on a drafted load while it asks
+    /// probabilities; else on a drafted load it drafts, banning or not,
+    /// alone in its round or beside another busy slot.
     fn sampled_stream(
         addr: &str,
         ids: &[u32],
         n: usize,
         ignore_eos: bool,
+        n_probs: usize,
     ) -> Result<(JoinHandle<()>, StreamedRx), GateError> {
         streamed_with(
             addr,
             json!({
                 "prompt": ids, "n_predict": n, "temperature": SAMPLED_TEMPERATURE,
                 "seed": SAMPLED_SEED, "ignore_eos": ignore_eos, "return_tokens": true,
-                "cache_prompt": false, "stream": true,
+                "cache_prompt": false, "stream": true, "n_probs": n_probs,
             }),
         )
     }
@@ -2152,6 +2159,8 @@ mod gate {
                     "slots_drafted_late_request_other_order_together_alone",
                     "slots_drafted_sampled_rounds_run_one_pass",
                     "slots_drafted_sampled_together_alone",
+                    "slots_drafted_probs_rounds_run_one_pass",
+                    "slots_drafted_probs_together_alone",
                     "slots_drafted_sampled_tail_drafts",
                 ] {
                     check(&mut ok, name, false);
@@ -2301,8 +2310,9 @@ mod gate {
 
     /// The slots clause's second server (the module header): the seat under
     /// its own defaults at `--parallel 2` but the draft (no `--place`, no
-    /// residency or width lever, `BLOOMERY_DRAFT=mtp` set as the unset draft
-    /// is off on two slots) runs the together pair once and holds (v2) and (v3)
+    /// residency or width lever, `BLOOMERY_DRAFT=mtp` set, so the clause holds
+    /// the drafted load whatever the unset draft's context rule picks) runs the
+    /// together pair once and holds (v2) and (v3)
     /// alone; under the adaptive residency a stream's bits need not equal
     /// its alone run's, so no id equality is asked. The recipe leaves the
     /// box env file's CUDA_VISIBLE_DEVICES pin (the 3090) in place, so the
@@ -2326,10 +2336,10 @@ mod gate {
         let own = dir.join("slots-default");
         std::fs::create_dir_all(&own)?;
         let err_log = own.join("server.err");
-        // PIN(2026-10-23): the draft is set, where this server took the unset draft. Unset
-        // on two slots it is off on a GGUF split as on a checkpoint folder (`draft_for_slots`),
-        // so this server keeps the drafted residency, rounds and chooser it holds by the set
-        // word, and the unset rule's two-slot answer is `draft_unset_is_off_on_two_slots`.
+        // PIN(2026-10-23): the draft is set, where this server took the unset draft, so it
+        // keeps the drafted residency, rounds and chooser it holds by the set word whatever
+        // the unset draft's context rule picks; the unset rule's two-slot answer is
+        // `draft_unset_drafts_on_two_slots`.
         let mut cmd = Command::new(Served38::exe()?);
         cmd.env(bloomery_levers::DRAFT, "mtp")
             .env_remove(bloomery_levers::RESIDENCY)
@@ -2984,9 +2994,10 @@ mod gate {
     /// A sampled pair's rounds (the sampled rounds clauses, the module
     /// header) on a `--parallel 2` server that prints its `slots round`
     /// records: the sampled streamed requests of `ids`, banning the end ids
-    /// when `ignore_eos`, each run alone and then both together. Over the
-    /// together run every record is one `step` pass of both slots
-    /// (`<name>_rounds_run_one_pass`), and each request's together ids are
+    /// when `ignore_eos` and asking `n_probs` probabilities a token, each run
+    /// alone and then both together. Over the together run every record is
+    /// one `cmd` pass of both slots — `step` where they step, `pass` where
+    /// they draft (`<name>_rounds_run_one_pass`), and each request's together ids are
     /// its alone ones (`<name>_together_alone`): each row of the pass and its
     /// logits bit for bit its step alone, each answer and logits row its own
     /// request's. The alone runs print no record (a round of one active
@@ -2996,29 +3007,30 @@ mod gate {
         addr: &str,
         err_log: &Path,
         ids: [&[u32]; 2],
-        ignore_eos: bool,
+        (ignore_eos, n_probs): (bool, usize),
+        cmd: &str,
     ) -> Result<bool, GateError> {
         let mut ok = true;
         let alone = [
             answer(
                 name,
-                sampled_stream(addr, ids[0], SLOTS_PREDICT, ignore_eos)?,
+                sampled_stream(addr, ids[0], SLOTS_PREDICT, ignore_eos, n_probs)?,
                 "alone A",
             )?,
             answer(
                 name,
-                sampled_stream(addr, ids[1], SLOTS_PREDICT, ignore_eos)?,
+                sampled_stream(addr, ids[1], SLOTS_PREDICT, ignore_eos, n_probs)?,
                 "alone B",
             )?,
         ];
         let before = seat_log(err_log)?.all(&record::SLOTS_ROUND)?.len();
         let runs = vec![
             (
-                sampled_stream(addr, ids[0], SLOTS_PREDICT, ignore_eos)?,
+                sampled_stream(addr, ids[0], SLOTS_PREDICT, ignore_eos, n_probs)?,
                 "together A",
             ),
             (
-                sampled_stream(addr, ids[1], SLOTS_PREDICT, ignore_eos)?,
+                sampled_stream(addr, ids[1], SLOTS_PREDICT, ignore_eos, n_probs)?,
                 "together B",
             ),
         ];
@@ -3039,7 +3051,7 @@ mod gate {
             &format!("{name}_rounds_run_one_pass"),
             err_log,
             before,
-            Some("step"),
+            Some(cmd),
         )?;
         check(
             &mut ok,
@@ -3051,40 +3063,49 @@ mod gate {
 
     /// The drafted sampled clauses (the module header) on the slots clause's
     /// server, after [`slots_drafted_beside`]: the sampled pair of `ids`
-    /// banning the end ids, which draws in drafted passes alone and steps
-    /// together on this drafted load ([`sampled_pair`],
-    /// `slots_drafted_sampled_*`); then the pair with no
-    /// ban, `ids[1]` asking [`DRAFTED_SAMPLED_SHORT`] ids, so `ids[0]` steps
-    /// beside it and then drafts alone from the state its rows in the pass
-    /// told its draft: its proposals an id past the short request's are at
-    /// least half its alone run's an id
-    /// (`slots_drafted_sampled_tail_drafts`; a draft its rows were not told
-    /// to has no refresh to propose from, refused by name), and some are
-    /// accepted
+    /// banning the end ids, which draws in drafted passes alone and together
+    /// on this drafted load, every together round one `pass` of both slots'
+    /// windows ([`sampled_pair`], `slots_drafted_sampled_*`); the same pair
+    /// asking a probability a token, which steps on this drafted load, every
+    /// together round one `step` pass of both rows, each row told to its
+    /// slot's draft (`slots_drafted_probs_*`); then the pair with no ban,
+    /// `ids[1]` asking [`DRAFTED_SAMPLED_SHORT`] ids, so `ids[0]` drafts
+    /// beside it and then alone from the state its windows in the shared
+    /// passes left its draft: its proposals an id past the short request's
+    /// are at least half its alone run's an id
+    /// (`slots_drafted_sampled_tail_drafts`), and some are accepted
     /// (`slots_drafted_sampled_tail_accepts`, which the fixture tier defers).
     /// Refused by name before either check unless the short request answered
     /// its [`DRAFTED_SAMPLED_SHORT`] ids and a `slots round` record of the
-    /// tail run is one `step` pass of both rows: the tail checks hold only
-    /// for a long request whose rows rode a pass beside the short one.
+    /// tail run is one `pass` of both slots: the tail checks hold only for a
+    /// long request whose window rode a pass beside the short one.
     fn slots_drafted_sampled(
         addr: &str,
         err_log: &Path,
         ids: [&[u32]; 2],
     ) -> Result<bool, GateError> {
-        let mut ok = sampled_pair("slots_drafted_sampled", addr, err_log, ids, true)?;
+        let mut ok = sampled_pair(
+            "slots_drafted_sampled",
+            addr,
+            err_log,
+            ids,
+            (true, 0),
+            "pass",
+        )?;
+        ok &= sampled_pair("slots_drafted_probs", addr, err_log, ids, (true, 1), "step")?;
         let alone = answer(
             "slots-drafted-sampled",
-            sampled_stream(addr, ids[0], SLOTS_PREDICT, false)?,
+            sampled_stream(addr, ids[0], SLOTS_PREDICT, false, 0)?,
             "alone long",
         )?;
         let before = seat_log(err_log)?.all(&record::SLOTS_ROUND)?.len();
         let runs = vec![
             (
-                sampled_stream(addr, ids[0], SLOTS_PREDICT, false)?,
+                sampled_stream(addr, ids[0], SLOTS_PREDICT, false, 0)?,
                 "tail long",
             ),
             (
-                sampled_stream(addr, ids[1], DRAFTED_SAMPLED_SHORT, false)?,
+                sampled_stream(addr, ids[1], DRAFTED_SAMPLED_SHORT, false, 0)?,
                 "tail short",
             ),
         ];
@@ -3098,10 +3119,10 @@ mod gate {
         }
         let rounds = seat_log(err_log)?.all(&record::SLOTS_ROUND)?;
         let shared = rounds.iter().skip(before).any(|r| {
-            r.word("cmd") == Ok("step") && r.u64("rows") == Ok(2) && r.u64("passes") == Ok(1)
+            r.word("cmd") == Ok("pass") && r.u64("rows") == Ok(2) && r.u64("passes") == Ok(1)
         });
         if !shared {
-            return Err("sampled tail: no shared plain round exercised the refresh".into());
+            return Err("sampled tail: no shared pass carried the long request's window".into());
         }
         let tail = tail.remove(0);
         // Proposals an id the request could draft: every id alone, the ids
@@ -3480,7 +3501,14 @@ mod gate {
             rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?,
             rendered(&url, json!([{ "role": "user", "content": SLOTS_B }]))?,
         );
-        ok &= sampled_pair("slots_sampled", &addr, &err_log, [&a_ids, &b_ids], false)?;
+        ok &= sampled_pair(
+            "slots_sampled",
+            &addr,
+            &err_log,
+            [&a_ids, &b_ids],
+            (false, 0),
+            "step",
+        )?;
         println!("slots-sampled server stopped: {}", served.stop()?);
         Ok(ok)
     }
@@ -3925,21 +3953,18 @@ mod gate {
     /// (`draft_unset_yields_to_the_slot_share`); with `BLOOMERY_DRAFT=mtp`
     /// set the server is refused by name before its plan record, the
     /// message's total the same ten positions (`draft_set_is_refused_by_name`).
-    /// At the default context the window fits, and the slot count alone turns
-    /// the unset draft off on this split, as on a checkpoint folder
-    /// (`draft_for_slots`): a server of `--parallel 2` with
-    /// `BLOOMERY_MTP_WIDTH` set and the draft unset is refused by name before
-    /// its plan record, the refusal naming the width lever and the two slots
-    /// (`draft_unset_is_off_on_two_slots`).
+    /// At the default context the window fits and the unset draft drafts on
+    /// two slots: a server of `--parallel 2` with `BLOOMERY_MTP_WIDTH` set
+    /// and the draft unset prints its plan record, refused by no word that
+    /// the server drafts nothing (`draft_unset_drafts_on_two_slots`).
     /// FAIL-first: a seat that judges the window on the total `--ctx-size`
     /// (eight, past five) keeps the unset draft and refuses it at the context
     /// the rule chose, so the first clause's server exits with the refusal
     /// before its load; a refusal whose total is one window short (the
     /// `VERIFY_ROWS` a slot) turns the second clause red; a seat whose check
     /// passes a set draft loads it, so its server prints a `plan` record and
-    /// no refusal; a seat that keeps the slot rule to checkpoint folders drafts
-    /// on this split's two slots, takes the width lever and prints its `plan`
-    /// record, red on the third. The fixture tier defers the clause by name:
+    /// no refusal; a seat that turns the unset draft off on two slots refuses
+    /// the width lever before its plan, red on the third. The fixture tier defers the clause by name:
     /// the draft file is the real file's.
     fn draft_slot_share(dir: &Path) -> Result<bool, GateError> {
         // The draft is the real file's: its draft file sits beside the target,
@@ -4021,8 +4046,8 @@ mod gate {
             status.is_some_and(|s| !s.success()) && text.contains(&want) && !planned,
         );
 
-        // The unset draft at the default context of two slots: off by the slot
-        // count, so the width lever beside it is refused by name.
+        // The unset draft at the default context of two slots: it drafts, so
+        // the width lever beside it plans.
         let args: Vec<&str> = DEFAULT_ARGS[..4]
             .iter()
             .chain(&["--parallel", "2"])
@@ -4030,18 +4055,14 @@ mod gate {
             .collect();
         let (status, text, planned) =
             refused("two-slot", &[(bloomery_levers::MTP_WIDTH, "fixed")], &args)?;
-        let why = bloomery_levers::Draft38Off::Slots { slots: 2 }.to_string();
-        let named = text.contains(&format!(
-            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server drafts \
-             nothing ({why})"
-        ));
-        if !named {
+        let refused_width = text.contains("the server drafts nothing");
+        if !planned || refused_width {
             last_lines("two-slot", &text);
         }
         check(
             &mut ok,
-            "draft_unset_is_off_on_two_slots",
-            status.is_some_and(|s| !s.success()) && named && !planned,
+            "draft_unset_drafts_on_two_slots",
+            status.is_none() && planned && !refused_width,
         );
 
         // The unset draft: off, and the load's record names why.

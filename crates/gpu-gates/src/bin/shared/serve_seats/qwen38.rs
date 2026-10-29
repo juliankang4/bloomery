@@ -136,8 +136,9 @@
 //! drafted load the server's round of the busy slots' drafted passes runs
 //! as one pass of their windows (`app::mtp::pass_slots`, every slot's rows
 //! verified together, the round cut into passes at the body's
-//! `SlotRows::MAX_ROWS`), and its round of plain steps (a sampling or
-//! id-banning request's) as one pass of their rows, each row told to its
+//! `SlotRows::MAX_ROWS`, a sampling or id-banning request's window among
+//! them), and its round of plain steps (of requests that take no pass: one
+//! that reads its logits row, a forced id) as one pass of their rows, each row told to its
 //! slot's draft as its step alone would be (`rounds::step_rows_drafted`:
 //! every slot's waiting draft rows walked in one store walk before the
 //! pass), slot 0 among the busy slots or not (a pass that leaves it out
@@ -268,11 +269,9 @@
 //! total under 5 a slot), each printed as a `load draft=off (<why>)` record
 //! after the `load` line (`no file at <path>[, <path>…]`, every place the pick looked), never a
 //! refusal; `BLOOMERY_DRAFT=mtp` set with stores that short is refused by
-//! name before the plan. Unset, the draft also goes off under `--parallel`
-//! above 1, whatever its source ([`draft_for_slots`]: a `load draft=off`
-//! record naming the slots): a drafted load runs a round of sampled or
-//! id-banning requests as one pass, as a plain load does, and also walks
-//! every slot's draft over its row, one store walk beside the pass. Unset, the draft
+//! name before the plan. Unset, the draft drafts on any `--parallel`, a
+//! round of the busy slots' sampled and greedy requests one pass of their
+//! windows. Unset, the draft
 //! then yields to the context
 //! (`bloomery_levers::RungCost::of`, at [`ctx38`]'s caller): it goes off
 //! when the plan with it leaves a slot half the positions of the plan
@@ -294,10 +293,11 @@
 //! most and none while no width beats the plain step, `fixed` the draft's
 //! three ids whole — the greedy ids the plain server's, `pass_rows` 4;
 //! under `cost` a request's `mtp width` record prints at the slot's next
-//! prompt call, a slot's last request's at the server's stop. A sampling or id-banning request drafts while its slot runs
-//! alone in the round, each kept id its draw from its verified row
+//! prompt call, a slot's last request's at the server's stop. A sampling or id-banning request drafts
+//! too, alone in the round or beside other busy slots (its window among the round's one pass,
+//! `rounds::pass_rows_one_pass`), each kept id its draw from its verified row
 //! (`Seat::pass_sampled`; an id-banning request's draw sets the banned
-//! logits to -inf first), and takes plain steps beside another busy slot.
+//! logits to -inf first), the ids its pass alone draws.
 //! Each step's row is the target's, read before the step is told to the
 //! draft; its ids are the plain server's. A `load draft=mtp` line
 //! follows the `load` line, then the `mtp head` record (which head, what
@@ -1079,24 +1079,6 @@ pub(crate) fn folder_draft_for(
     draft_off_for(why, word, (mtp, off))
 }
 
-/// [`draft38`]'s answer `(mtp, off)` with `slots` resident sequences, whatever the draft's
-/// source (a GGUF draft file or a checkpoint folder's MTP layer): a draft the unset rule would
-/// have run goes off on more than one slot ([`Draft38Off::Slots`]), as a drafted load walks every
-/// slot's draft over its row of a round of sampled or id-banning requests, one store walk beside
-/// the round's one pass (`rounds::step_rows_drafted`); a set word runs as set, and a reason the
-/// draft was already off for stands.
-pub(crate) fn draft_for_slots(
-    slots: usize,
-    word: Option<&str>,
-    (mtp, off): (bool, Option<Draft38Off>),
-) -> (bool, Option<Draft38Off>) {
-    if mtp && word.is_none() && slots > 1 {
-        (false, Some(Draft38Off::Slots { slots }))
-    } else {
-        (mtp, off)
-    }
-}
-
 /// The residency the load of `plan` at `place` runs: `set` (the word and
 /// its parse) as given; unset, the Qwen3.8 rule's
 /// ([`residency38`]: before the plan `off` under `--place gate`, beside the
@@ -1663,7 +1645,6 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         )?,
         None => (mtp, draft_off),
     };
-    let (mtp, draft_off) = draft_for_slots(slots, levers.draft(), (mtp, draft_off));
     // The folder's own MTP layer, opened with the folder above, is the draft both threads read:
     // the folder is not opened again for it.
     let own_draft = folder_draft
@@ -2246,7 +2227,6 @@ pub fn setup38(
         // These reasons name their own setting, or a set draft is refused beside them.
         Some(
             why @ (Draft38Off::Paged { .. }
-            | Draft38Off::Slots { .. }
             | Draft38Off::Media
             | Draft38Off::Folder
             | Draft38Off::FolderMtp { .. }),
@@ -2439,7 +2419,7 @@ struct Q38 {
     /// Whether a round of several slots' plain steps runs as one pass of the
     /// busy rows ([`Q38::step_slots`]): a load of more than one resident
     /// slot with no expert tier card, plain or MTP-drafted. A drafted load's
-    /// plain rounds (a sampling or id-banning request's steps) tell each row
+    /// plain rounds (the steps of requests that take no pass) tell each row
     /// to its slot's draft around the pass
     /// ([`super::rounds::step_rows_drafted`]). A lookup load keeps the
     /// fallback loop: its contexts follow each step at the selected slot's

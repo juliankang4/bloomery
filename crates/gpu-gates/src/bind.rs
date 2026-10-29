@@ -1129,12 +1129,23 @@ pub struct SlotStep {
 
 /// One row of a [`Cmd::PassSlots`] and of a [`Seat::pass_slots`] round: the
 /// slot, the id its pass runs, the caller's buffer of the pass's kept ids,
-/// and what the pass drafted, which the seat sets.
+/// what the pass drafted, which the seat sets, and the draw of a request
+/// that draws (`serve::SlotDraw`), whose pass is [`Seat::pass_sampled`]'s.
 pub struct SlotPassRow {
     pub slot: usize,
     pub last: u32,
     pub out: Vec<u32>,
     pub drafted: Drafted,
+    pub draw: Option<RowDraw>,
+}
+
+/// What a sampled row of a [`Cmd::PassSlots`] draws with, crossing to the
+/// engine thread and back with the row: the request's history, handed back
+/// as it was given, and its sampler, its state moved one draw a kept id
+/// ([`Seat::pass_sampled`]'s).
+pub struct RowDraw {
+    pub history: Vec<u32>,
+    pub sampler: serve::Sampler,
 }
 
 /// What a reply carries besides its result.
@@ -2155,11 +2166,24 @@ impl Link {
         }
         let mut sent = Vec::with_capacity(rows.len());
         for r in rows.iter_mut() {
+            let draw = match r.draw.as_mut() {
+                Some(d) => Some(RowDraw {
+                    history: d.history.to_vec(),
+                    sampler: d.sampler.take().ok_or_else(|| {
+                        EngineError(format!(
+                            "slot {}: a sampled row without its sampler",
+                            r.slot
+                        ))
+                    })?,
+                }),
+                None => None,
+            };
             sent.push(SlotPassRow {
                 slot: r.slot,
                 last: r.last,
                 out: std::mem::take(r.out),
                 drafted: Drafted::default(),
+                draw,
             });
         }
         let reply = self.ask(Cmd::PassSlots(sent))?;
@@ -2168,11 +2192,24 @@ impl Link {
                 "the engine thread answered a pass of several slots with no rows".to_owned(),
             ));
         };
+        let mut changed = None;
         for (row, back) in rows.iter_mut().zip(back.iter_mut()) {
             row.drafted = back.drafted;
             *row.out = std::mem::take(&mut back.out);
+            if let (Some(to), Some(from)) = (row.draw.as_mut(), back.draw.take()) {
+                if from.history != to.history {
+                    changed = Some(row.slot);
+                }
+                *to.sampler = Some(from.sampler);
+            }
         }
-        reply.result.map(|_| ()).map_err(EngineError)
+        reply.result.map_err(EngineError)?;
+        if let Some(slot) = changed {
+            return Err(EngineError(format!(
+                "slot {slot}: a sampled pass handed back another history"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -2479,7 +2516,11 @@ pub fn pass_rows_in_turn<S: Seat + ?Sized>(
         let at = g.pos();
         let run = g.select(r.slot).map_err(|e| e.to_string()).and_then(|()| {
             r.out.clear();
-            pass(g, r.last, &mut r.out).map_err(|e| format!("pass at position {at}: {e}"))
+            match r.draw.as_mut() {
+                None => pass(g, r.last, &mut r.out),
+                Some(d) => pass_sampled(g, r.last, &mut d.history, &mut d.sampler, &mut r.out),
+            }
+            .map_err(|e| format!("pass at position {at}: {e}"))
         });
         match run {
             Ok(d) => r.drafted = d,
@@ -3267,8 +3308,9 @@ mod tests {
     /// A link to a thread that answers every `Next` as the engine thread does:
     /// it fills the lent row and hands it back with the argmax. A
     /// `StepSlots` it answers the same way, a row at a time in row order, and
-    /// a `PassSlots` keeps `last` and one drafted id a row.
-    fn echo_link() -> (Link, std::thread::JoinHandle<()>) {
+    /// a `PassSlots` keeps `last` and one drafted id a row, a sampled row's
+    /// its sampler's draw given its history.
+    fn echo_link(alter_history: Option<usize>) -> (Link, std::thread::JoinHandle<()>) {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
         let worker = std::thread::spawn(move || {
@@ -3302,7 +3344,15 @@ mod tests {
                     }
                     Cmd::PassSlots(mut rows) => {
                         for r in rows.iter_mut() {
-                            r.out = vec![r.last, r.last + 1];
+                            let next = match r.draw.as_mut() {
+                                Some(d) => (d.sampler)(&[], &d.history),
+                                None => r.last + 1,
+                            };
+                            if alter_history == Some(r.slot) {
+                                let d = r.draw.as_mut().expect("the altered row samples");
+                                d.history[0] += 1;
+                            }
+                            r.out = vec![r.last, next];
                             r.drafted = serve::Drafted {
                                 proposed: 1,
                                 accepted: 1,
@@ -3381,7 +3431,7 @@ mod tests {
     #[test]
     fn a_round_of_slots_answers_in_row_order() {
         use serve::SlotRow;
-        let (mut link, worker) = echo_link();
+        let (mut link, worker) = echo_link(None);
         let mut a = [0.0f32; N_VOCAB];
         let mut b = [0.0f32; N_VOCAB];
         let mut rows = vec![
@@ -3487,32 +3537,46 @@ mod tests {
     /// A round of several drafted passes is one command whose reply gives
     /// each row its own kept ids and drafted counts in row order
     /// ([`Link::pass_slots`]), the caller's buffers crossing with the
-    /// command; a slot named twice is a named error.
+    /// command; a sampled row's history crosses with it and its sampler comes
+    /// back with its state moved; a slot named twice is a named error.
     #[test]
     fn a_round_of_passes_answers_in_row_order() {
         use serve::SlotPass;
-        let (mut link, worker) = echo_link();
+        let (mut link, worker) = echo_link(None);
         let mut a = Vec::new();
         let mut b = Vec::new();
+        let history = [7u32, 7, 7];
+        let mut draws = 0;
+        let mut sampler: Option<serve::Sampler> = Some(Box::new(move |_: &[f32], h: &[u32]| {
+            draws += 1;
+            100 * draws + h.len() as u32
+        }));
         let mut rows = vec![
             SlotPass {
                 slot: 1,
                 last: 3,
                 out: &mut a,
                 drafted: serve::Drafted::default(),
+                draw: None,
             },
             SlotPass {
                 slot: 0,
                 last: 5,
                 out: &mut b,
                 drafted: serve::Drafted::default(),
+                draw: Some(serve::SlotDraw {
+                    history: &history,
+                    sampler: &mut sampler,
+                }),
             },
         ];
         link.pass_slots(&mut rows).expect("a round of two passes");
         let counts = rows.iter().map(|r| r.drafted).collect::<Vec<_>>();
         drop(rows);
         assert_eq!(a, vec![3, 4], "the first row's kept ids");
-        assert_eq!(b, vec![5, 6], "the second row's kept ids");
+        assert_eq!(b, vec![5, 103], "the sampled row's draw, given its history");
+        let mut back = sampler.expect("the sampled row's sampler came back");
+        assert_eq!(back(&[], &[]), 200, "the sampler's state moved one draw");
         assert_eq!(
             counts,
             vec![
@@ -3533,12 +3597,14 @@ mod tests {
                 last: 2,
                 out: &mut c,
                 drafted: serve::Drafted::default(),
+                draw: None,
             },
             SlotPass {
                 slot: 2,
                 last: 4,
                 out: &mut d,
                 drafted: serve::Drafted::default(),
+                draw: None,
             },
         ];
         let e = link
@@ -3549,11 +3615,50 @@ mod tests {
         worker.join().expect("the echo thread");
     }
 
+    /// A same-length history edit in a successful round reply is refused
+    /// after every row's sampler and output have come home.
+    #[test]
+    fn a_round_rejects_a_changed_history_and_restores_every_sampler() {
+        let (mut link, worker) = echo_link(Some(1));
+        let histories = [[7, 7, 7], [9, 9, 9]];
+        let mut samplers: [Option<serve::Sampler>; 2] = std::array::from_fn(|_| {
+            let mut draws = 0u32;
+            Some(Box::new(move |_: &[f32], _: &[u32]| {
+                draws += 1;
+                draws
+            }) as serve::Sampler)
+        });
+        let mut outputs = [Vec::new(), Vec::new()];
+        let mut rows: Vec<_> = outputs
+            .iter_mut()
+            .zip(&mut samplers)
+            .zip(&histories)
+            .enumerate()
+            .map(|(i, ((out, sampler), history))| serve::SlotPass {
+                slot: 1 - i,
+                last: 3,
+                out,
+                drafted: serve::Drafted::default(),
+                draw: Some(serve::SlotDraw { history, sampler }),
+            })
+            .collect();
+        let result = link.pass_slots(&mut rows);
+        drop(rows);
+        link.tx = None;
+        worker.join().expect("the echo thread");
+        let e = result.expect_err("a same-length history edit must fail");
+        assert_eq!(e.0, "slot 1: a sampled pass handed back another history");
+        assert_eq!(outputs, [vec![3, 1], vec![3, 1]]);
+        for sampler in samplers {
+            assert_eq!(sampler.expect("every sampler comes back")(&[], &[]), 2);
+        }
+    }
+
     /// Every sampled step reads into the buffer the link was built with: the
     /// row crosses to the engine thread and back, and no token allocates one.
     #[test]
     fn sampled_steps_reuse_one_logits_buffer() {
-        let (mut link, worker) = echo_link();
+        let (mut link, worker) = echo_link(None);
         let built = link.logits.as_ptr();
         let mut out = [0.0f32; N_VOCAB];
         for last in [3u32, 5, 9] {
@@ -3577,7 +3682,7 @@ mod tests {
     /// A caller's buffer of another length is a named error, not a partial copy.
     #[test]
     fn a_short_caller_buffer_is_refused() {
-        let (mut link, worker) = echo_link();
+        let (mut link, worker) = echo_link(None);
         let mut short = [0.0f32; N_VOCAB - 1];
         let e = link.next(3, Some(&mut short)).expect_err("a short buffer");
         assert!(e.0.contains("holds 7, the engine's 8"), "{e}");

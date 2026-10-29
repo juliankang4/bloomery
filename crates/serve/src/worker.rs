@@ -481,6 +481,19 @@ pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
     sh.end_on(adopted);
 }
 
+/// `a`'s call of `need` on its slot alone, the round's only call of it:
+/// a select, then the step, the drafted pass or the sampled pass.
+fn call_alone(slot: &mut Slot, a: &mut Active, need: Need) -> Result<(), EngineError> {
+    slot.select(a.slot)?;
+    match need {
+        Need::Step(t) => slot.next(t, a.job.logits_out()).map(|g| a.job.stepped(g)),
+        Need::Advance(t) => slot.advance(t, a.job.kept_mut()).map(|d| a.job.advanced(d)),
+        Need::Sampled(t) => a.job.advance_sampled(slot, t),
+        Need::Fill => unreachable!("a round of fills alone makes no decode call"),
+        Need::Done => unreachable!("a finished request left the running ones"),
+    }
+}
+
 /// The sink a request's generation writes to: its channel.
 fn sink_of(events: &mpsc::Sender<Msg>) -> impl FnMut(Event<'_>) -> io::Result<()> + '_ {
     |ev| {
@@ -872,24 +885,8 @@ impl Worker {
             s.n_busy_slots_total += width;
         }
         let called = if let [a] = self.active.as_mut_slice() {
-            match needs[0] {
-                Need::Step(t) => self
-                    .slot
-                    .select(a.slot)
-                    .and_then(|()| self.slot.next(t, a.job.logits_out()))
-                    .map(|g| a.job.stepped(g)),
-                Need::Advance(t) => self
-                    .slot
-                    .select(a.slot)
-                    .and_then(|()| self.slot.advance(t, a.job.kept_mut()))
-                    .map(|d| a.job.advanced(d)),
-                Need::Sampled(t) => self
-                    .slot
-                    .select(a.slot)
-                    .and_then(|()| a.job.advance_sampled(&mut self.slot, t)),
-                Need::Fill => unreachable!("a round of fills alone makes no decode call"),
-                Need::Done => unreachable!("a finished request left the running ones"),
-            }
+            let need = needs.pop().expect("one running request, one need");
+            call_alone(&mut self.slot, a, need)
         } else {
             // One engine round, its rows split by what they need: the steps
             // of two slots or more in one call (one step is a select and a
@@ -897,14 +894,15 @@ impl Worker {
             // of two slots or more in one (one pass is a select and an
             // `advance`, as `advance_slots`' doc requires: the engine's pass
             // of one slot is the pass a request alone makes). Within each call
-            // the rows keep `active`'s order. A sampled request passes only
-            // alone in its round: here it steps.
+            // the rows keep `active`'s order. A sampled request's pass rides
+            // the drafted call with its draw (`Gen::pass_row`), its ids the
+            // ones its pass alone draws.
             let mut steps: Vec<SlotRow<'_>> = Vec::new();
             let mut step_at: Vec<usize> = Vec::new();
             let mut pass_at: Vec<usize> = Vec::new();
             for (i, (a, need)) in self.active.iter_mut().zip(&needs).enumerate() {
                 match *need {
-                    Need::Step(last) | Need::Sampled(last) => {
+                    Need::Step(last) => {
                         step_at.push(i);
                         steps.push(SlotRow {
                             slot: a.slot,
@@ -916,6 +914,10 @@ impl Worker {
                     Need::Advance(last) => {
                         pass_at.push(a.slot);
                         a.need = Some(Need::Advance(last));
+                    }
+                    Need::Sampled(last) => {
+                        pass_at.push(a.slot);
+                        a.need = Some(Need::Sampled(last));
                     }
                     Need::Fill => {}
                     Need::Done => unreachable!("a finished request left the running ones"),
@@ -945,40 +947,46 @@ impl Worker {
                     }
                 }
                 // Pumping may end a request and move the remaining entries.
-                let mut passes: Vec<SlotPass<'_>> = Vec::new();
+                let mut uncalled: Vec<(usize, Need)> = Vec::with_capacity(pass_at.len());
                 let mut active = self.active.iter_mut().enumerate();
-                for at in &mut pass_at {
+                for at in &pass_at {
                     let (i, a) = active
                         .find(|(_, a)| a.slot == *at)
-                        .expect("uncalled advances survive pumping in their original order");
-                    let Some(Need::Advance(last)) = a.need.take() else {
-                        unreachable!("an original advance keeps its uncalled need");
-                    };
-                    *at = i;
-                    passes.push(SlotPass {
-                        slot: a.slot,
-                        last,
-                        out: a.job.kept_mut(),
-                        drafted: Drafted::default(),
-                    });
+                        .expect("uncalled passes survive pumping in their original order");
+                    let need = a
+                        .need
+                        .take()
+                        .expect("an original pass keeps its uncalled need");
+                    uncalled.push((i, need));
                 }
-                called = if passes.len() > 1 {
-                    self.slot.advance_slots(&mut passes)
-                } else if let [row] = passes.as_mut_slice() {
-                    self.slot
-                        .select(row.slot)
-                        .and_then(|()| self.slot.advance(row.last, row.out))
-                        .map(|d| row.drafted = d)
-                } else {
-                    Ok(())
-                };
-                if called.is_ok() {
-                    let drafted: Vec<Drafted> = passes.iter().map(|r| r.drafted).collect();
-                    drop(passes);
-                    for (i, d) in pass_at.into_iter().zip(drafted) {
-                        self.active[i].job.advanced(d);
+                called = match uncalled.len() {
+                    0 => Ok(()),
+                    1 => {
+                        let (i, need) = uncalled.pop().expect("one uncalled pass");
+                        call_alone(&mut self.slot, &mut self.active[i], need)
                     }
-                }
+                    _ => {
+                        let mut passes: Vec<SlotPass<'_>> = Vec::with_capacity(uncalled.len());
+                        for (i, a) in self.active.iter_mut().enumerate() {
+                            let Some((_, need)) = uncalled.iter().find(|(at, _)| *at == i) else {
+                                continue;
+                            };
+                            let (Need::Advance(last) | Need::Sampled(last)) = *need else {
+                                unreachable!("an uncalled pass is an advance or a sampled pass");
+                            };
+                            passes.push(a.job.pass_row(a.slot, last));
+                        }
+                        let called = self.slot.advance_slots(&mut passes);
+                        if called.is_ok() {
+                            let drafted: Vec<Drafted> = passes.iter().map(|r| r.drafted).collect();
+                            drop(passes);
+                            for ((i, _), d) in uncalled.into_iter().zip(drafted) {
+                                self.active[i].job.advanced(d);
+                            }
+                        }
+                        called
+                    }
+                };
             }
             called
         };

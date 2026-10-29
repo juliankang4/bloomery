@@ -5148,6 +5148,7 @@ mod gate {
                     depth: 1,
                     draft,
                     out,
+                    draw: None,
                 })
                 .collect();
             let (commits, passes) = app::mtp::pass_slots(s, &mut windows)?;

@@ -1849,6 +1849,7 @@ mod gate {
                     last: l0,
                     depth: SLOT_DEPTH,
                     out: o0,
+                    draw: None,
                 },
                 SlotWindow {
                     slot: 1,
@@ -1856,6 +1857,7 @@ mod gate {
                     last: l1,
                     depth: SLOT_DEPTH,
                     out: o1,
+                    draw: None,
                 },
             ];
             let (done, _) = pass_slots(&mut s, &mut w)?;
