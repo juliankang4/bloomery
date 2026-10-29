@@ -160,8 +160,8 @@
 //!     for bit its clean output, in both entries, each raising the same word;
 //!     a group that is not twelve heads a key head refused by name by both
 //!     entries.
-//! 14. The selector's three entries and the two selected flashes compile with
-//!     no local depot.
+//! 14. The selector's three entries, the two selected flashes and their q8
+//!     entries (clause 21) compile with no local depot.
 //! 15. Deep: the selector and the selected flash at a cache of 262,144 rows
 //!     (Qwen3.8's `context_length`, the most a load serves), synthetic keys,
 //!     no model: one pool launch over every count bit for bit the
@@ -193,7 +193,9 @@
 //!     f16 cache of the dequantized values; a band would only re-derive the
 //!     twin's own clause, and bit identity against a host oracle is not claimed
 //!     (the exponential is the device's own). Asserted: the decode entry at
-//!     [`DEC_KEYS_Q8`] — the twin bit identity, a rerun bit-identical, every
+//!     [`DEC_KEYS_Q8`], and the pack-of-four entry the MTP draft's dense store
+//!     reads (`enqueue_pass_256_p4_q8`, Qwen3.8's 24/2) at [`DEC_KEYS_Q38`] — the
+//!     twin bit identity, a rerun bit-identical, every
 //!     key head's cache rows at or past the count holding the q8 sentinel bits
 //!     changing no bit; the eight-row launch each row bit for bit its one-row
 //!     launch; the `key_count` fault with NaN in exactly the bad rows; the
@@ -236,8 +238,23 @@
 //!     (a count past the cache and a zero), the captured launch (one node) and a
 //!     head count the kernel is not built for refused by name.
 //! 20. The six new entries compile with no local depot.
+//! 21. The q8_0 selected flashes (`flash_gqa::enqueue_pass_256_p12_sel` and
+//!     `flash_gqa_prefill::enqueue_256_p12_sel` over a [`CachePlanes::Q8`]
+//!     cache, `gqa_flash_seg_mma_256_p12_sel_q8` and
+//!     `gqa_prefill_flash_256_p12_sel_q8`), clause 16's discipline over the
+//!     selection's lists at counts 2,051, 2,052, 4,097 and 8,193 and on the
+//!     eight rows of a verify at 8,186..=8,193: each entry bit for bit itself
+//!     on the synthesized f16 cache of the dequantized values, every row
+//!     finite, the q8 sentinel bits in every cache row past the largest count
+//!     changing no bit; a list entry at the cache's height raising
+//!     `pool_select` at the launch's layer with that row NaN and the other row
+//!     its clean bits; a codes plane one row short refused by name. The
+//!     gated prompt entries (`_p4_gated_q8`, `_p12_sel_gated_q8`) are held the
+//!     same way by `flash_gqa_prefill`'s
+//!     `hw_q8_gated_entries_are_the_f16_entries_on_the_dequantized_cache`.
+//!     The four q8 entries compile with no local depot (clause 14's list).
 //!
-//! Tiers (`BLOOMERY_TIER`): the gate reads a model file and a set of ik's in clause 6 alone. Clauses 1–5 and 7–20 run
+//! Tiers (`BLOOMERY_TIER`): the gate reads a model file and a set of ik's in clause 6 alone. Clauses 1–5 and 7–21 run
 //! on synthetic inputs and are self-consistency clauses (`tier::sc`), run on either tier. Clause 6 is `Tag::Oracle` on
 //! the real batch set and the Q4_K_M file in the real tier, which the fixture tier leaves to the real tier by name, and
 //! `Tag::FixtureOracle` in the fixture tier, on the batch set of ik's dumped on the fixture file (refset's
@@ -265,7 +282,7 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::fault::{Fault, FaultSink, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{
-        FlashGqaKernels, GROUP, GROUP_7, GqaArgs, GqaListArgs, GqaQ8Args, GqaSelArgs,
+        CachePlanes, FlashGqaKernels, GROUP, GROUP_7, GqaArgs, GqaListArgs, GqaQ8Args, GqaSelArgs,
         HEAD_256 as HEAD, KEY_TILE, PACK_2, PACK_4, PACK_12, SEG_KEYS, SEGMENTS,
         listed_partials_ms_len, listed_partials_v_len_256, listed_segments, partials_ms_len,
         partials_v_len, partials_v_len_256, seg_span,
@@ -1798,16 +1815,33 @@ mod gate {
         })
     }
 
-    /// One decode launch of the q8 entry at Qwen3.6's layout over the planes
-    /// (`sentinel`: their sentinel twins), into fresh scratch, read back.
+    /// One q8 decode pass through `sh`'s entry (`enqueue_pass_256_q8`, or
+    /// `enqueue_pass_256_p4_q8` for the pack-of-four layout).
+    fn enqueue_dec_q8(
+        k: &FlashGqaKernels,
+        stream: &CudaStream,
+        sh: Shape,
+        args: GqaQ8Args<'_>,
+    ) -> Result<(), GpuError> {
+        if sh.pack4 {
+            k.enqueue_pass_256_p4_q8(stream, args, sh.n_head)
+        } else {
+            k.enqueue_pass_256_q8(stream, args)
+        }
+    }
+
+    /// One decode launch of `sh`'s q8 entry over the planes (`sentinel`:
+    /// their sentinel twins), into fresh scratch, read back.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the kernel, the stream and sink, the rows, the cache and its height, the planes"
+        reason = "the kernel, the stream and sink, the layout, the rows, the cache and its \
+                  height, the planes"
     )]
     fn run_dec_q8(
         k: &FlashGqaKernels,
         stream: &CudaStream,
         fault: FaultSink,
+        sh: Shape,
         q: &[f32],
         n_keys: &[u32],
         c: &Q8Cache,
@@ -1817,16 +1851,18 @@ mod gate {
         let m = n_keys.len();
         let qd = DeviceBuffer::from_host(stream, q)?;
         let nk = DeviceBuffer::from_host(stream, n_keys)?;
-        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(m, N_HEAD))?;
-        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, N_HEAD))?;
-        let mut y = DeviceBuffer::<f32>::zeroed(stream, m * N_HEAD * HEAD)?;
+        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(m, sh.n_head))?;
+        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, sh.n_head))?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, m * sh.width())?;
         let (kq, kd, vq, vd) = if sentinel {
             (&c.knq, &c.knd, &c.vnq, &c.vnd)
         } else {
             (&c.kq, &c.kd, &c.vq, &c.vd)
         };
-        k.enqueue_pass_256_q8(
+        enqueue_dec_q8(
+            k,
             stream,
+            sh,
             GqaQ8Args {
                 q: &qd,
                 kq,
@@ -1884,35 +1920,41 @@ mod gate {
         Ok(y.to_host_vec(stream)?)
     }
 
-    /// The decode q8 clause (module doc, 16) at Qwen3.6's layout: per count
-    /// the twin bit identity, a rerun and the sentinel padding; the rows, the
+    /// The decode q8 clause (module doc, 16) at `sh`'s layout: per count the
+    /// twin bit identity, a rerun and the sentinel padding; the rows, the
     /// fault and the graph.
-    fn decode_q8_check(gpu: &Gpu, k: &FlashGqaKernels, keys: &[usize]) -> Result<bool, GateError> {
+    fn decode_q8_check(
+        gpu: &Gpu,
+        k: &FlashGqaKernels,
+        sh: Shape,
+        keys: &[usize],
+    ) -> Result<bool, GateError> {
         let stream = gpu.stream();
         let unl = gpu.unlabelled_sink();
-        let w = N_HEAD * HEAD;
+        let (w, tag) = (sh.width(), sh.tag());
         let mut ok = true;
         for (i, &live) in keys.iter().enumerate() {
             let ctx = live + PAD;
             let seed = 900 + 10 * u32::try_from(i)?;
             let c = cache_q8(stream, ctx, live, seed)?;
-            let q: Vec<f32> = activations(HEAD, N_HEAD, seed + 5)
+            let q: Vec<f32> = activations(HEAD, sh.n_head, seed + 5)
                 .iter()
                 .map(|v| v * SEED_Q_SCALE)
                 .collect();
             let nk = [u32::try_from(live)?];
             // The tensor-core pass: bit for bit the f16 twin on the
             // synthesized cache, a rerun and the sentinel padding.
-            let y = run_dec_q8(k, stream, unl, &q, &nk, &c, ctx, false)?;
-            let y2 = run_dec_q8(k, stream, unl, &q, &nk, &c, ctx, false)?;
-            let ys = run_dec_q8(k, stream, unl, &q, &nk, &c, ctx, true)?;
+            let y = run_dec_q8(k, stream, unl, sh, &q, &nk, &c, ctx, false)?;
+            let y2 = run_dec_q8(k, stream, unl, sh, &q, &nk, &c, ctx, false)?;
+            let ys = run_dec_q8(k, stream, unl, sh, &q, &nk, &c, ctx, true)?;
             let (rerun, sentinel) = (bits_equal(&y, &y2), bits_equal(&y, &ys));
-            let tw = run_dec(k, stream, unl, Q36, &q, &nk, (&c.k16, &c.v16), ctx, true)?;
+            let tw = run_dec(k, stream, unl, sh, &q, &nk, (&c.k16, &c.v16), ctx, true)?;
             let twin_same = bits_equal(&y, &tw);
             let pass_ok = rerun && sentinel && twin_same;
             println!(
-                "decode q8 pass=mma keys={live} ctx={ctx}: = the f16 mma twin on the synthesized \
-                 f16 cache bit for bit {twin_same} rerun={rerun} sentinel_same={sentinel} {}",
+                "decode q8{tag} pass=mma keys={live} ctx={ctx}: = the f16 mma twin on the \
+                 synthesized f16 cache bit for bit {twin_same} rerun={rerun} \
+                 sentinel_same={sentinel} {}",
                 verdict(pass_ok)
             );
             ok &= pass_ok;
@@ -1924,12 +1966,13 @@ mod gate {
         let live = 1025usize;
         let ctx = live + PAD;
         let c = cache_q8(stream, ctx, live, 950)?;
-        let q1 = activations(HEAD, N_HEAD, 955);
+        let q1 = activations(HEAD, sh.n_head, 955);
+        let n_head = sh.n_head;
         let rows: Vec<f32> = (0..ROWS)
             .flat_map(|t| {
                 let q1 = &q1;
-                (0..N_HEAD).flat_map(move |h| {
-                    q1[((h + t) % N_HEAD) * HEAD..][..HEAD]
+                (0..n_head).flat_map(move |h| {
+                    q1[((h + t) % n_head) * HEAD..][..HEAD]
                         .iter()
                         .map(|v| v * SEED_Q_SCALE)
                 })
@@ -1938,13 +1981,14 @@ mod gate {
         let counts: Vec<u32> = (0..ROWS)
             .map(|t| u32::try_from(1 + t * (live - 1) / (ROWS - 1)))
             .collect::<Result<_, _>>()?;
-        let all = run_dec_q8(k, stream, unl, &rows, &counts, &c, ctx, false)?;
+        let all = run_dec_q8(k, stream, unl, sh, &rows, &counts, &c, ctx, false)?;
         let mut alone = true;
         for t in 0..ROWS {
             let one = run_dec_q8(
                 k,
                 stream,
                 unl,
+                sh,
                 &rows[t * w..(t + 1) * w],
                 &counts[t..=t],
                 &c,
@@ -1954,8 +1998,8 @@ mod gate {
             alone &= bits_equal(&all[t * w..(t + 1) * w], &one);
         }
         println!(
-            "decode q8 rows pass=mma m={ROWS} keys={counts:?} ctx={ctx}: each row = its one-row \
-             launch bit for bit {alone} {}",
+            "decode q8{tag} rows pass=mma m={ROWS} keys={counts:?} ctx={ctx}: each row = its \
+             one-row launch bit for bit {alone} {}",
             verdict(alone)
         );
         ok &= alone;
@@ -1970,6 +2014,7 @@ mod gate {
             k,
             stream,
             gpu.layer_sink(LAYER)?,
+            sh,
             &rows,
             &bad,
             &c,
@@ -1989,7 +2034,7 @@ mod gate {
         }
         let fault_ok = before.is_none() && raised == want && nan && others;
         println!(
-            "decode q8 fault pass=mma: counts {} (past ctx {ctx}) and 0 at rows {bad_hi}, \
+            "decode q8{tag} fault pass=mma: counts {} (past ctx {ctx}) and 0 at rows {bad_hi}, \
              {bad_zero}: word {raised:?} (want {want:?}), those rows NaN {nan}, other rows \
              bit-identical {others} {}",
             ctx + 1,
@@ -2001,13 +2046,15 @@ mod gate {
         let qd = DeviceBuffer::from_host(stream, &rows)?;
         let nkd = DeviceBuffer::from_host(stream, &counts)?;
         let (mut pv, mut pms, mut yg) = (
-            DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(ROWS, N_HEAD))?,
-            DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, N_HEAD))?,
+            DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(ROWS, sh.n_head))?,
+            DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, sh.n_head))?,
             DeviceBuffer::<f32>::zeroed(stream, ROWS * w)?,
         );
         let graph = gpu.capture(|s| {
-            k.enqueue_pass_256_q8(
+            enqueue_dec_q8(
+                k,
                 s,
+                sh,
                 GqaQ8Args {
                     q: &qd,
                     kq: &c.kq,
@@ -2032,7 +2079,7 @@ mod gate {
         let nodes = graph.node_count();
         let graph_ok = same && nodes == 2;
         println!(
-            "decode q8 graph pass=mma m={ROWS}: eager_vs_graph_bit_identical={same} \
+            "decode q8{tag} graph pass=mma m={ROWS}: eager_vs_graph_bit_identical={same} \
              graph_nodes={nodes} {}",
             verdict(graph_ok)
         );
@@ -3400,6 +3447,26 @@ mod gate {
         reason = "the kernels, the stream and sink, the entry, the rows, the lists, the cache and its height"
     )]
     fn run_sel(
+        ks: (&FlashGqaKernels, &FlashGqaPrefill),
+        stream: &CudaStream,
+        fault: FaultSink,
+        entry: SelFlash,
+        q: &[f32],
+        lists: (&DeviceBuffer<u32>, &DeviceBuffer<u32>),
+        m: usize,
+        (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
+        ctx: usize,
+    ) -> Result<Vec<f32>, GateError> {
+        let kv = CachePlanes::F16 { kc, vc };
+        run_sel_kv(ks, stream, fault, entry, q, lists, m, kv, ctx)
+    }
+
+    /// [`run_sel`] over planes of either cache format.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the kernels, the stream and sink, the entry, the rows, the lists, the cache and its height"
+    )]
+    fn run_sel_kv(
         (k, kp): (&FlashGqaKernels, &FlashGqaPrefill),
         stream: &CudaStream,
         fault: FaultSink,
@@ -3407,15 +3474,14 @@ mod gate {
         q: &[f32],
         (list, n_sel): (&DeviceBuffer<u32>, &DeviceBuffer<u32>),
         m: usize,
-        (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
+        kv: CachePlanes<'_>,
         ctx: usize,
     ) -> Result<Vec<f32>, GateError> {
         let qd = DeviceBuffer::from_host(stream, q)?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, m * Q38.width())?;
         let attn = GqaListArgs {
             q: &qd,
-            kc,
-            vc,
+            kv,
             list,
             n_sel,
             width: WIDTH,
@@ -3772,8 +3838,10 @@ mod gate {
                 )?;
                 let attn = GqaListArgs {
                     q: &qa,
-                    kc: &c.kc,
-                    vc: &c.vc,
+                    kv: CachePlanes::F16 {
+                        kc: &c.kc,
+                        vc: &c.vc,
+                    },
                     list: &scratch.list,
                     n_sel: &scratch.n_sel,
                     width: WIDTH,
@@ -3961,8 +4029,10 @@ mod gate {
             for entry in [SelFlash::Pass, SelFlash::Listed] {
                 let attn = GqaListArgs {
                     q: &qd,
-                    kc: &c.kc,
-                    vc: &c.vc,
+                    kv: CachePlanes::F16 {
+                        kc: &c.kc,
+                        vc: &c.vc,
+                    },
                     list: &clean_l,
                     n_sel: &clean_n,
                     width: WIDTH,
@@ -4026,8 +4096,10 @@ mod gate {
                     stream,
                     GqaListArgs {
                         q: args.q,
-                        kc: args.kc,
-                        vc: args.vc,
+                        kv: CachePlanes::F16 {
+                            kc: args.kc,
+                            vc: args.vc,
+                        },
                         list: &clean_l,
                         n_sel: args.n_keys,
                         width: WIDTH,
@@ -4042,6 +4114,182 @@ mod gate {
                 )
             },
         )?;
+        Ok(ok)
+    }
+
+    /// The q8_0 selected flashes' clause (module doc, 21).
+    fn sel_flash_q8_check(
+        gpu: &Gpu,
+        ks: (&FlashGqaKernels, &FlashGqaPrefill),
+        qk: &QsaKernels,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let idx = idx_inputs(stream, SEL_CTX, 651, false)?;
+        let (pooled, _) = pool_plane(qk, stream, &idx, SEL_N, SEL_N, unl)?;
+        let mut scratch = QsaScratch::new(stream, ROWS, SEL_CTX, KEPT)?;
+        let c = cache_q8(stream, SEL_CTX, SEL_N, 652)?;
+        let q8 = |sentinel: bool| {
+            if sentinel {
+                CachePlanes::Q8 {
+                    kq: &c.knq,
+                    kd: &c.knd,
+                    vq: &c.vnq,
+                    vd: &c.vnd,
+                }
+            } else {
+                CachePlanes::Q8 {
+                    kq: &c.kq,
+                    kd: &c.kd,
+                    vq: &c.vq,
+                    vd: &c.vd,
+                }
+            }
+        };
+        let twin = CachePlanes::F16 {
+            kc: &c.k16,
+            vc: &c.v16,
+        };
+        let entries = [
+            (SelFlash::Pass, "pass"),
+            (SelFlash::Listed, "listed prefill"),
+        ];
+        let w = Q38.width();
+        let mut ok = true;
+        let verify: Vec<usize> = (SEL_ROWS0..=SEL_N).collect();
+        let mut launches: Vec<Vec<usize>> = [WIDTH, SEL_COUNTS[1], SEL_COUNTS[2], SEL_N]
+            .iter()
+            .map(|&n| vec![n])
+            .collect();
+        launches.push(verify);
+        for (i, cs) in launches.iter().enumerate() {
+            let m = cs.len();
+            let cu: Vec<u32> = cs
+                .iter()
+                .map(|&v| u32::try_from(v))
+                .collect::<Result<_, _>>()?;
+            let seed = 653 + 2 * u32::try_from(i)?;
+            let s = run_select(
+                qk,
+                stream,
+                unl,
+                &idx,
+                &pooled,
+                &idx_queries(m, seed),
+                &cu,
+                &mut scratch,
+            )?;
+            let q: Vec<f32> = activations(HEAD, m * N_HEAD_Q38, seed + 1)
+                .iter()
+                .map(|v| v * SEED_Q_SCALE)
+                .collect();
+            let lsel = (&scratch.list, &scratch.n_sel);
+            for (entry, name) in entries {
+                let run = |kv| run_sel_kv(ks, stream, unl, entry, &q, lsel, m, kv, SEL_CTX);
+                let (y, ys, yt) = (run(q8(false))?, run(q8(true))?, run(twin)?);
+                let finite = y.iter().all(|v| v.is_finite());
+                let (same, sentinel) = (bits_equal(&y, &yt), bits_equal(&y, &ys));
+                let pass = finite && same && sentinel;
+                println!(
+                    "qsa q8 {name} counts={cs:?} lengths={:?}: f16 twin bit for bit {same} \
+                     sentinel rows changing no bit {sentinel} finite {finite} {}",
+                    s.n_sel,
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+        }
+
+        // Row 0's list naming the cache's height raises pool_select at the
+        // launch's layer, that row NaN and row 1 its clean bits.
+        let cs = [u32::try_from(TIE_COUNT)?, u32::try_from(SEL_N)?];
+        let s = run_select(
+            qk,
+            stream,
+            unl,
+            &idx,
+            &pooled,
+            &idx_queries(2, 671),
+            &cs,
+            &mut scratch,
+        )?;
+        let q: Vec<f32> = activations(HEAD, 2 * N_HEAD_Q38, 672)
+            .iter()
+            .map(|v| v * SEED_Q_SCALE)
+            .collect();
+        let clean_l = DeviceBuffer::from_host(stream, &s.list)?;
+        let clean_n = DeviceBuffer::from_host(stream, &s.n_sel)?;
+        let mut bad = s.list;
+        bad[7] = u32::try_from(SEL_CTX)?;
+        let bad_l = DeviceBuffer::from_host(stream, &bad)?;
+        for (entry, name) in entries {
+            let clean = run_sel_kv(
+                ks,
+                stream,
+                unl,
+                entry,
+                &q,
+                (&clean_l, &clean_n),
+                2,
+                q8(false),
+                SEL_CTX,
+            )?;
+            let before = gpu.fault()?;
+            let y = run_sel_kv(
+                ks,
+                stream,
+                gpu.layer_sink(LAYER)?,
+                entry,
+                &q,
+                (&bad_l, &clean_n),
+                2,
+                q8(false),
+                SEL_CTX,
+            )?;
+            let raised = gpu.take_fault()?;
+            let want = Some(Fault::at(u32::try_from(LAYER)?, FaultSite::PoolSelect));
+            let nan = y[..w].iter().all(|v| v.is_nan());
+            let other = bits_equal(&y[w..2 * w], &clean[w..2 * w]);
+            let pass = before.is_none() && raised == want && nan && other;
+            println!(
+                "qsa q8 {name} list entry at the cache's height: fault {raised:?} row NaN {nan} \
+                 other row its clean bits {other} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+
+        // A codes plane one row short, refused by name before any launch.
+        let (words, _) = q8_plane_lens(HEAD, N_KV, SEL_CTX);
+        let short = DeviceBuffer::<u32>::zeroed(stream, words - HEAD / 4)?;
+        let kv = CachePlanes::Q8 {
+            kq: &short,
+            kd: &c.kd,
+            vq: &c.vq,
+            vd: &c.vd,
+        };
+        for (entry, name) in entries {
+            let r = run_sel_kv(
+                ks,
+                stream,
+                unl,
+                entry,
+                &q,
+                (&clean_l, &clean_n),
+                2,
+                kv,
+                SEL_CTX,
+            );
+            let named = r
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("kq.len()"));
+            println!(
+                "qsa q8 {name} short codes plane: {} {}",
+                r.err().map_or("accepted".to_string(), |e| e.to_string()),
+                verdict(named)
+            );
+            ok &= named;
+        }
         Ok(ok)
     }
 
@@ -5272,8 +5520,10 @@ mod gate {
                         )?;
                         let attn = GqaListArgs {
                             q: &r.q,
-                            kc: &c.kc,
-                            vc: &c.vc,
+                            kv: CachePlanes::F16 {
+                                kc: &c.kc,
+                                vc: &c.vc,
+                            },
                             list: &scratch.list,
                             n_sel: &scratch.n_sel,
                             width: WIDTH,
@@ -5341,6 +5591,10 @@ mod gate {
             "qsa_topk",
             "gqa_flash_seg_mma_256_p12_sel",
             "gqa_prefill_flash_256_p12_sel",
+            "gqa_flash_seg_mma_256_p12_sel_q8",
+            "gqa_prefill_flash_256_p12_sel_q8",
+            "gqa_prefill_flash_256_p12_sel_gated_q8",
+            "gqa_prefill_flash_256_p4_gated_q8",
         ])
     }
 
@@ -5388,8 +5642,12 @@ mod gate {
         println!("cross geometry {}", verdict(x));
         ok &= x;
         tier::sc("16 decode flash 256 q8: the q8_0 read path against its f16 twin")?;
-        let q = decode_q8_check(&gpu, &k, &DEC_KEYS_Q8)?;
+        let q = decode_q8_check(&gpu, &k, Q36, &DEC_KEYS_Q8)?;
         println!("decode flash 256 q8 {}", verdict(q));
+        ok &= q;
+        tier::sc("16 decode flash 256 p4 q8: the MTP draft's q8_0 pass against its f16 twin")?;
+        let q = decode_q8_check(&gpu, &k, Q38, &DEC_KEYS_Q38)?;
+        println!("decode flash 256 p4 q8 {}", verdict(q));
         ok &= q;
         tier::sc("17 rope-norm: the NORM append against the host rule")?;
         let r = nb_rope_check(&gpu, &rope_norm)?;
@@ -5429,6 +5687,10 @@ mod gate {
         tier::sc("11-13 qsa selected flash: against the dense flash and the exact attention")?;
         let s = sel_flash_check(&gpu, (&k, &kp), &qk)?;
         println!("qsa selected flash {}", verdict(s));
+        ok &= s;
+        tier::sc("21 qsa selected flash q8: the q8_0 entries against their f16 twins")?;
+        let s = sel_flash_q8_check(&gpu, (&k, &kp), &qk)?;
+        println!("qsa selected flash q8 {}", verdict(s));
         ok &= s;
         tier::sc("15 qsa deep: the selector and the flashes at a cache of 262,144 rows")?;
         let s = deep_check(&gpu, (&k, &kp), &qk)?;

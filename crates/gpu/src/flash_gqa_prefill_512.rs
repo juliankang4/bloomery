@@ -738,7 +738,14 @@ impl FlashGqaPrefill512 {
         let what = "flash_gqa_prefill_512::enqueue_p4";
         let packs = crate::flash_gqa_prefill::checked_packed(
             what,
-            &args,
+            args.q,
+            crate::flash_gqa::CachePlanes::F16 {
+                kc: args.kc,
+                vc: args.vc,
+            },
+            args.n_keys,
+            &*args.y,
+            (args.n_head, args.n_kv, args.ctx, args.t),
             (HEAD_512, KEY_TILE_512, PACK_4),
         )?;
         let GqaPrefillArgs {
@@ -793,7 +800,14 @@ impl FlashGqaPrefill512 {
         }
         let packs = crate::flash_gqa_prefill::checked_packed(
             what,
-            &args,
+            args.q,
+            crate::flash_gqa::CachePlanes::F16 {
+                kc: args.kc,
+                vc: args.vc,
+            },
+            args.n_keys,
+            &*args.y,
+            (args.n_head, args.n_kv, args.ctx, args.t),
             (HEAD_512, KEY_TILE_512, PACK_4),
         )?;
         let GqaPrefillArgs {
