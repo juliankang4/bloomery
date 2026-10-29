@@ -166,7 +166,7 @@ fn node_nvme_host_run(
         };
         let mut node = NodeCensus {
             devices: census,
-            host_room: 0,
+            host_room: (0, workstation::HostRead::Given),
             arena_given: Some(72 << 20),
         };
         let mut resident = open.clone();
@@ -175,7 +175,27 @@ fn node_nvme_host_run(
         }
         resident.project(&source, &node).unwrap();
         assert!(resident.nvme.is_none());
-        let refused = open.project(&source, &node).is_err();
+        for read in [
+            workstation::HostRead::Given,
+            workstation::HostRead::MemAvailable,
+            workstation::HostRead::VmStats,
+            workstation::HostRead::Cgroup {
+                path: "/node.scope".into(),
+            },
+            workstation::HostRead::Machine,
+        ] {
+            node.host_room.1 = read.clone();
+            let refusal = open
+                .project(&source, &node)
+                .expect_err("the node has no host room");
+            assert!(
+                refusal
+                    .to_string()
+                    .contains(&format!("the node's host room 0 B ({read})")),
+                "a remote plan refusal must name its own reading: {refusal}"
+            );
+        }
+        node.host_room.1 = workstation::HostRead::Given;
         let mut reconstructed = open.clone();
         reconstructed.nvme = Some(super::super::node::NodeNvme {
             room: u64::MAX,
@@ -186,21 +206,21 @@ fn node_nvme_host_run(
         let need = workstation::HostNeed::of(&reconstructed, 0);
         let assigned_bytes = (LAYERS * 3 * (EXPERTS - 1) * ROW_BYTES * WIDTH) as u64;
         println!(
-            "node host budget: assigned={assigned_bytes} os={} zero-room-refused={refused} reconstructed={}",
+            "node host budget: assigned={assigned_bytes} os={} zero-room-refused=true reconstructed={}",
             need.os,
             need.bytes()
         );
-        assert_eq!((refused, need.bytes()), (true, assigned_bytes));
-        node.host_room = u64::MAX;
+        assert_eq!(need.bytes(), assigned_bytes);
+        node.host_room.0 = u64::MAX;
         open.project(&source, &node).unwrap();
         assert_eq!(open.nvme.as_ref().unwrap().arena.planned, 0);
-        node.host_room = 160 << 20;
+        node.host_room.0 = 160 << 20;
         open.project(&source, &node).unwrap();
         resident.nvme = open.nvme.clone();
-        node.host_room = 0;
+        node.host_room.0 = 0;
         resident.project(&source, &node).unwrap();
         assert!(resident.nvme.is_none());
-        node.host_room = 160 << 20;
+        node.host_room.0 = 160 << 20;
         let paging = open
             .nvme
             .as_ref()

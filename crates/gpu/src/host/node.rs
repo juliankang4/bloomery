@@ -42,7 +42,7 @@ use gguf::Split;
 use gguf::digest::sha256_hex_of;
 use model::ops::DEFER_MAX_COLS;
 use model::placement::devices::{DeviceId, DeviceInfo, spec_of_device};
-use model::placement::workstation::{self, ArenaGrant, CardSpec};
+use model::placement::workstation::{self, ArenaGrant, CardSpec, HostRead};
 use model::placement::{
     Device, ExpertList, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment,
 };
@@ -114,7 +114,8 @@ fn open_bound(open: &NodeOpen) -> Result<Duration, GpuError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeCensus {
     pub devices: Vec<DeviceInfo>,
-    pub host_room: u64,
+    /// The node's available host bytes and the reading that supplied them.
+    pub host_room: (u64, HostRead),
     pub arena_given: Option<u64>,
 }
 
@@ -123,7 +124,7 @@ impl NodeCensus {
     pub fn here() -> Result<NodeCensus, GpuError> {
         Ok(NodeCensus {
             devices: crate::census()?,
-            host_room: workstation::host_available().map_err(|e| GpuError::plan(SERVER, e))?,
+            host_room: workstation::host_available_read().map_err(|e| GpuError::plan(SERVER, e))?,
             arena_given: workstation::nvtier_arena_given()
                 .map_err(|e| GpuError::plan(SERVER, e))?,
         })
@@ -131,7 +132,14 @@ impl NodeCensus {
 
     /// Append this census to the node protocol payload.
     pub fn write(&self, o: &mut Out) {
-        o.u32(wire::VERSION).u64(self.host_room);
+        o.u32(wire::VERSION).u64(self.host_room.0);
+        match &self.host_room.1 {
+            HostRead::Given => o.u8(0),
+            HostRead::MemAvailable => o.u8(1),
+            HostRead::VmStats => o.u8(2),
+            HostRead::Cgroup { path } => o.u8(3).str(path),
+            HostRead::Machine => o.u8(4),
+        };
         match self.arena_given {
             Some(bytes) => o.u8(1).u64(bytes),
             None => o.u8(0),
@@ -160,7 +168,18 @@ impl NodeCensus {
                 wire::VERSION
             ));
         }
-        let host_room = i.u64("host room")?;
+        let bytes = i.u64("host room")?;
+        let read = match i.u8("host reading")? {
+            0 => HostRead::Given,
+            1 => HostRead::MemAvailable,
+            2 => HostRead::VmStats,
+            3 => HostRead::Cgroup {
+                path: i.str("host cgroup path")?,
+            },
+            4 => HostRead::Machine,
+            tag => return Err(format!("unknown host reading {tag}")),
+        };
+        let host_room = (bytes, read);
         let arena_given = if i.flag("arena given")? {
             Some(i.u64("arena bytes")?)
         } else {
@@ -350,10 +369,18 @@ impl NodeOpen {
             .os
             .checked_add(reserve)
             .ok_or_else(|| GpuError::shape(WHAT, "the projected host reserve overflows"))?;
-        model::placement::expert_nvme_tier(&mut projected, census.host_room, census.arena_given)
-            .map_err(|e| GpuError::plan(WHAT, e))?;
+        model::placement::expert_nvme_tier(&mut projected, census.host_room.0, census.arena_given)
+            .map_err(|e| {
+                GpuError::plan(
+                    WHAT,
+                    format!(
+                        "the node's host room {} B ({}): {e}",
+                        census.host_room.0, census.host_room.1
+                    ),
+                )
+            })?;
         self.nvme = Some(NodeNvme {
-            room: census.host_room,
+            room: census.host_room.0,
             arena: ArenaGrant::whole(projected.host.nvme_arena_bytes),
             reserve,
         });
@@ -1880,6 +1907,7 @@ pub(super) mod tests {
     use gguf::write::{Layout, Writer};
     use gguf::{GgmlType, Split};
     use model::placement::devices::{DeviceId, DeviceInfo};
+    use model::placement::workstation::HostRead;
     use model::placement::{Format, ModelTensor, ModelTensors, Role};
 
     pub(in crate::host) fn empty_file(tag: &str) -> (std::path::PathBuf, std::sync::Arc<Split>) {
@@ -2225,9 +2253,57 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_census_keeps_its_host_reading() {
+        for read in [
+            HostRead::Given,
+            HostRead::MemAvailable,
+            HostRead::VmStats,
+            HostRead::Cgroup { path: "/".into() },
+            HostRead::Cgroup {
+                path: "/user.slice/job.scope".into(),
+            },
+            HostRead::Machine,
+        ] {
+            let census = NodeCensus {
+                devices: vec![gb10(7)],
+                host_room: (1234, read),
+                arena_given: Some(0),
+            };
+            let mut out = Out::default();
+            census.write(&mut out);
+            let mut input = In::new(out.done());
+            assert_eq!(
+                NodeCensus::read(&mut input),
+                Ok(census),
+                "the census must preserve the room and its reading"
+            );
+            input.end().expect("the exact census payload");
+            for n in 0..out.done().len() {
+                assert!(
+                    NodeCensus::read(&mut In::new(&out.done()[..n])).is_err(),
+                    "a truncated census at byte {n} must be refused"
+                );
+            }
+        }
+        let mut out = Out::default();
+        out.u32(super::wire::VERSION).u64(1234).u8(255);
+        let refusal = NodeCensus::read(&mut In::new(out.done())).unwrap_err();
+        assert!(
+            refusal.contains("unknown host reading 255"),
+            "an undefined host reading must be named: {refusal}"
+        );
+        out.clear().u32(5).u64(1234).u8(0);
+        let refusal = NodeCensus::read(&mut In::new(out.done())).unwrap_err();
+        assert!(
+            refusal.contains("protocol version 5"),
+            "a census without a host reading must be refused by version: {refusal}"
+        );
+    }
+
+    #[test]
     fn messages_read_back_as_written() {
         let census = NodeCensus {
-            host_room: u64::MAX,
+            host_room: (u64::MAX, HostRead::Given),
             arena_given: None,
             devices: vec![gb10(7)],
         };
