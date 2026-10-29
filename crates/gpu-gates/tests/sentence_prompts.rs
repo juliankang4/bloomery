@@ -16,7 +16,7 @@ fn sentence_prompts_startup(case: &str) {
         .unwrap();
     let result = sentence_prompts(&flags, &model);
     match case {
-        "base" | "own" => {
+        "base" | "own" | "base-rev" => {
             let prompts = result.unwrap();
             assert_eq!(prompts["query"], "query: ");
             assert_eq!(prompts["document"], "document: ");
@@ -41,41 +41,56 @@ fn cached_sentence_prompts_survive_an_offline_restart() {
     std::fs::create_dir(&bin).unwrap();
     let curl = bin.join("curl");
     use std::os::unix::fs::PermissionsExt;
-    for case in ["base", "own", "no-card", "no-base-config", "malformed"] {
+    for case in [
+        "base",
+        "own",
+        "no-card",
+        "no-base-config",
+        "malformed",
+        "base-rev",
+    ] {
         let root = dir.join(case);
         let hub = root.join("hub");
         let cache = root.join("cache");
         let config = r#"{"prompts":{"query":"query: ","document":"document: "}}"#;
-        let mut files = vec![("fixture/quant", "model-Q4_K_M.gguf", "GGUF")];
+        let mut files = vec![("fixture/quant", "main", "model-Q4_K_M.gguf", "GGUF")];
+        let card = if case == "base-rev" {
+            "---\nbase_model: fixture/base@v1\n---\n"
+        } else {
+            "---\nbase_model: fixture/base\n---\n"
+        };
         if case != "no-card" {
-            files.push((
-                "fixture/quant",
-                "README.md",
-                "---\nbase_model: fixture/base\n---\n",
-            ));
+            files.push(("fixture/quant", "main", "README.md", card));
         }
         match case {
-            "own" => files.push(("fixture/quant", CONFIG, config)),
-            "base" => files.push(("fixture/base", CONFIG, config)),
-            "malformed" => files.push(("fixture/base", CONFIG, r#"{"prompts":{"query":7}}"#)),
+            "own" => files.push(("fixture/quant", "main", CONFIG, config)),
+            "base" => files.push(("fixture/base", "main", CONFIG, config)),
+            "base-rev" => {
+                let other = r#"{"prompts":{"query":"main query: ","document":"main document: "}}"#;
+                files.push(("fixture/base", "main", CONFIG, other));
+                files.push(("fixture/base", "v1", CONFIG, config));
+            }
+            "malformed" => {
+                files.push(("fixture/base", "main", CONFIG, r#"{"prompts":{"query":7}}"#))
+            }
             _ => {}
         }
-        let mut listings = std::collections::BTreeMap::<&str, Vec<String>>::new();
-        listings.insert("fixture/base", Vec::new());
-        for (repo, name, text) in files {
-            let path = hub.join(repo).join("resolve/main").join(name);
+        let mut listings = std::collections::BTreeMap::<(&str, &str), Vec<String>>::new();
+        listings.insert(("fixture/base", "main"), Vec::new());
+        for (repo, rev, name, text) in files {
+            let path = hub.join(repo).join("resolve").join(rev).join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, text).unwrap();
             let digest = hf::fetch::digest(&path, hf::Check::GitSha1, text.len() as u64).unwrap();
-            listings.entry(repo).or_default().push(format!(
+            listings.entry((repo, rev)).or_default().push(format!(
                 r#"{{"type":"file","path":"{name}","size":{},"oid":"{digest}"}}"#,
                 text.len()
             ));
         }
-        for (repo, entries) in listings {
+        for ((repo, rev), entries) in listings {
             let tree = hub.join("api/models").join(repo).join("tree");
             std::fs::create_dir_all(&tree).unwrap();
-            std::fs::write(tree.join("main"), format!("[{}]", entries.join(","))).unwrap();
+            std::fs::write(tree.join(rev), format!("[{}]", entries.join(","))).unwrap();
         }
         std::fs::write(root.join("scenario"), case).unwrap();
         for mode in ["online", "cached", "offline", "down"] {

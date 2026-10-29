@@ -148,7 +148,7 @@ impl Flags {
             if cfg!(feature = "vision") && !self.image.disabled() {
                 let repo = hf::RepoRef::parse(hf)?;
                 Some(
-                    model_file::fetch_exact(&repo.repo, &[mmproj])?
+                    model_file::fetch_exact(&repo.id(), &[mmproj])?
                         .into_iter()
                         .next()
                         .ok_or("the projector fetch returned no file")?,

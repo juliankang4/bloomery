@@ -183,7 +183,8 @@ pub struct Ask<'a> {
     pub head_config: Option<&'a Path>,
     /// The `--model` word: [`WORD`], a generative seat's, or none.
     pub word: Option<&'a str>,
-    /// The repo (`owner/name`) the model file was fetched from under `--hf`.
+    /// The repo (`owner/name`, `owner/name@rev` at a revision) the model file was fetched from
+    /// under `--hf`.
     pub hf: Option<&'a str>,
     /// The model file's architecture.
     pub arch: &'a str,

@@ -1,4 +1,4 @@
-//! What fetches: `--hf <repo>[:<quant>]` into the cache ([`hf::fetch`]) and the files beside a set.
+//! What fetches: `--hf <repo>[@<rev>][:<quant>]` into the cache ([`hf::fetch`]) and the files beside a set.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -14,10 +14,12 @@ use super::{model_file, set_model_file};
 use crate::GateError;
 use crate::record::{self, Record};
 
-/// The `--hf` repo the model file came from, set once beside it ([`name`]).
+/// The `--hf` repo at its revision ([`hf::RepoRef::id`]) the model file came from, set once
+/// beside it ([`name`]).
 static MODEL_REPO: OnceLock<String> = OnceLock::new();
 
-/// The `--hf` repo the process's model file came from; `None` for a file named by path.
+/// The `--hf` repo at its revision the process's model file came from; `None` for a file named
+/// by path.
 #[must_use]
 pub fn hf_repo() -> Option<&'static str> {
     MODEL_REPO.get().map(String::as_str)
@@ -273,7 +275,8 @@ pub fn fetch_exact(repo: &str, paths: &[&str]) -> Result<Vec<PathBuf>, GateError
     Ok(client(repo)?.resolve_exact(repo, paths, &mut print)?)
 }
 
-/// Named embedding prefixes beside a local model, or in its HF repo or single base model.
+/// Named embedding prefixes beside a local model, or in its HF repo or single base model, each
+/// at the revision its name gives.
 pub fn sentence_prompts(
     flags: &Flags,
     model: &Path,
@@ -283,8 +286,9 @@ pub fn sentence_prompts(
         && let Some(repo) = &flags.hf
     {
         record::require(record::groups::fetch::FETCH, "model_file::sentence_prompts");
-        let repo = hf::RepoRef::parse(repo)?.repo;
-        let c = client(&repo)?;
+        let r = hf::RepoRef::parse(repo)?;
+        let repo = r.id();
+        let c = client(&r.repo)?;
         let paths = match c.resolve_exact(&repo, &[NAME], &mut print) {
             Ok(paths) => paths,
             Err(e) if no_file(&e) => {
@@ -292,8 +296,8 @@ pub fn sentence_prompts(
                 else {
                     return Ok(std::collections::BTreeMap::default());
                 };
-                let base = hf::RepoRef::parse(&base)?.repo;
-                match client(&base)?.resolve_exact(&base, &[NAME], &mut print) {
+                let base = hf::RepoRef::parse(&base)?;
+                match client(&base.repo)?.resolve_exact(&base.id(), &[NAME], &mut print) {
                     Ok(paths) => paths,
                     Err(e) if no_file(&e) => return Ok(std::collections::BTreeMap::default()),
                     Err(e) => return Err(e.into()),
@@ -366,7 +370,7 @@ pub fn name(flags: &Flags) -> Result<(), GateError> {
         // A path flag wins over `--hf` ([`source::resolve`]), so the file is the repo's only
         // without one.
         if let (None, Some(h)) = (&flags.path, &flags.hf) {
-            let repo = hf::RepoRef::parse(h)?.repo;
+            let repo = hf::RepoRef::parse(h)?.id();
             MODEL_REPO.set(repo).map_err(|r| {
                 format!("the model's --hf repo is set already, and a second set names {r}")
             })?;
@@ -376,18 +380,21 @@ pub fn name(flags: &Flags) -> Result<(), GateError> {
 }
 
 /// The `general.architecture` and the decision type (`<arch>.decision.type`) of the model the
-/// `--hf` repo `r` holds, read before any of its files is fetched, from the file a fetch
+/// `--hf` repo `r` holds at its revision ([`Client::hub_at`]), read before any of its files is
+/// fetched, from the file a fetch
 /// ([`resolve`]) would open first: a set's first shard by its header, read by HTTP Range
 /// ([`model_hf::remote::shard_header`]), or a checkpoint's `config.json` as its folder's map
 /// reads it ([`model_hf::folder::architecture`]; a folder declares no decision type). Under
 /// `HF_HUB_OFFLINE` there is no listing to read it from.
 pub fn repo_architecture(r: &hf::RepoRef) -> Result<(String, Option<String>), GateError> {
     let client = client(&r.repo)?;
+    let id = r.id();
+    let (repo, rev) = client.hub_at(&id);
     if client.offline {
         return Err(format!("--hf {r}: HF_HUB_OFFLINE is set, so there is no listing").into());
     }
-    let entries = client.listing(&r.repo)?;
-    let sets = hf::gguf_sets(&r.repo, &entries)?;
+    let entries = client.listing(&id)?;
+    let sets = hf::gguf_sets(&id, &entries)?;
     if sets.is_empty()
         && let Some(files) = hf::checkpoint_files(&entries)
     {
@@ -395,10 +402,10 @@ pub fn repo_architecture(r: &hf::RepoRef) -> Result<(String, Option<String>), Ga
             .iter()
             .find(|e| e.path == "config.json")
             .ok_or_else(|| format!("--hf {r}: the checkpoint has no config.json"))?;
-        let bytes = client.fetch_range(&r.repo, "main", &config.path, 0, config.size)?;
+        let bytes = client.fetch_range(repo, rev, &config.path, 0, config.size)?;
         return Ok((model_hf::folder::architecture(&bytes)?.to_owned(), None));
     }
-    let first = hf::pick(&r.repo, &sets, r.quant.as_deref())?
+    let first = hf::pick(&id, &sets, r.quant.as_deref())?
         .files
         .first()
         .ok_or_else(|| format!("--hf {r}: the picked set has no file"))?;
@@ -406,7 +413,7 @@ pub fn repo_architecture(r: &hf::RepoRef) -> Result<(String, Option<String>), Ga
     let header =
         model_hf::remote::shard_header(&dest, &first.path, first.size, &mut |from, len| {
             client
-                .fetch_range(&r.repo, "main", &first.path, from, len)
+                .fetch_range(repo, rev, &first.path, from, len)
                 .map_err(Into::into)
         })?;
     let arch = header
@@ -419,7 +426,7 @@ pub fn repo_architecture(r: &hf::RepoRef) -> Result<(String, Option<String>), Ga
 }
 
 /// The image projector the `--hf` repo holds beside the process's model file, a set's first
-/// shard in the cache (`<root>/<owner>/<name>/<path in the repo>`, which gives the cache root and
+/// shard in the cache (`<root>/<owner>/<name>[@<rev>]/<path in the repo>`, which gives the cache root and
 /// the model's path in the repo): the listing's `mmproj` sibling of the model
 /// ([`hf::mmproj_sibling`], through [`Client::mmproj_path`]), fetched and checked. `None` when
 /// the model file was named by path, or the repo holds no projector.

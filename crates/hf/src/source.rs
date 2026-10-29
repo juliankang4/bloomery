@@ -1,6 +1,6 @@
 //! Where a server's model file comes from: a path (`-m PATH`, `--model-file
 //! PATH`, and whatever other spellings a binary gives the flag), a repo
-//! (`--hf <repo>[:<quant>]`), the gates' environment variable
+//! (`--hf <repo>[@<rev>][:<quant>]`), the gates' environment variable
 //! `BLOOMERY_REF_MODEL`, or a catalog model by name ([`Source::Named`], which the
 //! pick turns into a repo). A model is named once: a flag given twice, a path
 //! beside `--hf`, and a flag beside the variable when the two name different
@@ -187,6 +187,7 @@ mod tests {
             resolve(&hf, None).expect("hf"),
             Some(Source::Hf(RepoRef {
                 repo: "a/b".into(),
+                rev: None,
                 quant: Some("Q8_0".into())
             }))
         );
