@@ -227,9 +227,8 @@ const EBADF: i32 = 9;
 const EFAULT: i32 = 14;
 const EINVAL: i32 = 22;
 
-/// How long a refused connection is written to and read from: the read consumes
-/// the request it sent, so the close does not reset the connection before the
-/// client reads the 503.
+/// How long a refused connection is written to, and how long a connection closed
+/// after its answer is read from ([`linger_close`]).
 const REFUSE_DRAIN: Duration = Duration::from_millis(200);
 
 /// The default [`ServerConfig::fatal_linger`]: long enough for a client or a
@@ -1294,9 +1293,8 @@ fn refuse(stream: TcpStream, message: &str) {
 }
 
 /// Answers a connection the server does not serve with a 503 carrying `body`
-/// and `Retry-After`, then closes it after reading what the client sent, for
-/// at most about [`REFUSE_DRAIN`] twice. Runs on the connection's thread, never
-/// the listener's accept loop.
+/// and `Retry-After`, then closes it through [`linger_close`]. Runs on the
+/// connection's thread, never the listener's accept loop.
 fn refuse_with(mut stream: TcpStream, body: &Value) {
     if stream.set_write_timeout(Some(REFUSE_DRAIN)).is_err() {
         return;
@@ -1309,18 +1307,30 @@ fn refuse_with(mut stream: TcpStream, body: &Value) {
         &[("Retry-After", RETRY_AFTER_SECS.to_owned())],
         body.to_string().as_bytes(),
     );
-    if sent.is_err() || stream.shutdown(Shutdown::Write).is_err() {
-        return;
+    if sent.is_ok() {
+        linger_close(&stream);
     }
-    if stream.set_read_timeout(Some(REFUSE_DRAIN)).is_err() {
+}
+
+/// Ends a connection whose answer is written while request bytes may still be
+/// arriving: shuts the write side, then reads and drops what the client sends
+/// for at most about [`REFUSE_DRAIN`] twice and [`http::MAX_BODY`] bytes, so the
+/// close does not reset the connection before the client reads the answer
+/// (RFC 9112 9.6). The caller drops the stream afterwards.
+fn linger_close(stream: &TcpStream) {
+    if stream.shutdown(Shutdown::Write).is_err()
+        || stream.set_read_timeout(Some(REFUSE_DRAIN)).is_err()
+    {
         return;
     }
     let until = Instant::now() + REFUSE_DRAIN;
     let mut sink = [0u8; 4096];
-    while Instant::now() < until {
-        match stream.read(&mut sink) {
+    let mut left = http::MAX_BODY;
+    let mut r = stream;
+    while left > 0 && Instant::now() < until {
+        match r.read(&mut sink) {
             Ok(0) | Err(_) => return,
-            Ok(_) => {}
+            Ok(n) => left = left.saturating_sub(n),
         }
     }
 }
@@ -1409,7 +1419,8 @@ impl Drop for Answering<'_> {
 /// the connection alive ([`next_request_arrives`]); `route` answers one
 /// request, `Ok(true)` when the connection may carry another, counted in
 /// `answers` until it returns. Headers are authorized against `keys` before
-/// continuing or reading the body; a denied or unreadable request closes the connection.
+/// continuing or reading the body; a denied or unreadable request closes the connection,
+/// as does an answer that left the request's body unread, each through [`linger_close`].
 pub(crate) fn keep_alive(
     stream: TcpStream,
     answers: &Answers,
@@ -1428,29 +1439,30 @@ pub(crate) fn keep_alive(
         if !next_request_arrives(&mut r) {
             return;
         }
-        let req = match (|| -> io::Result<Option<Request>> {
+        let (req, unread) = match (|| -> io::Result<Option<(Request, bool)>> {
             let Some(mut req) = http::read_head(&mut r)? else {
                 return Ok(None);
             };
             if key_denied(keys, &mut req, &mut w)? {
+                linger_close(r.get_ref());
                 return Ok(None);
             }
+            let mut unread = false;
             if req.method == "OPTIONS" || matches!(req.path.as_str(), "/health" | "/v1/health") {
                 // These public handlers ignore bodies; unread framing cannot carry a next request.
-                req.keep_alive &= req.header("transfer-encoding").is_none()
-                    && req
-                        .header("content-length")
-                        .is_none_or(|len| len.parse::<usize>() == Ok(0));
+                unread = req.header("transfer-encoding").is_some()
+                    || http::content_length(&req)?.is_some_and(|len| len > 0);
+                req.keep_alive &= !unread;
             } else {
                 http::read_body(&mut r, &mut w, &mut req)?;
             }
-            Ok(Some(req))
+            Ok(Some((req, unread)))
         })() {
-            Ok(Some(req)) => req,
+            Ok(Some(read)) => read,
             Ok(None) => return,
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 let body = error_body(400, "invalid_request_error", &e.to_string());
-                let _ = http::respond(
+                let sent = http::respond(
                     &mut w,
                     &closing(),
                     400,
@@ -1458,6 +1470,9 @@ pub(crate) fn keep_alive(
                     &[],
                     body.to_string().as_bytes(),
                 );
+                if sent.is_ok() {
+                    linger_close(r.get_ref());
+                }
                 return;
             }
             Err(_) => return,
@@ -1468,6 +1483,7 @@ pub(crate) fn keep_alive(
         };
         match answered {
             Ok(true) if req.keep_alive => {}
+            Ok(_) if unread => return linger_close(r.get_ref()),
             _ => return,
         }
     }
@@ -2873,7 +2889,6 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
             &state.info.eos_text,
         ],
     )
-    .map_err(guard_error)?
     .except(&markers);
     // GPT-OSS's template is the one that renders the `developer` role itself,
     // named by the `<|channel|>` marker in its source.
@@ -3023,8 +3038,7 @@ fn template_error(e: TemplateError) -> ApiError {
     }
 }
 
-/// A request whose strings cannot be guarded, or a template that cut a guarded text apart, is
-/// the request's 400 naming it.
+/// A template that cut a guarded text apart is the request's 400 naming it.
 fn guard_error(e: GuardError) -> ApiError {
     invalid(e.to_string())
 }
@@ -6619,6 +6633,38 @@ mod tests {
         assert!(body.contains("content"), "the generation answered: {body}");
     }
 
+    /// Sends `head`, then a body in pieces the server reads after it answered from the head,
+    /// and returns the answer's status once the connection ends with EOF: an answer that
+    /// closes with request bytes unread still reaches the client.
+    fn answer_before_the_body(addr: SocketAddr, head: &str) -> u16 {
+        use std::io::{BufReader, Write};
+        use std::net::{Shutdown, TcpStream};
+
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(head.as_bytes()).unwrap();
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(20));
+            stream
+                .write_all(&[b'x'; 256])
+                .expect("the server reads the rest of the request");
+        }
+        stream.shutdown(Shutdown::Write).unwrap();
+        let mut reader = BufReader::new(stream);
+        let (status, _, _) = crate::http::read_test_response(&mut reader);
+        let mut byte = [0];
+        assert_eq!(
+            reader
+                .read(&mut byte)
+                .expect("the connection ends with EOF"),
+            0,
+            "{head:?}"
+        );
+        status
+    }
+
     /// Refusals and public bodyless handlers answer headers without `100 Continue` or a body;
     /// authorized requests retain both body framings, the handshake and the next keyed request.
     #[test]
@@ -6689,6 +6735,8 @@ mod tests {
             let mut byte = [0];
             assert_eq!(r.read(&mut byte).expect("the unread public body closes"), 0);
         }
+        let denied = "POST /completion HTTP/1.1\r\nContent-Length: 1024\r\n\r\n";
+        assert_eq!(answer_before_the_body(addr, denied), 401);
 
         let ask = r#"{"prompt":"hello","max_tokens":1}"#;
         for chunked in [false, true] {
@@ -6744,28 +6792,281 @@ mod tests {
             super::testserve::mock_config(),
         );
         let mut accepted = Vec::new();
-        for (headers, body) in [
-            ("Content-Length: 2\r\ncontent-length: 3\r\n", "{}"),
-            ("Content-Length: 2, 3\r\n", "{}"),
-            ("Transfer-Encoding: chunked\r\n", "2\r\n{}JUNK\r\n0\r\n\r\n"),
-            ("Transfer-Encoding: chunked\r\n", "2\r\n{}\n0\r\n\r\n"),
-            ("Transfer-Encoding: chunked\r\n", "0\r\nTrailer: value\r\n"),
-            ("Transfer-Encoding: chunked\r\n", "0\r\n\r"),
-        ] {
+        let next = "GET /health HTTP/1.1\r\nConnection: close\r\n\r\n";
+        let smuggled = format!("Content-Length: 0\r\ncontent-length: {}\r\n", next.len());
+        let body = r#"{"content":"x"}"#;
+        let whitespace_frames = ["\u{b}", "\u{c}", "\u{85}", "\u{a0}", "\u{2003}", "\r"]
+            .into_iter()
+            .flat_map(|space| {
+                let n = body.len();
+                [
+                    (
+                        "POST /tokenize",
+                        format!("Content-Length: {space}{n}\r\n"),
+                        format!("{body}{next}"),
+                    ),
+                    (
+                        "POST /tokenize",
+                        format!("Content-Length: {n}{space}\r\n"),
+                        format!("{body}{next}"),
+                    ),
+                    (
+                        "POST /tokenize",
+                        format!("Content-Length: {n},{space}{n}\r\n"),
+                        format!("{body}{next}"),
+                    ),
+                    (
+                        "POST /tokenize",
+                        "Transfer-Encoding: chunked\r\n".to_owned(),
+                        format!("{n:x}{space}\r\n{body}\r\n0\r\n\r\n{next}"),
+                    ),
+                    (
+                        "POST /tokenize",
+                        "Transfer-Encoding: chunked\r\n".to_owned(),
+                        format!("{n:x}{space};x=y\r\n{body}\r\n0\r\n\r\n{next}"),
+                    ),
+                    (
+                        "POST /tokenize",
+                        "Transfer-Encoding: chunked\r\n".to_owned(),
+                        format!("{n:x}\r\n{body}\r\n0{space}\r\n\r\n{next}"),
+                    ),
+                    (
+                        "GET /health",
+                        format!("Content-Length: {space}0\r\n"),
+                        next.to_owned(),
+                    ),
+                    (
+                        "GET /v1/health",
+                        format!("Content-Length: 0,{space}0\r\n"),
+                        next.to_owned(),
+                    ),
+                    (
+                        "OPTIONS /tokenize",
+                        format!("Content-Length: 0{space}\r\n"),
+                        next.to_owned(),
+                    ),
+                ]
+            });
+        for (start, headers, body) in [
+            (
+                "POST /tokenize",
+                "Content-Length: 2\r\ncontent-length: 3\r\n",
+                "{}",
+            ),
+            ("POST /tokenize", "Content-Length: 2, 3\r\n", "{}"),
+            ("POST /tokenize", "Content-Length: 3\r\n", "{}"),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: chunked\r\n",
+                "2\r\n{}JUNK\r\n0\r\n\r\n",
+            ),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: chunked\r\n",
+                "2\r\n{}\n0\r\n\r\n",
+            ),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: chunked\r\n",
+                "2\r\n{}XX0\r\n\r\n",
+            ),
+            ("POST /tokenize", "Transfer-Encoding: chunked\r\n", "2\r\n{"),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: chunked\r\n",
+                "2\r\n{}",
+            ),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: chunked\r\n",
+                "2\r\n{}\r",
+            ),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: chunked\r\n",
+                "0\r\nTrailer: value\r\n",
+            ),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: chunked\r\n",
+                "0\r\n\r",
+            ),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: gzip\r\n",
+                "2\r\n{}\r\n0\r\n\r\n",
+            ),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+                "2\r\n{}\r\n0\r\n\r\n",
+            ),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: chunked, gzip\r\n",
+                "2\r\n{}\r\n0\r\n\r\n",
+            ),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: xchunked\r\n",
+                "2\r\n{}\r\n0\r\n\r\n",
+            ),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding : chunked\r\n",
+                "2\r\n{}\r\n0\r\n\r\n",
+            ),
+            ("POST /tokenize", "X-Folded\r\nContent-Length: 2\r\n", "{}"),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: chunked\r\n",
+                "+2\r\n{}\r\n0\r\n\r\n",
+            ),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: chunked\r\n",
+                " 2\r\n{}\r\n0\r\n\r\n",
+            ),
+            ("GET /health", &smuggled, next),
+            ("GET /v1/health", &smuggled, next),
+            ("OPTIONS /tokenize", &smuggled, next),
+            ("GET /health", "Content-Length: +0\r\n", ""),
+            ("GET /health", "Content-Length\u{00a0}: 24\r\n", next),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: chunked\r\n",
+                "f \r\n{\"content\":\"x\"}\r\n0\r\n\r\n",
+            ),
+            (
+                "POST /tokenize",
+                "Transfer-Encoding: chunked\r\n",
+                "f\t\r\n{\"content\":\"x\"}\r\n0\r\n\r\n",
+            ),
+        ]
+        .into_iter()
+        .map(|(start, headers, body)| (start, headers.to_owned(), body.to_owned()))
+        .chain(whitespace_frames)
+        {
             let mut stream = TcpStream::connect(addr).expect("connect");
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            write!(stream, "POST /tokenize HTTP/1.1\r\n{headers}\r\n{body}").unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .write_all(format!("{start} HTTP/1.1\r\n{headers}\r\n{body}").as_bytes())
+                .unwrap();
             stream.shutdown(Shutdown::Write).unwrap();
             let mut reader = BufReader::new(stream);
             let (status, head, _) = response(&mut reader);
             if status != 400 || !head.contains("Connection: close") {
-                accepted.push(format!("{headers:?} {body:?}: {head}"));
+                accepted.push(format!("{start} {headers:?} {body:?}: {head}"));
             }
             let mut byte = [0];
-            assert_eq!(reader.read(&mut byte).expect("the refused connection closes"), 0,
-                "no next request after malformed framing");
+            assert_eq!(
+                reader
+                    .read(&mut byte)
+                    .expect("the refused connection closes"),
+                0,
+                "no next request after malformed framing: {start} {headers:?}"
+            );
         }
-        assert!(accepted.is_empty(), "malformed framing accepted: {accepted:?}");
+        assert!(
+            accepted.is_empty(),
+            "malformed framing accepted: {accepted:?}"
+        );
+        for (head, status) in [
+            (
+                "POST /tokenize HTTP/1.1\r\nContent-Length: 2, 3\r\n\r\n",
+                400,
+            ),
+            ("GET /health HTTP/1.1\r\nContent-Length: 1024\r\n\r\n", 200),
+        ] {
+            assert_eq!(answer_before_the_body(addr, head), status);
+        }
+
+        for (headers, body) in [
+            (
+                format!("Content-Length: {0}\r\ncontent-length: {0}\r\n", body.len()),
+                body.to_owned(),
+            ),
+            (
+                format!("Content-Length: {0}, {0}\r\n", body.len()),
+                body.to_owned(),
+            ),
+            (
+                format!("Content-Length: \t{0} \t,\t {0}\t \r\n", body.len()),
+                body.to_owned(),
+            ),
+            (
+                "Transfer-Encoding: chunked\r\n".to_owned(),
+                format!(
+                    "{:x};x=y\r\n{body}\r\n0\r\nTrailer: value\r\n\r\n",
+                    body.len()
+                ),
+            ),
+            (
+                "Transfer-Encoding: chunked\r\n".to_owned(),
+                format!(
+                    "{:x} \t;x=y\r\n{body}\r\n0\r\nTrailer: value\r\n\r\n",
+                    body.len()
+                ),
+            ),
+        ] {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(format!("POST /tokenize HTTP/1.1\r\n{headers}\r\n{body}GET /health HTTP/1.1\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+            let mut reader = BufReader::new(stream);
+            let (status, head, _) = response(&mut reader);
+            assert_eq!(status, 200, "valid framing: {headers:?}");
+            assert!(head.contains("Connection: keep-alive"));
+            assert_eq!(response(&mut reader).0, 200, "the next request survives");
+        }
+
+        for (path, body) in [
+            ("/tokenize", r#"{"content":"x"}"#),
+            (
+                "/completion",
+                r#"{"prompt":"x","n_predict":1,"stream":true}"#,
+            ),
+        ] {
+            for length in [
+                "Content-Length: 1\r\n",
+                "Content-Length: 1\r\nContent-Length: 2\r\n",
+                "content-length: 1, 2\r\n",
+                "cOnTeNt-LeNgTh: invalid\r\n",
+                "Content-Length: \r\n",
+            ] {
+                let mut stream = TcpStream::connect(addr).expect("connect");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream.write_all(format!("POST {path} HTTP/1.1\r\n{length}Transfer-Encoding: ChUnKeD\r\nExpect: 100-continue\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n{next}", body.len()).as_bytes()).unwrap();
+                let mut reader = BufReader::new(stream);
+                assert_eq!(response(&mut reader).0, 100, "chunked takes precedence");
+                let mut raw = String::new();
+                reader
+                    .read_to_string(&mut raw)
+                    .expect("the response ends with EOF");
+                let (head, _) = raw.split_once("\r\n\r\n").expect("response head");
+                assert!(
+                    head.starts_with("HTTP/1.1 200 "),
+                    "{path} {length:?}: {head}"
+                );
+                assert!(
+                    head.contains("Connection: close"),
+                    "{path} {length:?}: {head}"
+                );
+                assert_eq!(
+                    raw.matches("HTTP/1.1 ").count(),
+                    1,
+                    "no pipelined response: {raw}"
+                );
+                if path == "/completion" {
+                    assert!(raw.ends_with("0\r\n\r\n"), "the stream finishes: {raw}");
+                }
+            }
+        }
     }
 
     /// `POST /shutdown` needs the key even from a loopback peer: without one

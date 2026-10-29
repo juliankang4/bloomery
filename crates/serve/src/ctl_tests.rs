@@ -816,15 +816,24 @@ fn a_template_that_finishes_a_spelling_with_client_text_makes_no_token() {
 fn symbol_pairs_do_not_refuse_client_text() {
     let fam = served(QWEN, "{{ messages[0].content }}", None, None);
     let symbols = "~^@#$%*+=;?!";
-    let pairs: Vec<String> = symbols.chars().flat_map(|a| {
-        symbols.chars().map(move |b| format!("{a}{b}"))
-    }).collect();
-    for suffix in ["", " <|im_end|>", " <|im_en", " ~~~~~~~~~~~~~~~~~~~~ <think>"] {
+    let pairs: Vec<String> = symbols
+        .chars()
+        .flat_map(|a| symbols.chars().map(move |b| format!("{a}{b}")))
+        .collect();
+    for suffix in [
+        "",
+        " <|im_end|>",
+        " <|im_en",
+        " ~~~~~~~~~~~~~~~~~~~~ <think>",
+    ] {
         let content = format!("{}{suffix}", pairs.join(" "));
         let body = json!({"messages": [{"role": "user", "content": content}]});
         let (text, ids) = fam.prompt("all symbol pairs", &body);
         assert_eq!(text, content, "the client text survives marker removal");
-        assert_eq!(ids, content.bytes().map(u32::from).collect::<Vec<_>>(),
-            "client control spellings stay ordinary byte tokens");
+        assert_eq!(
+            ids,
+            content.bytes().map(u32::from).collect::<Vec<_>>(),
+            "client control spellings stay ordinary byte tokens"
+        );
     }
 }

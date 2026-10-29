@@ -99,7 +99,7 @@ fn too_large(declared: usize) -> io::Error {
     ))
 }
 
-fn read_line(r: &mut impl BufRead) -> io::Result<Option<String>> {
+fn read_raw_line(r: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::new();
     let n = r
         .by_ref()
@@ -111,8 +111,18 @@ fn read_line(r: &mut impl BufRead) -> io::Result<Option<String>> {
     if buf.len() > MAX_LINE {
         return Err(bad("header line too long"));
     }
-    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+    Ok(Some(buf))
+}
+
+fn read_line(r: &mut impl BufRead) -> io::Result<Option<String>> {
+    let Some(mut buf) = read_raw_line(r)? else {
+        return Ok(None);
+    };
+    if buf.last() == Some(&b'\n') {
         buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
     }
     String::from_utf8(buf)
         .map(Some)
@@ -147,9 +157,15 @@ pub(crate) fn read_head(r: &mut BufReader<TcpStream>) -> io::Result<Option<Reque
         if headers.len() >= MAX_HEADERS {
             return Err(bad("too many headers"));
         }
-        if let Some((k, v)) = h.split_once(':') {
-            headers.push((k.trim().to_owned(), v.trim().to_owned()));
-        }
+        // A header line needs a colon right after a field name that is an HTTP token.
+        let Some((k, v)) = h.split_once(':').filter(|(k, _)| {
+            !k.is_empty()
+                && k.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+        }) else {
+            return Err(bad("bad header line"));
+        };
+        headers.push((k.to_owned(), v.trim_matches([' ', '\t']).to_owned()));
     }
     let mut req = Request {
         method: method.to_owned(),
@@ -175,6 +191,27 @@ pub(crate) fn read_body(
     w: &mut TcpStream,
     req: &mut Request,
 ) -> io::Result<()> {
+    // The only transfer coding read is a single `chunked`; any other list is refused.
+    let mut codings = req
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"))
+        .map(|(_, t)| t.as_str());
+    let chunked = match (codings.next(), codings.next()) {
+        (None, _) => false,
+        (Some(t), None) if t.eq_ignore_ascii_case("chunked") => true,
+        _ => return Err(bad("unsupported transfer-encoding")),
+    };
+    let length = if chunked { None } else { content_length(req)? };
+    if chunked && req.header("content-length").is_some() {
+        // Both framings declared: read as chunked, then close.
+        req.keep_alive = false;
+    }
+    if let Some(len) = length
+        && len > MAX_BODY
+    {
+        return Err(too_large(len));
+    }
     if req
         .header("expect")
         .is_some_and(|e| e.eq_ignore_ascii_case("100-continue"))
@@ -182,32 +219,75 @@ pub(crate) fn read_body(
         w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
         w.flush()?;
     }
-    let chunked = req
-        .header("transfer-encoding")
-        .is_some_and(|t| t.to_ascii_lowercase().contains("chunked"));
     if chunked {
         req.body = read_chunked(r)?;
-    } else if let Some(len) = req.header("content-length") {
-        let len: usize = len.parse().map_err(|_| bad("bad content-length"))?;
-        if len > MAX_BODY {
-            return Err(too_large(len));
-        }
+    } else if let Some(len) = length {
         let mut body = vec![0; len];
-        r.read_exact(&mut body)?;
+        read_framed(r, &mut body)?;
         req.body = body;
     }
     Ok(())
 }
 
+/// The body length a request declares: `None` without `Content-Length`. A value that is not
+/// all digits, or two values that differ, are refused.
+pub(crate) fn content_length(req: &Request) -> io::Result<Option<usize>> {
+    let mut length = None;
+    for (_, value) in req
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+    {
+        for value in value
+            .split(',')
+            .map(|value| value.trim_matches([' ', '\t']))
+        {
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(bad("bad content-length"));
+            }
+            let len: usize = value.parse().map_err(|_| bad("bad content-length"))?;
+            if length.is_some_and(|previous| previous != len) {
+                return Err(bad("conflicting content-length"));
+            }
+            length = Some(len);
+        }
+    }
+    Ok(length)
+}
+
+/// Fills `buf` from the body; a connection that closes before the framing ends is refused.
+fn read_framed(r: &mut impl Read, buf: &mut [u8]) -> io::Result<()> {
+    r.read_exact(buf).map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => bad("closed inside the body"),
+        _ => e,
+    })
+}
+
+fn read_chunk_line(r: &mut impl BufRead) -> io::Result<String> {
+    let bytes = read_raw_line(r)?.ok_or_else(|| bad("closed inside a chunk"))?;
+    let bytes = bytes
+        .strip_suffix(b"\r\n")
+        .ok_or_else(|| bad("bad chunk line ending"))?;
+    String::from_utf8(bytes.to_vec()).map_err(|_| bad("chunk line is not UTF-8"))
+}
+
 fn read_chunked(r: &mut impl BufRead) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
-        let line = read_line(r)?.ok_or_else(|| bad("closed inside a chunk"))?;
-        let size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|_| bad("bad chunk size"))?;
+        let line = read_chunk_line(r)?;
+        let digits = match line.split_once(';') {
+            Some((digits, _)) => digits.trim_end_matches([' ', '\t']),
+            None => line.as_str(),
+        };
+        let size = digits
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+            .then(|| usize::from_str_radix(digits, 16).ok())
+            .flatten()
+            .ok_or_else(|| bad("bad chunk size"))?;
         if size == 0 {
             // Trailers until the blank line.
-            while read_line(r)?.is_some_and(|l| !l.is_empty()) {}
+            while !read_chunk_line(r)?.is_empty() {}
             return Ok(body);
         }
         // The loop keeps `body.len() <= MAX_BODY`, so the subtraction cannot underflow.
@@ -216,8 +296,12 @@ fn read_chunked(r: &mut impl BufRead) -> io::Result<Vec<u8>> {
         }
         let at = body.len();
         body.resize(at + size, 0);
-        r.read_exact(&mut body[at..])?;
-        read_line(r)?;
+        read_framed(r, &mut body[at..])?;
+        let mut end = [0; 2];
+        read_framed(r, &mut end)?;
+        if end != *b"\r\n" {
+            return Err(bad("bad chunk data ending"));
+        }
     }
 }
 
@@ -293,8 +377,11 @@ impl<'a> EventStream<'a> {
             ctype,
             &[("Cache-Control", "no-cache".to_owned())],
         );
-        h.push_str(if chunked {
-            "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+        if chunked {
+            h.push_str("Transfer-Encoding: chunked\r\n");
+        }
+        h.push_str(if chunked && req.keep_alive {
+            "Connection: keep-alive\r\n\r\n"
         } else {
             "Connection: close\r\n\r\n"
         });
