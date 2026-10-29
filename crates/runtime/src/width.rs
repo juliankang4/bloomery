@@ -2611,6 +2611,21 @@ mod tests {
         r.run(2);
         assert_eq!(&r.rows()[calls..], &[4, 3], "the losing probe ran again");
         assert!(r.choosing().warm.is_empty());
+
+        // A refreshed profile can pay at the old median and lose at the
+        // new wall: the old median must not open the gate meanwhile.
+        let mut r = Rig::<true>::build(acc, acc.map(|a| a as f32), &LINEAR, Mode::Cost, rule);
+        r.run(600);
+        let c = r.choosing();
+        c.read_at[3] = 0;
+        c.since_probe = rule.probe_every;
+        r.acc.set([1.0; 3]);
+        r.choosing().draft().p.set([1.0; 3]);
+        r.clock.verify_rows(&[LINEAR[0], LINEAR[1], 160_000]);
+        r.run(2);
+        let c = r.choosing();
+        assert_eq!(c.width(), 2, "the stale median moved the gate");
+        assert_eq!(c.warm.front(), Some(&3));
     }
 
     /// Width 3's verify 20 % slow while `on`, the rig's walls otherwise.
