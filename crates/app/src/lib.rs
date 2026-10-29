@@ -720,9 +720,9 @@ where
     /// rows and [`SlotRows::MAX_SLOTS`] sequences, run in `round_passes`'
     /// order (the pass that holds slot 0 last), each row's greedy next
     /// token in row order and each slot's
-    /// position moved by its own. With `logits`, every row's logits of each
-    /// pass come back too, read through [`GpuModel::slots_logits_into`] into
-    /// the session's own buffer at the pass's rows of the round, lent until
+    /// position moved by its own. `logits` names one request per entry of
+    /// `rows`; only a requested entry's rows come back, read through
+    /// [`GpuModel::slots_row_into`] into the session's packed buffer, lent until
     /// the next call — never [`GpuModel::logits_into`], which a pass of
     /// several rows refuses by name; a NaN among them is a named error, as a
     /// step's row is. The round leaves slot 0 selected, as
@@ -733,23 +733,37 @@ where
     pub fn step_slots_rounds(
         &mut self,
         rows: &[(usize, &[u32])],
-        logits: bool,
+        logits: &[bool],
     ) -> Result<SlotsRound<'_>, SessionError> {
         let cuts = round_passes(
             rows.iter().map(|(slot, t)| (*slot, t.len())),
             (B::MAX_ROWS, B::MAX_SLOTS),
         )?;
-        let n_vocab = if logits { self.model.n_vocab()? } else { 0 };
-        let total = rows
-            .iter()
-            .try_fold(0usize, |n, (_, ids)| n.checked_add(ids.len()))
-            .ok_or_else(|| SessionError::Refused("round row count overflow".into()))?;
-        let floats = total
+        if logits.len() != rows.len() {
+            return Err(SessionError::Refused(format!(
+                "round of {} slots has {} logits requests",
+                rows.len(),
+                logits.len()
+            )));
+        }
+        let n_vocab = if logits.iter().any(|&want| want) {
+            self.model.n_vocab()?
+        } else {
+            0
+        };
+        let mut offsets = Vec::new();
+        let mut wanted = 0usize;
+        for ((_, tokens), &want) in rows.iter().zip(logits) {
+            for _ in *tokens {
+                offsets.push(want.then_some(wanted));
+                wanted += usize::from(want);
+            }
+        }
+        let total = offsets.len();
+        let floats = wanted
             .checked_mul(n_vocab)
             .ok_or_else(|| SessionError::Refused("round logits size overflow".into()))?;
-        if self.round.len() < floats {
-            self.round.resize(floats, 0.0);
-        }
+        self.round.resize(floats, 0.0);
         let mut ids = vec![0; total];
         for cut in &cuts {
             let held: usize = rows[..cut.start].iter().map(|(_, t)| t.len()).sum();
@@ -762,33 +776,48 @@ where
                     out.ids.len()
                 )));
             }
-            if logits {
-                let pass = &mut self.round[held * n_vocab..(held + n) * n_vocab];
-                self.model.slots_logits_into(pass)?;
-                let slots = chunk
-                    .iter()
-                    .flat_map(|(slot, toks)| std::iter::repeat_n(*slot, toks.len()));
-                for (i, slot) in slots.enumerate() {
-                    let row = &pass[i * n_vocab..(i + 1) * n_vocab];
-                    if let Some(at) = row.iter().position(|v| v.is_nan()) {
-                        return Err(SessionError::Refused(format!(
-                            "slot {slot}'s logit {at} is NaN"
-                        )));
-                    }
-                }
+            let mut fetched = false;
+            let slots = chunk
+                .iter()
+                .flat_map(|(slot, toks)| std::iter::repeat_n(*slot, toks.len()));
+            for (r, slot) in slots.enumerate() {
+                round_row(slot, offsets[held + r], n_vocab, &mut self.round, |row| {
+                    self.model.slots_row_into(r, &mut self.pass, fetched, row)?;
+                    fetched = true;
+                    Ok(())
+                })?;
             }
             ids[held..held + n].copy_from_slice(&out.ids);
         }
         Ok(SlotsRound {
             ids,
             passes: cuts.len(),
-            logits: logits.then(|| RoundLogits {
-                all: &self.round[..total * n_vocab],
-                rows: total,
+            logits: (wanted > 0).then(|| RoundLogits {
+                all: &self.round,
+                offsets,
                 n_vocab,
             }),
         })
     }
+}
+
+/// Read and validate a requested row; an unrequested row touches no logits.
+fn round_row(
+    slot: usize,
+    offset: Option<usize>,
+    n_vocab: usize,
+    round: &mut [f32],
+    read: impl FnOnce(&mut [f32]) -> Result<(), GpuError>,
+) -> Result<(), SessionError> {
+    let Some(offset) = offset else { return Ok(()) };
+    let row = &mut round[offset * n_vocab..(offset + 1) * n_vocab];
+    read(row)?;
+    if let Some(at) = row.iter().position(|v| v.is_nan()) {
+        return Err(SessionError::Refused(format!(
+            "slot {slot}'s logit {at} is NaN"
+        )));
+    }
+    Ok(())
 }
 
 /// The passes a round of several slots runs and their order: the round's
@@ -814,8 +843,7 @@ pub(crate) fn round_passes(
 
 /// What [`Session::step_slots_rounds`] ran: each row's greedy next token in
 /// row order, the passes the round took (one a cut at the body's
-/// row and sequence bounds), and every row's logits when the caller
-/// asked for them, each pass's rows in the round's row order — the
+/// row and sequence bounds), and the requested rows' logits in the round's row order, the
 /// session's own buffer, lent until its next call.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SlotsRound<'a> {
@@ -824,20 +852,20 @@ pub struct SlotsRound<'a> {
     pub logits: Option<RoundLogits<'a>>,
 }
 
-/// A round's logits rows: row `i` of the round at `i · n_vocab` in the
-/// session's buffer.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A round's requested logits rows, packed in the session's buffer.
+#[derive(Clone, Debug, PartialEq)]
 pub struct RoundLogits<'a> {
     all: &'a [f32],
-    rows: usize,
+    offsets: Vec<Option<usize>>,
     n_vocab: usize,
 }
 
 impl<'a> RoundLogits<'a> {
-    /// Each row's logits (`n_vocab` f32), in the round's row order.
-    pub fn rows(self) -> impl ExactSizeIterator<Item = &'a [f32]> {
-        let (all, n_vocab) = (self.all, self.n_vocab);
-        (0..self.rows).map(move |i| &all[i * n_vocab..(i + 1) * n_vocab])
+    /// One entry per round row: its requested logits, or `None` for a greedy row.
+    pub fn rows(&self) -> impl ExactSizeIterator<Item = Option<&'a [f32]>> + '_ {
+        self.offsets
+            .iter()
+            .map(|offset| offset.map(|i| &self.all[i * self.n_vocab..(i + 1) * self.n_vocab]))
     }
 }
 
@@ -1086,6 +1114,33 @@ mod tests {
             panic!("a window past the pass was not refused");
         };
         assert!(text.contains("slot 1's"), "{text}");
+    }
+
+    #[test]
+    fn round_reads_only_requested_logits() {
+        let mut row = [f32::NAN; 3];
+        super::round_row(0, None, 3, &mut row, |_| panic!("greedy logits read"))
+            .expect("greedy rows do not read or validate logits");
+        super::round_row(1, Some(0), 3, &mut row, |dst| {
+            dst.copy_from_slice(&[1.0, 2.0, 3.0]);
+            Ok(())
+        })
+        .expect("sampled row read");
+        let logits = super::RoundLogits {
+            all: &row,
+            offsets: vec![None, Some(0)],
+            n_vocab: 3,
+        };
+        assert_eq!(logits.rows().collect::<Vec<_>>(), [None, Some(&row[..])]);
+        let error = super::round_row(1, Some(0), 3, &mut row, |dst| {
+            dst[2] = f32::NAN;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("slot 1's logit 2 is NaN"),
+            "{error}"
+        );
     }
 
     /// A poisoned model is refused by name, naming its fault; a clean one

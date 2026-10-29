@@ -114,8 +114,8 @@ where
         .zip(last.chunks(1))
         .map(|(&i, one)| (rows[i].slot, one))
         .collect();
-    let lent = rows.iter().any(|r| r.logits.is_some());
-    let out = s.step_slots_rounds(&round, lent)?;
+    let lent: Vec<bool> = order.iter().map(|&i| rows[i].logits.is_some()).collect();
+    let out = s.step_slots_rounds(&round, &lent)?;
     if out.ids.len() != order.len() {
         return Err(format!(
             "a round of {} rows answered {} ids",
@@ -135,18 +135,18 @@ where
         }
         Some(all) => {
             for (&i, row) in order.iter().zip(all.rows()) {
-                let want = rows[i].logits.as_ref().map_or(row.len(), Vec::len);
-                if want != row.len() {
+                let want = rows[i].logits.as_ref().map(Vec::len);
+                if want != row.map(<[f32]>::len) {
                     return Err(format!(
-                        "slot {}: a logits row of {want} values lent for the pass's row of {}",
+                        "slot {}: a logits request of {want:?} values lent for the pass's row of {:?}",
                         rows[i].slot,
-                        row.len()
+                        row.map(<[f32]>::len)
                     )
                     .into());
                 }
             }
         }
-        None if lent => {
+        None if lent.iter().any(|&want| want) => {
             return Err("a round whose rows lent logits rows read back none".into());
         }
         None => {}
@@ -156,7 +156,7 @@ where
     }
     if let Some(all) = out.logits {
         for (&i, row) in order.iter().zip(all.rows()) {
-            if let Some(dst) = rows[i].logits.as_deref_mut() {
+            if let (Some(dst), Some(row)) = (rows[i].logits.as_deref_mut(), row) {
                 dst.copy_from_slice(row);
             }
         }
