@@ -196,11 +196,12 @@ fn word_dot(f: f32, q: u32, d: f32, x: [f32; 4]) -> f32 {
 
 /// The block-wide sum of `v` over a [`NORM_THREADS`] block: each warp's by
 /// the butterfly, then the warps' in order from warp 0. Every thread calls
-/// it and gets the same value (two barriers).
+/// it and gets the same value (one barrier).
 ///
 /// # Safety
 /// `ws` points at [`NORM_WARPS`] f32 of this block's shared memory that
-/// nothing else uses across the call.
+/// nothing else uses across the call, and nothing writes after it: a warp
+/// may still read the slots when another returns.
 #[inline(always)]
 unsafe fn block_sum(v: f32, tid: usize, ws: *mut f32) -> f32 {
     let s = warp::reduce_sum_f32(v);
@@ -216,7 +217,6 @@ unsafe fn block_sum(v: f32, tid: usize, ws: *mut f32) -> f32 {
         // SAFETY: w < NORM_WARPS.
         sum += unsafe { *ws.add(w) };
     }
-    thread::sync_threads();
     sum
 }
 
