@@ -2375,16 +2375,61 @@ mod gate {
         Ok(())
     }
 
+    /// One server of the slots-round clause ([`slots_rounds_run_one_pass`]): its
+    /// directory under the file's, the prefix of its checks' names, the flags
+    /// past `--parallel 2`, its environment, whether a round is one pass, and
+    /// whether its second request samples, seeded, beside a greedy first.
+    struct RoundsArm<'a> {
+        dir: &'a str,
+        prefix: &'a str,
+        flags: &'a [&'a str],
+        env: &'a [(&'a str, &'a str)],
+        one_pass: bool,
+        sampled: bool,
+    }
+
+    /// The whole-card rounds arm: no flag past `--parallel 2`.
+    const WHOLE_ROUNDS: RoundsArm<'static> = RoundsArm {
+        dir: "slots-rounds",
+        prefix: "",
+        flags: &[],
+        env: &[],
+        one_pass: true,
+        sampled: false,
+    };
+
+    /// The placed rounds arm (its checks `placed_…`): `--place a` under a
+    /// card budget of [`PLACED_BUDGET`].
+    const PLACED_ROUNDS: RoundsArm<'static> = RoundsArm {
+        dir: "slots-rounds-placed",
+        prefix: "placed_",
+        flags: &["--place", "a"],
+        env: &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
+        one_pass: true,
+        sampled: false,
+    };
+
+    /// The sampled rounds arm (its checks `mixed_…`): a greedy and a seeded
+    /// sampled request at the seat's own `--ctx`.
+    const SAMPLED_ROUNDS: RoundsArm<'static> = RoundsArm {
+        dir: "slots-rounds-mixed",
+        prefix: "mixed_",
+        flags: &["--ctx", "4096"],
+        env: &[],
+        one_pass: true,
+        sampled: true,
+    };
+
     /// The slots-round clause (module header) on a server of `--parallel 2`
     /// started with `BLOOMERY_STEP_STATS=1` and the arm's flags and
     /// environment into its own directory: two greedy streamed requests, or
-    /// under `mixed` one greedy and one seeded sampled request, each first
-    /// run alone and then together. The mixed pair keeps its alone ids;
+    /// on a `sampled` arm one greedy and one seeded sampled request, each first
+    /// run alone and then together. The sampled arm's pair keeps its alone ids;
     /// its greedy request asks for no logits. The `slots round` records
     /// between the requests hold their pass shape.
-    /// Both arms are one pass: every together-run record holds `passes=1`
-    /// (`slots_rounds_run_one_pass`, `placed_slots_rounds_run_one_pass` on
-    /// the placed arm). On both arms the window holds a round
+    /// Every arm is one pass: every together-run record holds `passes=1`
+    /// (`slots_rounds_run_one_pass`, `placed_…` and `mixed_…` on those
+    /// arms). On every arm the window holds a round
     /// of both ([`rounds_hold_a_round_of_both`]: at least one record of
     /// `rows=2` — the records carry no round of one stepping slot, so the
     /// records cannot see one-slot stretches, and the window's solo count
@@ -2397,214 +2442,183 @@ mod gate {
     /// `BLOOMERY_STEP_STATS=1` moves no computation on this server — the seat
     /// and the fallback loop branch on it only to print the record — so the
     /// together-equals-alone bits of these runs stand for the default server.
-    #[allow(
-        clippy::type_complexity,
-        reason = "the arm tuple, one line a field (rust-quality R8)"
-    )]
     fn slots_rounds_run_one_pass(
         model: &Path,
-        seat: qwen_seat::Family,
         dir: &Path,
+        arm: &RoundsArm<'_>,
         ok: &mut bool,
-        mixed: bool,
     ) -> Result<(), GateError> {
-        type Arm<'a> = (
-            &'a str,
-            &'a str,
-            &'a [&'a str],
-            &'a [(&'a str, &'a str)],
-            bool,
-        );
-        let whole: Arm<'_> = ("slots-rounds", "", &[], &[], true);
-        let placed: Arm<'_> = (
-            "slots-rounds-placed",
-            "placed_",
-            &["--place", "a"],
-            &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
-            true,
-        );
-        let mut arms = vec![whole];
-        if routed(seat) && !mixed {
-            arms.push(placed);
-        } else if !routed(seat) && !mixed {
-            not_for_dense(
-                "placed_slots_rounds_*",
-                "no host tier: a budgeted placement is the floor refusal",
-            );
+        let &RoundsArm {
+            dir: dir_name,
+            prefix,
+            flags,
+            env,
+            one_pass,
+            sampled,
+        } = arm;
+        let named = |c: &str| format!("{prefix}{c}");
+        let d = dir.join(dir_name);
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        let mut cmd = stats_cmd()?;
+        for &(k, v) in env {
+            cmd.env(k, v);
         }
-        for (dir_name, prefix, flags, env, one_pass) in arms {
-            let prefix = if mixed { "mixed_" } else { prefix };
-            let named = |c: &str| format!("{prefix}{c}");
-            let d = dir.join(if mixed {
-                "slots-rounds-mixed"
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let mut args = vec![
+            "--model",
+            "qwen3",
+            "--port",
+            "0",
+            "--parallel",
+            "2",
+            "-m",
+            m,
+        ];
+        args.extend_from_slice(flags);
+        let mut s = Served::spawn_cmd(cmd, &args, &d)?;
+        let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        // The shape the seat's open decided, by the line it printed before its load: one pass
+        // of the busy rows (`qwen3::pass_of`, `Body3::serves_one_pass`), whole-card and
+        // placed. The rounds below hold the records to that shape. A printed plan is still
+        // read: it names the split and does not choose turns.
+        let log = std::fs::read_to_string(&err_log)?;
+        // PIN(2026-10-22): a placed load of `Body` or `Body35` serves
+        // several slots' rows as one pass. A printed plan is that load
+        // and names `one`, the same as a whole-card load. Lookup stays
+        // turns in `pass_of` and is not an arm here.
+        // FAIL-first: the word `turns`, or a together record of `passes=rows`.
+        let plan = routed_split(&seat_records(&log, &err_log))?;
+        println!(
+            "{dir_name}: plan (host, card, ctx) {plan:?}; a round is {}",
+            if one_pass { "one pass" } else { "turns" }
+        );
+        let parallel = log.lines().find(|l| l.starts_with("parallel rule="));
+        println!("{dir_name}: {parallel:?}");
+        check(
+            ok,
+            &named(if one_pass {
+                "slots_parallel_line_names_one_pass"
             } else {
-                dir_name
-            });
-            std::fs::create_dir_all(&d)?;
-            let err_log = d.join("server.err");
-            let mut cmd = stats_cmd()?;
-            for &(k, v) in env {
-                cmd.env(k, v);
+                "slots_parallel_line_names_turns"
+            }),
+            parallel.is_some_and(|l| {
+                parallel_word(l, "slots") == Some("2")
+                    && parallel_word(l, "pass") == Some(if one_pass { "one" } else { "turns" })
+            }),
+        );
+        let a_ids = rendered(&url, messages())?;
+        let b_ids = tokenized(&url, PROSE)?;
+        let request = |ids: &[u32], second: bool| {
+            if sampled {
+                streamed_body(
+                    &addr,
+                    json!({
+                        "prompt": ids, "n_predict": SLOTS_PREDICT,
+                        "temperature": if second { 0.8 } else { 0.0 }, "seed": 42,
+                        "return_tokens": true, "cache_prompt": false, "stream": true,
+                    }),
+                )
+            } else {
+                streamed(&addr, ids, SLOTS_PREDICT)
             }
-            let m = model.to_str().ok_or("the model path is not UTF-8")?;
-            let mut args = vec![
-                "--model",
-                "qwen3",
-                "--port",
-                "0",
-                "--parallel",
-                "2",
-                "-m",
-                m,
-            ];
-            args.extend_from_slice(flags);
-            if mixed {
-                args.extend_from_slice(&["--ctx-size", "4096", "--cache-ram", "0"]);
-            }
-            let mut s = Served::spawn_cmd(cmd, &args, &d)?;
-            let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
-            let url = |p: &str| format!("http://{addr}{p}");
-            // The shape the seat's open decided, by the line it printed before its load: one pass
-            // of the busy rows (`qwen3::pass_of`, `Body3::serves_one_pass`), whole-card and
-            // placed. The rounds below hold the records to that shape. A printed plan is still
-            // read: it names the split and does not choose turns.
-            let log = std::fs::read_to_string(&err_log)?;
-            // PIN(2026-10-22): a placed load of `Body` or `Body35` serves
-            // several slots' rows as one pass. A printed plan is that load
-            // and names `one`, the same as a whole-card load. Lookup stays
-            // turns in `pass_of` and is not an arm here.
-            // FAIL-first: the word `turns`, or a together record of `passes=rows`.
-            let plan = routed_split(&seat_records(&log, &err_log))?;
-            println!(
-                "{dir_name}: plan (host, card, ctx) {plan:?}; a round is {}",
-                if one_pass { "one pass" } else { "turns" }
-            );
-            let parallel = log.lines().find(|l| l.starts_with("parallel rule="));
-            println!("{dir_name}: {parallel:?}");
-            check(
-                ok,
-                &named(if one_pass {
-                    "slots_parallel_line_names_one_pass"
-                } else {
-                    "slots_parallel_line_names_turns"
-                }),
-                parallel.is_some_and(|l| {
-                    parallel_word(l, "slots") == Some("2")
-                        && parallel_word(l, "pass") == Some(if one_pass { "one" } else { "turns" })
-                }),
-            );
-            let a_ids = rendered(&url, messages())?;
-            let b_ids = tokenized(&url, PROSE)?;
-            let request = |ids: &[u32], sampled: bool| {
-                if mixed {
-                    streamed_body(
-                        &addr,
-                        json!({
-                            "prompt": ids, "n_predict": SLOTS_PREDICT,
-                            "temperature": if sampled { 0.8 } else { 0.0 }, "seed": 42,
-                            "return_tokens": true, "cache_prompt": false, "stream": true,
-                        }),
-                    )
-                } else {
-                    streamed(&addr, ids, SLOTS_PREDICT)
-                }
-            };
-            let mut alone = Vec::new();
-            for (j, ids) in [&a_ids, &b_ids].into_iter().enumerate() {
-                let (h, rx) = request(ids, j == 1)?;
-                h.join()
-                    .map_err(|_| format!("{dir_name}: an alone request's thread panicked"))?;
-                let ran = rx.recv().map_err(|_| {
-                    format!("{dir_name}: an alone request's thread gave no answer")
-                })??;
-                alone.push(ran.tokens);
-            }
-            let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
-            // The alone runs print no record (a round of one row is a select
-            // and a `next`), so the window opens empty; taken anyway, so the
-            // together run's records are exactly the ones after this point.
-            let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
-            let first = request(&a_ids, false)?;
-            let second = request(&b_ids, true)?;
-            let mut together = Vec::new();
-            for ((h, rx), what) in [(first, "first"), (second, "second")] {
-                h.join()
-                    .map_err(|_| format!("{dir_name}: the {what} request's thread panicked"))?;
-                together.push(rx.recv().map_err(|_| {
-                    format!("{dir_name}: the {what} request's thread gave no answer")
-                })??);
-            }
-            if mixed {
-                let ids: Vec<&[u32]> = together.iter().map(|s| s.tokens.as_slice()).collect();
-                println!("mixed slots: alone {alone:?}, together {ids:?}");
-                check(
-                    ok,
-                    "mixed_slots_together_alone",
-                    alone
-                        .iter()
-                        .zip(&together)
-                        .all(|(a, t)| !a.is_empty() && *a == t.tokens),
-                );
-            }
-            let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
-            let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
-            let window = &rounds[before.min(rounds.len())..];
-            let rows: Vec<u64> = window.iter().map(|r| r.u64("rows").unwrap_or(0)).collect();
-            let every = !window.is_empty()
-                && window.iter().all(|r| {
-                    r.word("cmd") == Ok("step")
-                        && r.u64("slots") == Ok(2)
-                        && matches!(r.u64("rows"), Ok(n) if (2..=MAX_TOKENS as u64).contains(&n))
-                        && r.u64("passes") == if one_pass { Ok(1) } else { r.u64("rows") }
-                });
-            println!(
-                "{dir_name}: {} record(s) in the together window, rows {rows:?} (alone {} and \
-                 {} ids, together {} and {})",
-                window.len(),
-                alone[0].len(),
-                alone[1].len(),
-                together[0].tokens.len(),
-                together[1].tokens.len(),
-            );
-            check(
-                ok,
-                &named(if one_pass {
-                    "slots_rounds_run_one_pass"
-                } else {
-                    "slots_rounds_run_in_turn"
-                }),
-                every,
-            );
-            // The window's solo rounds (a round of one stepping slot is a
-            // select and a `next`, no record): the decode deltas less the
-            // records and the two requests' prompt-phase calls, booked at
-            // their end (`worker.rs`'s `end_request`).
-            let solo = decode1 - decode0 - window.len() as f64 - 2.0;
-            rounds_hold_a_round_of_both(
-                ok,
-                &named("slots_rounds_hold_a_round_of_both"),
-                dir_name,
-                window,
-                solo,
-            );
-            if prefix.is_empty() {
-                // The tokens decoded beyond the two prompts' first: each
-                // request's `n_predict` less one, its first token being the
-                // prompt's own last step. The no-flag arm, whole or placed.
-                let sum: u64 = rows.iter().sum();
-                let want = 2 * (SLOTS_PREDICT - 1) as u64;
-                println!(
-                    "{dir_name}: rows sum {sum} + {solo} solo round(s) against the {want} \
-                     decoded beyond the prompts' first (decode {decode0} -> {decode1})",
-                );
-                check(
-                    ok,
-                    "slots_rounds_rows_sum_the_decoded_tokens",
-                    solo >= 0.0 && sum + solo as u64 == want,
-                );
-            }
-            println!("{dir_name} server stopped: {}", s.stop()?);
+        };
+        let mut alone = Vec::new();
+        for (j, ids) in [&a_ids, &b_ids].into_iter().enumerate() {
+            let (h, rx) = request(ids, j == 1)?;
+            h.join()
+                .map_err(|_| format!("{dir_name}: an alone request's thread panicked"))?;
+            let ran = rx
+                .recv()
+                .map_err(|_| format!("{dir_name}: an alone request's thread gave no answer"))??;
+            alone.push(ran.tokens);
         }
+        let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
+        // The alone runs print no record (a round of one row is a select
+        // and a `next`), so the window opens empty; taken anyway, so the
+        // together run's records are exactly the ones after this point.
+        let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
+        let first = request(&a_ids, false)?;
+        let second = request(&b_ids, true)?;
+        let mut together = Vec::new();
+        for ((h, rx), what) in [(first, "first"), (second, "second")] {
+            h.join()
+                .map_err(|_| format!("{dir_name}: the {what} request's thread panicked"))?;
+            together.push(rx.recv().map_err(|_| {
+                format!("{dir_name}: the {what} request's thread gave no answer")
+            })??);
+        }
+        if sampled {
+            let ids: Vec<&[u32]> = together.iter().map(|s| s.tokens.as_slice()).collect();
+            println!("{dir_name}: alone {alone:?}, together {ids:?}");
+            check(
+                ok,
+                &named("slots_together_alone"),
+                alone
+                    .iter()
+                    .zip(&together)
+                    .all(|(a, t)| !a.is_empty() && *a == t.tokens),
+            );
+        }
+        let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
+        let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
+        let window = &rounds[before.min(rounds.len())..];
+        let rows: Vec<u64> = window.iter().map(|r| r.u64("rows").unwrap_or(0)).collect();
+        let every = !window.is_empty()
+            && window.iter().all(|r| {
+                r.word("cmd") == Ok("step")
+                    && r.u64("slots") == Ok(2)
+                    && matches!(r.u64("rows"), Ok(n) if (2..=MAX_TOKENS as u64).contains(&n))
+                    && r.u64("passes") == if one_pass { Ok(1) } else { r.u64("rows") }
+            });
+        println!(
+            "{dir_name}: {} record(s) in the together window, rows {rows:?} (alone {} and \
+                 {} ids, together {} and {})",
+            window.len(),
+            alone[0].len(),
+            alone[1].len(),
+            together[0].tokens.len(),
+            together[1].tokens.len(),
+        );
+        check(
+            ok,
+            &named(if one_pass {
+                "slots_rounds_run_one_pass"
+            } else {
+                "slots_rounds_run_in_turn"
+            }),
+            every,
+        );
+        // The window's solo rounds (a round of one stepping slot is a
+        // select and a `next`, no record): the decode deltas less the
+        // records and the two requests' prompt-phase calls, booked at
+        // their end (`worker.rs`'s `end_request`).
+        let solo = decode1 - decode0 - window.len() as f64 - 2.0;
+        rounds_hold_a_round_of_both(
+            ok,
+            &named("slots_rounds_hold_a_round_of_both"),
+            dir_name,
+            window,
+            solo,
+        );
+        if prefix.is_empty() {
+            // The tokens decoded beyond the two prompts' first: each
+            // request's `n_predict` less one, its first token being the
+            // prompt's own last step. The no-flag arm, whole or placed.
+            let sum: u64 = rows.iter().sum();
+            let want = 2 * (SLOTS_PREDICT - 1) as u64;
+            println!(
+                "{dir_name}: rows sum {sum} + {solo} solo round(s) against the {want} \
+                     decoded beyond the prompts' first (decode {decode0} -> {decode1})",
+            );
+            check(
+                ok,
+                "slots_rounds_rows_sum_the_decoded_tokens",
+                solo >= 0.0 && sum + solo as u64 == want,
+            );
+        }
+        println!("{dir_name} server stopped: {}", s.stop()?);
         Ok(())
     }
 
@@ -4573,7 +4587,7 @@ mod gate {
             println!("== {}", model.display());
             let seat = seat_of(model)?;
             if a.only_mixed {
-                slots_rounds_run_one_pass(model, seat, &dir, &mut ok, true)?;
+                slots_rounds_run_one_pass(model, &dir, &SAMPLED_ROUNDS, &mut ok)?;
                 continue;
             }
             if a.only_images {
@@ -4665,8 +4679,16 @@ mod gate {
             slots_count_their_checkpoints(model, seat, &dir, &mut ok)?;
             slot_ctx_too_small_is_refused(model, &dir, &mut ok)?;
             slots_late_request_together_alone(model, &dir, &mut ok)?;
-            slots_rounds_run_one_pass(model, seat, &dir, &mut ok, false)?;
-            slots_rounds_run_one_pass(model, seat, &dir, &mut ok, true)?;
+            slots_rounds_run_one_pass(model, &dir, &WHOLE_ROUNDS, &mut ok)?;
+            if routed(seat) {
+                slots_rounds_run_one_pass(model, &dir, &PLACED_ROUNDS, &mut ok)?;
+            } else {
+                not_for_dense(
+                    "placed_slots_rounds_*",
+                    "no host tier: a budgeted placement is the floor refusal",
+                );
+            }
+            slots_rounds_run_one_pass(model, &dir, &SAMPLED_ROUNDS, &mut ok)?;
             if seat == qwen_seat::Family::Qwen3moe {
                 // The qwen3moe arm alone: the placed prompt past the GEMM
                 // walk.
