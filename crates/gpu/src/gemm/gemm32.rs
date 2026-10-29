@@ -1531,10 +1531,8 @@ struct Gemm32Launch {
 }
 
 impl Gemm32Launch {
-    /// Err unless `a` is launchable, in this order: a filled route table,
-    /// rows a positive multiple of 16 that make the table's experts, the
-    /// stack's layout at the activations' K, whole tokens of `top_k`, room in
-    /// `act` and `y` for every slot; then every launch argument in `u32`.
+    /// Check the route, weight, activation and launch arguments, then room
+    /// in `y` for every slot's rows.
     fn check<Y>(what: &'static str, a: &Gemm32Args<'_, Y>) -> Result<Gemm32Launch, GpuError> {
         let l = Self::operands(what, a.w, a.rows_per_expert, a.act, a.route, a.input)?;
         let n_slots = l.n_slots as usize;
