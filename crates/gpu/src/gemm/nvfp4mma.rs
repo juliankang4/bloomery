@@ -123,11 +123,20 @@ const ACT_SHARED_MAX: usize =
 const _: () = assert!(ACT_SHARED_MAX == 24776);
 
 /// # Safety
-/// Both inputs contain the aligned four-value span at `base`.
+/// The input spans contain four values at `base`. SwiGLU inputs are
+/// 16-byte aligned; an identity input (`code == u32::MAX`) needs only f32 alignment.
 #[inline(always)]
 unsafe fn act_quad(g: &[f32], u: &[f32], base: usize, code: u32, limit: f32) -> [f32; 4] {
-    // SAFETY: the caller supplies an aligned, in-bounds gate quad.
-    let g = unsafe { (*g.as_ptr().add(base).cast::<cuda_device::vector::F32x4>()).0 };
+    // SAFETY: the quad is in bounds. Identity inputs permit unaligned vector reads;
+    // a SwiGLU input has the caller's checked 16-byte alignment.
+    let g = unsafe {
+        let p = g.as_ptr().add(base).cast::<cuda_device::vector::F32x4>();
+        if code == u32::MAX {
+            p.read_unaligned().0
+        } else {
+            (*p).0
+        }
+    };
     if code == u32::MAX {
         return g;
     }
@@ -183,7 +192,7 @@ mod swiglu {
             let block = 4 * group + (lane >> 3);
             let source = block.min(blocks - 1);
             let at = 32 * source + 4 * (lane & 7);
-            // SAFETY: K divides 64; this aligned quad is inside the checked input column.
+            // SAFETY: K divides 64; this quad is in the checked column, and SwiGLU inputs are aligned.
             let v = unsafe { act_quad(g, u, col * k + at, code, limit) };
             let (word, sum, dv, refused) = crate::gemm::act32::quant32_lane(v, lane);
             if block < blocks {
@@ -2092,7 +2101,6 @@ impl Kernels {
         act: &mut GemmAct32,
         fault: crate::fault::FaultSink,
     ) -> Result<(), GpuError> {
-        crate::tensor::check_alignment::<F32x4, _>("NVFP4 activation", "x", x)?;
         let shared = ((act.k / 4 + act.k / 32 + 2) * 4) as u32;
         let prep = self
             .module
@@ -2451,7 +2459,11 @@ mod tests {
                     _ => ((i % 31) as f32 - 15.0) * 2.0f32.powi(-120),
                 })
                 .collect();
-            let input = DeviceBuffer::from_host(stream, &values)?;
+            let mut padded = Vec::with_capacity(values.len() + 1);
+            padded.push(0.0);
+            padded.extend_from_slice(&values);
+            let parent = DeviceBuffer::from_host(stream, &padded)?;
+            let input = crate::Window::<f32>::of(&parent, 4, values.len())?;
             let mut reference = GemmAct32::new(stream, cols, k)?;
             kernels.enqueue_quantize_gemm32(stream, &input, cols, &mut reference, sink)?;
             let reference_fault = gpu.take_fault()?;
