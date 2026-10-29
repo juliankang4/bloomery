@@ -188,7 +188,7 @@ use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_s
 use super::program38::{Ctx38, beta_alpha_mut, beta_alpha_rows};
 use super::router::gated;
 use super::scratch::{Append256, Io, KvPlanes, PrefillFlash, RecStore, cells_view, param_view};
-use super::scratch38::{Arena38, ROUTE_ROWS, Store38, final_res, no_carry};
+use super::scratch38::{Arena38, Ple38, ROUTE_ROWS, Store38, final_res, no_carry};
 use super::tier38::TierSide38;
 use super::wide::{RingStacks, with_ring_windows};
 use crate::GpuError;
@@ -1824,9 +1824,9 @@ pub(super) struct WideParts<'a> {
     pub(super) ple_rows: Option<&'a mut PleRowsIn<'a>>,
 }
 
-/// [`WideParts::ple_rows`]: the walk's PLE rows decoded and copied into the
-/// arena's `e`.
-pub(super) type PleRowsIn<'a> = dyn FnMut(&mut DeviceBuffer<f32>) -> Result<(), GpuError> + 'a;
+/// [`WideParts::ple_rows`]: the walk's PLE rows landed in the arena's `e`
+/// (`Body38`'s `PleHost::land`, through the arena's planes).
+pub(super) type PleRowsIn<'a> = dyn FnMut(&mut Ple38) -> Result<(), GpuError> + 'a;
 
 /// The kernels of the walk's dense sites ([`site::resident_gemm`]).
 fn dense_kernels<'a>(c: &Ctx38<'a>) -> WideKernels<'a> {
@@ -2082,7 +2082,7 @@ impl WideParts<'_> {
             )?;
         } else if let Some(pp) = &p.ple {
             if let Some(rows_in) = self.ple_rows.take() {
-                rows_in(&mut s.ple.e)?;
+                rows_in(&mut s.ple)?;
             }
             combine(c, u, &mut x.hc, gpu.layer_sink(l - 1)?)?;
             let w = c.w;

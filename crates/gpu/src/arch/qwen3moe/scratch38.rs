@@ -210,10 +210,13 @@ pub(super) struct Qsa38 {
     pub(super) sel: QsaScratch,
 }
 
-/// The PLE site's intermediates: the rows the host gathered (`e`), the key
-/// and value projections, the gate's outputs.
+/// The PLE site's intermediates: the rows the host gathered (`e`) and, for
+/// NVFP4 rows the card decodes, their code and scale planes as read
+/// (`planes`, 9 bytes a 16 values), the key and value projections, the
+/// gate's outputs.
 pub(super) struct Ple38 {
     pub(super) e: DeviceBuffer<f32>,
+    pub(super) planes: DeviceBuffer<u8>,
     pub(super) key: DeviceBuffer<f32>,
     pub(super) value: DeviceBuffer<f32>,
     pub(super) gv: DeviceBuffer<f32>,
@@ -387,6 +390,7 @@ impl Arena38 {
             },
             ple: Ple38 {
                 e: f(h)?,
+                planes: DeviceBuffer::zeroed(stream, rows * h / 16 * 9)?,
                 key: f(wide)?,
                 value: f(h)?,
                 gv: f(wide)?,
@@ -474,6 +478,7 @@ impl Arena38 {
             .iter()
             .map(|b| b.num_bytes())
             .sum::<usize>()
+            + p.planes.num_bytes()
             + self.route.bytes()
     }
 }

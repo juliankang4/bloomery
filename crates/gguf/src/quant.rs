@@ -1125,14 +1125,43 @@ impl Nvfp4Rows {
         scales: &[u8],
         dst: &mut [f32],
     ) -> Result<(), QuantError> {
-        let groups = Self::group_count(dst.len())?;
+        let groups = Self::plane_groups(codes, scales, dst.len())?;
+        self.decode_groups(groups, dst)
+    }
+
+    /// [`Self::decode_planes`]'s refusals of a span of `values` values alone,
+    /// by the same names, for a caller that decodes the planes elsewhere at
+    /// [`Self::scale`].
+    pub fn check_planes(
+        &self,
+        codes: &[u8],
+        scales: &[u8],
+        values: usize,
+    ) -> Result<(), QuantError> {
+        self.refusal(Self::plane_groups(codes, scales, values)?)
+    }
+
+    /// The tensor scale every value is multiplied by.
+    #[must_use]
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// The `(scale byte, codes)` groups of a span of `values` values in
+    /// separate planes; a span of partial groups or a short plane refused.
+    fn plane_groups<'a>(
+        codes: &'a [u8],
+        scales: &'a [u8],
+        values: usize,
+    ) -> Result<impl Iterator<Item = (u8, &'a [u8; 8])> + Clone, QuantError> {
+        let groups = Self::group_count(values)?;
         let take = |src: &[u8], need| {
             if src.len() < need {
                 Err(QuantError::ShortSrc {
                     ty: GgmlType::NVFP4_ROWS,
                     src: src.len(),
                     need,
-                    n: dst.len(),
+                    n: values,
                 })
             } else {
                 Ok(())
@@ -1140,13 +1169,12 @@ impl Nvfp4Rows {
         };
         take(codes, groups * 8)?;
         take(scales, groups)?;
-        let groups = codes[..groups * 8]
+        Ok(codes[..groups * 8]
             .as_chunks::<8>()
             .0
             .iter()
             .zip(&scales[..groups])
-            .map(|(codes, &scale)| (scale, codes));
-        self.decode_groups(groups, dst)
+            .map(|(codes, &scale)| (scale, codes)))
     }
 
     fn group_count(values: usize) -> Result<usize, QuantError> {
@@ -1160,25 +1188,30 @@ impl Nvfp4Rows {
         Ok(values / 16)
     }
 
-    fn decode_groups<'a>(
+    /// The first group that is no span of values: its scale byte no UE4M3
+    /// scale, or a value times the tensor scale outside f32's range.
+    fn refusal<'a>(
         &self,
-        groups: impl Iterator<Item = (u8, &'a [u8; 8])> + Clone,
-        dst: &mut [f32],
+        groups: impl Iterator<Item = (u8, &'a [u8; 8])>,
     ) -> Result<(), QuantError> {
-        let undefined = groups
-            .clone()
-            .enumerate()
-            .find_map(|(block, (byte, codes))| {
-                let why = match ue4m3(byte) {
-                    Err(why) => Some(why),
-                    Ok(half) => codes
-                        .iter()
-                        .flat_map(|&q| fp4_pair(q))
-                        .any(|v| !(half * f32::from(v) * self.scale).is_finite())
-                        .then_some("a value times the tensor scale leaves f32's range"),
-                };
-                why.map(|why| (block, byte, why))
-            });
+        let undefined = groups.enumerate().find_map(|(block, (byte, codes))| {
+            let half = self.halves[usize::from(byte)];
+            let why = if half.is_nan() {
+                ue4m3(byte).err()
+            } else if (half * 12.0 * self.scale).is_finite() {
+                // 12 is the largest doubled code; `half · v` is exact and its
+                // rounded product with the scale grows with |v|, so every
+                // value of the group is finite.
+                None
+            } else {
+                codes
+                    .iter()
+                    .flat_map(|&q| fp4_pair(q))
+                    .any(|v| !(half * f32::from(v) * self.scale).is_finite())
+                    .then_some("a value times the tensor scale leaves f32's range")
+            };
+            why.map(|why| (block, byte, why))
+        });
         if let Some((block, byte, why)) = undefined {
             return Err(QuantError::UndefinedScale {
                 ty: GgmlType::NVFP4_ROWS,
@@ -1188,6 +1221,15 @@ impl Nvfp4Rows {
                 why,
             });
         }
+        Ok(())
+    }
+
+    fn decode_groups<'a>(
+        &self,
+        groups: impl Iterator<Item = (u8, &'a [u8; 8])> + Clone,
+        dst: &mut [f32],
+    ) -> Result<(), QuantError> {
+        self.refusal(groups.clone())?;
         for ((byte, codes), out) in groups.zip(dst.as_chunks_mut::<16>().0) {
             let half = self.halves[usize::from(byte)];
             for (pair, &q) in out.as_chunks_mut::<2>().0.iter_mut().zip(codes) {
@@ -3450,6 +3492,10 @@ mod tests {
             assert_eq!(dst, [0.0; 80], "a refusal must leave dst unchanged");
             let mut scales = [0x38; 5];
             scales[3] = byte;
+            let checked = decode
+                .check_planes(&[0x38; 40], &scales, 80)
+                .expect_err("undefined");
+            assert_eq!(checked.to_string(), e.to_string());
             assert_eq!(decode.decode_planes(&[0x38; 40], &scales, &mut dst), Err(e));
             assert_eq!(dst, [0.0; 80], "a refusal must leave dst unchanged");
         }
@@ -3475,6 +3521,18 @@ mod tests {
                 );
                 assert!(e.to_string().contains("leaves f32's range"), "{e}");
                 assert_eq!(dst, [0.0; 80], "a refusal must leave dst unchanged");
+                let (codes, scales): (Vec<u8>, Vec<u8>) = src
+                    .as_chunks::<9>()
+                    .0
+                    .iter()
+                    .map(|g| (g[1..].to_vec(), g[0]))
+                    .fold((vec![], vec![]), |(mut c, mut s), (g, b)| {
+                        c.extend(g);
+                        s.push(b);
+                        (c, s)
+                    });
+                let planes = super::Nvfp4Rows::new(scale).check_planes(&codes, &scales, 80);
+                assert_eq!(planes, Err(e));
             }
         }
         assert_eq!(
@@ -3488,6 +3546,10 @@ mod tests {
         assert!(matches!(
             decode.decode_planes(&[0x38; 8], &[0x38], &mut [0.0; 8]),
             Err(QuantError::UnalignedDst { dst: 8, .. })
+        ));
+        assert!(matches!(
+            decode.check_planes(&[0x38; 7], &[0x38], 16),
+            Err(QuantError::ShortSrc { src: 7, .. })
         ));
         assert!(matches!(
             decode.decode_planes(&[0x38; 7], &[0x38], &mut [0.0; 16]),
