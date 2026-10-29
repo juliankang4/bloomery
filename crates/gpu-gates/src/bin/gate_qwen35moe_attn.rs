@@ -108,10 +108,18 @@
 //!    four rows' mean, the RMS gain norm, the turn of the first 64 values at
 //!    the pool's first position, f16), within its band of the references'
 //!    rule in f64, the incomplete pool untouched, a rerun and launches of
-//!    seven rows the same plane; the same on a crafted input whose rows
-//!    cancel across 24 binades, where the transcription's pairwise and
-//!    reversed sums move every key, so the bits see the mean's order; a NaN
-//!    in one raw row raises `pool_select` with that pool alone not finite.
+//!    seven rows and of one row the same plane (each launch reads its own
+//!    rows from f32 projections between f16 values and rounds them to the
+//!    reference keys, and reads the rows before it from the raw key
+//!    ring); the same on a crafted input whose rows cancel across 24
+//!    binades, where the transcription's pairwise and reversed sums move
+//!    every key, so the bits see the mean's order; a NaN in one raw row
+//!    raises `pool_select` with that pool alone not finite, and so does a
+//!    launch whose counts are not consecutive (counts 4 and 13; counts 1, 9,
+//!    3 and 4, whose completing row is consecutive with the first), which
+//!    writes no pool of a row it reads; the raw key append
+//!    (`q38::qsa_key_append`) of positions 0 and 11 at ctx 12, which share
+//!    ring slot 0, raises it too and writes row 0's key alone.
 //! 10. Selection (score and top-k): the query heads bit for bit the
 //!     transcription, each scored pool's score within its band of the f64
 //!     score on the launch's own heads and keys, each list and length
@@ -292,9 +300,10 @@ mod gate {
     };
     use bloomery_gpu::gated_quant::{GateLayout, GatedQuantKernels};
     use bloomery_gpu::gemm::GemmAct;
+    use bloomery_gpu::q38::{KeyAppendArgs, Q38Kernels};
     use bloomery_gpu::qsa::{
         DIM as IDX_DIM, HEADS as IDX_HEADS, MAX_ROWS, POOL, PoolArgs, QsaKernels, QsaScratch,
-        ROT as IDX_ROT, SelectArgs, list_width, pools_for,
+        RING_ROWS, ROT as IDX_ROT, SelectArgs, list_width, pools_for,
     };
     use bloomery_gpu::rope_neox::{
         PartialNeoxArgs, ROT_256 as ROT, RopeNeoxKernels, q8_plane_lens,
@@ -2840,15 +2849,15 @@ mod gate {
     }
 
     /// The selector's inputs: raw indexer keys (`ctx` rows of 128 f16, the
-    /// rows of [`TIE_POOLS`] zero when `tie`), the key and query gains, the
-    /// rope table; on the host and on the device.
+    /// rows of [`TIE_POOLS`] zero when `tie`; a pool launch takes its rows
+    /// through [`pool_rows`]), the key and query gains, the rope table, the
+    /// last three on the host and on the device.
     struct Idx {
         raw: Vec<u16>,
         gk: Vec<f32>,
         gq: Vec<f32>,
         table: Vec<f32>,
         ctx: usize,
-        raw_d: DeviceBuffer<u16>,
         gk_d: DeviceBuffer<f32>,
         gq_d: DeviceBuffer<f32>,
         table_d: DeviceBuffer<f32>,
@@ -2873,7 +2882,6 @@ mod gate {
         let (gk, gq) = (gain(seed + 1), gain(seed + 2));
         let table = idx_table(ctx)?;
         Ok(Idx {
-            raw_d: DeviceBuffer::from_host(stream, &raw)?,
             gk_d: DeviceBuffer::from_host(stream, &gk)?,
             gq_d: DeviceBuffer::from_host(stream, &gq)?,
             table_d: DeviceBuffer::from_host(stream, &table)?,
@@ -2903,8 +2911,38 @@ mod gate {
                 }
             }
         }
-        idx.raw_d = DeviceBuffer::from_host(stream, &idx.raw)?;
         Ok(idx)
+    }
+
+    /// The pool pass's inputs for a launch over the consecutive counts `c0
+    /// ..= c1` of `idx`'s raw keys, on the device: the launch's rows (`[c1 −
+    /// c0 + 1][IDX_DIM]` f32, perturbed between f16 values so rounding must
+    /// recover the reference keys) and the raw key ring of the
+    /// positions before it (slot `p mod RING_ROWS`, the slots of no position
+    /// [`NAN16`]).
+    fn pool_rows(
+        stream: &CudaStream,
+        idx: &Idx,
+        (c0, c1): (usize, usize),
+    ) -> Result<(DeviceBuffer<f32>, DeviceBuffer<u16>), GateError> {
+        let start = c0 - 1;
+        let kr: Vec<f32> = idx.raw[start * IDX_DIM..c1 * IDX_DIM]
+            .iter()
+            .map(|&h| {
+                let x = half_to_f32(h);
+                // At most a quarter f16 ULP away, so the reference key stays x.
+                x + x * (1.0 / 8192.0)
+            })
+            .collect();
+        let mut ring = vec![NAN16; RING_ROWS * IDX_DIM];
+        for p in start.saturating_sub(RING_ROWS)..start {
+            let at = p % RING_ROWS * IDX_DIM;
+            ring[at..at + IDX_DIM].copy_from_slice(&idx.raw[p * IDX_DIM..(p + 1) * IDX_DIM]);
+        }
+        Ok((
+            DeviceBuffer::from_host(stream, &kr)?,
+            DeviceBuffer::from_host(stream, &ring)?,
+        ))
     }
 
     /// The pooled plane after the pool pass over counts `1 ..= n` in
@@ -2926,10 +2964,12 @@ mod gate {
                 .map(u32::try_from)
                 .collect::<Result<_, _>>()?;
             let nk = DeviceBuffer::from_host(stream, &counts)?;
+            let (kr, ring) = pool_rows(stream, idx, (c0, c0 + counts.len() - 1))?;
             qk.enqueue_pool(
                 stream,
                 PoolArgs {
-                    raw: &idx.raw_d,
+                    kr: &kr,
+                    ring: &ring,
                     gain: &idx.gk_d,
                     table: &idx.table_d,
                     n_keys: &nk,
@@ -3142,6 +3182,10 @@ mod gate {
         let (_, c) = pool_plane(qk, stream, &idx, small, 7, unl)?;
         let chunked = c[..small / POOL * IDX_DIM] == a[..small / POOL * IDX_DIM]
             && c[small / POOL * IDX_DIM..].iter().all(|&h| h == SENTINEL);
+        // Launches of one row, a decode step's: every pool's first three rows
+        // come from the ring.
+        let (_, one) = pool_plane(qk, stream, &idx, small, 1, unl)?;
+        let chunked = chunked && one == c;
         // The crafted input, where the order of the mean's adds moves bits.
         let ord = order_inputs(stream)?;
         let crafted = ORDER_CTX / POOL;
@@ -3161,7 +3205,7 @@ mod gate {
         println!(
             "qsa pool counts 1..={SEL_N} ctx={SEL_CTX}: {complete} pools bit_exact_host={exact} \
              f64 measured/bound {worst:.3e} band={band} incomplete pools untouched={untouched} \
-             rerun={rerun} seven-row launches the same plane={chunked}; crafted \
+             rerun={rerun} seven-row and one-row launches the same plane={chunked}; crafted \
              ctx={ORDER_CTX}: {crafted} pools bit_exact_host={o_exact} f64 measured/bound \
              {o_worst:.3e} band={o_band}, pairwise and reversed sums move {seen} of {crafted} \
              keys {}",
@@ -3171,7 +3215,6 @@ mod gate {
         // A NaN in one raw row of pool 5.
         let mut bad = idx_inputs(stream, SEL_CTX, 501, false)?;
         bad.raw[(POOL * 5 + 2) * IDX_DIM + 17] = NAN16;
-        bad.raw_d = DeviceBuffer::from_host(stream, &bad.raw)?;
         let before = gpu.fault()?;
         let (_, r) = pool_plane(qk, stream, &bad, SEL_N, SEL_N, gpu.layer_sink(LAYER)?)?;
         let raised = gpu.take_fault()?;
@@ -3186,7 +3229,110 @@ mod gate {
              {want:?}), pool 5 not finite {nan}, other pools bit-identical {others} {}",
             verdict(fault_ok)
         );
-        Ok(pass && fault_ok)
+
+        // Counts 4 and 13 in one launch: row 0 is its own first row and
+        // completes pool 0; row 1 is not position 4 + 1 and completes no
+        // pool, so only the first-row check raises the fault.
+        let mut pooled =
+            DeviceBuffer::from_host(stream, &vec![SENTINEL; pools_for(idx.ctx) * IDX_DIM])?;
+        let nk = DeviceBuffer::from_host(stream, &[4u32, 13])?;
+        let (kr, ring) = pool_rows(stream, &idx, (4, 5))?;
+        let before = gpu.fault()?;
+        qk.enqueue_pool(
+            stream,
+            PoolArgs {
+                kr: &kr,
+                ring: &ring,
+                gain: &idx.gk_d,
+                table: &idx.table_d,
+                n_keys: &nk,
+                eps: EPS,
+                ctx: idx.ctx,
+                m: 2,
+                fault: gpu.layer_sink(LAYER)?,
+                pooled: &mut pooled,
+            },
+        )?;
+        stream.synchronize()?;
+        let raised = gpu.take_fault()?;
+        let p = pooled.to_host_vec(stream)?;
+        let first = p[..IDX_DIM] == a[..IDX_DIM];
+        let unwritten = p[IDX_DIM..].iter().all(|&h| h == SENTINEL);
+        let gap_ok = before.is_none() && raised == want && first && unwritten;
+        println!(
+            "qsa pool fault: counts 4 and 13 in one launch, layer {LAYER}: word {raised:?} (want \
+             {want:?}), pool 0 written {first}, the other pools unwritten {unwritten} {}",
+            verdict(gap_ok)
+        );
+
+        // Counts 1, 9, 3 and 4 in one launch: row 3 completes pool 0, but row
+        // 1 of the call is not position 1, so no pool is written.
+        let mut pooled =
+            DeviceBuffer::from_host(stream, &vec![SENTINEL; pools_for(idx.ctx) * IDX_DIM])?;
+        let nk = DeviceBuffer::from_host(stream, &[1u32, 9, 3, 4])?;
+        let (kr, ring) = pool_rows(stream, &idx, (1, 4))?;
+        let before = gpu.fault()?;
+        qk.enqueue_pool(
+            stream,
+            PoolArgs {
+                kr: &kr,
+                ring: &ring,
+                gain: &idx.gk_d,
+                table: &idx.table_d,
+                n_keys: &nk,
+                eps: EPS,
+                ctx: idx.ctx,
+                m: 4,
+                fault: gpu.layer_sink(LAYER)?,
+                pooled: &mut pooled,
+            },
+        )?;
+        stream.synchronize()?;
+        let raised = gpu.take_fault()?;
+        let none = pooled.to_host_vec(stream)?.iter().all(|&h| h == SENTINEL);
+        let skip_ok = before.is_none() && raised == want && none;
+        println!(
+            "qsa pool fault: counts 1, 9, 3 and 4 in one launch, layer {LAYER}: word {raised:?} \
+             (want {want:?}), every pool unwritten {none} {}",
+            verdict(skip_ok)
+        );
+
+        // The key append of positions 0 and 11 at ctx 12: both map to ring
+        // slot 0, so row 1, not position 0 + 1, writes nothing.
+        let q38 = Q38Kernels::load(gpu.context())?;
+        let kr = DeviceBuffer::from_host(
+            stream,
+            &idx.raw[..2 * IDX_DIM]
+                .iter()
+                .map(|&h| half_to_f32(h))
+                .collect::<Vec<_>>(),
+        )?;
+        let pos = DeviceBuffer::from_host(stream, &[0u32, 11])?;
+        let mut ring = DeviceBuffer::from_host(stream, &vec![NAN16; RING_ROWS * IDX_DIM])?;
+        let before = gpu.fault()?;
+        q38.enqueue_key_append(
+            stream,
+            KeyAppendArgs {
+                kr: &kr,
+                pos: &pos,
+                m: 2,
+                ctx: 12,
+                fault: gpu.layer_sink(LAYER)?,
+                ring: &mut ring,
+            },
+        )?;
+        stream.synchronize()?;
+        let raised = gpu.take_fault()?;
+        let r = ring.to_host_vec(stream)?;
+        let row0 = r[..IDX_DIM] == idx.raw[..IDX_DIM];
+        let rest = r[IDX_DIM..].iter().all(|&h| h == NAN16);
+        let append_ok = before.is_none() && raised == want && row0 && rest;
+        println!(
+            "qsa key append fault: positions 0 and 11 at ctx 12, layer {LAYER}: word {raised:?} \
+             (want {want:?}), slot 0 row 0's key {row0}, the other slots untouched {rest} {}",
+            verdict(append_ok)
+        );
+        Ok(pass && fault_ok && gap_ok && skip_ok && append_ok)
     }
 
     /// The selection clause (module doc, 10).
@@ -3803,16 +3949,28 @@ mod gate {
                     .collect::<Vec<_>>(),
             )?;
             let nk = DeviceBuffer::from_host(stream, &cs)?;
+            // The pool pass takes a sequence's consecutive rows: the m counts
+            // that end at the launch's highest.
+            let hi = usize::try_from(cs.iter().copied().max().unwrap_or(0))?;
+            let lo = hi + 1 - m;
+            let pool_nk = DeviceBuffer::from_host(
+                stream,
+                &(lo..=hi)
+                    .map(u32::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            let (pool_kr, pool_ring) = pool_rows(stream, &idx, (lo, hi))?;
             let mut ya = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
             let mut yg = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
             let mut chain = |s: &CudaStream, y: &mut DeviceBuffer<f32>| -> Result<(), GpuError> {
                 qk.enqueue_pool(
                     s,
                     PoolArgs {
-                        raw: &idx.raw_d,
+                        kr: &pool_kr,
+                        ring: &pool_ring,
                         gain: &idx.gk_d,
                         table: &idx.table_d,
-                        n_keys: &nk,
+                        n_keys: &pool_nk,
                         eps: EPS,
                         ctx: SEL_CTX,
                         m,

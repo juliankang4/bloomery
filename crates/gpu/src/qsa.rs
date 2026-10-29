@@ -27,7 +27,13 @@
 //!   four rows' mean, the RMS gain norm, the NEOX turn of the first [`ROT`]
 //!   values at the pool's first position, rounded once to f16 into the pooled
 //!   plane. Every position passes through some row of some launch, so every
-//!   pool is written exactly once, before any row can see it complete.
+//!   pool is written exactly once, before any row can see it complete. A
+//!   raw key is the f16 rounding of its projection: a row of the launch reads
+//!   its own from the projection's output, a row before the launch from the
+//!   raw key ring (`[RING_ROWS][DIM]` f16, position `p` in slot `p mod
+//!   RING_ROWS`), which a pool reaches at most `POOL − 1` rows back. The
+//!   launch's rows are consecutive positions (`n_keys[t] = n_keys[0] + t`);
+//!   it runs before the launch's key append writes the ring.
 //! - [`qsa_kernels::qsa_score`] — per row: its [`HEADS`] indexer query heads
 //!   normed and turned at its position (every block of its group of
 //!   [`MAX_ROWS`] rows builds them; the group's first block writes them to
@@ -93,6 +99,11 @@ pub const MAX_ROWS: usize = 8;
 pub const POOL_TILE: usize = 32;
 /// Bins of the top-k's first histogram: the top ten bits of an order key.
 const HIST_BINS: usize = 1024;
+/// Slots of the raw key ring: the `POOL − 1` keys of a pool not yet complete
+/// and a pass ([`crate::linear::PASS_ROWS`], `runtime::stores::index_ring_rows`),
+/// so a launch from any of a pass's positions finds the keys its pools read
+/// before it.
+pub const RING_ROWS: usize = POOL - 1 + crate::linear::PASS_ROWS;
 /// The longest list for `kept` pools: their tokens and a tail of `POOL − 1`.
 #[must_use]
 pub const fn list_width(kept: usize) -> usize {
@@ -100,6 +111,8 @@ pub const fn list_width(kept: usize) -> usize {
 }
 
 const _: () = assert!(HEADS == 4 && DIM == 128 && ROT == 64 && POOL == 4);
+// The pool pass's launch contract names the ring's length as a literal.
+const _: () = assert!(RING_ROWS * DIM == 1408);
 const _: () = assert!(MAX_ROWS == 8 && HIST_BINS == 1024 && HIST_BINS <= FINE_BINS);
 
 /// Rotating partials of the score dot, and u32 words of a key row.
@@ -506,11 +519,15 @@ mod qsa_kernels {
     /// The pool pass: warp `w` of block `b` serves row `t = 4b + w`. A row
     /// whose live count `c` is accepted (`1..=ctx`) and a multiple of
     /// [`POOL`] completes pool `j = c/4 − 1`: lane `l` reads values
-    /// [`lane_dims`] of the raw rows `4j .. 4j + 3` (`raw`, `[ctx][DIM]` f16),
-    /// takes their mean, norms it by `gain`, turns it by the table's row `4j`
-    /// (`table[4j·ROT ..]`), and rounds the four values into
-    /// `pooled[j·DIM ..]`. Any other row writes nothing. The warp's rows are
-    /// its own; no barrier.
+    /// [`lane_dims`] of the raw rows `q = 4j .. 4j + 3` (the f16 rounding of
+    /// the call's row `t − (4j + 3 − q)` of `kr` when there is one, else ring
+    /// slot `q mod RING_ROWS`, which holds that rounding's bits), takes their mean, norms it by `gain`, turns it by the
+    /// table's row `4j` (`table[4j·ROT ..]`), and rounds the four values into
+    /// `pooled[j·DIM ..]`. Any other row writes nothing. A row whose count is
+    /// not `n_keys[0] + t`, or a completing row whose call rows before it do
+    /// not count down by one each, raises [`FaultSite::PoolSelect`] and writes
+    /// nothing: its rows of the call are not where the rule reads them. The
+    /// warp's rows are its own; no barrier.
     #[kernel]
     #[launch_bounds(128)]
     #[launch_contract(
@@ -518,7 +535,8 @@ mod qsa_kernels {
         block = (128, 1, 1),
         requires = (
             n_keys.len() >= m,
-            raw.len() >= ctx * 128,
+            kr.len() >= m * 128,
+            ring.len() >= 1408,
             gain.len() >= 128,
             table.len() >= ctx * 64,
             pools * 4 >= ctx,
@@ -530,7 +548,8 @@ mod qsa_kernels {
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
     pub fn qsa_pool(
-        raw: &[u16],
+        kr: &[f32],
+        ring: &[u16],
         gain: &[f32],
         table: &[f32],
         n_keys: &[u32],
@@ -549,8 +568,24 @@ mod qsa_kernels {
         }
         // SAFETY: t < m <= n_keys.len() by the launch contract.
         let c = unsafe { *n_keys.get_unchecked(t) };
+        // SAFETY: t < m makes m nonzero, and m <= n_keys.len().
+        let c0 = unsafe { *n_keys.get_unchecked(0) };
+        if c0.checked_add(t as u32) != Some(c) {
+            fault.raise(FaultSite::PoolSelect);
+            return; // warp-uniform
+        }
         if c == 0 || c > ctx || !c.is_multiple_of(POOL as u32) {
             return; // warp-uniform
+        }
+        for back in 1..POOL {
+            if back <= t {
+                // SAFETY: t − back < t < m <= n_keys.len().
+                let before = unsafe { *n_keys.get_unchecked(t - back) };
+                if c.checked_sub(back as u32) != Some(before) {
+                    fault.raise(FaultSite::PoolSelect);
+                    return; // warp-uniform
+                }
+            }
         }
         let j = (c / POOL as u32 - 1) as usize;
         let lane = warp::lane_id() as usize;
@@ -559,20 +594,25 @@ mod qsa_kernels {
         let mut g = [0.0f32; 4];
         for i in 0..4 {
             thread::__unroll_config::<0>();
-            let at = POOL * j * DIM + d[i];
-            // SAFETY: the rows 4j .. 4j + 3 are below c <= ctx, so each index
-            // is below ctx·DIM <= raw.len(); d[i] < DIM <= gain.len().
-            let (r0, r1, r2, r3, gi) = unsafe {
-                (
-                    half_bits_to_f32(*raw.get_unchecked(at)),
-                    half_bits_to_f32(*raw.get_unchecked(at + DIM)),
-                    half_bits_to_f32(*raw.get_unchecked(at + 2 * DIM)),
-                    half_bits_to_f32(*raw.get_unchecked(at + 3 * DIM)),
-                    *gain.get_unchecked(d[i]),
-                )
+            // Row k of the pool lies POOL − 1 − k rows before row t: the
+            // call's row when it holds one, else the ring's slot.
+            let row = |k: usize| {
+                let back = POOL - 1 - k;
+                let bits = if back <= t {
+                    // SAFETY: back <= t and t < m; d[i] < DIM, so
+                    // (t - back) * DIM + d[i] < m * DIM <= kr.len().
+                    let value = unsafe { *kr.get_unchecked((t - back) * DIM + d[i]) };
+                    f32_to_f16_bits(value)
+                } else {
+                    // SAFETY: the slot is below RING_ROWS and d[i] < DIM,
+                    // so the index is below RING_ROWS * DIM <= ring.len().
+                    unsafe { *ring.get_unchecked((POOL * j + k) % RING_ROWS * DIM + d[i]) }
+                };
+                half_bits_to_f32(bits)
             };
-            x[i] = (((r0 + r1) + r2) + r3) * 0.25;
-            g[i] = gi;
+            x[i] = (((row(0) + row(1)) + row(2)) + row(3)) * 0.25;
+            // SAFETY: lane_dims gives d[i] < DIM <= gain.len().
+            g[i] = unsafe { *gain.get_unchecked(d[i]) };
         }
         let p = POOL * j;
         // SAFETY: p < c <= ctx and 2·lane + 1 < ROT: inside row p of the
@@ -1313,13 +1353,15 @@ pub fn pools_for(ctx: usize) -> usize {
     ctx.div_ceil(POOL)
 }
 
-/// [`QsaKernels::enqueue_pool`]'s arguments: the layer's raw indexer keys
-/// (`[ctx][DIM]` f16, the rows the call wrote included), the key norm's gain
-/// (`DIM`), the rope table (`ctx` rows of [`ROT`]), the rows' live counts on
-/// the device (`m`), the norm's epsilon, and the pooled plane
-/// (`[pools_for(ctx)][DIM]` f16).
+/// [`QsaKernels::enqueue_pool`]'s arguments: the call's raw indexer key
+/// projections (`[m][DIM]` f32, token-major), the layer's raw key ring
+/// (`[RING_ROWS][DIM]` f16, the keys of the positions before the call), the
+/// key norm's gain (`DIM`), the rope table (`ctx` rows of [`ROT`]), the
+/// rows' live counts on the device (`m`, consecutive), the norm's epsilon,
+/// and the pooled plane (`[pools_for(ctx)][DIM]` f16).
 pub struct PoolArgs<'a> {
-    pub raw: &'a DeviceBuffer<u16>,
+    pub kr: &'a DeviceBuffer<f32>,
+    pub ring: &'a DeviceBuffer<u16>,
     pub gain: &'a DeviceBuffer<f32>,
     pub table: &'a DeviceBuffer<f32>,
     pub n_keys: &'a DeviceBuffer<u32>,
@@ -1381,8 +1423,9 @@ impl QsaKernels {
 
     /// Enqueue the pool pass for `m` rows: every row whose count completes a
     /// pool writes that pool's key. One launch of `⌈m/4⌉` blocks; it must
-    /// follow the call's raw-key writes and precede its selection, on every
-    /// call from position 0 on — a pool no launch wrote is never written.
+    /// follow the call's key projection, precede the call's ring append and
+    /// its selection, on every call from position 0 on — a pool no launch
+    /// wrote is never written.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_pool(&self, stream: &CudaStream, a: PoolArgs<'_>) -> Result<(), GpuError> {
         let what = "qsa::enqueue_pool";
@@ -1394,7 +1437,8 @@ impl QsaKernels {
         }
         let pools = pools_for(a.ctx);
         let lens = [
-            ("raw", a.raw.len(), a.ctx * DIM),
+            ("kr", a.kr.len(), a.m * DIM),
+            ("ring", a.ring.len(), RING_ROWS * DIM),
             ("gain", a.gain.len(), DIM),
             ("table", a.table.len(), a.ctx * ROT),
             ("n_keys", a.n_keys.len(), a.m),
@@ -1412,7 +1456,8 @@ impl QsaKernels {
         self.module.qsa_pool(
             stream,
             &prep,
-            a.raw,
+            a.kr,
+            a.ring,
             a.gain,
             a.table,
             a.n_keys,

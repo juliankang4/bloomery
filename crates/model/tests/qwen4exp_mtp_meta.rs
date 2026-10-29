@@ -194,7 +194,11 @@ const LIST_ROWS: u32 = 40_960;
 // PIN(2026-10-28): the ubatch arena's query, β·α and one-row indexer rows leave the target scratch,
 // 110,624,768 B at 4,096 positions: rooms 37,484,271,572 and 11,882,239,956 over 30,720 give
 // 1,220,191 and 386,791; the pin is one fewer.
-const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_220_190), ("3090", 386_790)];
+// PIN(2026-10-29): a selecting layer's raw index keys leave the per-position bytes for a ring of 11
+// rows (qwen4exp_meta's KV_AT): 27,648 B a position, and the 12 rings' 33,792 B join the fixed terms.
+// Rooms 37,484,237,780 and 11,882,206,164 over 27,648 give 1,355,766 and 429,767; the pin is one
+// fewer.
+const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_355_765), ("3090", 429_766)];
 
 /// The plan with the shared draft (`place::PlanInputs::plan_mtp`): on each
 /// card at 4,096 and 32,768 positions the target's plan is `plan`'s field
@@ -519,8 +523,12 @@ fn hw_qwen4exp_mtp_plan() {
 // ubatch arena's query, β·α and one-row indexer rows leave the stage's scratch, 110,624,768 B at
 // 4,096 positions; the tier keeps its 7,236 experts, its bytes and rounding [derived: the planner on
 // this tree over the pinned headers printed this row].
+// PIN(2026-10-29): the A6000 244 on the first 26 layers (was 23), both cards 395 on the first 14
+// layers (was 11). The selecting layers' raw key rings leave the card's kv 12,549,120 B at 4,096
+// (qwen4exp_meta's KV_AT); the tier keeps its 7,236 experts, its bytes and rounding [derived: the
+// planner on this tree over the pinned headers printed this row].
 const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
-    (244, 23, 243, 395, 11, 7_236, 22_677_401_600, 145_903_616);
+    (244, 26, 243, 395, 14, 7_236, 22_677_401_600, 145_903_616);
 
 /// Plan (b′) of the Qwen3.8 file with the shared draft (`place::machine_bp`
 /// with `MtpInputs::card_bytes` as the A6000's reserve, `plan_mtp_with`

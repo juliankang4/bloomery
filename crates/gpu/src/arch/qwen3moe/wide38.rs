@@ -2162,8 +2162,8 @@ impl WideParts<'_> {
                 gdn(c, g, (rec, stamp, lane), (s, &mut *x), u, sink)?;
                 narrow(c, x, u, keep)
             }
-            (Mixer38::Qsa(q), Store38::Qsa { kv, raw, pooled }) => {
-                let split = qsa(c, q, (kv, raw, pooled), (s, x), (u, keep), sink)?;
+            (Mixer38::Qsa(q), Store38::Qsa { kv, ring, pooled }) => {
+                let split = qsa(c, q, (kv, ring, pooled), (s, x), (u, keep), sink)?;
                 u.split = Some(split);
                 Ok(())
             }
@@ -2666,17 +2666,17 @@ fn gdn(
 }
 
 /// A selecting attention layer's mixer over unit `u`'s rows and its store
-/// (the K/V planes, the raw and pooled indexer keys), the first `u.dense` of
-/// them selecting nothing ([`dense_rows`]), the attention site's mix in
-/// `s.mixed`, its output projection into the unit's `y`. Every row goes
-/// through the projections, the appends and the pool; the flash, the gate
+/// (the K/V planes, the raw indexer key ring and the pooled keys), the first
+/// `u.dense` of them selecting nothing ([`dense_rows`]), the attention site's
+/// mix in `s.mixed`, its output projection into the unit's `y`. Every row goes
+/// through the projections, the pool and the appends; the flash, the gate
 /// and the output projection run over the last `keep` of them, the unit cut
 /// to those first ([`narrow`]). Returns the unit's rows that select nothing
 /// and those that select.
 fn qsa(
     c: &Ctx38<'_>,
     qp: &QsaPlan,
-    (kv, raw, pooled): (
+    (kv, ring, pooled): (
         &mut KvPlanes,
         &mut DeviceBuffer<u16>,
         &mut DeviceBuffer<u16>,
@@ -2702,21 +2702,11 @@ fn qsa(
     dense_gemm(c, by, &qp.k, act, table, &mut q.k)?;
     dense_gemm(c, by, &qp.v, act, table, &mut q.v)?;
     dense_gemm(c, by, &qp.idx_k, act, table, &mut q.kr)?;
-    c.k.q38.enqueue_key_append(
-        stream,
-        KeyAppendArgs {
-            kr: &q.kr,
-            pos: &u.pos,
-            m,
-            ctx,
-            fault: sink,
-            raw: &mut *raw,
-        },
-    )?;
     c.k.qsa.enqueue_pool(
         stream,
         PoolArgs {
-            raw: &*raw,
+            kr: &q.kr,
+            ring: &*ring,
             gain: f32_gain(w, &qp.idx_k_norm)?,
             table: c.table,
             n_keys: &u.n_keys,
@@ -2725,6 +2715,17 @@ fn qsa(
             m,
             fault: sink,
             pooled: &mut *pooled,
+        },
+    )?;
+    c.k.q38.enqueue_key_append(
+        stream,
+        KeyAppendArgs {
+            kr: &q.kr,
+            pos: &u.pos,
+            m,
+            ctx,
+            fault: sink,
+            ring: &mut *ring,
         },
     )?;
     dense_gemm(c, by, &qp.idx_q, act, table, &mut q.qi)?;

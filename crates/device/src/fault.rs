@@ -120,7 +120,9 @@ pub enum FaultSite {
     /// A token-pool selector (`qsa`; GLM's `latent::index_pool` and `kpool`)
     /// met an indexer key that is not finite after its f16 rounding
     /// (`q38::qsa_key_append`, the raw key), a pooled key or a head's score
-    /// that is not finite, its top-k a refused live count, or its selected
+    /// that is not finite, a launch whose rows' positions or live counts are
+    /// not consecutive (`qsa_key_append`, the pool pass), its top-k a refused
+    /// live count, or its selected
     /// flash a list entry at or past the cache. A block selector (MiniMax's
     /// `msa`) raises it for a head's score that is not finite, a selection
     /// that lost the query's own block, and its selected flash for a block

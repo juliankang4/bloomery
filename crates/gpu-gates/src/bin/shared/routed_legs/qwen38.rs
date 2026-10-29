@@ -241,16 +241,15 @@ fn text_of(outcome: Outcome) -> GateError {
 }
 
 /// The seat's resident sequences: every slot takes checkpoints, priced by
-/// the body's own derivation from the file's delta layers
+/// the body's own derivation from the file's delta and selecting layers
 /// (`checkpoint_price38`).
 fn seqs38(inputs: &PlanInputs, slots: usize) -> Seqs {
-    let gdn = inputs
-        .spec
-        .layers
+    let layers = &inputs.spec.layers;
+    let gdn = layers
         .iter()
         .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
         .count();
-    Seqs::priced(slots, checkpoint_price38(gdn))
+    Seqs::priced(slots, checkpoint_price38(gdn, layers.len() - gdn))
 }
 
 /// A `GpuError` as a red outcome: the device census and the ubatch read

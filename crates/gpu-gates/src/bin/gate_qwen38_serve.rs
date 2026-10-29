@@ -3609,21 +3609,20 @@ mod gate {
 
     /// The host bytes the seat's `slots` sequences of a slot's `ctx` positions
     /// pin in checkpoints on the file: `slots` of the body's budget at that
-    /// context (`checkpoint_budget38` over the file's delta layers), the
+    /// context (`checkpoint_budget38` over the file's delta and selecting layers), the
     /// reserve the server's machine holds and [`gate_plan_at`]'s does not.
     fn pinned_checkpoints((ctx, slots): (usize, usize)) -> Result<u64, GateError> {
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&split)?;
-        let gdn = inputs
-            .spec
-            .layers
+        let layers = &inputs.spec.layers;
+        let gdn = layers
             .iter()
             .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
             .count();
         Ok(runtime::seqstate::pinned(
             slots,
-            checkpoint_budget38(gdn, u64::try_from(ctx)?)?,
+            checkpoint_budget38(gdn, layers.len() - gdn, u64::try_from(ctx)?)?,
         ))
     }
 

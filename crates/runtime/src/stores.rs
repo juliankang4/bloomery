@@ -2,7 +2,8 @@
 //! for the plan that counts their bytes and the card body that allocates
 //! them: the recurrent conv ring's rows, the PLE conv ring's rows, a window
 //! layer's key ring ([`window_rows`], [`ring_rows`], [`Rows`],
-//! [`cut_depth_keeps`]), the pooled plane's rows, and each layer's bytes by
+//! [`cut_depth_keeps`]), the pooled plane's rows, a selecting layer's raw
+//! index key ring ([`index_ring_rows`]), and each layer's bytes by
 //! kind. Pure arithmetic over the file's widths; a card constant that must
 //! equal one of these holds itself to it with a `const` assertion where it is
 //! defined.
@@ -251,10 +252,51 @@ pub const fn dense_kv_bytes(kv_heads: usize, head_dim: usize, ctx: usize) -> u64
     ctx as u64 * kv_row_bytes(kv_heads, head_dim)
 }
 
-/// A selecting attention layer's bytes at `ctx` positions: each position's
-/// K and V ([`kv_plane_bytes`] in the layout `q8` names) and raw index key of
-/// `idx_dim` f16, and one pooled key of `idx_dim` f16 a pool of `pool`
-/// positions ([`pooled_rows`]). The index keys stay f16 in either layout.
+/// Rows of a selecting layer's raw index key ring: the keys of a pool not
+/// yet complete (`pool − 1` positions) and a pass, so a cut anywhere inside
+/// a pass of up to [`PASS_ROWS`] positions still finds every key its next
+/// pool reads.
+///
+/// # Panics
+///
+/// On a pool of no position, by name.
+#[must_use]
+pub const fn index_ring_rows(pool: usize) -> usize {
+    assert!(
+        pool >= 1,
+        "index_ring_rows: a pool of at least one position"
+    );
+    pool - 1 + PASS_ROWS
+}
+
+/// A selecting layer's raw index key ring in bytes: [`index_ring_rows`] rows
+/// of `idx_dim` f16 values.
+#[must_use]
+pub const fn index_ring_bytes(idx_dim: usize, pool: usize) -> u64 {
+    index_ring_rows(pool) as u64 * idx_dim as u64 * F16_BYTES
+}
+
+/// A selecting attention layer's positional bytes at `ctx` positions: each
+/// position's K and V ([`kv_plane_bytes`] in the layout `q8` names), and one
+/// pooled key of `idx_dim` f16 a pool of `pool` positions ([`pooled_rows`]).
+/// What a sequence state carries of the layer by position. The index keys
+/// stay f16 in either layout.
+#[must_use]
+pub const fn selecting_rows_bytes(
+    kv_heads: usize,
+    head_dim: usize,
+    q8: bool,
+    idx_dim: usize,
+    pool: usize,
+    ctx: usize,
+) -> u64 {
+    kv_plane_bytes(kv_heads, head_dim, q8, ctx as u64)
+        + pooled_rows(ctx, pool) as u64 * idx_dim as u64 * F16_BYTES
+}
+
+/// A selecting attention layer's bytes at `ctx` positions: its positional
+/// rows ([`selecting_rows_bytes`]) and its raw index key ring
+/// ([`index_ring_bytes`]).
 #[must_use]
 pub const fn selecting_bytes(
     kv_heads: usize,
@@ -264,19 +306,18 @@ pub const fn selecting_bytes(
     pool: usize,
     ctx: usize,
 ) -> u64 {
-    let raw = idx_dim as u64 * F16_BYTES;
-    kv_plane_bytes(kv_heads, head_dim, q8, ctx as u64)
-        + ctx as u64 * raw
-        + pooled_rows(ctx, pool) as u64 * raw
+    selecting_rows_bytes(kv_heads, head_dim, q8, idx_dim, pool, ctx)
+        + index_ring_bytes(idx_dim, pool)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         DELTA_LANES, PROMPT_BATCH, RING_ALIGN, Rows, conv_ring_bytes, conv_ring_rows,
-        cut_depth_keeps, delta_carry_bytes, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes,
-        kv_row_bytes, mamba2_bytes, mamba2_lens, ple_ring_bytes, ple_ring_rows, pooled_rows,
-        recurrent_bytes, ring_rows, selecting_bytes, window_rows,
+        cut_depth_keeps, delta_carry_bytes, delta_lane_bytes, dense_kv_bytes, index_ring_bytes,
+        index_ring_rows, kv_plane_bytes, kv_row_bytes, mamba2_bytes, mamba2_lens, ple_ring_bytes,
+        ple_ring_rows, pooled_rows, recurrent_bytes, ring_rows, selecting_bytes,
+        selecting_rows_bytes, window_rows,
     };
 
     /// A GQA layer's planes over `ctx` positions are `ctx` rows of the layout asked for: f16 K and V,
@@ -314,8 +355,8 @@ mod tests {
     /// eleven conv rows of 10,240 f32 channels and a carry of four words and
     /// fifteen rows of 64 heads of 128 f32 and 2 × 48 f32; the PLE ring 17
     /// rows of four 2,560-value streams; an attention position 2 × 2 × 256 f16 of K and V
-    /// (17/16 B a value in q8_0) and a 128-value raw index key, and a 128-value pooled key per four
-    /// positions, the last pool whole.
+    /// (17/16 B a value in q8_0), a 128-value pooled key per four positions, the last pool
+    /// whole, and eleven raw index key rows of 128 f16 whatever the context.
     #[test]
     fn qwen38_sizes() {
         assert_eq!(conv_ring_rows(4), 11);
@@ -324,18 +365,24 @@ mod tests {
         assert_eq!(delta_carry_bytes(48, 16, 128), (4 + 15 * (8192 + 96)) * 4);
         assert_eq!(ple_ring_bytes(4, 3, 4, 2560), 696_320);
         assert_eq!(kv_row_bytes(2, 256), 2048);
+        assert_eq!(index_ring_rows(4), 11);
+        assert_eq!(index_ring_bytes(128, 4), 2816);
+        assert_eq!(
+            selecting_rows_bytes(2, 256, false, 128, 4, 4096),
+            4096 * 2048 + 1024 * 256
+        );
         assert_eq!(
             selecting_bytes(2, 256, false, 128, 4, 4096),
-            4096 * 2304 + 1024 * 256
+            4096 * 2048 + 1024 * 256 + 2816
         );
         assert_eq!(
             selecting_bytes(2, 256, false, 128, 4, 4097),
-            4097 * 2304 + 1025 * 256
+            4097 * 2048 + 1025 * 256 + 2816
         );
         // q8_0: 2 · 2 · 256 values at 17/16 B, the index keys unchanged.
         assert_eq!(
             selecting_bytes(2, 256, true, 128, 4, 4096),
-            4096 * (1088 + 256) + 1024 * 256
+            4096 * 1088 + 1024 * 256 + 2816
         );
     }
 

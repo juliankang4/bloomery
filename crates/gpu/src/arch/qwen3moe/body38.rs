@@ -169,7 +169,7 @@ use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{BY_NAME_COLS, ByName};
 use crate::tensor::{WindowMut, to_host};
 use crate::weights::{Weights, tensor_scales};
-use crate::{Branch, DeviceTensor, Gpu, GpuError, StagedRows, launch_u32, ple};
+use crate::{Branch, DeviceTensor, Gpu, GpuError, StagedRows, launch_u32, ple, qsa};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use engram::hash::{History, Window};
@@ -299,7 +299,7 @@ pub struct Slot38 {
 /// recurrent copy the shared part counts ([`POINT_ROW_BYTES`]).
 #[must_use]
 pub fn seq38_bytes(gdn: usize, qsa: usize, positions: usize, drafts: bool, kv: KvQ8) -> u64 {
-    let shared = seq_positional_bytes(qsa, positions, kv) + 2 * checkpoint_bytes(gdn);
+    let shared = seq_positional_bytes(qsa, positions, kv) + 2 * checkpoint_bytes(gdn, qsa);
     if !drafts {
         return shared;
     }
@@ -315,10 +315,11 @@ const POINT_ROW_BYTES: u64 = (geo::STREAMS * geo::HIDDEN * size_of::<f32>()) as 
 
 /// The host bytes one sequence's checkpoint hidden rows hold at most on a
 /// load with the MTP draft, in a load of `ctx` positions (a slot's share) of
-/// `gdn` delta layers: one [`POINT_ROW_BYTES`] row for each point the
-/// sequence's checkpoint budget holds ([`checkpoint_budget38`]).
-pub fn point_row_budget38(gdn: usize, ctx: u64) -> Result<u64, GpuError> {
-    Ok(checkpoint_budget38(gdn, ctx)? / checkpoint_bytes(gdn) * POINT_ROW_BYTES)
+/// `gdn` delta layers and `qsa` selecting layers: one [`POINT_ROW_BYTES`] row
+/// for each point the sequence's checkpoint budget holds
+/// ([`checkpoint_budget38`]).
+pub fn point_row_budget38(gdn: usize, qsa: usize, ctx: u64) -> Result<u64, GpuError> {
+    Ok(checkpoint_budget38(gdn, qsa, ctx)? / checkpoint_bytes(gdn, qsa) * POINT_ROW_BYTES)
 }
 
 /// The spacing of a prompt call's inner checkpoints (`runtime::seqstate`'s
@@ -330,25 +331,32 @@ pub fn point_row_budget38(gdn: usize, ctx: u64) -> Result<u64, GpuError> {
 pub const CHECKPOINT_EVERY: u32 = UBATCH_MOST as u32;
 
 /// The f32s of each store one checkpoint of a load of `gdn` delta layers
-/// copies, in the layers' order: each delta layer's committed lane, conv
-/// ring and carry, then the PLE ring. The one derivation of what a
-/// checkpoint holds, read by the sequences' `Checkpoints`,
-/// [`checkpoint_bytes`] and [`checkpoint_price38`].
-fn checkpoint_lens(gdn: usize) -> Vec<usize> {
+/// and `qsa` selecting layers copies, in the layers' order: each delta
+/// layer's committed lane, conv ring and carry, then the PLE ring, then each
+/// selecting layer's raw key ring (its f16 pairs as f32 words, a copy that
+/// reads no value). The one derivation of what a checkpoint holds, read by
+/// the sequences' `Checkpoints`, [`checkpoint_bytes`] and
+/// [`checkpoint_price38`].
+fn checkpoint_lens(gdn: usize, qsa: usize) -> Vec<usize> {
     (0..gdn)
         .flat_map(|_| [GDN.state_len(), GDN.ring_len(), GDN.carry_len()])
         .chain([ple::ring_len(geo::STREAMS)])
+        .chain((0..qsa).map(|_| KEY_RING_WORDS))
         .collect()
 }
 
-/// [`checkpoint_lens`] of the delta layers among `stores`.
+/// f32 words of a selecting layer's raw key ring (`[qsa::RING_ROWS][IDX_DIM]`
+/// f16), as a checkpoint copies it.
+const KEY_RING_WORDS: usize = qsa::RING_ROWS * geo::IDX_DIM / 2;
+const _: () = assert!((qsa::RING_ROWS * geo::IDX_DIM).is_multiple_of(2));
+
+/// [`checkpoint_lens`] of the delta and the selecting layers among `stores`.
 fn checkpoint_lens_of(stores: &[Store38]) -> Vec<usize> {
-    checkpoint_lens(
-        stores
-            .iter()
-            .filter(|s| matches!(s, Store38::Rec { .. }))
-            .count(),
-    )
+    let gdn = stores
+        .iter()
+        .filter(|s| matches!(s, Store38::Rec { .. }))
+        .count();
+    checkpoint_lens(gdn, stores.len() - gdn)
 }
 
 /// The commit's replay table over the delta layers among `stores`, each
@@ -373,39 +381,46 @@ fn recovery_table(stream: &CudaStream, stores: &[Store38]) -> Result<RecoveryTab
     unsafe { RecoveryTable::new(stream, GDN, LANES, &rows) }
 }
 
-/// The bytes one checkpoint of a load of `gdn` delta layers copies: each
-/// delta layer's committed lane, conv ring and carry, and the PLE ring.
+/// The bytes one checkpoint of a load of `gdn` delta layers and `qsa`
+/// selecting layers copies: each delta layer's committed lane, conv ring and
+/// carry, the PLE ring, and each selecting layer's raw key ring.
 #[must_use]
-pub fn checkpoint_bytes(gdn: usize) -> u64 {
-    checkpoint::point_bytes(&checkpoint_lens(gdn))
+pub fn checkpoint_bytes(gdn: usize, qsa: usize) -> u64 {
+    checkpoint::point_bytes(&checkpoint_lens(gdn, qsa))
 }
 
-/// What one checkpoint of a load of `gdn` delta layers costs on the host and
-/// how a prompt call spaces them ([`CHECKPOINT_EVERY`]): the figure every
-/// sequence's `Checkpoints` is made with ([`Checkpoints::sequence`]) and a
-/// plan's host reserve prices (`residency38::reserve_checkpoints`), so the
-/// two cannot differ.
+/// What one checkpoint of a load of `gdn` delta layers and `qsa` selecting
+/// layers costs on the host and how a prompt call spaces them
+/// ([`CHECKPOINT_EVERY`]): the figure every sequence's `Checkpoints` is made
+/// with ([`Checkpoints::sequence`]) and a plan's host reserve prices
+/// (`residency38::reserve_checkpoints`), so the two cannot differ.
 #[must_use]
-pub fn checkpoint_price38(gdn: usize) -> Price {
-    checkpoint::price(&checkpoint_lens(gdn), CHECKPOINT_EVERY)
+pub fn checkpoint_price38(gdn: usize, qsa: usize) -> Price {
+    checkpoint::price(&checkpoint_lens(gdn, qsa), CHECKPOINT_EVERY)
 }
 
 /// The host bytes one sequence's checkpoints pin at most in a load of `ctx`
-/// positions (a slot's share) of `gdn` delta layers ([`Price::budget`] of
-/// [`checkpoint_price38`]).
-pub fn checkpoint_budget38(gdn: usize, ctx: u64) -> Result<u64, GpuError> {
-    checkpoint::budget(checkpoint_price38(gdn), ctx)
+/// positions (a slot's share) of `gdn` delta layers and `qsa` selecting
+/// layers ([`Price::budget`] of [`checkpoint_price38`]).
+pub fn checkpoint_budget38(gdn: usize, qsa: usize, ctx: u64) -> Result<u64, GpuError> {
+    checkpoint::budget(checkpoint_price38(gdn, qsa), ctx)
 }
 
 /// The positional bytes a sequence state of `positions` positions carries
-/// for `qsa` selecting layers: each one's K and V rows in the cache format
-/// `kv`, raw indexer keys and the pooled keys of the pools the positions
-/// reach (f16 in either format).
+/// for `qsa` selecting layers: each one's positional rows, its K and V in
+/// the cache format `kv` ([`runtime::stores::selecting_rows_bytes`]; its raw
+/// key ring is a checkpoint store, [`checkpoint_bytes`]).
 #[must_use]
 pub const fn seq_positional_bytes(qsa: usize, positions: usize, kv: KvQ8) -> u64 {
-    let f16 = size_of::<u16>();
-    let keys = positions * geo::IDX_DIM * f16 + positions.div_ceil(geo::POOL) * geo::IDX_DIM * f16;
-    qsa as u64 * (kv_rows_bytes(positions, kv) + keys as u64)
+    qsa as u64
+        * runtime::stores::selecting_rows_bytes(
+            geo::N_KV,
+            geo::HEAD,
+            matches!(kv, KvQ8::Q8),
+            geo::IDX_DIM,
+            geo::POOL,
+            positions,
+        )
 }
 
 /// One attention store's K and V rows of `positions` positions in the cache
@@ -1125,10 +1140,11 @@ fn ple_takes(
 }
 
 /// A layer's store read back ([`Body38::stores_host`]): a delta layer's
-/// state, conv ring and carry, or a selecting layer's K/V planes and its raw
-/// and pooled indexer keys. A side's plane is its f16 bits, or on a q8_0
-/// cache its codes plane's 16-bit halves (each word's low half first) then
-/// its scales plane: bit equality reads either, a row's values only the f16.
+/// state, conv ring and carry, or a selecting layer's K/V planes, its raw
+/// indexer key ring and its pooled indexer keys. A side's plane is its f16
+/// bits, or on a q8_0 cache its codes plane's 16-bit halves (each word's low
+/// half first) then its scales plane: bit equality reads either, a row's
+/// values only the f16.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Store38Host {
     Rec {
@@ -1139,7 +1155,7 @@ pub enum Store38Host {
     Qsa {
         k: Vec<u16>,
         v: Vec<u16>,
-        raw: Vec<u16>,
+        ring: Vec<u16>,
         pooled: Vec<u16>,
     },
 }
@@ -2720,7 +2736,7 @@ impl Body38 {
                             .ok_or_else(no_carry)?
                             .to_host_vec(stream)?,
                     },
-                    Store38::Qsa { kv, raw, pooled } => {
+                    Store38::Qsa { kv, ring, pooled } => {
                         let q8 = |codes: &DeviceBuffer<u32>, scales: &DeviceBuffer<u16>| {
                             let mut halves: Vec<u16> = codes
                                 .to_host_vec(stream)?
@@ -2739,7 +2755,7 @@ impl Body38 {
                         Store38Host::Qsa {
                             k,
                             v,
-                            raw: raw.to_host_vec(stream)?,
+                            ring: ring.to_host_vec(stream)?,
                             pooled: pooled.to_host_vec(stream)?,
                         }
                     }
@@ -2749,7 +2765,7 @@ impl Body38 {
         Ok((stores, self.ple_ring.to_host_vec(stream)?))
     }
 
-    /// Every selecting store's K/V planes and raw and pooled keys set to
+    /// Every selecting store's K/V planes, raw key ring and pooled keys set to
     /// `bits`, an f16 pattern: a gate's stand-in for the rows `reset` leaves
     /// as they were, so a path that reads a row it did not write reads the
     /// pattern, not a previous run's value. On a q8_0 cache the scales hold
@@ -2759,7 +2775,7 @@ impl Body38 {
         let fill = |buf: &mut DeviceBuffer<u16>| buf.copy_from_host(stream, &vec![bits; buf.len()]);
         let word = u32::from(bits) * 0x1_0001;
         for s in &mut self.stores {
-            if let Store38::Qsa { kv, raw, pooled } = s {
+            if let Store38::Qsa { kv, ring, pooled } = s {
                 match kv {
                     KvPlanes::F16 { k, v } => {
                         fill(k)?;
@@ -2773,7 +2789,7 @@ impl Body38 {
                         fill(vd)?;
                     }
                 }
-                fill(raw)?;
+                fill(ring)?;
                 fill(pooled)?;
             }
         }
@@ -2898,7 +2914,8 @@ impl Body38 {
     }
 
     /// The waiting cut carried out ([`Checkpoints::apply`]): the committed
-    /// lane, the conv rings and the PLE ring from the point's slot, each
+    /// lane, the conv rings, the PLE ring and the raw key rings from the
+    /// point's slot, each
     /// delta layer's committed lane stamped at the position the cut left
     /// (`held`) and every other never written. Nothing when no cut waits.
     /// Waits for the copies.
@@ -3145,8 +3162,8 @@ impl Body38 {
     /// side read (its arenas' rows, blocking), the PLE history and the
     /// checkpoints' pick for `pos` ([`Checkpoints::save_points`]) as the
     /// state's host values, the stores lent, and `take` (the copy, on the
-    /// engine stream or on a lane) run on them. The K/V planes' rows, the raw
-    /// keys' and the pooled keys' of positions below `pos`, the draft's
+    /// engine stream or on a lane) run on them. The K/V planes' rows and the
+    /// pooled keys' of positions below `pos`, the draft's
     /// store rows of the same positions, the recurrent stores at `pos` and at
     /// each picked point, each with its PLE history. Refused by name while a
     /// verify waits, after a call failed past its launch, when the history
@@ -5225,9 +5242,10 @@ impl ChainBody for Body38 {
     /// stamp to a fresh store's, the lane word to 0, a new PLE history, no
     /// verify waiting or call staged, no gate plant (a failure, a slot map,
     /// ubatch routes), no ubatch walk's split or tapped positions, after the
-    /// host tier's reset. The K/V planes and the
-    /// raw and pooled keys need nothing: nothing reads a row at or past a
-    /// live count, and every row below it is written by its own step first.
+    /// host tier's reset. The K/V planes, the
+    /// raw key rings and the pooled keys need nothing: nothing reads a row at
+    /// or past a live count, and every row below it is written by its own
+    /// step first.
     /// Synchronizes: the engine stream waited for within
     /// [`crate::host::ENGINE_BOUND`] before zeroing the stores and at
     /// the end ([`crate::host::await_done`]).
@@ -5738,17 +5756,19 @@ struct Copied<'a> {
     rings: Vec<&'a mut DeviceBuffer<f32>>,
     carries: Vec<&'a mut DeviceBuffer<f32>>,
     ple: &'a mut DeviceBuffer<f32>,
+    /// Each selecting layer's raw key ring as f32 words, in layer order.
+    keys: Vec<WindowMut<'a, f32>>,
 }
 
 impl<'a> Copied<'a> {
     /// The stores of `stores` and `ple_ring` a checkpoint copies — each
-    /// delta layer's state lane `lane`, its conv ring and carry, then the PLE ring
+    /// delta layer's state lane `lane`, its conv ring and carry, then the PLE
+    /// ring, then each selecting layer's raw key ring ([`checkpoint_lens`])
     /// — and, with `rows` (`(ctx, n)`), each selecting layer's rows of
     /// positions below `n`: its K/V planes' ([`KvPlanes::spans`](super::scratch::KvPlanes::spans), in
-    /// the cache's format),
-    /// its raw keys' (`[ctx][IDX_DIM]`) and its pooled keys' of the pools
-    /// those positions reach; then `draft`'s store rows of the same
-    /// positions ([`Mtp38::store_spans`]).
+    /// the cache's format)
+    /// and its pooled keys' of the pools those positions reach; then
+    /// `draft`'s store rows of the same positions ([`Mtp38::store_spans`]).
     fn of(
         stores: &'a mut [Store38],
         ple: &'a mut DeviceBuffer<f32>,
@@ -5771,6 +5791,7 @@ impl<'a> Copied<'a> {
             rings: Vec::new(),
             carries: Vec::new(),
             ple,
+            keys: Vec::new(),
         };
         for s in stores {
             match s {
@@ -5783,11 +5804,11 @@ impl<'a> Copied<'a> {
                     c.rings.push(ring);
                     c.carries.push(carry.as_mut().ok_or_else(no_carry)?);
                 }
-                Store38::Qsa { kv, raw, pooled } => {
+                Store38::Qsa { kv, ring, pooled } => {
+                    c.keys.push(WindowMut::of_mut(ring, 0, KEY_RING_WORDS)?);
                     if let Some((ctx, n)) = rows {
                         let d = geo::IDX_DIM;
                         c.spans.extend(kv.spans((geo::N_KV, ctx, geo::HEAD), n)?);
-                        c.spans.push(Spans::by_position(raw, 1, 0, n, d)?);
                         c.spans
                             .push(Spans::by_pool(pooled, 1, 0, n, (geo::POOL, d))?);
                     }
@@ -5801,7 +5822,7 @@ impl<'a> Copied<'a> {
     }
 
     /// The stores in the checkpoints' order: each delta layer's lane, ring
-    /// and carry, then the PLE ring.
+    /// and carry, then the PLE ring, then each selecting layer's key ring.
     fn list(&mut self) -> Vec<&mut DeviceBuffer<f32>> {
         self.list_split().1
     }
@@ -5815,6 +5836,7 @@ impl<'a> Copied<'a> {
             rings,
             carries,
             ple,
+            keys,
         } = self;
         let mut out: Vec<&mut DeviceBuffer<f32>> = Vec::new();
         for ((l, r), c) in lanes
@@ -5827,6 +5849,7 @@ impl<'a> Copied<'a> {
             out.push(&mut **c);
         }
         out.push(&mut **ple);
+        out.extend(keys.iter_mut().map(|k| &mut **k));
         (spans, out)
     }
 }
@@ -6354,30 +6377,33 @@ mod tests {
     };
     use engram::hash::{EosWindow, Window};
 
-    /// A checkpoint of Qwen3.8-Flash-Next's 36 delta layers (48 layers at
-    /// interval 4) copies each one's committed lane (786,432 f32), conv ring
-    /// (112,640 f32) and carry (124,324 f32), and the PLE ring (174,080
-    /// f32): 148,065,344 B, one derivation for the sequences' `Checkpoints`
-    /// and the plan's price, spaced at the 4,096-token ubatch, so a slot of
-    /// 2,048 positions pins two points (a whole call's one and the previous
-    /// call's end), one of 10,240 four, and the host budget fits 29.
+    /// A checkpoint of Qwen3.8-Flash-Next's 36 delta layers and 12
+    /// selecting layers (48 layers at interval 4) copies each delta layer's
+    /// committed lane (786,432 f32), conv ring (112,640 f32) and carry
+    /// (124,324 f32), the PLE ring (174,080 f32), and each selecting layer's
+    /// raw key ring (eleven rows of 128 f16, 704 f32 words): 148,099,136 B,
+    /// one derivation for the sequences' `Checkpoints` and the plan's price,
+    /// spaced at the 4,096-token ubatch, so a slot of 2,048 positions pins two
+    /// points (a whole call's one and the previous call's end), one of 10,240
+    /// four, and the host budget fits 29.
     #[test]
-    fn a_checkpoint_copies_the_delta_layers_lane_ring_and_the_ple_ring() {
-        let lens = checkpoint_lens(36);
-        assert_eq!(lens.len(), 3 * 36 + 1);
+    fn a_checkpoint_copies_the_delta_layers_lane_ring_the_ple_ring_and_the_key_rings() {
+        let lens = checkpoint_lens(36, 12);
+        assert_eq!(lens.len(), 3 * 36 + 1 + 12);
         assert!(
             lens[..108]
                 .chunks(3)
                 .all(|c| c == [786_432, 112_640, 124_324])
         );
         assert_eq!(lens[108], 174_080);
-        assert_eq!(checkpoint_bytes(36), 148_065_344);
-        assert_eq!(checkpoint_price38(36).point_bytes, 148_065_344);
-        assert_eq!(checkpoint_price38(36).every, 4_096);
+        assert!(lens[109..].iter().all(|&n| n == 704));
+        assert_eq!(checkpoint_bytes(36, 12), 148_099_136);
+        assert_eq!(checkpoint_price38(36, 12).point_bytes, 148_099_136);
+        assert_eq!(checkpoint_price38(36, 12).every, 4_096);
         for (ctx, points) in [(2_048u64, 2u64), (10_240, 4), (1 << 20, 29)] {
             assert_eq!(
-                checkpoint_budget38(36, ctx).expect("a budget"),
-                points * 148_065_344,
+                checkpoint_budget38(36, 12, ctx).expect("a budget"),
+                points * 148_099_136,
                 "ctx {ctx}"
             );
         }

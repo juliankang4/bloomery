@@ -708,7 +708,8 @@ impl Place38 {
         }
         reserve_checkpoints(&mut machine, seqs38(inputs, slots), ctx)?;
         if mtp.is_some() {
-            let bytes = point_row_budget38(gdn_layers(inputs), ctx)?;
+            let (gdn, qsa) = layer_counts(inputs);
+            let bytes = point_row_budget38(gdn, qsa, ctx)?;
             machine
                 .host_mut()
                 .reserves
@@ -730,19 +731,22 @@ impl Place38 {
 /// What the seat's load of `slots` resident sequences of the file `inputs`
 /// describes declares ([`reserve_checkpoints`]): every slot takes checkpoints,
 /// the seat turning them on (`set_checkpoints`), each priced by the body's own
-/// derivation ([`checkpoint_price38`]) from the file's delta layers.
+/// derivation ([`checkpoint_price38`]) from the file's delta and selecting
+/// layers.
 fn seqs38(inputs: &PlanInputs, slots: usize) -> Seqs {
-    Seqs::priced(slots, checkpoint_price38(gdn_layers(inputs)))
+    let (gdn, qsa) = layer_counts(inputs);
+    Seqs::priced(slots, checkpoint_price38(gdn, qsa))
 }
 
-/// The delta layers of the file `inputs` describes.
-fn gdn_layers(inputs: &PlanInputs) -> usize {
-    inputs
-        .spec
-        .layers
+/// The delta layers of the file `inputs` describes, and its other
+/// (selecting) layers.
+fn layer_counts(inputs: &PlanInputs) -> (usize, usize) {
+    let layers = &inputs.spec.layers;
+    let gdn = layers
         .iter()
         .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
-        .count()
+        .count();
+    (gdn, layers.len() - gdn)
 }
 
 /// The MTP draft file at `path`, which `from` picked; an error names both.
@@ -1222,9 +1226,8 @@ impl Plans<'_> {
 /// copies, the draft's side under `drafts`, [`seq38_bytes`]) — at one
 /// position the least one saved state of the prompt cache holds.
 fn seq38_state(inputs: &PlanInputs, positions: usize, drafts: bool) -> u64 {
-    let gdn = gdn_layers(inputs);
-    let kv = KvQ8::of(inputs.kv.is_q8());
-    seq38_bytes(gdn, inputs.spec.layers.len() - gdn, positions, drafts, kv)
+    let (gdn, qsa) = layer_counts(inputs);
+    seq38_bytes(gdn, qsa, positions, drafts, KvQ8::of(inputs.kv.is_q8()))
 }
 
 /// The context the seat loads ([`ctx38`]): a slot's own, the stores' rows
@@ -2053,11 +2056,10 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         mtp_inputs.as_ref(),
         slots,
     )?;
-    check_reserve(
-        &machine,
-        slots,
-        checkpoint_budget38(gdn_layers(&inputs), u64::try_from(ctx)?)?,
-    )?;
+    check_reserve(&machine, slots, {
+        let (gdn, qsa) = layer_counts(&inputs);
+        checkpoint_budget38(gdn, qsa, u64::try_from(ctx)?)?
+    })?;
     let (plan, draft_bytes) = match &mtp_inputs {
         None => (
             inputs.plan_with_slots(&machine, u64::try_from(ctx)?, &plan_levers, experts, slots)?,
@@ -2526,7 +2528,8 @@ impl Q38 {
         let ctx_ub = (u64::try_from(a.ctx)?, u64::try_from(ub)?);
         // The sequences the load makes pin the body's budget at this context;
         // the plan's machine must reserve at least that.
-        let ckpt = checkpoint_budget38(gdn_layers(&inputs), ctx_ub.0)?;
+        let (gdn, qsa) = layer_counts(&inputs);
+        let ckpt = checkpoint_budget38(gdn, qsa, ctx_ub.0)?;
         // The wall before the loader's call, which the `load phases` record names.
         let opened: Duration;
         let mut m = match a.mtp {

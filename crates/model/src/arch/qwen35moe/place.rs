@@ -68,8 +68,8 @@ use crate::placement::{
 use gguf::digest::hex;
 
 use runtime::stores::{
-    DELTA_LANES, F32_BYTES, delta_carry_bytes, delta_lane_bytes, kv_plane_bytes, ple_ring_bytes,
-    recurrent_bytes, selecting_bytes,
+    DELTA_LANES, F32_BYTES, delta_carry_bytes, delta_lane_bytes, index_ring_bytes, kv_plane_bytes,
+    ple_ring_bytes, recurrent_bytes, selecting_rows_bytes,
 };
 pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 
@@ -1698,10 +1698,11 @@ fn check_draft_reserve(machine: &Machine, want: Option<u64>) -> Result<(), Place
 /// - an attention layer: a position's K and V (`2 · kv_heads · head_dim`
 ///   values — f16, or q8_0's two-plane layout when the load runs its cache
 ///   in it ([`KvLayout::in_q8`], the cache lever's `q8_0`), a selecting
-///   layer's planes as well); with the selector, also its raw indexer key
-///   (`idx_dim` f16, in either layout) and
-///   a pooled key (`idx_dim` f16) per pool of `ratio` positions, the last
-///   pool counted whole (`runtime::stores::selecting_bytes`).
+///   layer's planes as well); with the selector, also a pooled key (`idx_dim`
+///   f16, in either layout) per pool of `ratio` positions, the last pool
+///   counted whole, and a raw indexer key ring of `ratio − 1 + PASS_ROWS`
+///   rows of `idx_dim` f16 whatever the context
+///   (`runtime::stores::selecting_bytes`).
 #[derive(Clone, Debug)]
 pub struct KvLayout {
     /// Per layer: its kind.
@@ -1974,8 +1975,10 @@ pub fn slot_resident_bytes(spec: &ModelSpec) -> u64 {
 }
 
 impl KvLayout {
-    /// Attention layer `layer`'s positional bytes at `ctx_max` positions.
-    fn attention_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+    /// Attention layer `layer`'s bytes at `ctx_max` positions: its
+    /// positional rows, and a selecting layer's raw key ring, which a
+    /// checkpoint copies.
+    fn attention_bytes(&self, layer: usize, ctx_max: u64) -> (u64, u64) {
         match &self.select {
             Some((idx_dim, pools)) => {
                 let pool =
@@ -1983,24 +1986,37 @@ impl KvLayout {
                         "KvLayout: an attention layer's pool (of_spec_lanes refuses 0 there)",
                     );
                 let ctx = usize::try_from(ctx_max).expect("KvLayout: a context of usize");
-                selecting_bytes(self.kv_heads, self.head_dim, self.q8, *idx_dim, pool, ctx)
+                (
+                    selecting_rows_bytes(
+                        self.kv_heads,
+                        self.head_dim,
+                        self.q8,
+                        *idx_dim,
+                        pool,
+                        ctx,
+                    ),
+                    index_ring_bytes(*idx_dim, pool),
+                )
             }
-            None => kv_plane_bytes(self.kv_heads, self.head_dim, self.q8, ctx_max),
+            None => (
+                kv_plane_bytes(self.kv_heads, self.head_dim, self.q8, ctx_max),
+                0,
+            ),
         }
     }
 
     /// The host bytes one saved sequence state of `positions` positions holds
-    /// of the file's own layers: every attention layer's positional bytes
-    /// and two copies of a checkpoint — each GDN layer's committed lane and
-    /// conv ring, and the PLE ring.
+    /// of the file's own layers: every attention layer's positional rows and
+    /// two copies of a checkpoint — each GDN layer's committed lane and conv
+    /// ring, the PLE ring, and each selecting layer's raw key ring.
     fn state_bytes(&self, positions: u64) -> u64 {
-        let attention = (0..self.kinds.len())
+        let (rows, rings) = (0..self.kinds.len())
             .filter(|&l| self.kinds[l] == Kind::Attention)
             .map(|l| self.attention_bytes(l, positions))
-            .sum::<u64>();
+            .fold((0, 0), |(r, k), (lr, lk)| (r + lr, k + lk));
         let gdn = self.kinds.iter().filter(|&&k| k == Kind::DeltaRule).count() as u64;
-        let checkpoint = gdn * self.copy + self.ple.map_or(0, |(_, bytes)| bytes);
-        attention + 2 * checkpoint
+        let checkpoint = gdn * self.copy + self.ple.map_or(0, |(_, bytes)| bytes) + rings;
+        rows + 2 * checkpoint
     }
 }
 
@@ -2012,7 +2028,10 @@ impl KvBytes for KvLayout {
         };
         let own = match self.kinds.get(layer) {
             Some(Kind::DeltaRule) => self.recurrent,
-            Some(Kind::Attention) => self.attention_bytes(layer, ctx_max),
+            Some(Kind::Attention) => {
+                let (rows, ring) = self.attention_bytes(layer, ctx_max);
+                rows + ring
+            }
             None => 0,
         };
         own + ple
@@ -2713,8 +2732,8 @@ mod tests {
 
     /// Qwen3.8's layers by kind (the sizes themselves are
     /// `runtime::stores`'s, pinned there): a GDN layer's state lanes, conv
-    /// ring and carry, the PLE ring beside it on its layer, an attention layer's K/V, raw and
-    /// pooled keys at a context of whole pools and one past.
+    /// ring and carry, the PLE ring beside it on its layer, an attention layer's K/V and
+    /// pooled keys at a context of whole pools and one past and its raw key ring.
     #[test]
     fn qwen38_layer_bytes() {
         let kv = KvLayout {
@@ -2735,8 +2754,8 @@ mod tests {
             kv.layer_bytes(1, 4096),
             3_596_288 + 9_437_200 + 497_296 + 696_320
         );
-        assert_eq!(kv.layer_bytes(2, 4096), 4096 * 2304 + 1024 * 256);
-        assert_eq!(kv.layer_bytes(2, 4097), 4097 * 2304 + 1025 * 256);
+        assert_eq!(kv.layer_bytes(2, 4096), 4096 * 2048 + 1024 * 256 + 2816);
+        assert_eq!(kv.layer_bytes(2, 4097), 4097 * 2048 + 1025 * 256 + 2816);
         assert_eq!(kv.layer_bytes(3, 4096), 0);
     }
 
@@ -2855,10 +2874,10 @@ mod tests {
 
     /// One saved sequence state of Qwen3.8's 48 layers (36 GDN, every fourth
     /// one attention, the PLE ring on layer 1) at a context of whole pools
-    /// [derived]: twelve attention layers' 2,304 B a position and 256 B a
+    /// [derived]: twelve attention layers' 2,048 B a position and 256 B a
     /// pool of four, and two checkpoints of 36 · 4,093,584 B (the committed
-    /// lane, conv ring and carry, not the four lanes a layer holds) and the
-    /// PLE ring's 696,320 B.
+    /// lane, conv ring and carry, not the four lanes a layer holds), the
+    /// PLE ring's 696,320 B and twelve raw key rings of 2,816 B.
     #[test]
     fn qwen38_state_bytes() {
         let kv = KvLayout {
@@ -2885,16 +2904,16 @@ mod tests {
             q8: false,
             rope_row: 64 * 4,
         };
-        let checkpoint = 36 * 4_093_584 + 696_320;
+        let checkpoint = 36 * 4_093_584 + 696_320 + 12 * 2816;
         assert_eq!(kv.state_bytes(0), 2 * checkpoint);
         assert_eq!(
             kv.state_bytes(262_144),
-            12 * (262_144 * 2304 + 65_536 * 256) + 2 * checkpoint
+            12 * (262_144 * 2048 + 65_536 * 256) + 2 * checkpoint
         );
-        assert_eq!(kv.state_bytes(262_144), 7_745_214_592);
+        assert_eq!(kv.state_bytes(262_144), 6_939_975_808);
         assert_eq!(
             kv.state_bytes(4097),
-            12 * (4097 * 2304 + 1025 * 256) + 2 * checkpoint
+            12 * (4097 * 2048 + 1025 * 256) + 2 * checkpoint
         );
     }
 
@@ -2977,7 +2996,7 @@ mod tests {
             rope_row: 64 * 4,
         };
         let sel = selecting.layer_bytes(0, 4096);
-        let idx = 4096 * 128 * 2 + 1024 * 128 * 2;
+        let idx = 1024 * 128 * 2 + 11 * 128 * 2;
         assert_eq!(sel, 4096 * 2 * 256 * 2 * 2 + idx);
         assert_eq!(
             selecting.in_q8().layer_bytes(0, 4096),
@@ -3976,7 +3995,8 @@ mod tests {
 
         /// The layout the description gives is the one `qwen38_layer_bytes` pins layer by layer: a
         /// GDN layer's state lanes, conv ring and carry, the PLE ring on layer 1, the selecting
-        /// layer's K/V and pooled keys at a context of whole pools and one past.
+        /// layer's K/V and pooled keys at a context of whole pools and one past and its raw key
+        /// ring.
         #[test]
         fn the_description_gives_the_qwen38_layer_bytes() {
             let kv = KvLayout::of_spec(&description()).expect("the description's layout");
@@ -3986,8 +4006,8 @@ mod tests {
                 3_596_288 + 9_437_200 + 497_296 + 696_320
             );
             assert_eq!(kv.layer_bytes(2, 4096), 3_596_288 + 9_437_200 + 497_296);
-            assert_eq!(kv.layer_bytes(3, 4096), 4096 * 2304 + 1024 * 256);
-            assert_eq!(kv.layer_bytes(3, 4097), 4097 * 2304 + 1025 * 256);
+            assert_eq!(kv.layer_bytes(3, 4096), 4096 * 2048 + 1024 * 256 + 2816);
+            assert_eq!(kv.layer_bytes(3, 4097), 4097 * 2048 + 1025 * 256 + 2816);
             assert_eq!(kv.layer_bytes(4, 4096), 0);
             assert_eq!(kv.stage_position_bytes(4096), 64 * 4 * 4096);
         }
