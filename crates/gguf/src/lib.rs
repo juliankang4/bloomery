@@ -1760,6 +1760,58 @@ mod split_tests {
     use crate::write::{TensorDecl, write_file};
     use std::path::{Path, PathBuf};
 
+    #[test]
+    fn duplicate_header_keys_are_refused() {
+        for values in [[1, 2], [2, 1]] {
+            let layout = crate::write::Layout::new(&[
+                kv("qwen4exp.block_count", Value::U32(values[0])),
+                kv("qwen4exp.block_counX", Value::U32(values[1])),
+            ], vec![]).unwrap();
+            let mut bytes = layout.header_bytes().to_vec();
+            let second = bytes.windows(20).position(|w| w == b"qwen4exp.block_counX").unwrap();
+            bytes[second + 19] = b't';
+            let Err(e) = super::parse_header(&bytes, layout.file_len()) else {
+                panic!("metadata key uniqueness must not depend on declaration order")
+            };
+            let text = e.to_string();
+            assert!(text.contains("qwen4exp.block_count") && text.contains("duplicate") && text.contains("offset"), "{text}");
+        }
+        let layout = crate::write::Layout::new(&[], ["gate", "up__"].into_iter().map(|name| TensorDecl {
+            name: name.into(), dims: vec![4], type_id: 0, nbytes: 16,
+        }).collect()).unwrap();
+        let mut bytes = layout.header_bytes().to_vec();
+        let second = bytes.windows(4).position(|w| w == b"up__").unwrap();
+        bytes[second..second + 4].copy_from_slice(b"gate");
+        let Err(e) = super::parse_header(&bytes, layout.file_len()) else {
+            panic!("a repeated tensor name must be refused before building the name table")
+        };
+        assert!(e.to_string().contains("gate") && e.to_string().contains("twice"), "{e}");
+    }
+
+    #[test]
+    fn overlapping_tensor_ranges_are_refused() {
+        for offsets in [[0, 0], [0, 8], [8, 0]] {
+            let layout = crate::write::Layout::new(&[], ["gate", "up"].into_iter().map(|name| TensorDecl {
+                name: name.into(), dims: vec![4], type_id: 0, nbytes: 16,
+            }).collect()).unwrap();
+            let mut h = super::parse_header(layout.header_bytes(), layout.file_len()).unwrap();
+            for (t, off) in h.tensors.iter_mut().zip(offsets) { t.offset = off; }
+            let Err(e) = super::strict_tensors(h.tensors, h.data_base, layout.file_len(), &[], false) else {
+                panic!("overlapping tensor data must be refused in either declaration order")
+            };
+            let text = e.to_string();
+            assert!(text.contains("gate") && text.contains("up") && text.contains("overlap") && text.contains(".."), "{text}");
+        }
+        for offsets in [[0, 16], [32, 0]] {
+            let layout = crate::write::Layout::new(&[], ["gate", "up"].into_iter().map(|name| TensorDecl {
+                name: name.into(), dims: vec![4], type_id: 0, nbytes: 16,
+            }).collect()).unwrap();
+            let mut h = super::parse_header(layout.header_bytes(), layout.file_len()).unwrap();
+            for (t, off) in h.tensors.iter_mut().zip(offsets) { t.offset = off; }
+            assert!(super::strict_tensors(h.tensors, h.data_base, layout.file_len(), &[], false).is_ok(), "adjacent and disjoint tensors must still open");
+        }
+    }
+
     /// A metadata pair as the synthetic shards carry it.
     fn kv(key: &str, v: Value) -> (String, Value) {
         (key.to_string(), v)

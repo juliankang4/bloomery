@@ -832,6 +832,52 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_header_keys_are_refused() {
+        let a = r#"{"dtype":"F32","shape":[1],"data_offsets":[0,4]}"#;
+        let b = r#"{"dtype":"F32","shape":[1],"data_offsets":[4,8]}"#;
+        for (first, second) in [(a, b), (b, a)] {
+            let text = format!(r#"{{"model.layers.0.weight":{first},"model.layers.0.weight":{second}}}"#);
+            let mut file = (text.len() as u64).to_le_bytes().to_vec();
+            file.extend_from_slice(text.as_bytes());
+            file.extend_from_slice(&[0; 8]);
+            assert!(matches!(Safetensors::parse(file), Err(Error::Format(e))
+                if e.contains("duplicate key") && e.contains("model.layers.0.weight")),
+                "both declaration orders must refuse the repeated tensor name");
+        }
+        for (text, key) in [
+            (r#"{"x":{"dtype":"F32","dtype":"U32","shape":[1],"data_offsets":[0,4]}}"#, "dtype"),
+            (r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4],"data_offsets":[4,8]}}"#, "data_offsets"),
+            (r#"{"__metadata__":{"source":"a","source":"b"}}"#, "source"),
+        ] {
+            let mut file = (text.len() as u64).to_le_bytes().to_vec();
+            file.extend_from_slice(text.as_bytes());
+            file.extend_from_slice(&[0; 8]);
+            assert!(matches!(Safetensors::parse(file), Err(Error::Format(e))
+                if e.contains("duplicate key") && e.contains(key)),
+                "nested objects must preserve key uniqueness too: {key}");
+        }
+    }
+
+    #[test]
+    fn duplicate_index_keys_are_refused() {
+        let d = Dir::new("duplicate-index");
+        for (first, second) in [("a.safetensors", "b.safetensors"), ("b.safetensors", "a.safetensors")] {
+            for shard in [first, second] {
+                d.file(shard, &write(&[("model.layers.0.weight", "F32", &[1], &[0; 4])]));
+            }
+            for text in [
+                format!(r#"{{"weight_map":{{"model.layers.0.weight":"{first}","model.layers.0.weight":"{second}"}}}}"#),
+                format!(r#"{{"weight_map":{{"model.layers.0.weight":"{first}"}},"weight_map":{{"model.layers.0.weight":"{second}"}}}}"#),
+            ] {
+                d.file(Folder::INDEX, text.as_bytes());
+                let Err(e) = Folder::open(&d.0) else { panic!("a duplicate index key must be refused") };
+                assert!(e.to_string().contains("duplicate key"), "{e}");
+                assert!(e.to_string().contains("model.layers.0.weight") || e.to_string().contains("weight_map"), "{e}");
+            }
+        }
+    }
+
+    #[test]
     fn overlapping_ranges_are_refused() {
         let text = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
         let mut file = (text.len() as u64).to_le_bytes().to_vec();
