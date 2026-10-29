@@ -924,7 +924,8 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    (`crates/gpu/src/host/node.rs`): TCP, one connection a load, one reply a request, then it exits.
    `BLOOMERY_TIER_NODES` names the node of each tier; it takes loopback, private or 198.18.0.0/15 (benchmarking range) IPv4 addresses. An off-host node
    requires `BLOOMERY_TIER_LINK=rdma`. The unauthenticated control channel belongs on a trusted network.
-   On connect node 1 sends its census: each device's census row, its own available host room and its arena override.
+   On connect node 1 sends its census: each device's census row, its own available host room with its reading
+   (given, MemAvailable, cgroup path or virtual-memory statistics) and its arena override.
    The load (`Place::on`) and the gate read it with one function (`node_cards`) and plan (b′) with node 1's card as
    the tier card (`spec_of_device` of the row node 1 sent) before anything loads. Node 1 refuses an open whose rows are
    not the tier's set, then loads the rows of node 0's plan from its own copy of the file, each tensor checked against

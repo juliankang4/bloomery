@@ -2283,7 +2283,7 @@ mod tests {
                     let mut payload = Out::default();
                     bloomery_gpu::host::node::NodeCensus {
                         devices: vec![remote],
-                        host_room: u64::MAX,
+                        host_room: (u64::MAX, workstation::HostRead::Given),
                         arena_given: None,
                     }
                     .write(&mut payload);

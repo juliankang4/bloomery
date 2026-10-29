@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 /// The protocol's version, the census's first word: a node of another
 /// version is refused by name.
-pub(super) const VERSION: u32 = 5;
+pub(super) const VERSION: u32 = 6;
 
 /// The longest frame either side takes: an open's rows are the largest, a
 /// few hundred kilobytes.
