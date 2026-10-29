@@ -410,9 +410,9 @@ pub struct Session<B: ChainBody> {
     /// The pass's head as a row read fetched it ([`GpuModel::pass_row_into`]),
     /// grown once and reused.
     pass: Vec<f32>,
-    /// The logits of the last round of several slots' steps
-    /// ([`Session::step_slots_rounds`]), every row's, grown to the widest
-    /// round once and reused.
+    /// The requested rows' logits of the last round of several slots' steps
+    /// ([`Session::step_slots_rounds`]), packed, grown to the widest round
+    /// once and reused.
     round: Vec<f32>,
     /// The last tapped rows read back ([`Tapped::taps`]).
     tapped: Vec<f32>,
@@ -1147,40 +1147,6 @@ mod tests {
         assert!(
             error.to_string().contains("slot 1's logit 2 is NaN"),
             "{error}"
-        );
-        let (n_vocab, rounds) = (151_936, 32);
-        let stage = vec![1.0f32; 2 * n_vocab];
-        let mut both = vec![0.0; 2 * n_vocab];
-        let mut selected = vec![0.0; n_vocab];
-        let began = std::time::Instant::now();
-        for _ in 0..rounds {
-            for r in 0..2 {
-                let dst = &mut both[r * n_vocab..(r + 1) * n_vocab];
-                for (out, &v) in dst.iter_mut().zip(stage.iter().skip(r).step_by(2)) {
-                    *out = v;
-                }
-                assert!(!std::hint::black_box(&*dst).iter().any(|v| v.is_nan()));
-            }
-            std::hint::black_box(&both);
-        }
-        let all_us = began.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
-        let began = std::time::Instant::now();
-        for _ in 0..rounds {
-            for (slot, offset) in [None, Some(0)].into_iter().enumerate() {
-                super::round_row(slot, offset, n_vocab, &mut selected, |dst| {
-                    for (out, &v) in dst.iter_mut().zip(stage.iter().skip(slot).step_by(2)) {
-                        *out = v;
-                    }
-                    Ok(())
-                })
-                .expect("a requested row");
-            }
-            std::hint::black_box(&selected);
-        }
-        let selected_us = began.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
-        assert_eq!(selected, both[n_vocab..]);
-        eprintln!(
-            "mixed-logits vocab={n_vocab} rounds={rounds} all_host_us={all_us:.3} selected_host_us={selected_us:.3}"
         );
     }
 
