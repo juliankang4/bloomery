@@ -2460,6 +2460,7 @@ mod tests {
             for only_native in [false, true] {
                 let mut act = if only_native {
                     GemmAct32::new_routed_for(stream, cols, k, [GgmlType::NVFP4])?
+                        .native_input_only()
                 } else {
                     GemmAct32::new_routed(stream, cols, k)?
                 };
@@ -2505,6 +2506,10 @@ mod tests {
             let mut route = GemmRoute::new(stream, cols, 2)?;
             kernels.enqueue_route_remap(stream, &ids, &map, cols, &mut route, sink)?;
             let _ = gpu.take_fault()?;
+            let expected = reference.native.as_ref().unwrap();
+            let expected_q = expected.q.to_host_vec(stream)?;
+            let expected_e = expected.e.to_host_vec(stream)?;
+            let expected_scale = bits(expected.scale.to_host_vec(stream)?);
             let out = reference.native.as_mut().unwrap();
             out.q
                 .copy_from_host(stream, &vec![0xdead_beef; cols * k / 8])?;
@@ -2520,6 +2525,13 @@ mod tests {
                 out.e.to_host_vec(stream)?,
                 out.scale.to_host_vec(stream)?,
             );
+            for slot in [0, 2, 3, 5] {
+                let qr = slot * k / 8..(slot + 1) * k / 8;
+                let er = slot * k / 64..(slot + 1) * k / 64;
+                assert_eq!(q[qr.clone()], expected_q[qr]);
+                assert_eq!(e[er.clone()], expected_e[er]);
+                assert_eq!(scale[slot].to_bits(), expected_scale[slot]);
+            }
             for slot in [1, 4, 6] {
                 assert!(
                     q[slot * k / 8..(slot + 1) * k / 8]
