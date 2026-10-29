@@ -386,20 +386,30 @@ impl Client {
     /// [`Client::listing`] of `repo` at revision `rev` (a branch, a tag or a
     /// commit hash).
     pub fn listing_at(&self, repo: &str, rev: &str) -> Result<Vec<Entry>, HfError> {
-        let headers = self
-            .root
-            .join(format!(".listing-{}.headers", std::process::id()));
+        // One header file per call: listings run at once in one process.
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let headers = self.root.join(format!(
+            ".listing-{}-{}.headers",
+            std::process::id(),
+            CALLS.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(&self.root).map_err(|e| HfError::io(&self.root, e))?;
         let mut url = format!("{}/api/models/{repo}/tree/{rev}?recursive=true", self.base);
         let mut out = Vec::new();
         loop {
-            let body = self.curl(
-                &format!("listing {url}"),
-                &["--dump-header".as_ref(), headers.as_os_str(), url.as_ref()],
-            );
-            let head = fs::read_to_string(&headers).unwrap_or_default();
+            let page = self
+                .curl(
+                    &format!("listing {url}"),
+                    &["--dump-header".as_ref(), headers.as_os_str(), url.as_ref()],
+                )
+                .and_then(|body| {
+                    let head =
+                        fs::read_to_string(&headers).map_err(|e| HfError::io(&headers, e))?;
+                    Ok((body, head))
+                });
             let _ = fs::remove_file(&headers);
-            let body = String::from_utf8(body?).map_err(|e| HfError::Listing {
+            let (body, head) = page?;
+            let body = String::from_utf8(body).map_err(|e| HfError::Listing {
                 repo: repo.to_owned(),
                 why: e.to_string(),
             })?;
@@ -1736,6 +1746,97 @@ pub(crate) mod tests {
             .resolve_exact("a/b", &["m.bin"], &mut |_| {})
             .expect("resolve");
         assert_eq!(fs::read(&got[0]).expect("read"), older);
+    }
+
+    /// Listings run at once in one process each follow their own `Link` header to their last page:
+    /// every first page is held until all have been asked for, so their header files overlap.
+    #[test]
+    fn concurrent_paginated_listings_each_read_their_own_pages() {
+        use std::io::Write as _;
+        const REPOS: usize = 8;
+        let d = scratch("listing-concurrent");
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://127.0.0.1:{}", l.local_addr().expect("addr").port());
+        let first_pages = std::sync::Arc::new(std::sync::Barrier::new(REPOS));
+        let served = base.clone();
+        thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let (first_pages, base) = (first_pages.clone(), served.clone());
+                thread::spawn(move || {
+                    let mut c = c;
+                    let mut buf = [0u8; 4096];
+                    let n = c.read(&mut buf).expect("request");
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let target = request.split(' ').nth(1).expect("request target");
+                    let repo = target.split('/').nth(4).expect("repo");
+                    let (page, link) = if target.ends_with("&cursor=2") {
+                        (2, String::new())
+                    } else {
+                        first_pages.wait();
+                        (
+                            1,
+                            format!("Link: <{base}{target}&cursor=2>; rel=\"next\"\r\n"),
+                        )
+                    };
+                    let body = format!(
+                        "[{{\"type\":\"file\",\"path\":\"{repo}-{page}.gguf\",\"size\":1,\"lfs\":{{\"oid\":\"{}\",\"size\":1}}}}]",
+                        "0".repeat(64)
+                    );
+                    let _ = write!(
+                        c,
+                        "HTTP/1.1 200 OK\r\n{link}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        let c = Client {
+            base,
+            token: None,
+            root: d.join("cache"),
+            curl: "curl".into(),
+            offline: false,
+            revision: "main".to_owned(),
+        };
+        thread::scope(|s| {
+            let runs: Vec<_> = (0..REPOS)
+                .map(|i| {
+                    let c = &c;
+                    s.spawn(move || (i, c.listing(&format!("o/r{i}"))))
+                })
+                .collect();
+            for run in runs {
+                let (i, got) = run.join().expect("listing thread");
+                let paths: Vec<String> =
+                    got.expect("listing").into_iter().map(|e| e.path).collect();
+                assert_eq!(paths, [format!("r{i}-1.gguf"), format!("r{i}-2.gguf")]);
+            }
+        });
+    }
+
+    /// A page curl answered but whose header file cannot be read is an error, not a last page.
+    #[cfg(unix)]
+    #[test]
+    fn a_listing_page_without_its_headers_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = scratch("listing-no-headers");
+        let script = d.join("curl");
+        fs::write(&script, "#!/bin/sh\nprintf '[]'\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let c = Client {
+            base: "http://127.0.0.1:1".to_owned(),
+            token: None,
+            root: d.join("cache"),
+            curl: script.into_os_string(),
+            offline: false,
+            revision: "main".to_owned(),
+        };
+        let err = c.listing("a/b").expect_err("a page with no headers");
+        assert!(
+            matches!(&err, HfError::Io { path, .. } if path.ends_with(".headers")),
+            "{err}"
+        );
     }
 
     /// The hub answers a request with a redirect whose body is longer than a short range (310
