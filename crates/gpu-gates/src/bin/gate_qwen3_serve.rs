@@ -2377,9 +2377,11 @@ mod gate {
 
     /// The slots-round clause (module header) on a server of `--parallel 2`
     /// started with `BLOOMERY_STEP_STATS=1` and the arm's flags and
-    /// environment into its own directory: two greedy streamed requests of
-    /// the slots clause's prompts, each first run alone on that server and
-    /// then both together, the `slots round` records between read back.
+    /// environment into its own directory: two greedy streamed requests, or
+    /// under `mixed` one greedy and one seeded sampled request, each first
+    /// run alone and then together. The mixed pair keeps its alone ids;
+    /// its greedy request asks for no logits. The `slots round` records
+    /// between the requests hold their pass shape.
     /// Both arms are one pass: every together-run record holds `passes=1`
     /// (`slots_rounds_run_one_pass`, `placed_slots_rounds_run_one_pass` on
     /// the placed arm). On both arms the window holds a round
@@ -2531,6 +2533,18 @@ mod gate {
                 together.push(rx.recv().map_err(|_| {
                     format!("{dir_name}: the {what} request's thread gave no answer")
                 })??);
+            }
+            if mixed {
+                let ids: Vec<&[u32]> = together.iter().map(|s| s.tokens.as_slice()).collect();
+                println!("mixed slots: alone {alone:?}, together {ids:?}");
+                check(
+                    ok,
+                    "mixed_slots_together_alone",
+                    alone
+                        .iter()
+                        .zip(&together)
+                        .all(|(a, t)| !a.is_empty() && *a == t.tokens),
+                );
             }
             let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
             let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
