@@ -2576,11 +2576,12 @@ gate-ds41-bind:
 # answers the NVMe tier floor's refusal and a unified pool's PoolBudget, and no other; a checkpoint folder's plan holds
 # its least part reads on the NVMe tier arena's floor, and on a unified pool an unset context fits under them while a
 # set one is refused. The shared serve client
-# holds the reply evidence. The seat's `mtp width` record and the `mtp summary` it shares carry the width chooser's
+# holds the reply evidence; serve_config holds the settings file's overrides and named refusals.
+# The seat's `mtp width` record and the `mtp summary` it shares carry the width chooser's
 # state in their pinned shape (record::tests::width_records). Host only, no card or gate lock.
 [group('host')]
 gate-q38-serve-rules:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,gemma-embedding2,hf --lib -- serve_client:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,gemma-embedding2,hf --lib -- record::tests::width_records && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,gemma-embedding2,hf --bin bloomery-serve-qwen38'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,gemma-embedding2,hf --lib -- serve_client:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,gemma-embedding2,hf --lib -- serve_config:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,gemma-embedding2,hf --lib -- record::tests::width_records && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,gemma-embedding2,hf --bin bloomery-serve-qwen38'
 
 # The shared draft's prompt boundaries and per-slot costs in the other serve targets that include it, and the Raon seat's
 # unset draft rule: a request drafts while its think span is open, up to the tag that closes it. The launcher's checks

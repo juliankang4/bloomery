@@ -67,6 +67,9 @@ pub mod rounding;
 pub mod seat_bin;
 #[cfg(feature = "deepseek41")]
 pub mod serve_client;
+// A server start's settings file (`--config`), read as the flags it names.
+#[cfg(feature = "deepseek41")]
+pub mod serve_config;
 #[cfg(feature = "deepseek41")]
 pub mod side_seat;
 #[cfg(feature = "gpu")]

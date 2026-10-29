@@ -10,8 +10,12 @@
 //!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|decide]
 //!                    [-m PATH | --model-file PATH | --hf <repo>[@<rev>][:<quant>]]
 //!                    [--head <weights> [--head-config <file>]]
-//!                    <the seat's own flags>
+//!                    [--config FILE] <the seat's own flags>
 //!     bloomery-serve --version
+//!
+//! `--config FILE` reads the start's settings from one JSON object, each key a flag's name
+//! (`bloomery_gpu_gates::serve_config`): its flags join the command line's before anything else
+//! reads them, and a flag the command line gives replaces the file's.
 //!
 //! Every start prints one line on stderr before the load begins
 //! ([`drive::FIRST_START`]): a first start on a new card can compile the GPU
@@ -184,10 +188,11 @@ mod drive {
     use std::ffi::OsString;
     use std::process::ExitCode;
 
+    use bloomery_gpu_gates::serve_config::SOURCE_FLAGS;
     use bloomery_gpu_gates::side_seat;
     use bloomery_gpu_gates::start::{self, Refusal};
     use bloomery_gpu_gates::{
-        GateError, gpu_census, llama_launch, llama_place, model_file, ref_model_path,
+        GateError, gpu_census, llama_launch, llama_place, model_file, ref_model_path, serve_config,
     };
     use gguf::Split;
     use hf::catalog::{self, CatalogError, CatalogRef, Outcome};
@@ -213,7 +218,7 @@ mod drive {
                         (docs/agents.md)";
 
     const USAGE: &str = "usage: bloomery-serve [--model NAME[:VARIANT]|ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|decide] \
-                         [--revision REV] [--recommend] [--dry-run] [--json] \
+                         [--config FILE] [--revision REV] [--recommend] [--dry-run] [--json] \
                          [-m PATH | --model-file PATH | --hf <repo>[@<rev>][:<quant>]] [--head <weights> \
                          [--head-config <file>]] [--embd-model FILE | --embd-hf \
                          <repo>[@<rev>][:<quant>]] [--embd-ctx N] [--embd-cache-bytes N] [--embd-mmproj FILE | \
@@ -477,8 +482,7 @@ models (the --model word is optional with a model file: the file's architecture 
 
     /// The model source parser receives model options without mistaking other values for flags.
     fn take_source(args: &[String]) -> Result<(hf::source::Flags, Vec<String>), GateError> {
-        let flags: Vec<&str> = PATH_FLAGS.iter().copied().chain(["--hf"]).collect();
-        let (selected, rest) = llama_launch::take_serve_args(args, &flags);
+        let (selected, rest) = llama_launch::take_serve_args(args, SOURCE_FLAGS);
         let (model, _) = model_file::take(&selected, PATH_FLAGS)?;
         Ok((model, rest))
     }
@@ -684,6 +688,11 @@ models (the --model word is optional with a model file: the file's architecture 
             );
             return ExitCode::SUCCESS;
         }
+        // The `--config` file's settings join the command line, which replaces them.
+        let args = match serve_config::from_file(NAME, &args) {
+            Ok(v) => v,
+            Err(e) => return refuse(Code::Usage, e),
+        };
         // llama-server's `LLAMA_ARG_MODEL` and `LLAMA_ARG_HF_REPO` name the model unless the
         // command line does.
         let args = match llama_launch::model_from_env(NAME, args, PATH_FLAGS) {

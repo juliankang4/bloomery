@@ -31,25 +31,28 @@ use crate::llama_place::{self, Flags, Target};
 #[cfg(feature = "gpu")]
 use crate::llama_place::{LIST_DEVICES, take_with_env};
 
+/// Serve flags that answer the command line instead of setting the start.
+pub(crate) const SERVE_ACTIONS: &[&str] = &[
+    "--help",
+    "-h",
+    "--version",
+    "--plan",
+    llama_place::LIST_DEVICES,
+    "--records-schema",
+    "--levers",
+    "--recommend",
+    "--dry-run",
+    "--json",
+];
+
 /// Whether a serve option consumes its following value. The seat table owns its spellings.
 pub(crate) fn serve_takes_value(flag: &str) -> bool {
     if let Some(read) = SEAT_FLAGS.iter().find(|read| read.spelled.contains(&flag)) {
         return read.flag != "--mmproj" || flag != "--no-mmproj";
     }
-    !matches!(
-        flag,
-        "--help"
-            | "-h"
-            | "--version"
-            | "--plan"
-            | "--embd-no-mmproj"
-            | llama_place::LIST_DEVICES
-            | "--records-schema"
-            | "--levers"
-            | "--recommend"
-            | "--dry-run"
-            | "--json"
-    ) && !llama_place::CPU_MOE.contains(&llama_place::spelled(flag).as_str())
+    !SERVE_ACTIONS.contains(&flag)
+        && flag != "--embd-no-mmproj"
+        && !llama_place::CPU_MOE.contains(&llama_place::spelled(flag).as_str())
 }
 
 /// Serve options paired with their values, leaving a value's spelling untouched.
@@ -69,6 +72,16 @@ pub fn serve_args(args: &[String]) -> impl Iterator<Item = (&String, Option<&Str
 /// Whether `wanted` occurs as a serve option, skipping values of other options.
 pub fn serve_option(args: &[String], wanted: &str) -> bool {
     serve_args(args).any(|(flag, _)| flag == wanted)
+}
+
+/// Whether `a` and `b` set one thing: one spelling, two of a row of [`SEAT_FLAGS`], or one placement
+/// ([`llama_place::one_placement`]).
+pub(crate) fn one_setting(a: &str, b: &str) -> bool {
+    a == b
+        || SEAT_FLAGS
+            .iter()
+            .any(|read| read.spelled.contains(&a) && read.spelled.contains(&b))
+        || llama_place::one_placement(a, b)
 }
 
 /// Separates the named serve options and their values from all other option-value pairs.
