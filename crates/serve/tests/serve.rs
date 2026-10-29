@@ -437,7 +437,8 @@ fn hw_unsupported_fields_are_refused() {
         ("grammar", json!("root ::= \"a\"")),
         ("logprobs", json!(5)),
         ("top_logprobs", json!(2)),
-        ("n", json!(2)),
+        // PIN(2026-10-29): chat supports n=2; exercise a count beyond its capacity.
+        ("n", json!(serve::MAX_CONNECTIONS + 1)),
         ("tool_choice", json!("required")),
     ];
     for (field, value) in refused {

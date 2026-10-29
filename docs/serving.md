@@ -14,8 +14,14 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   them. Point Claude Code or the Anthropic SDK at `ANTHROPIC_BASE_URL=http://localhost:8080`.
 - **The OpenAI text completion API**: `POST /v1/completions` runs the `/completion` path under OpenAI's shape —
   `object: "text_completion"`, `choices` with `finish_reason` `stop`/`length`, `usage`, and a stream of chunks ending
-  in `data: [DONE]`. One completion a request: a `prompt` array of several prompts, `echo`, a non-empty `suffix` and
+  in `data: [DONE]`. One prompt a request: a `prompt` array of several prompts, `echo`, a non-empty `suffix` and
   `best_of > 1` are refused by name, as is `logprobs`.
+- **Several choices**: `n` on `/v1/chat/completions` and `/v1/completions` asks for that many choices of the one
+  prompt, each answered with its `index`, in a stream too. Choice `i` samples with the request's `seed` plus `i`, so
+  choice 0 is the answer `n` 1 gives and a seeded request repeats; a greedy request answers the same text `n` times.
+  The choices queue together, so `n` is at most the slots plus the queue depth (64 with the defaults): under
+  `--parallel N` up to N run at once, and on one slot they run one after another. `usage` counts the prompt once and
+  every choice's completion tokens; `timings` are the first choice's. Other routes refuse `n` above 1.
 - **Chat token counts**: `POST /chat/completions/input_tokens` (and its `/v1/` spelling) answers
   `{"input_tokens": N}` with the same chat request's prompt ids — the chat template's render, an image as its span;
   `max_tokens` is not needed.
@@ -294,8 +300,9 @@ A request field is read, refused or ignored:
 
 - **Read.** Validation is field-specific. Sampling fields such as `temperature` reject wrong types and non-finite
   values; `n_predict` and `repeat_last_n` enforce llama-server's count limits. Their `null` values are unset.
-- **Refused.** A field the server cannot honor is a 400 naming it, never a 200 that drops it: `n` above 1,
-  a non-empty `logit_bias` or `grammar`, probabilities on a route that renders none (`/completion` takes `n_probs`,
+- **Refused.** A field the server cannot honor is a 400 naming it, never a 200 that drops it: `n` above 1 outside
+  `/v1/chat/completions` and `/v1/completions` (and past the slots plus the queue depth on them), a non-empty
+  `logit_bias` or `grammar`, probabilities on a route that renders none (`/completion` takes `n_probs`,
   `/v1/chat/completions` takes `logprobs` and `top_logprobs`), and the fields under "Refused by name" above.
   `/v1/responses` also refuses a stored response (`previous_response_id`, `store: true`, `background: true`).
 - **Ignored.** A field the server does not know is ignored, as llama-server ignores it. So a misspelled field is no

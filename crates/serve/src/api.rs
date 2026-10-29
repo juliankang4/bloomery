@@ -92,7 +92,7 @@ use crate::sched::{Board, Refusal, Reserve, SlotConfig, Use, default_depth};
 use crate::slotfile;
 use crate::swap::Park;
 use crate::video::{self, VideoSupport};
-use crate::worker::{self, Acted, Action, Msg, Shared, Submit};
+use crate::worker::{self, Acted, Action, Events, Msg, Shared, Submit};
 
 use self::listener::Listener;
 
@@ -443,6 +443,7 @@ impl Server {
         let state = State {
             shared: Arc::new(shared),
             parallel,
+            depth,
             tok,
             vocab,
             fatal_linger: config.fatal_linger,
@@ -707,6 +708,9 @@ struct State {
     shared: Arc<Shared>,
     /// Slots.
     parallel: usize,
+    /// The requests that may wait past the free slots: with the slots, the
+    /// most choices one request may ask for ([`take_choices`]).
+    depth: usize,
     /// The engine's vocabulary, read without the engine.
     tok: Arc<dyn Tokenizer>,
     /// What structured output needs of the vocabulary, read once when the
@@ -1898,7 +1902,8 @@ fn sampler_order(o: &Map<String, Value>, sp: &SamplingParams) -> Result<(), ApiE
 ///
 /// A field this server cannot honor is a 400 naming it, never a 200 that ignores it:
 /// `n_probs > 0`, a non-empty `grammar`, `logprobs` other than `false` (a bool, or
-/// OpenAI's text completion count), `top_logprobs > 0`, `n > 1`, a non-empty
+/// OpenAI's text completion count), `top_logprobs > 0`, `n > 1` (the OpenAI
+/// chat and text completion routes take it out first, [`take_choices`]), a non-empty
 /// `logit_bias`, the samplers [`unserved_samplers`] names, and a `samplers` other
 /// than this server's order ([`sampler_order`]). `null` counts as absent. Other
 /// unknown fields are ignored.
@@ -3358,13 +3363,8 @@ fn ctx_hint(prompt_tokens: usize, n_predict: i64, slots: usize) -> String {
     hint
 }
 
-/// Validates the prompt and builds the request's sampler (its factory's
-/// refusal is a 400), hands the request to the engine thread, and passes its
-/// events to `sink` with the slot it took. `input` is what the engine is
-/// fed: the ids, and the images' spans and feeds of a chat that carries any.
-/// Returns the outcome and the slot; an error before any event is the
-/// request's answer. A sink that fails ends the request: the engine thread
-/// sees its channel closed.
+/// [`run_choices`] of a request of one choice: its outcome and the slot it
+/// took.
 fn run_gen(
     state: &State,
     input: &Prompt,
@@ -3372,7 +3372,37 @@ fn run_gen(
     p: &GenParams,
     peer: TcpStream,
     sink: &mut dyn FnMut(Event<'_>, usize) -> io::Result<()>,
-) -> Result<(Result<Outcome, GenError>, usize), ApiError> {
+) -> Result<Result<(Outcome, usize), GenError>, ApiError> {
+    let ran = run_choices(
+        state,
+        input,
+        prompt,
+        std::slice::from_ref(p),
+        peer,
+        &mut |ev, _, slot| sink(ev, slot),
+    )?;
+    Ok(ran.map(|mut all| all.swap_remove(0)))
+}
+
+/// Validates the prompt and builds each choice's sampler (a factory's
+/// refusal is a 400), hands the choices to the engine thread together (the
+/// board queues all of them or refuses the request, [`Board::admits`]), and
+/// passes their events to `sink` with the choice (its index in `ps`, one
+/// `GenParams` a choice) and the slot it took. `input` is what the engine is
+/// fed: the ids, and the images' spans and feeds of a chat that carries any.
+/// Returns every choice's outcome and slot, in the choices' order, once each
+/// one is done; an error before any event is the request's answer. The first
+/// choice that fails, and a sink that fails, end the request: the choices
+/// still queued leave the queue, and the running ones end at their next
+/// event, the channel they send on closed.
+fn run_choices(
+    state: &State,
+    input: &Prompt,
+    prompt: Value,
+    ps: &[GenParams],
+    peer: TcpStream,
+    sink: &mut dyn FnMut(Event<'_>, usize, usize) -> io::Result<()>,
+) -> Result<Result<Vec<(Outcome, usize)>, GenError>, ApiError> {
     if let Some(reason) = state.fatal() {
         return Err(dead_engine(&reason));
     }
@@ -3383,6 +3413,7 @@ fn run_gen(
     if ids.is_empty() {
         return Err(invalid("the prompt is empty"));
     }
+    let n_predict = ps.first().map_or(-1, |p| p.n_predict);
     if ids.len() >= state.info.ctx_max {
         return Err(ApiError {
             retry_after: false,
@@ -3392,66 +3423,106 @@ fn run_gen(
                 "the prompt has {} tokens and the context holds {}{}",
                 ids.len(),
                 state.info.ctx_max,
-                ctx_hint(ids.len(), p.n_predict, state.parallel)
+                ctx_hint(ids.len(), n_predict, state.parallel)
             ),
         });
     }
-    // A sampler its factory refuses ends the request here, before it takes a
-    // slot, as any refused sampling field does.
-    let sampler = genloop::sampler_of(&state.shared.sampler, p)
-        .map_err(|e| invalid(format!("the sampler refuses the sampling parameters: {e}")))?;
     let client = Arc::new(Client {
         stream: peer,
         gone: Mutex::new(false),
     });
     let (events, rx) = mpsc::channel();
-    let submit = Submit {
-        p: p.clone(),
-        prompt,
-        settings: generation_settings(state, p),
-        media: input.feeds.clone(),
-        sampler,
-        events,
-        client: Arc::clone(&client),
-    };
-    relock(&state.shared.board)
-        .enqueue(input.held.clone(), submit)
-        .map_err(|r| refused(state, r, "the slot"))?;
+    // A sampler its factory refuses ends the request here, before it takes a
+    // slot, as any refused sampling field does.
+    let subs = ps
+        .iter()
+        .enumerate()
+        .map(|(choice, p)| {
+            let sampler = genloop::sampler_of(&state.shared.sampler, p).map_err(|e| {
+                invalid(format!("the sampler refuses the sampling parameters: {e}"))
+            })?;
+            Ok(Submit {
+                p: p.clone(),
+                prompt: prompt.clone(),
+                settings: generation_settings(state, p),
+                media: input.feeds.clone(),
+                sampler,
+                events: Events::new(events.clone(), choice),
+                client: Arc::clone(&client),
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    drop(events);
+    {
+        let mut board = relock(&state.shared.board);
+        board
+            .admits(subs.len())
+            .map_err(|r| refused(state, r, "the slot"))?;
+        for sub in subs {
+            board
+                .enqueue(input.held.clone(), sub)
+                .map_err(|r| refused(state, r, "the slot"))?;
+        }
+    }
     state.shared.work.notify_one();
-    let mut slot = None;
+    // The request ends before every choice took a slot: the ones still
+    // queued leave it, each counted as cancelled before its prompt.
+    let leave = || {
+        let mut board = relock(&state.shared.board);
+        let mut left = 0;
+        while board.cancel(|sub| Arc::ptr_eq(&sub.client, &client)) {
+            left += 1;
+        }
+        drop(board);
+        if left > 0 {
+            relock(&state.shared.stats).n_cancelled_before_prompt_total += left;
+        }
+    };
+    let stream = ps.first().is_some_and(|p| p.stream);
+    let mut slots: Vec<Option<usize>> = vec![None; ps.len()];
+    let mut done: Vec<Option<Outcome>> = ps.iter().map(|_| None).collect();
     loop {
-        let at = slot.unwrap_or(0);
-        if (slot.is_none() || !p.stream)
+        let started = slots.iter().all(Option::is_some);
+        if (!started || !stream)
             && let Err(e) = client.check()
         {
-            let cancelled =
-                relock(&state.shared.board).cancel(|sub| Arc::ptr_eq(&sub.client, &client));
-            if cancelled {
-                relock(&state.shared.stats).n_cancelled_before_prompt_total += 1;
-            }
-            return Ok((Err(GenError::Client(e)), at));
+            leave();
+            return Ok(Err(GenError::Client(e)));
         }
-        let received = if p.stream && slot.is_some() {
+        let received = if stream && started {
             rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
         } else {
             rx.recv_timeout(Duration::from_millis(100))
         };
-        let m = match received {
+        let (choice, m) = match received {
             Ok(m) => m,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(engine_gone(state, slot.is_some()));
+                return Err(engine_gone(state, slots.iter().any(Option::is_some)));
             }
         };
+        let at = slots[choice].unwrap_or(0);
         let sent = match m {
             Msg::Started(s) => {
-                slot = Some(s);
+                slots[choice] = Some(s);
                 Ok(())
             }
-            Msg::Prompt(t) => sink(Event::Prompt(&t), at),
-            Msg::Text(text, t) => sink(Event::Text(&text, &t), at),
-            Msg::Done(r) => return Ok((r, at)),
+            Msg::Prompt(t) => sink(Event::Prompt(&t), choice, at),
+            Msg::Text(text, t) => sink(Event::Text(&text, &t), choice, at),
+            Msg::Done(Ok(o)) => {
+                done[choice] = Some(o);
+                if done.iter().all(Option::is_some) {
+                    let slots = slots.iter().map(|s| s.unwrap_or(0));
+                    return Ok(Ok(done.into_iter().flatten().zip(slots).collect()));
+                }
+                Ok(())
+            }
+            Msg::Done(Err(e)) => {
+                leave();
+                return Ok(Err(e));
+            }
             Msg::Refused(why) => {
+                leave();
                 return Err(ApiError {
                     retry_after: true,
                     code: 503,
@@ -3461,7 +3532,8 @@ fn run_gen(
             }
         };
         if let Err(e) = sent {
-            return Ok((Err(GenError::Client(e)), at));
+            leave();
+            return Ok(Err(GenError::Client(e)));
         }
     }
 }
@@ -3517,11 +3589,7 @@ fn probe_client(w: &TcpStream) -> io::Result<()> {
     }
 }
 
-/// [`run_gen`] for a request that answers once the generation is whole: it
-/// sends nothing while the generation runs. The shared transport check ends
-/// a failed connection while preserving a client's write-side shutdown. The
-/// outer error is that client's, whose connection ends with no answer; the
-/// inner one is the request's answer, an engine error a 500.
+/// [`run_whole_choices`] of a request of one choice.
 fn run_whole(
     state: &State,
     input: &Prompt,
@@ -3529,11 +3597,29 @@ fn run_whole(
     p: &GenParams,
     w: &TcpStream,
 ) -> io::Result<Result<(Outcome, usize), ApiError>> {
-    match run_gen(state, input, prompt, p, w.try_clone()?, &mut |_, _| Ok(())) {
+    let ran = run_whole_choices(state, input, prompt, std::slice::from_ref(p), w)?;
+    Ok(ran.map(|mut all| all.swap_remove(0)))
+}
+
+/// [`run_choices`] for a request that answers once every generation is
+/// whole: it sends nothing while they run. The shared transport check ends a
+/// failed connection while preserving a client's write-side shutdown. The
+/// outer error is that client's, whose connection ends with no answer; the
+/// inner one is the request's answer, an engine error a 500.
+fn run_whole_choices(
+    state: &State,
+    input: &Prompt,
+    prompt: Value,
+    ps: &[GenParams],
+    w: &TcpStream,
+) -> io::Result<Result<Vec<(Outcome, usize)>, ApiError>> {
+    match run_choices(state, input, prompt, ps, w.try_clone()?, &mut |_, _, _| {
+        Ok(())
+    }) {
         Err(e) => Ok(Err(e)),
-        Ok((Err(GenError::Client(e)), _)) => Err(e),
-        Ok((Err(e), _)) => Ok(Err(engine_error(&e))),
-        Ok((Ok(o), slot)) => Ok(Ok((o, slot))),
+        Ok(Err(GenError::Client(e))) => Err(e),
+        Ok(Err(e)) => Ok(Err(engine_error(&e))),
+        Ok(Ok(all)) => Ok(Ok(all)),
     }
 }
 
@@ -4046,11 +4132,10 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
         };
         run_gen(state, &input, prompt.clone(), &p, peer, &mut sink)
     };
-    let slot = r.as_ref().map_or(0, |(_, slot)| *slot);
-    finish_stream(req, stream, w_opt, r.map(|(o, _)| o), |s, o| {
+    finish_stream(req, stream, w_opt, r, |s, (o, slot)| {
         sse(
             s,
-            &completion_final(state, o, &p, &prompt, return_tokens, slot),
+            &completion_final(state, o, &p, &prompt, return_tokens, *slot),
         )
     })
 }
@@ -4067,12 +4152,12 @@ fn progress(t: &Timings) -> Value {
 
 /// Ends a stream: validation errors before the first byte go out as a plain
 /// error response; an engine error mid-stream as an `error` event.
-fn finish_stream(
+fn finish_stream<T>(
     req: &Request,
     stream: Option<EventStream<'_>>,
     w_opt: Option<&mut TcpStream>,
-    r: Result<Result<Outcome, GenError>, ApiError>,
-    last: impl FnOnce(&mut EventStream<'_>, &Outcome) -> io::Result<()>,
+    r: Result<Result<T, GenError>, ApiError>,
+    last: impl FnOnce(&mut EventStream<'_>, &T) -> io::Result<()>,
 ) -> io::Result<bool> {
     let mut stream = match (stream, w_opt) {
         (Some(s), _) => s,
@@ -4222,13 +4307,57 @@ fn tool_markup_error(e: &MarkupError) -> ApiError {
     }
 }
 
-fn usage(o: &Outcome) -> Value {
+/// OpenAI's `usage` of a request's choices (each outcome and its slot): the
+/// prompt once, as the first choice evaluated it, and every choice's
+/// completion tokens.
+fn usage(all: &[(Outcome, usize)]) -> Value {
+    let completion: usize = all.iter().map(|(o, _)| o.timings.predicted_n).sum();
+    let prompt = all.first().map(|(o, _)| &o.timings);
+    let n_prompt = prompt.map_or(0, |t| t.n_prompt);
     json!({
-        "completion_tokens": o.timings.predicted_n,
-        "prompt_tokens": o.timings.n_prompt,
-        "total_tokens": o.timings.predicted_n + o.timings.n_prompt,
-        "prompt_tokens_details": { "cached_tokens": o.timings.cache_n },
+        "completion_tokens": completion,
+        "prompt_tokens": n_prompt,
+        "total_tokens": completion + n_prompt,
+        "prompt_tokens_details": { "cached_tokens": prompt.map_or(0, |t| t.cache_n) },
     })
+}
+
+/// The choices an OpenAI request asks for, its `n` (1 when unset), taken out
+/// of `b` first so the shared steps' refusal of `n > 1` stays every other
+/// route's. A request's choices queue together ([`Board::admits`]), so they
+/// are at most the slots and the requests that may wait beside them; a count
+/// below 1 or past that is a 400 naming `n`.
+fn take_choices(state: &State, b: &mut Map<String, Value>) -> Result<usize, ApiError> {
+    let most = state.parallel + state.depth;
+    let n = get_i(b, "n")?.unwrap_or(1);
+    b.remove("n");
+    usize::try_from(n)
+        .ok()
+        .filter(|n| (1..=most).contains(n))
+        .ok_or_else(|| {
+            invalid(format!(
+                "n must be between 1 and {most}, the {} slots and the {} requests that may wait \
+                 beside them, not {n}",
+                state.parallel, state.depth
+            ))
+        })
+}
+
+/// The generation of each of `n` choices of `p`: choice `i` samples with
+/// `p`'s seed plus `i`, so choice 0 is the request of one choice and a
+/// seeded request repeats choice by choice, and logs its own probabilities.
+fn choice_params(state: &State, p: &GenParams, n: usize) -> Vec<GenParams> {
+    (0..n as u64)
+        .map(|i| {
+            let mut c = p.clone();
+            c.sampling.seed = p.sampling.seed.wrapping_add(i);
+            c.logprobs = p
+                .logprobs
+                .as_ref()
+                .map(|a| logprobs::Ask::new(a.asked(), state.info.n_vocab));
+            c
+        })
+        .collect()
 }
 
 /// What a chat request runs, built by [`chat_plan`].
@@ -4291,10 +4420,11 @@ fn chat_plan_logprobs(state: &State, b: &mut Map<String, Value>) -> Result<ChatP
 
 fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let parsed = body(req).and_then(|mut b| {
+        let n = take_choices(state, &mut b)?;
         let plan = chat_plan_logprobs(state, &mut b)?;
-        Ok((b, plan))
+        Ok((b, n, plan))
     });
-    let (b, plan) = match parsed {
+    let (b, n, plan) = match parsed {
         Ok(x) => x,
         Err(e) => return send_error(w, req, &e),
     };
@@ -4302,13 +4432,16 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         p,
         input,
         prompt,
-        mut parser,
+        parser,
     } = plan;
-    parser = if p.stream {
+    let parser = if p.stream {
         parser.streaming_calls()
     } else {
         parser.keeping_cut_call()
     };
+    // Each choice parses its own output.
+    let mut parsers = vec![parser; n];
+    let ps = choice_params(state, &p, n);
     let ids_meta = ChatIds {
         id: format!("chatcmpl-{}", state.random_id()),
         created: unix_now(),
@@ -4319,27 +4452,25 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     };
     let vocab = &*state.tok;
     if !p.stream {
-        return match run_whole(state, &input, prompt, &p, w)? {
-            Err(e) => send_error(w, req, &e),
-            Ok((o, _)) => match parser
+        let all = match run_whole_choices(state, &input, prompt, &ps, w)? {
+            Ok(all) => all,
+            Err(e) => return send_error(w, req, &e),
+        };
+        let mut choices = Vec::with_capacity(n);
+        for (i, ((o, _), parser)) in all.iter().zip(&mut parsers).enumerate() {
+            if let Err(e) = parser
                 .try_push(&o.content)
                 .and_then(|_| parser.try_finish_at(o.cut()))
             {
-                Ok(_) => {
-                    let lp = p
-                        .logprobs
-                        .as_ref()
-                        .map(|a| logprobs::chat_object(a.whole(vocab)));
-                    send_json(
-                        w,
-                        req,
-                        200,
-                        &chat_final(&ids_meta, &o, parser.message(), lp),
-                    )
-                }
-                Err(e) => send_error(w, req, &tool_markup_error(&e)),
-            },
-        };
+                return send_error(w, req, &tool_markup_error(&e));
+            }
+            let lp = ps[i]
+                .logprobs
+                .as_ref()
+                .map(|a| logprobs::chat_object(a.whole(vocab)));
+            choices.push(chat_choice(&ids_meta, i, o, parser.message(), lp));
+        }
+        return send_json(w, req, 200, &chat_final(&ids_meta, choices, &all));
     }
     let peer = w.try_clone()?;
     let mut stream: Option<EventStream<'_>> = None;
@@ -4348,26 +4479,22 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     // Markup that does not parse stops the generation (the sink fails) and
     // ends the stream with an error event instead of a dropped connection.
     let mut markup: Option<MarkupError> = None;
-    // The tokens whose entries went out: a chunk's last delta carries the
-    // tokens its event counts past them; an event that makes no delta leaves
-    // its tokens to the next chunk that has one, the last chunk what is left.
-    let mut sent = 0;
+    // The tokens whose entries went out, a choice's own: a chunk's last delta
+    // carries the tokens its event counts past them; an event that makes no
+    // delta leaves its tokens to the next chunk that has one, the last chunk
+    // what is left.
+    let mut sent = vec![0; n];
     let r = {
         let meta = &ids_meta;
-        let mut sink = |ev: Event<'_>, _slot: usize| -> io::Result<()> {
+        let parsers = &mut parsers;
+        let ps = &ps;
+        let mut sink = |ev: Event<'_>, i: usize, _slot: usize| -> io::Result<()> {
             if stream.is_none() {
                 let w = w_opt
                     .take()
                     .ok_or_else(|| io::Error::other("stream writer taken"))?;
                 let mut s = EventStream::start(w, req, 200, "text/event-stream")?;
-                // OpenAI opens every stream with the role.
-                sse(
-                    &mut s,
-                    &meta.chunk(json!([{
-                        "finish_reason": null, "index": 0,
-                        "delta": { "role": "assistant", "content": null },
-                    }])),
-                )?;
+                open_choices(&mut s, meta, n)?;
                 stream = Some(s);
             }
             let s = stream
@@ -4380,6 +4507,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                     sse(s, &v)
                 }
                 Event::Text(text, t) => {
+                    let parser = &mut parsers[i];
                     let d = match parser.try_push(text) {
                         Ok(d) => d,
                         Err(e) => {
@@ -4388,16 +4516,16 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                         }
                     };
                     let deltas = meta.deltas(&d, &parser.take_pieces());
-                    let n = deltas.len();
-                    for (i, delta) in deltas.into_iter().enumerate() {
+                    let last = deltas.len();
+                    for (k, delta) in deltas.into_iter().enumerate() {
                         let mut v = meta.chunk(json!([{
-                            "finish_reason": null, "index": 0, "delta": delta,
+                            "finish_reason": null, "index": i, "delta": delta,
                         }]));
-                        if i + 1 == n
-                            && let Some(ask) = &p.logprobs
+                        if k + 1 == last
+                            && let Some(ask) = &ps[i].logprobs
                         {
-                            let entries = ask.entries(sent, t.predicted_n, vocab);
-                            sent = t.predicted_n;
+                            let entries = ask.entries(sent[i], t.predicted_n, vocab);
+                            sent[i] = t.predicted_n;
                             if !entries.is_empty() {
                                 v["choices"][0]["logprobs"] = logprobs::chat_object(entries);
                             }
@@ -4411,7 +4539,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 }
             }
         };
-        run_gen(state, &input, prompt, &p, peer, &mut sink).map(|(o, _)| o)
+        run_choices(state, &input, prompt, ps, peer, &mut sink)
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),
@@ -4419,66 +4547,90 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     };
     let include_usage = p.include_usage;
     let opened = stream.is_some();
-    finish_stream(req, stream, w_opt, r, |s, o| {
+    finish_stream(req, stream, w_opt, r, |s, all| {
         if !opened {
-            sse(
-                s,
-                &ids_meta.chunk(json!([{
-                    "finish_reason": null, "index": 0,
-                    "delta": { "role": "assistant", "content": null },
-                }])),
-            )?;
+            open_choices(s, &ids_meta, n)?;
         }
-        let d = match parser.try_finish_at(o.cut()) {
-            Ok(d) => d,
-            Err(e) => {
-                let e = tool_markup_error(&e);
-                return sse(
-                    s,
-                    &json!({ "error": error_body(e.code, e.kind, &e.message)["error"] }),
-                );
+        let mut last = Value::Null;
+        for (i, ((o, _), parser)) in all.iter().zip(&mut parsers).enumerate() {
+            // The choice before this one finishes first.
+            if !last.is_null() {
+                sse(s, &last)?;
             }
-        };
-        // The tokens no chunk carried yet go with the last delta, or with the
-        // finishing chunk when the parser releases none.
-        let mut left = p
-            .logprobs
-            .as_ref()
-            .map(|a| a.entries(sent, o.timings.predicted_n, vocab))
-            .filter(|e| !e.is_empty());
-        let deltas = ids_meta.deltas(&d, &parser.take_pieces());
-        let n = deltas.len();
-        for (i, delta) in deltas.into_iter().enumerate() {
-            let mut v =
-                ids_meta.chunk(json!([{ "finish_reason": null, "index": 0, "delta": delta }]));
-            if i + 1 == n
-                && let Some(e) = left.take()
-            {
-                v["choices"][0]["logprobs"] = logprobs::chat_object(e);
+            let d = match parser.try_finish_at(o.cut()) {
+                Ok(d) => d,
+                Err(e) => {
+                    let e = tool_markup_error(&e);
+                    return sse(
+                        s,
+                        &json!({ "error": error_body(e.code, e.kind, &e.message)["error"] }),
+                    );
+                }
+            };
+            // The tokens no chunk carried yet go with the last delta, or with
+            // the finishing chunk when the parser releases none.
+            let mut left = ps[i]
+                .logprobs
+                .as_ref()
+                .map(|a| a.entries(sent[i], o.timings.predicted_n, vocab))
+                .filter(|e| !e.is_empty());
+            let deltas = ids_meta.deltas(&d, &parser.take_pieces());
+            let count = deltas.len();
+            for (k, delta) in deltas.into_iter().enumerate() {
+                let mut v =
+                    ids_meta.chunk(json!([{ "finish_reason": null, "index": i, "delta": delta }]));
+                if k + 1 == count
+                    && let Some(e) = left.take()
+                {
+                    v["choices"][0]["logprobs"] = logprobs::chat_object(e);
+                }
+                sse(s, &v)?;
             }
-            sse(s, &v)?;
-        }
-        let mut last = ids_meta.chunk(json!([{
-            "finish_reason": chat_finish_reason(o, parser.message()), "index": 0, "delta": {},
-        }]));
-        if let Some(e) = left.take() {
-            last["choices"][0]["logprobs"] = logprobs::chat_object(e);
+            last = ids_meta.chunk(json!([{
+                "finish_reason": chat_finish_reason(o, parser.message()), "index": i, "delta": {},
+            }]));
+            if let Some(e) = left.take() {
+                last["choices"][0]["logprobs"] = logprobs::chat_object(e);
+            }
         }
         if include_usage {
             sse(s, &last)?;
             last = ids_meta.chunk(json!([]));
-            last["usage"] = usage(o);
+            last["usage"] = usage(all);
         }
-        last["timings"] = o.timings.to_json();
+        if let Some((o, _)) = all.first() {
+            last["timings"] = o.timings.to_json();
+        }
         sse(s, &last)?;
         s.send(b"data: [DONE]\n\n")
     })
 }
 
-/// The non-stream response. `reasoning_content` and `tool_calls` appear only when
+/// The chunks that open a chat stream: OpenAI opens each choice with its role.
+fn open_choices(s: &mut EventStream<'_>, meta: &ChatIds, n: usize) -> io::Result<()> {
+    for i in 0..n {
+        sse(
+            s,
+            &meta.chunk(json!([{
+                "finish_reason": null, "index": i,
+                "delta": { "role": "assistant", "content": null },
+            }])),
+        )?;
+    }
+    Ok(())
+}
+
+/// One choice of the non-stream response, `index` its place among the
+/// request's. `reasoning_content` and `tool_calls` appear only when
 /// non-empty, as llama-server writes them; `logprobs`, the chat path's
 /// probabilities object, only when the request asked for it.
-fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message, probs: Option<Value>) -> Value {
+fn chat_choice(
+    meta: &ChatIds,
+    index: usize,
+    o: &Outcome,
+    m: &Message,
+    probs: Option<Value>,
+) -> Value {
     let mut message = json!({ "role": "assistant", "content": m.content });
     if !m.reasoning.is_empty() {
         message["reasoning_content"] = json!(m.reasoning);
@@ -4488,20 +4640,26 @@ fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message, probs: Option<Value>) ->
     }
     let mut choice = json!({
         "finish_reason": chat_finish_reason(o, m),
-        "index": 0,
+        "index": index,
         "message": message,
     });
     if let Some(lp) = probs {
         choice["logprobs"] = lp;
     }
+    choice
+}
+
+/// The non-stream response: its `choices`, the `usage` of all of them
+/// ([`usage`]) and the first choice's `timings`.
+fn chat_final(meta: &ChatIds, choices: Vec<Value>, all: &[(Outcome, usize)]) -> Value {
     json!({
-        "choices": [choice],
+        "choices": choices,
         "created": meta.created,
         "model": meta.model,
         "object": "chat.completion",
-        "usage": usage(o),
+        "usage": usage(all),
         "id": meta.id,
-        "timings": o.timings.to_json(),
+        "timings": all.first().map(|(o, _)| o.timings.to_json()),
     })
 }
 
@@ -6863,7 +7021,7 @@ mod tests {
                         settings: serde_json::Value::Null,
                         media: Vec::new(),
                         sampler: None,
-                        events,
+                        events: crate::worker::Events::new(events, 0),
                         client,
                     },
                 )

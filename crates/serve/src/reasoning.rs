@@ -146,7 +146,7 @@ pub struct Split {
 /// into `</think>`; outside it passes text through untouched — unless the model
 /// may still open the span, where it holds everything until the first output
 /// that is neither the tag nor leading whitespace.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ThinkSplit {
     tags: ThinkTags,
     inside: bool,

@@ -330,7 +330,7 @@ fn kind_of(schema: &Value, root: &Value) -> Kind {
 }
 
 /// Streaming scanner over the text after the think span.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct QwenScan {
     kinds: ParamKinds,
     framing: Framing,

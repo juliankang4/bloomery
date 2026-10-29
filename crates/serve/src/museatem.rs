@@ -67,7 +67,7 @@ const PARAM_CLOSE: &str = "</atem:parameter>";
 
 /// The streaming scan over one generation. The reasoning split is this
 /// scan's own: the `to=self` span, no think tag.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct MuseScan {
     /// The message the scan is inside, if any: its recipient and the body
     /// text held back (a tool message's whole body; nothing is held for the

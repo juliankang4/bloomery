@@ -9,8 +9,9 @@
 //! sampling fields, the generation and the stop rules. Only the answer's
 //! shape is this module's: `object: "text_completion"`, `id` `cmpl-…`,
 //! `created`, `model`, `choices: [{text, index, logprobs, finish_reason}]`
-//! and `usage`; a stream sends one chunk a text event, then the chunk with
-//! `finish_reason` and `usage`, then `data: [DONE]`, and opens with no chunk
+//! and `usage`; a stream sends one chunk a text event, then a chunk with
+//! each choice's `finish_reason`, the last with `usage`, then `data: [DONE]`,
+//! and opens with no chunk
 //! of its own (OpenAI's text completion stream opens with text, unlike the
 //! chat stream's role delta). `finish_reason` is llama-server's rule: `stop`
 //! on EOS or a stop word, `length` at the limit.
@@ -22,9 +23,13 @@
 //! `id` is `cmpl-…` where llama-server reuses the chat path's `chatcmpl-…`
 //! prefix — OpenAI's own spelling, one no chat id can collide with.
 //!
+//! `n` asks for that many choices of the prompt ([`take_choices`]): choice
+//! `i` samples with the request's seed plus `i`, `index` is its place, and
+//! the usage counts the prompt once and every choice's completion tokens.
+//!
 //! The request refuses by name what it cannot honour: a `prompt` array of
 //! several prompts (llama-server, as OpenAI, answers one choice per prompt;
-//! this server generates one completion a request — an array that mixes
+//! this server takes one prompt a request — an array that mixes
 //! strings and ids is one prompt, as `/completion` reads it, and a
 //! one-element array is one prompt), `echo` other than `false` (llama-server
 //! parses the field but never echoes the prompt in the answer), a non-empty
@@ -47,19 +52,21 @@ use std::net::TcpStream;
 use serde_json::{Map, Value, json};
 
 use super::{
-    ApiError, CompletionPlan, State, body, chat_input, completion_plan, finish_stream, get_i,
-    invalid, progress, run_gen, run_whole, send_error, send_json, sse, unix_now, usage,
+    ApiError, CompletionPlan, State, body, chat_input, choice_params, completion_plan,
+    finish_stream, get_i, invalid, progress, run_choices, run_whole_choices, send_error, send_json,
+    sse, take_choices, unix_now, usage,
 };
 use crate::genloop::{Event, Outcome};
 use crate::http::{EventStream, Request};
 
 /// `POST /v1/completions`: the completion path's generation, OpenAI's answer.
 pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    let parsed = body(req).and_then(|b| {
+    let parsed = body(req).and_then(|mut b| {
         openai_fields(&b)?;
-        Ok((completion_plan(state, &b)?, b))
+        let n = take_choices(state, &mut b)?;
+        Ok((completion_plan(state, &b)?, n, b))
     });
-    let (plan, b) = match parsed {
+    let (plan, n, b) = match parsed {
         Ok(x) => x,
         Err(e) => return send_error(w, req, &e),
     };
@@ -69,11 +76,18 @@ pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io
         prompt,
         return_tokens: _,
     } = plan;
+    let ps = choice_params(state, &p, n);
     let ids = Ids::new(state, &b);
     if !p.stream {
-        return match run_whole(state, &input, prompt, &p, w)? {
+        return match run_whole_choices(state, &input, prompt, &ps, w)? {
             Err(e) => send_error(w, req, &e),
-            Ok((o, _)) => send_json(w, req, 200, &answer(&ids, &o, &o.content)),
+            Ok(all) => {
+                let choices = all
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (o, _))| choice(i, &o.content, json!(o.stop.finish_reason())));
+                send_json(w, req, 200, &last(&ids, choices.collect(), &all))
+            }
         };
     }
     let peer = w.try_clone()?;
@@ -82,7 +96,7 @@ pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io
     let tpt = p.timings_per_token;
     let r = {
         let ids = &ids;
-        let mut sink = |ev: Event<'_>, _slot: usize| -> io::Result<()> {
+        let mut sink = |ev: Event<'_>, i: usize, _slot: usize| -> io::Result<()> {
             if stream.is_none() {
                 let w = w_opt
                     .take()
@@ -94,12 +108,12 @@ pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io
                 .ok_or_else(|| io::Error::other("no stream"))?;
             let v = match ev {
                 Event::Prompt(t) => {
-                    let mut v = ids.chunk("", Value::Null);
+                    let mut v = ids.chunk(json!([choice(i, "", Value::Null)]));
                     v["prompt_progress"] = progress(t);
                     v
                 }
                 Event::Text(text, t) => {
-                    let mut v = ids.chunk(text, Value::Null);
+                    let mut v = ids.chunk(json!([choice(i, text, Value::Null)]));
                     if tpt {
                         v["timings"] = t.to_json();
                     }
@@ -108,10 +122,23 @@ pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io
             };
             sse(s, &v)
         };
-        run_gen(state, &input, prompt, &p, peer, &mut sink)
+        run_choices(state, &input, prompt, &ps, peer, &mut sink)
     };
-    finish_stream(req, stream, w_opt, r.map(|(o, _)| o), |s, o| {
-        sse(s, &answer(&ids, o, ""))?;
+    finish_stream(req, stream, w_opt, r, |s, all| {
+        // One frame a choice with its `finish_reason` (its text already
+        // sent), the last frame with the usage and the timings.
+        let mut frames: Vec<Value> = all
+            .iter()
+            .enumerate()
+            .map(|(i, (o, _))| choice(i, "", json!(o.stop.finish_reason())))
+            .collect();
+        let end = frames.pop().map(|c| last(&ids, vec![c], all));
+        for c in frames {
+            sse(s, &ids.chunk(json!([c])))?;
+        }
+        if let Some(end) = end {
+            sse(s, &end)?;
+        }
         s.send(b"data: [DONE]\n\n")
     })
 }
@@ -144,7 +171,7 @@ fn openai_fields(b: &Map<String, Value>) -> Result<(), ApiError> {
         && !a.iter().any(|x| x.as_i64().is_some())
     {
         return Err(invalid(format!(
-            "'prompt' holds {} prompts: this server generates one completion a request",
+            "'prompt' holds {} prompts: this server takes one prompt a request",
             a.len()
         )));
     }
@@ -179,16 +206,11 @@ impl Ids {
         }
     }
 
-    /// One frame of the answer: `choices` around `text` (`finish` `null`
-    /// until the last frame) and the fields every frame carries.
-    fn chunk(&self, text: &str, finish: Value) -> Value {
+    /// One frame of the answer: its `choices` and the fields every frame
+    /// carries.
+    fn chunk(&self, choices: Value) -> Value {
         json!({
-            "choices": [{
-                "text": text,
-                "index": 0,
-                "logprobs": null,
-                "finish_reason": finish,
-            }],
+            "choices": choices,
             "created": self.created,
             "model": self.model,
             "object": "text_completion",
@@ -197,14 +219,27 @@ impl Ids {
     }
 }
 
-/// The whole answer, or the stream's last frame (`text` empty there: the
-/// text is already sent) — llama-server's `to_json_oaicompat`, the final
-/// form: the usage and the timings of the outcome, `logprobs` null (this
-/// server serves no probabilities).
-fn answer(ids: &Ids, o: &Outcome, text: &str) -> Value {
-    let mut v = ids.chunk(text, json!(o.stop.finish_reason()));
-    v["usage"] = usage(o);
-    v["timings"] = o.timings.to_json();
+/// Choice `index` of a frame: `text`, and `finish` `null` until its last
+/// frame.
+fn choice(index: usize, text: &str, finish: Value) -> Value {
+    json!({
+        "text": text,
+        "index": index,
+        "logprobs": null,
+        "finish_reason": finish,
+    })
+}
+
+/// The whole answer, or the stream's last frame, over `choices`: as
+/// llama-server's `to_json_oaicompat` writes the final form, with the usage of
+/// every choice ([`usage`]), the first choice's timings and `logprobs` null
+/// (this route serves no probabilities).
+fn last(ids: &Ids, choices: Vec<Value>, all: &[(Outcome, usize)]) -> Value {
+    let mut v = ids.chunk(Value::Array(choices));
+    v["usage"] = usage(all);
+    if let Some((o, _)) = all.first() {
+        v["timings"] = o.timings.to_json();
+    }
     v
 }
 
@@ -212,8 +247,10 @@ fn answer(ids: &Ids, o: &Outcome, text: &str) -> Value {
 mod tests {
     use serde_json::{Value, json};
 
+    use super::super::Server;
     use super::super::testserve::{mock_config, roundtrip, spawn};
-    use crate::{MockTokenizer, ScriptedEngine, Tokenizer};
+    use crate::sched::SlotConfig;
+    use crate::{MockEngine, MockTokenizer, ScriptedEngine, Tokenizer};
 
     /// One HTTP/1.0 request over a fresh connection (the harness of the
     /// in-crate tests): the status and the whole body, a stream's included.
@@ -381,7 +418,7 @@ mod tests {
             let (status, text) = post(addr, "/v1/completions", &body);
             assert_eq!(status, 400, "{prompt}: {text}");
             assert!(text.contains("prompt"), "the 400 names prompt: {text}");
-            assert!(text.contains("one completion"), "{text}");
+            assert!(text.contains("one prompt a request"), "{text}");
         }
         for prompt in [r#""ab""#, r#"["ab"]"#, r#"["ab",7]"#, r#"[6,7]"#] {
             let body = format!(r#"{{"prompt":{prompt},"max_tokens":1}}"#);
@@ -470,5 +507,146 @@ mod tests {
         assert_eq!(status, 200, "{text}");
         let v: Value = serde_json::from_str(&text).expect("the chat answer is JSON");
         assert_eq!(v["usage"]["prompt_tokens"], json!(n), "{text}");
+    }
+
+    /// The text of each choice of an answer on `path`, whole or streamed, in
+    /// `index` order (every choice's frames carry its index, and a choice
+    /// ends once with a `finish_reason`), and its `usage`.
+    fn choices(addr: std::net::SocketAddr, path: &str, body: &Value) -> (Vec<String>, Value) {
+        let (status, text) = post(addr, path, &body.to_string());
+        assert_eq!(status, 200, "{path}: {text}");
+        let piece = |c: &Value| {
+            let t = if path.contains("chat") {
+                c.get("message").unwrap_or(&c["delta"])["content"].as_str()
+            } else {
+                c["text"].as_str()
+            };
+            t.unwrap_or_default().to_owned()
+        };
+        if body["stream"] != true {
+            let v: Value = serde_json::from_str(&text).expect("the answer is JSON");
+            let all = v["choices"].as_array().expect("choices");
+            for (i, c) in all.iter().enumerate() {
+                assert_eq!(c["index"], json!(i), "{path}: {text}");
+            }
+            return (all.iter().map(piece).collect(), v["usage"].clone());
+        }
+        let mut texts: Vec<String> = Vec::new();
+        let mut ended: Vec<usize> = Vec::new();
+        let mut usage = Value::Null;
+        for e in text.split("\n\n").filter_map(|f| f.strip_prefix("data: ")) {
+            if e == "[DONE]" {
+                continue;
+            }
+            let v: Value = serde_json::from_str(e).expect("chunk JSON");
+            if !v["usage"].is_null() {
+                usage = v["usage"].clone();
+            }
+            for c in v["choices"].as_array().expect("choices") {
+                let i = usize::try_from(c["index"].as_u64().expect("an index")).expect("usize");
+                if texts.len() <= i {
+                    texts.resize(i + 1, String::new());
+                }
+                texts[i].push_str(&piece(c));
+                if !c["finish_reason"].is_null() {
+                    ended.push(i);
+                }
+            }
+        }
+        ended.sort_unstable();
+        assert_eq!(
+            ended,
+            (0..texts.len()).collect::<Vec<_>>(),
+            "{path}: {text}"
+        );
+        (texts, usage)
+    }
+
+    /// `n` choices of one prompt, on the chat and the text completion routes,
+    /// whole and streamed, over one slot (the choices queue) and two (they
+    /// run together): choice `i` is the request of one choice seeded with the
+    /// request's seed plus `i`, so sampled choices differ, and the usage counts
+    /// the prompt once and every choice's tokens.
+    #[test]
+    fn n_choices_are_the_requests_of_the_following_seeds() {
+        let request = |path: &str, n: u64, seed: u64, stream: bool| {
+            let mut b = json!({
+                "max_tokens": 8, "temperature": 1.5, "seed": seed, "n": n, "stream": stream,
+                "stream_options": {"include_usage": true},
+            });
+            let text = "abcabdabeabfabgab";
+            if path.contains("chat") {
+                b["messages"] = json!([{"role": "user", "content": text}]);
+            } else {
+                b["prompt"] = json!(text);
+            }
+            b
+        };
+        for slots in [1, 2] {
+            let server = Server::bind_with(
+                "127.0.0.1:0",
+                Box::new(MockEngine::new(256).with_slots(slots)),
+                mock_config(),
+                SlotConfig {
+                    parallel: slots,
+                    ..SlotConfig::default()
+                },
+            )
+            .expect("bind");
+            let addr = server.local_addr().expect("addr");
+            let _started = server.start().expect("start");
+            for path in ["/v1/chat/completions", "/v1/completions"] {
+                let alone: Vec<(String, Value)> = (0..3)
+                    .map(|i| {
+                        let (mut texts, usage) =
+                            choices(addr, path, &request(path, 1, 7 + i, false));
+                        (texts.remove(0), usage)
+                    })
+                    .collect();
+                let texts: Vec<&String> = alone.iter().map(|(t, _)| t).collect();
+                assert!(texts.iter().any(|t| *t != texts[0]), "{path}: {texts:?}");
+                let tokens: u64 = alone
+                    .iter()
+                    .map(|(_, u)| u["completion_tokens"].as_u64().expect("a count"))
+                    .sum();
+                for stream in [false, true] {
+                    let (got, usage) = choices(addr, path, &request(path, 3, 7, stream));
+                    assert_eq!(got.iter().collect::<Vec<_>>(), texts, "{path} {stream}");
+                    assert_eq!(usage["completion_tokens"], json!(tokens), "{path} {usage}");
+                    assert_eq!(usage["prompt_tokens"], alone[0].1["prompt_tokens"]);
+                }
+            }
+        }
+    }
+
+    /// `n` is a count of 1 up to the slots and the requests that may wait
+    /// beside them (the choices queue together): 0, a negative count or one
+    /// past that is a 400 naming it on both OpenAI routes, and `/completion`,
+    /// which answers one generation, refuses `n > 1` by name.
+    #[test]
+    fn n_outside_one_to_the_slots_and_the_queue_is_refused_by_name() {
+        let (addr, _, _) = scripted();
+        let most = crate::MAX_CONNECTIONS;
+        for path in ["/v1/chat/completions", "/v1/completions"] {
+            for n in [0, -1, most as i64 + 1] {
+                let body = format!(
+                    r#"{{"messages":[{{"role":"user","content":"ab"}}],"prompt":"ab","max_tokens":1,"n":{n}}}"#
+                );
+                let (status, text) = post(addr, path, &body);
+                assert_eq!(status, 400, "{path} n={n}: {text}");
+                assert!(
+                    text.contains(&format!("n must be between 1 and {most}")),
+                    "{text}"
+                );
+            }
+            let body = format!(
+                r#"{{"messages":[{{"role":"user","content":"ab"}}],"prompt":"ab","max_tokens":1,"n":{most}}}"#
+            );
+            let (status, text) = post(addr, path, &body);
+            assert_eq!(status, 200, "{path} n={most}: {text}");
+        }
+        let (status, text) = post(addr, "/completion", r#"{"prompt":"ab","n":2}"#);
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("n is not supported"), "{text}");
     }
 }

@@ -836,7 +836,7 @@ fn stream(
             })?;
             blocks.push(ids, &d).iter().try_for_each(|v| event(s, v))
         };
-        run_gen(state, &prompt_ids, prompt, &p, peer, &mut sink).map(|(o, _)| o)
+        run_gen(state, &prompt_ids, prompt, &p, peer, &mut sink).map(|r| r.map(|(o, _)| o))
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),
