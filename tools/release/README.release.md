@@ -84,7 +84,9 @@ Downloads go to `~/.cache/bloomery/hf` (`BLOOMERY_CACHE` overrides it). A gated 
 
 ## Cards
 
-A generative seat takes `--parallel N` (one by default): the slots are resident sequences in the one model, and the busy ones advance together each round. The `nemotron`, `raon1`, `solar2` and `musespark` seats serve one slot and refuse `--parallel` above 1 by name. A plan that cannot fit the card's free bytes is refused by name with its terms and the processes holding the card.
+A generative seat takes `--parallel N` (one by default): the slots are resident sequences in the one model, and the busy ones advance together each round. The `nemotron`, `raon1`, `solar2` and `musespark` seats serve one slot and refuse `--parallel` above 1 by name. Unset, `--ctx-size` gives each slot the largest context its plan holds; a set `--ctx-size` is the total the slots share. A plan that cannot fit the card's free bytes is refused by name with its terms and the processes holding the card.
+
+A flag on the command line wins over its `LLAMA_ARG_*` variable and over the `BLOOMERY_*` lever it stands for, and `bin/bloomery-serve -m <model> --levers` prints the levers the model's seat applies. A request field the server does not know is ignored, as in llama-server. Each seat's flags, the order of settings and the request fields: https://github.com/midagedev/bloomery/blob/main/docs/serving.md#settings
 
 `--place` picks the cards for the models with CPU experts: `a` runs the model on the visible card with the most memory,
 `bp` adds the next card as an expert tier, and `0+1` names cards by CUDA index (`CUDA_DEVICE_ORDER=PCI_BUS_ID` makes it `nvidia-smi`'s numbering). The single-card models run on

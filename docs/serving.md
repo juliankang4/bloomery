@@ -213,6 +213,93 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 Where it ends today: one model a server, sm_86+ GPUs, and the seats' own defaults where llama-server has none
 (see [Limits](#limits)).
 
+## Settings
+
+A start needs a model and nothing else: every flag and lever below has a default, and the start lines (`ctx`,
+`parallel`, `ubatch`, `plan`, `setup`) name what the start chose. This section lists what each seat takes, which
+setting wins when two name the same thing, and what a request's fields do.
+
+### Flags by seat
+
+`bloomery-serve` reads its own flags first: `--model <seat>`, the model (`-m`/`--model-file` or `--hf`), `--head`
+and `--head-config` (the decide seat), the embedding side model (`--embd-*`, the generative seats),
+llama-server's placement flags ([Placement](#placement); not on the decide seat), `--levers`, `--list-devices` and
+`--version`. The seat parses every other flag. Every generative seat takes this common set: `--host`, `--port`,
+`--ctx` (`--ctx-size`, `-c`), `--parallel` (`-np`), `--place`, `--plan`, `--queue-depth`, `--chat-template-file`,
+`--api-key`, `--api-key-file`, `--alias` and `--slot-save-path`, and the qwen3 seat refuses the last two. The table
+gives what differs. A flag the seat named by `--model` does not take is refused by name with the seat's usage, before `--hf`
+downloads anything; `bloomery-serve --model <seat> --help` prints that usage.
+
+| Seat | `--parallel` | `--cache-ram` | `-ub`, `--ubatch-size` | `--mmproj` ¹ | Its own flags |
+|---|---|---|---|---|---|
+| `ds41` | N | yes | no | yes | |
+| `glm` | N | yes | no | yes | `--prefill batch\|steps` |
+| `qwen38` | N | yes | 1 to 4096 | yes ² | |
+| `qwen3` | N | no | a file with no routed expert ³ | yes | `--cache-type-k f16\|q8_0` |
+| `mimo2` | N | yes | no | no | `--prefill batch\|steps` |
+| `minimaxm3` | N | yes | no | no | |
+| `flint` | N | no | no | no | |
+| `musespark` | 1 | yes | no | no | |
+| `solar2`, `nemotron`, `raon1` | 1 | no | no | no | |
+| `decide` | no (one request at a time) | no | yes | Clef only | `--head`, `--head-config`; it takes only `--host`, `--port`, `--ctx`, `-ub`, the key flags and the image flags |
+
+`N` is any count, 1 by default; `1` is the seat's one slot, and `--parallel` above 1 is refused by name. `--mmproj`
+stands for the image flags together (`--no-mmproj`, `--image-min-tokens`, `--image-max-tokens`; Image input, below).
+`--park-ram` is refused by name on every seat that reads it (ds41, glm, qwen3, qwen38): their slots are resident
+sequences. The short spellings `-c`, `-np`, `-ub`, `-a`, `-mm` and `-cram` are the long flags
+([The environment](#the-environment)).
+
+¹ A build with the `vision` feature; the release has it, and another build refuses the image flags by name.
+² An image load runs no MTP draft: `BLOOMERY_DRAFT=mtp` beside `--mmproj` is refused by name.
+³ A file with routed experts takes `BLOOMERY_QWEN3_UBATCH` and refuses the flag by name.
+
+`-ub` on the qwen38 seat trades card memory for prompt speed. Each position of the size is about 0.81 MB of the
+plan's card bytes on the FP4-Local folder on a GB10 [derived: the `need` record's card bytes at 4096 less those at 48,
+3,289,846,032 B, over 4,048], so `-ub 48` frees about 3.3 GB beside the default 4096, and a smaller size runs a long prompt in more, shorter passes,
+which is slower. Lower it only to fit a context or a slot count that the default does not fit; `--plan` prints the
+card bytes of each size.
+
+`--plan` prints the plan records and exits before any weight is read onto a card. It is not an offline check: it
+needs the model file (`--hf` downloads it first), the driver, and the cards' free bytes, and the qwen38 seat opens a
+CUDA context on its stage card first, as a load does. Run it on the machine that will serve.
+
+### Which setting wins
+
+One value a setting, chosen in this order:
+
+1. **The command line.** A flag replaces its `LLAMA_ARG_*` variable, and one line on stderr says so. A flag that
+   stands for a `BLOOMERY_*` lever replaces the lever's value: `-ub` replaces `BLOOMERY_QWEN3_UBATCH`,
+   `--cache-type-k` replaces `BLOOMERY_QWEN3_KV`, and the placement flags replace the levers they set
+   ([Placement](#placement)).
+2. **llama-server's variables.** A `LLAMA_ARG_*` variable is read as its flag ([The environment](#the-environment)),
+   so it also replaces the lever: `LLAMA_ARG_UBATCH=48` beside `BLOOMERY_QWEN3_UBATCH=64` runs 48.
+3. **The levers.** A `BLOOMERY_*` variable that no flag or `LLAMA_ARG_*` variable names.
+4. **The seat's default.**
+
+Two cases are not ranked. The keys add: `LLAMA_API_KEY`, `--api-key` and `--api-key-file` together make one set. Two
+sources of one thing are refused by name, never picked between: the model named twice (`-m` beside `--hf`,
+`LLAMA_ARG_MODEL` beside `LLAMA_ARG_HF_REPO`, or `BLOOMERY_REF_MODEL` naming another file), `--place` beside a
+placement flag, and the routed experts' place named twice. `<bin> --levers` prints each lever, whether the binary
+(on `bloomery-serve`, the seat) applies it, and its value. The levers themselves are the rows of
+[`crates/levers/src/registry.rs`](../crates/levers/src/registry.rs) ([`BUILD.md`](BUILD.md#levers)).
+
+### Request fields
+
+A request field is read, refused or ignored:
+
+- **Read.** Validation is field-specific. Sampling fields such as `temperature` reject wrong types and non-finite
+  values; `n_predict` and `repeat_last_n` enforce llama-server's count limits. Their `null` values are unset.
+- **Refused.** A field the server cannot honor is a 400 naming it, never a 200 that drops it: `n` above 1,
+  a non-empty `logit_bias` or `grammar`, probabilities on a route that renders none (`/completion` takes `n_probs`,
+  `/v1/chat/completions` takes `logprobs` and `top_logprobs`), and the fields under "Refused by name" above.
+  `/v1/responses` also refuses a stored response (`previous_response_id`, `store: true`, `background: true`).
+- **Ignored.** A field the server does not know is ignored, as llama-server ignores it. So a misspelled field is no
+  error: `"temprature": 0` answers 200 and samples at the default temperature.
+
+Unset, a generation samples at llama-server's defaults: `temperature` 0.8, `top_k` 40, `top_p` 0.95, `min_p` 0.05,
+`repeat_penalty` 1, `repeat_last_n` 64, no token limit but the context (`n_predict` -1) and `cache_prompt` true. A
+structured-output request decodes greedily, so its `temperature` defaults to 0 (Limits, below).
+
 ## Placement
 
 `bloomery-serve` places a model with the flags llama-server places it with. Name a card and the plan is made on that
@@ -450,7 +537,7 @@ bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` needs no head flag. The earlier `qw
 file: `--head joint_head.safetensors`, its `joint_head_config.json` beside it. A `--head` beside a `clef` file names the
 head instead of the file's own.
 
-**Concurrent requests.** Every generative seat but nemotron, raon1 and solar2 (one slot each, above) takes `--parallel N` (unset, one slot; a set
+**Concurrent requests.** Every generative seat but nemotron, raon1, solar2 and musespark (one slot each, [Flags by seat](#flags-by-seat)) takes `--parallel N` (unset, one slot; a set
 `--ctx-size` with no `--parallel` serves one slot at the whole of it — the flag is one request's context, as
 llama-server reads it, and the startup line says so). A count you set is never lowered. The N slots are resident sequences
 inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
@@ -572,10 +659,10 @@ save is refused by name. For Qwen3.5 and Qwen3.6, when the vocabulary and chat t
 for another question. Reuse still requires that slot to hold the shared prefix; another conversation can replace it. `timings.cache_ms` and `/metrics`'
 `prompt_cache_seconds_total` count the cache's work.
 
-**Image input (V4.1, Qwen3.6, MiniCPM-V 4.7, Sage-A1.5, GLM-5.3, Clef).** These seats read images when they have a vision encoder: `--mmproj <file>`,
+**Image input (V4.1, Qwen3.8, Qwen3.6, MiniCPM-V 4.7, Sage-A1.5, GLM-5.3, Clef).** These seats read images when they have a vision encoder: `--mmproj <file>`,
 llama-server's flag, naming the model's encoder GGUF. On V4.1 the file is `mmproj-DeepSeek-V4.1-Flash-BF16.gguf`.
 Under `--hf` with no `--mmproj`, every image seat takes the repo's own projector beside the model, unless `--no-mmproj`
-says none. The V4.1, qwen3 and GLM-5.3 seats load it only when the text model keeps the same card experts and
+says none. The V4.1, qwen38, qwen3 and GLM-5.3 seats load it only when the text model keeps the same card experts and
 context with the encoder as without it, also when the encoder sits on a card off the plan; otherwise one vision line gives the projector's bytes and cost, and the seat serves text. Qwen3-30B-A3B has no encoder, and `--mmproj` there is refused by name. A file of
 another encoder is refused by name. Images travel inside the request as PNG or JPEG bytes: an OpenAI `image_url`
 part holding a `data:` URL, or an Anthropic `image` block with a base64 source; any other URL is refused, not
@@ -661,7 +748,7 @@ and the model fits) states no need and consults no hook; a set hook is named on 
 - One model a server; one expert tier card at most (`--place bp`).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, MiMo-V2.6-Flash, GLM-5.3 and Qwen3.8; a placed
   Qwen3-30B or Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
-  streams wait. The decide seat serves one request at a time, and the nemotron, raon1 and solar2 seats one
+  streams wait. The decide seat serves one request at a time, and the nemotron, raon1, solar2 and musespark seats one
   slot each; DSpark drafts never rejoin — `--parallel > 1` with
   `BLOOMERY_DRAFT=dspark` is refused by name.
 - With adaptive residency on, a request's tokens follow the placement its passes ran on, and the placement follows
