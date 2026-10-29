@@ -15,8 +15,9 @@
 //! [`CARD_LAUNCHES`] — and the back combines `(hsum + acc) + sh·w`
 //! (`q38_card_shared_add`). The ubatch walk runs the card route
 //! (`wide38`'s, over the same stacks through the grouped GEMMs) on a layer
-//! with card experts and the same back; on a layer without a host leg
-//! ([`Card38::hostless`]) its sum and the combine are one launch
+//! with card experts and the same back. On a layer without a host leg
+//! ([`Card38::hostless`]) the step, the verify, the pass and the ubatch
+//! walk retain the down rows, and their sum and the combine are one launch
 //! (`q38_card_sum_shared_add`). A layer without card experts
 //! launches none of them and keeps `q38_shared_add`. The slot places each
 //! launch reads are the ones the walk's handoff or places launch wrote
@@ -56,10 +57,10 @@ use super::program38::Ctx38;
 use super::scratch38::PASS_ROWS;
 use super::swap38::Qwen38Stacks;
 use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, RouteW, StackW};
-use crate::card_slots::CardAcc;
+use crate::card_slots::{CardAcc, DownRows};
 use crate::hybrid::SlotMap;
 use crate::kquant::Act;
-use crate::q38::{CardTierSharedAddArgs, SLOTS, W_PITCH};
+use crate::q38::{CardSumSharedAddArgs, CardTierSharedAddArgs, SLOTS, W_PITCH};
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
@@ -75,7 +76,7 @@ const WHAT: &str = "qwen4exp card leg";
 /// q8_1, the gate·up, the q8_1 of the card slots' columns, the down and the
 /// card sum.
 pub(super) const CARD_LAUNCHES: usize = 5;
-/// The card leg's launches on a layer an expert tier holds experts of: those
+/// The card leg's launches on a hostless or expert-tier layer: those
 /// of [`CARD_LAUNCHES`] but the card sum, which moves into the join.
 pub(super) const TIER_CARD_LAUNCHES: usize = CARD_LAUNCHES - 1;
 
@@ -283,9 +284,6 @@ struct CardRun {
     down: DeviceBuffer<f32>,
     /// The card slots' weighted sum, a row a token.
     acc: DeviceBuffer<f32>,
-    /// Zeros, a row a token, on a load with a layer that runs without a
-    /// host leg: that layer's host sum ([`Card38::zero_sum`]).
-    zero: Option<DeviceBuffer<f32>>,
 }
 
 /// Qwen3.8's card leg: each layer's card experts, and, when any layer has
@@ -455,10 +453,6 @@ impl Card38 {
                 sel: SelRun::new(gpu, PASS_ROWS)?,
                 down: DeviceBuffer::zeroed(stream, slots * geo::HIDDEN)?,
                 acc: DeviceBuffer::zeroed(stream, PASS_ROWS * geo::HIDDEN)?,
-                zero: hostless
-                    .contains(&true)
-                    .then(|| DeviceBuffer::zeroed(stream, PASS_ROWS * geo::HIDDEN))
-                    .transpose()?,
             })
         } else {
             None
@@ -477,8 +471,8 @@ impl Card38 {
     }
 
     /// The step and the verify run layer `l` without a host leg: no go, no
-    /// wait, the host not told of the row, and zeros for the host's sum
-    /// ([`Card38::zero_sum`]). The load decides it once ([`Card38::new`]):
+    /// wait, the host not told of the row, and a fused card sum and shared
+    /// add. The load decides it once ([`Card38::new`]):
     /// every routed expert of the layer is on the card, and `keep_host` is
     /// false, which the load sets when a residency machine runs or the host
     /// service records a route trace. It holds for the load's life: with no
@@ -612,23 +606,10 @@ impl Card38 {
             .ok_or(GpuError::state(WHAT, "a layer with card experts"))
     }
 
-    /// The host's routed sum of a layer run without a host leg
-    /// ([`Card38::hostless`]): zeros, a row a token, as the host writes for
-    /// an empty list. Refused by name on a load with no such layer.
-    pub(super) fn zero_sum(&self) -> Result<&DeviceBuffer<f32>, GpuError> {
-        self.run
-            .as_ref()
-            .and_then(|r| r.zero.as_ref())
-            .ok_or(GpuError::state(WHAT, "a layer run without a host leg"))
-    }
-
     /// Device bytes of the buffers.
     pub(super) fn bytes(&self) -> usize {
         self.run.as_ref().map_or(0, |r| {
-            r.sel.bytes()
-                + r.down.num_bytes()
-                + r.acc.num_bytes()
-                + r.zero.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            r.sel.bytes() + r.down.num_bytes() + r.acc.num_bytes()
         })
     }
 
@@ -670,8 +651,9 @@ impl Card38 {
     }
 
     /// [`Card38::enqueue`] but the card sum: the card slots' down outputs
-    /// stay in the leg's rows for a tier layer's join
-    /// ([`Card38::enqueue_tier_join`]). [`TIER_CARD_LAUNCHES`] launches.
+    /// stay in the leg's rows for a tier or hostless layer's join
+    /// ([`Card38::enqueue_tier_join`], [`Card38::enqueue_hostless_join`]).
+    /// [`TIER_CARD_LAUNCHES`] launches.
     pub(super) fn enqueue_rows(
         &mut self,
         c: &Ctx38<'_>,
@@ -687,6 +669,34 @@ impl Card38 {
             return Err(no_card(l));
         };
         r.sel.enqueue(c.gpu, c.w, (l, cl), x, m, sel, &mut r.down)
+    }
+
+    /// Sum a hostless layer's retained down rows and add its gated shared
+    /// expert in one launch, with the same slot order as the card sum.
+    pub(super) fn enqueue_hostless_join(
+        &self,
+        c: &Ctx38<'_>,
+        (l, m): (usize, usize),
+        (sel, sh, weights): (&DeviceBuffer<u32>, &DeviceBuffer<f32>, &DeviceBuffer<f32>),
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let (Some(cl), Some(r)) = (self.layer(l), self.run.as_ref()) else {
+            return Err(no_card(l));
+        };
+        c.k.q38.enqueue_card_sum_shared_add(
+            c.gpu.stream(),
+            CardSumSharedAddArgs {
+                down: DownRows::F32(&r.down),
+                w: weights,
+                sel,
+                sh,
+                n: geo::HIDDEN,
+                m,
+                n_card: cl.n_card,
+                fault: c.gpu.layer_sink(l)?,
+                y,
+            },
+        )
     }
 
     /// Enqueue the join of tier layer `l` over the unit's `m` columns, after
