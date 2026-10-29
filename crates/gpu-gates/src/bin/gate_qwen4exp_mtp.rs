@@ -204,6 +204,12 @@
 //!   windows diverge from position 0 on (the deep prompt read past the
 //!   set's own whole length), so no per-sequence state the two share by
 //!   content can pass for one the slots exchanged.
+//! - (iv) MTP refuses target hidden rows outside the last layer's completed range
+//!   (a tapped call that failed past its launch leaves none), and an own row after a
+//!   state adoption, reset, store walk, slot exchange or cut until a Rows refresh, or
+//!   at a position other than the refreshed walk's next position. A sink's completed rows
+//!   and the own row after a refresh run. The checkpoint-only input test exercises
+//!   these clauses and the existing plain and drafted greedy runners on one load.
 //! - (z) the same two windows' drafted passes run as one pass of both slots'
 //!   verify rows (`app::mtp::pass_slots`, `Session::verify_slots` and
 //!   `commit_slots`), each window's draft its own and capped at depth 1 (a
@@ -2375,7 +2381,7 @@ mod gate {
         Ok(ok && runs_ok)
     }
 
-    /// Only completed target rows may feed MTP: a headless pass or ubatch leaves none,
+    /// (iv) Only completed target rows may feed MTP: a headless pass or ubatch leaves none,
     /// a headed ubatch leaves its last row, and a sink completes every requested row.
     fn completed_rows(m: &mut Qwen38Model, prompt: &[u32]) -> Result<bool, GateError> {
         let ids = &prompt[..4];
@@ -2433,6 +2439,21 @@ mod gate {
                 verdict(ran)
             );
             ok &= ran;
+            // The finite rows above stay in the arena; a tapped call that fails
+            // past its launch must leave no completed record of its own rows.
+            m.reset()?;
+            m.body_parts("completed rows")?.2.plant_after_launch();
+            ok &= refused(
+                &format!("{walk:?} tapped call failed past its launch"),
+                m.prefill38_with(ids, path, Some(&mut sink)),
+                "planted failure after the launch",
+            );
+            warm(m)?;
+            ok &= refused(
+                &format!("{walk:?} first hidden row of the failed call"),
+                m.mtp_draft(feed(walk, 0, 1), h, e),
+                "arena holds no position",
+            );
         }
         m.reset()?;
         m.prompt38(ids, Prompt38::Gemm)?;
@@ -2450,6 +2471,7 @@ mod gate {
 
     /// The shared own row is valid only at the next position of the live slot's walk.
     fn own_row(m: &mut Qwen38Model, prompt: &[u32]) -> Result<bool, GateError> {
+        const REFRESH: &str = "Rows refresh required";
         m.add_slots(2)?;
         let zeros = vec![0.0; WIDE];
         let (h, e) = (DraftHead::Rows, WalkMode::Eager);
@@ -2470,7 +2492,46 @@ mod gate {
         let mut ok = refused(
             "own row at the wrong position",
             m.mtp_draft(DraftFeed::Own { pos0: 0 }, h, e),
-            "own row",
+            "requested position 0",
+        );
+        // Each invalidation below follows a refresh whose next position is the
+        // one requested, so only the invalidation itself refuses the walk.
+        m.reset()?;
+        m.prompt38(&prompt[..2], Prompt38::Pass)?;
+        let state = m.seq_save()?;
+        m.reset()?;
+        refresh(m, prompt[0])?;
+        // The model is empty, so the resume adopts the state without a reset.
+        m.seq_resume(&state)?;
+        ok &= refused(
+            "own row after a state adoption",
+            m.mtp_draft(DraftFeed::Own { pos0: 1 }, h, e),
+            REFRESH,
+        );
+        refresh(m, prompt[0])?;
+        m.reset()?;
+        ok &= refused(
+            "own row after a reset",
+            m.mtp_draft(DraftFeed::Own { pos0: 1 }, h, e),
+            REFRESH,
+        );
+        refresh(m, prompt[0])?;
+        m.mtp_store_slots(
+            &[(
+                0,
+                Feed {
+                    tokens: &[prompt[0]],
+                    pos0: 0,
+                    hidden: Hidden::Host(&zeros),
+                    media: None,
+                },
+            )],
+            h,
+        )?;
+        ok &= refused(
+            "own row after a store walk",
+            m.mtp_draft(DraftFeed::Own { pos0: 1 }, h, e),
+            REFRESH,
         );
         m.select_slot(1)?;
         m.reset()?;
@@ -2479,20 +2540,21 @@ mod gate {
         ok &= refused(
             "own row after A to B to A",
             m.mtp_draft(DraftFeed::Own { pos0: 1 }, h, e),
-            "own row",
+            REFRESH,
         );
         refresh(m, prompt[0])?;
         let ran = m
             .mtp_draft(DraftFeed::Own { pos0: 1 }, h, WalkMode::Graph)
             .is_ok();
         println!("(iv) own row after Rows refresh {}", verdict(ran));
+        refresh(m, prompt[0])?;
         // A verify's rejected tail cannot leave its branch's own input live.
         m.verify_slots(&[(0, &prompt[..2])])?;
         m.commit_slots(&[1])?;
         ok &= refused(
             "own row after a cut",
             m.mtp_draft(DraftFeed::Own { pos0: 1 }, h, e),
-            "own row",
+            REFRESH,
         );
         m.reset()?;
         Ok(ok && ran)
@@ -2560,7 +2622,6 @@ mod gate {
         m.set_mode(bloomery_gpu::model::StepMode::Graph);
         let prompt = [1, 2, 3, 4];
         let rows_ok = completed_rows(&mut m, &prompt)?;
-        let own_ok = own_row(&mut m, &prompt)?;
         // Use the gate's existing greedy runner and drafted session on the same load.
         let (m, plain, _) = plain_to(m, &prompt, Prompt38::Gemm, 8)?;
         let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Gemm), CTX_INPUT as u32)?;
@@ -2573,8 +2634,18 @@ mod gate {
             &runtime::Stop::new(8, CTX_INPUT as u32)?,
             &mut Kept::default(),
         )?;
-        let same = plain == drafted.tokens;
-        println!("(iv) drafted greedy ids = plain ids {}", verdict(same));
+        // The runtime keeps the last pass whole; compare the requested prefix.
+        let same = drafted.tokens.get(..plain.len()) == Some(plain.as_slice());
+        if !same {
+            eprintln!("(iv) greedy plain={plain:?} drafted={:?}", drafted.tokens);
+        }
+        println!(
+            "(iv) first {} drafted greedy ids = plain ids {}; draft kept {} ids",
+            plain.len(),
+            verdict(same),
+            drafted.tokens.len()
+        );
+        let own_ok = own_row(s.model_mut(), &prompt)?;
         if rows_ok && own_ok && same {
             Ok(())
         } else {
@@ -5045,7 +5116,6 @@ mod gate {
             2,
         )?;
         m.set_mode(bloomery_gpu::model::StepMode::Graph);
-        let own_ok = own_row(&mut m, a)?;
         let mut s = app::Session::from_model(m, ctx);
         let mut spec = s.with_draft::<app::mtp::MtpDraft<Body38>, 4>(
             app::mtp::MtpDraft::open(
@@ -5085,6 +5155,7 @@ mod gate {
             capped_run(&mut s, a, &plain[0])?,
             capped_run(&mut s, b, &plain[1])?,
         ];
+        let own_ok = own_row(s.model_mut(), a)?;
         s.model_mut().add_slots(2)?;
         // Together, in the server's order: slot 0's prompt call and first
         // plain step run together, then slot 1's, then the drafted passes
