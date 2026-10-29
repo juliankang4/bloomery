@@ -148,8 +148,8 @@ use serde_json::{Map, Value, json};
 
 use super::{
     ApiError, ChatPlan, State, body, chat_input, chat_plan, check_effort, error_body,
-    finish_stream, get_i, get_i_in, invalid, json_type, progress, run_gen, run_whole, send_error,
-    send_json, sse, tool_markup_error, unix_now,
+    finish_stream, gen_body, get_i, get_i_in, invalid, json_type, progress, run_gen, run_whole,
+    send_error, send_json, sse, tool_markup_error, unix_now,
 };
 use crate::dsml::{Message, ToolCall};
 use crate::genloop::{Event, Outcome, StopKind, Timings};
@@ -170,7 +170,7 @@ const INCLUDE_LOGPROBS: &str = "message.output_text.logprobs";
 
 /// `POST /v1/responses` and `POST /responses`.
 pub(super) fn create(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    let parsed = body(req).and_then(|b| {
+    let parsed = gen_body(req).and_then(|b| {
         let chat = to_chat(&b)?;
         let plan = chat_plan(state, &chat, chat.get("reasoning_format"))?;
         Ok((Ids::new(state, &b), plan))

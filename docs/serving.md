@@ -302,9 +302,18 @@ A request field is read, refused or ignored:
   values; `n_predict` and `repeat_last_n` enforce llama-server's count limits. Their `null` values are unset.
 - **Refused.** A field the server cannot honor is a 400 naming it, never a 200 that drops it: `n` above 1 outside
   `/v1/chat/completions` and `/v1/completions` (and past the slots plus the queue depth on them), a non-empty
-  `logit_bias` or `grammar`, probabilities on a route that renders none (`/completion` takes `n_probs`,
+  `grammar`, probabilities on a route that renders none (`/completion` takes `n_probs`,
   `/v1/chat/completions` takes `logprobs` and `top_logprobs`), and the fields under "Refused by name" above.
   `/v1/responses` also refuses a stored response (`previous_response_id`, `store: true`, `background: true`).
+- **`logit_bias`.** OpenAI's object from token ids to a number in -100 to 100, which is added to that id's logit
+  before every pick, on `/completion`, `/v1/completions`, `/v1/chat/completions` and `/v1/responses` (also `/responses`):
+  -100 keeps an id out in practice, +100 makes it the pick. It applies to greedy, sampled and structured-output requests,
+  with or without the MTP draft (each pass draws from its verified rows with the bias added, as a step does, so the ids are
+  the same). Under `ignore_eos` the stop ids stay at -inf whatever their bias. A structured-output request adds the
+  bias before its schema's mask: the bias reorders the ids the schema allows and lets in no other. `logprobs` report
+  the model's own row, before the bias. llama-server's other forms (an array of pairs, `false`, a token's text), a key
+  that is not an id of the vocabulary, a value out of range and one id named twice are 400s naming the field;
+  `generation_settings` reports the bias as llama-server does (`[{"bias": -100.0, "token": 15}]`).
 - **Ignored.** A field the server does not know is ignored, as llama-server ignores it. So a misspelled field is no
   error: `"temprature": 0` answers 200 and samples at the default temperature.
 
@@ -641,10 +650,10 @@ of the plan without it or fewer, a set `--ctx-size`/`--ctx` included, a `draft y
 card bytes and the positions a slot gets either way, and the context line that follows is the plain plan's.
 `BLOOMERY_DRAFT=mtp` keeps it on whatever the context. On Qwen3.8 the MTP draft runs on any slot count, set or unset.
 The drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones
-(the default, temperature 0.8 as in llama-server) and on ones that ban an id (`ignore_eos`), alone or beside other
-running requests: each kept id is the request's own draw from its verified row (its sampler's, or the argmax, with
-every banned id's logit at -inf), as llama.cpp's speculative decoding takes it, so a request of one seed takes the
-same ids alone and beside others. A request under DSpark decodes one token a step.
+(the default, temperature 0.8 as in llama-server) and on ones that ban an id (`ignore_eos`) or bias ids (`logit_bias`),
+alone or beside other running requests: each kept id is the request's own draw from its verified row (its sampler's,
+or the argmax, with each biased id's bias added and every banned id's logit at -inf), as llama.cpp's speculative decoding
+takes it, so a request of one seed takes the same ids alone and beside others. A request under DSpark decodes one token a step.
 
 **Adaptive residency.** V4.1, Qwen3.8 and GLM-5.3 count their own routing as they run and swap routed experts
 between the card and the host between steps; a prompt call streams its hottest host experts onto the card, so

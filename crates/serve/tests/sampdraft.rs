@@ -2,9 +2,9 @@
 //! ([`serve::Engine::advance_sampled`]) takes the ids a plain run of the same
 //! seed takes, alone in its round or beside another busy slot's pass, and
 //! steps where a pass would read what the loop has not settled: a think close
-//! it forces. A
-//! request that bans an id (`ignore_eos`) draws in those passes too, greedy or
-//! sampled, from rows whose banned ids are at -inf. The drafted mock is
+//! it forces. A request that bans an id (`ignore_eos`) or biases ids
+//! (`logit_bias`) draws in those passes too, greedy or sampled, from rows
+//! whose banned ids are at -inf and whose biased ids carry their bias. The drafted mock is
 //! [`DraftMock`]; its plain twin is the same mock
 //! [`DraftMock::without_sampled`]. Both servers sample with [`penalised`],
 //! whose draws read the history, so a pass that hands the sampler another
@@ -383,6 +383,48 @@ fn hw_a_banned_id_drafts() {
         "the passes kept {accepted} of {proposed} proposed ids: both kept and taken-back rows are \
          needed"
     );
+    assert!(count(&drain(&dlog), MockCall::Sampled) > 0, "no pass drew");
+    assert_eq!(
+        count(&drain(&plog), MockCall::Sampled),
+        0,
+        "the plain twin ran a pass"
+    );
+}
+
+/// A request with a `logit_bias` drafts, greedy and sampled, and takes the
+/// plain twin's ids: its passes draw from the verified rows with the bias
+/// added, as its steps do. -100 on `c` keeps every `c` out, +3 on `d` lifts
+/// it over the mock's echo where it follows, so the bias moves the ids.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_biased_request_drafts() {
+    let (dlog, plog) = (log(), log());
+    let drafted = serve(drafting(4096), &dlog);
+    let plain = serve(drafting(4096).without_sampled(), &plog);
+    let id = |c: &str| u64::from(serve::MockTokenizer.encode(c)[0]);
+    let bias = json!({id("c").to_string(): -100, id("d").to_string(): 3.0});
+    let (mut proposed, mut moved) = (0, false);
+    for temperature in [0.0, 0.8] {
+        for seed in 1..=4u64 {
+            let mut body = sampled(BRANCHY, 32, temperature, seed);
+            let (unbiased, _) = ids_of(plain, &body);
+            body["logit_bias"] = bias.clone();
+            let at = format!("T {temperature}, seed {seed}");
+            let (want, w) = ids_of(plain, &body);
+            let (got, v) = ids_of(drafted, &body);
+            assert_eq!(got, want, "{at}: {v}");
+            assert!(!got.contains(&id("c")), "{at}: {got:?}");
+            assert_eq!(
+                draft_counts(&w),
+                (0, 0),
+                "{at}: the plain twin drafted: {w}"
+            );
+            proposed += draft_counts(&v).0;
+            moved |= got != unbiased;
+        }
+    }
+    assert!(proposed > 0, "the biased requests drafted nothing");
+    assert!(moved, "the bias moved no id");
     assert!(count(&drain(&dlog), MockCall::Sampled) > 0, "no pass drew");
     assert_eq!(
         count(&drain(&plog), MockCall::Sampled),
