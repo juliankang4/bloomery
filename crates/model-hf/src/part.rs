@@ -25,6 +25,10 @@ use safetensors::{Dtype, Folder, Raw};
 
 use crate::folder::Constant;
 
+/// The most stored bytes one direct read of an NVFP4 stack's experts holds, unless a single
+/// expert is larger.
+const NVFP4_READ_MAX: u64 = 32 << 20;
+
 /// Why a part was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -183,6 +187,65 @@ impl Checkpoint {
         }
     }
 
+    /// Bound each direct read to a run of experts of at most `limit` stored bytes, allowing a
+    /// single larger expert whole; each run with the bytes its read holds, every stored tensor
+    /// with its two alignment blocks.
+    fn nvfp4_batches(
+        &self,
+        placed: &[(&str, &Placed)],
+        limit: u64,
+    ) -> Result<Vec<(Range<usize>, u64)>, Error> {
+        let mut runs = Vec::new();
+        let (mut first, mut bytes) = (0, 0u64);
+        for (i, source) in placed.iter().enumerate() {
+            let mut held = 0u64;
+            for n in stored(std::slice::from_ref(source)) {
+                let (_, range) = self.folder.file_range(n)?;
+                held = held
+                    .checked_add(range.end - range.start)
+                    .and_then(|n| n.checked_add((2 * DIRECT_ALIGN) as u64))
+                    .ok_or_else(|| refuse(source.0, "stored read bytes pass u64"))?;
+            }
+            if i > first && bytes.saturating_add(held) > limit {
+                runs.push((first..i, bytes));
+                first = i;
+                bytes = 0;
+            }
+            bytes = bytes
+                .checked_add(held)
+                .ok_or_else(|| refuse(source.0, "stored read bytes pass u64"))?;
+        }
+        if first < placed.len() {
+            runs.push((first..placed.len(), bytes));
+        }
+        Ok(runs)
+    }
+
+    /// Read one bounded input batch at a time into the stack's single output allocation.
+    fn read_nvfp4(&self, placed: &[(&str, &Placed)], limit: u64) -> Result<Normal, Error> {
+        let mut stack = modelopt::Nvfp4Stack::new(placed.len());
+        for (run, _) in self.nvfp4_batches(placed, limit)? {
+            let sources = &placed[run];
+            let read = Wholes::read(&self.folder, stored(sources))?;
+            for &source in sources {
+                stack.push(|n| self.raw(read.as_ref(), n), source)?;
+            }
+        }
+        Ok(stack.finish()?)
+    }
+
+    /// Prefer the direct batch's bytes, using the mapping when direct reads are unsupported.
+    fn raw<'a>(
+        &'a self,
+        read: Option<&'a Wholes<'_>>,
+        name: &str,
+    ) -> Result<safetensors::Raw<'a>, safetensors::Error> {
+        match read.and_then(|w| w.raw(name)) {
+            Some(raw) => Ok(raw),
+            None => self.folder.raw(name),
+        }
+    }
+
     /// The card type `name`, made as `m`, is normalized into.
     fn card_type(&self, name: &str, m: &Made) -> Result<GgmlType, Error> {
         let format = modelopt::format_of(&self.placed(m))?;
@@ -295,36 +358,36 @@ impl Source for Checkpoint {
         // reads probes it with two ([`DirectFile::open`]), one shard at a time.
         let direct = (3 * DIRECT_ALIGN) as u64;
         if ty == GgmlType::NVFP4 && p.at.is_none() && m.step.is_none() {
-            // An NVFP4 matrix read whole (`modelopt::normalize`): its stored tensors in one direct
-            // buffer, each compressed block scale decoded to an eighth of its weight's bytes
-            // beside one weight's u16 and u32 parts widened to u32 words, and its blocks
-            // allocated once at their length, with one tensor scale an expert.
-            let (mut bytes, mut words) = (direct, 0u64);
-            for &(source, pl) in &placed {
-                let mut parts = 0u64;
-                for companion in &pl.companions {
-                    let n = len(companion)?;
-                    bytes = sum(bytes, sum(n, (2 * DIRECT_ALIGN) as u64)?)?;
-                    let size = self.folder.raw(companion)?.dtype.size() as u64;
-                    if size > 1 {
-                        let widened = (n / size)
-                            .checked_mul(4)
-                            .ok_or_else(|| refuse(name, "read bytes pass u64"))?;
-                        parts = sum(parts, widened)?;
+            // One bounded batch of stored inputs, the current expert's decoded scales and
+            // widened companion words, and the stack's single output allocation coexist.
+            let mut peak = 0;
+            for (run, held) in self.nvfp4_batches(&placed, NVFP4_READ_MAX)? {
+                let mut scratch = 0;
+                for &(source, pl) in &placed[run] {
+                    let mut words = 0;
+                    for n in stored(&[(source, pl)]).filter(|&n| n != source) {
+                        let dtype = self.folder.raw(n)?.dtype.size() as u64;
+                        if dtype > 1 {
+                            words = sum(
+                                words,
+                                (len(n)? / dtype)
+                                    .checked_mul(4)
+                                    .ok_or_else(|| refuse(name, "read bytes pass u64"))?,
+                            )?;
+                        }
+                    }
+                    if compressed {
+                        scratch = scratch.max(sum(len(source)?.div_ceil(8), words)?);
                     }
                 }
-                let weight = len(source)?;
-                bytes = sum(bytes, sum(weight, (2 * DIRECT_ALIGN) as u64)?)?;
-                if compressed {
-                    bytes = sum(bytes, weight.div_ceil(8))?;
-                    words = words.max(parts);
-                }
+                peak = peak.max(sum(sum(direct, held)?, scratch)?);
             }
             let scales = (placed.len() as u64)
                 .checked_mul(8)
                 .ok_or_else(|| refuse(name, "read bytes pass u64"))?;
-            return sum(sum(bytes, words)?, sum(whole.nbytes, scales)?);
+            return sum(peak, sum(whole.nbytes, scales)?);
         }
+
         // Direct inputs, or growing cut buffers; decoded companion words and widened plain
         // values coexist with them. A step may shrink the tensor, so its pre-step output is
         // bounded from the stored bytes too. Output capacity can grow to twice its length.
@@ -387,27 +450,29 @@ impl Source for Checkpoint {
         let ty = self.card_type(name, m)?;
         // A whole tensor's stored bytes are read into memory of the read's own ([`Wholes::read`]);
         // a part reads only its rows through the mapping.
-        let read = match p.at.is_none() || m.step.is_some() {
+        let streamed = ty == GgmlType::NVFP4 && p.at.is_none() && m.step.is_none();
+        let read = match !streamed && (p.at.is_none() || m.step.is_some()) {
             true => Wholes::read(&self.folder, stored(&placed))?,
             false => None,
         };
-        let get = |n: &str| match read.as_ref().and_then(|w| w.raw(n)) {
-            Some(raw) => Ok(raw),
-            None => self.folder.raw(n),
-        };
-        let n = match (&p.at, &m.step) {
-            (Some(At::Along(dim, r)), None) => {
-                modelopt::normalize_part(get, &placed, m.role, &m.dims, (*dim, r.clone()))?
-            }
-            (Some(At::Experts(list)), None) => {
-                modelopt::normalize(get, &self.listed(name, m, list)?, m.role)?
-            }
-            _ => {
-                let mut n = modelopt::normalize(get, &placed, m.role)?;
-                if let Some(step) = &m.step {
-                    step(&mut n).map_err(Error::Step)?;
+        let get = |n: &str| self.raw(read.as_ref(), n);
+        let n = if streamed {
+            self.read_nvfp4(&placed, NVFP4_READ_MAX)?
+        } else {
+            match (&p.at, &m.step) {
+                (Some(At::Along(dim, r)), None) => {
+                    modelopt::normalize_part(get, &placed, m.role, &m.dims, (*dim, r.clone()))?
                 }
-                n
+                (Some(At::Experts(list)), None) => {
+                    modelopt::normalize(get, &self.listed(name, m, list)?, m.role)?
+                }
+                _ => {
+                    let mut n = modelopt::normalize(get, &placed, m.role)?;
+                    if let Some(step) = &m.step {
+                        step(&mut n).map_err(Error::Step)?;
+                    }
+                    n
+                }
             }
         };
         let whole = whole(name, ty, &m.dims)?;
@@ -1118,10 +1183,10 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A stack of `experts` compressed-tensors NVFP4 experts (codes, block scales, a divisor and
-    /// an input scale each, as MiniMax-M3.1 stores them), each expert in a shard of its own, and
-    /// the 2-D `lone.weight` in `model.safetensors`.
-    fn stack(dir: &std::path::Path, experts: usize) -> Checkpoint {
+    /// A stack of `experts` compressed-tensors NVFP4 experts of `rows` rows (codes, block scales,
+    /// a divisor and an input scale each, as MiniMax-M3.1 stores them), each expert in a shard of
+    /// its own, and the 2-D `lone.weight` in `model.safetensors`.
+    fn stack(dir: &std::path::Path, experts: usize, rows: usize) -> Checkpoint {
         let f32s = |v: f32| v.to_le_bytes().to_vec();
         let mut shards: Vec<(String, Vec<Stored>)> = vec![(
             "model.safetensors".into(),
@@ -1149,14 +1214,14 @@ pub(crate) mod tests {
                     (
                         format!("ex.{e}.w"),
                         "U8",
-                        vec![32, 64],
-                        bytes(2048, |i| (i * 13 + 41 * e) as u8),
+                        vec![rows, 64],
+                        bytes(rows * 64, |i| (i * 13 + 41 * e) as u8),
                     ),
                     (
                         format!("ex.{e}.s"),
                         "F8_E4M3",
-                        vec![32, 8],
-                        bytes(256, |i| 0x30 + ((i + 3 * e) % 11) as u8),
+                        vec![rows, 8],
+                        bytes(rows * 8, |i| 0x30 + ((i + 3 * e) % 11) as u8),
                     ),
                     (
                         format!("ex.{e}.g"),
@@ -1208,7 +1273,7 @@ pub(crate) mod tests {
                 "ex.weight".to_string(),
                 made(
                     (0..experts).map(|e| format!("ex.{e}.w")).collect(),
-                    &[128, 32, experts as u64],
+                    &[128, rows as u64, experts as u64],
                 ),
             ),
             ("lone.weight".into(), made(vec!["lone.w".into()], &[128, 8])),
@@ -1226,7 +1291,7 @@ pub(crate) mod tests {
     #[test]
     fn a_stack_s_listed_experts_are_the_same_part_from_the_folder_and_its_gguf() {
         let dir = temp_dir("listed");
-        let f = stack(&dir, 4);
+        let f = stack(&dir, 4, 32);
         let g = gguf_of(&f, &dir.join("model.gguf"));
         let list = |ids: &[u32], n: u64| ExpertList::new(ids.to_vec(), n).unwrap();
         let listed = |name: &'static str, l: ExpertList| {
@@ -1334,7 +1399,7 @@ pub(crate) mod tests {
             return;
         }
         let dir = temp_dir("many-shards");
-        let c = stack(&dir, 64);
+        let c = stack(&dir, 64, 32);
         let placed = c.placed(&c.made["ex.weight"]);
         if Wholes::read(&c.folder, stored(&placed)).unwrap().is_none() {
             eprintln!("direct reads unsupported; descriptor-limit check skipped");
@@ -1404,7 +1469,8 @@ pub(crate) mod tests {
     /// Each part read whole holds at most its read bytes on the reading thread, counted by the
     /// allocator: stored inputs, decoded and widened scales, scratch and the result. An NVFP4
     /// matrix's read bytes pass that peak by at most two alignment blocks a stored tensor and the
-    /// three of the direct buffer and its shard's probe, where its shard takes direct reads.
+    /// three of the direct buffer and its shard's probe, where its shard takes direct reads. A
+    /// stack over the production read limit is read and counted in runs of two of its experts.
     ///
     /// FAIL-first: the `csf` stack's read bytes without its decoded scales, and the BF16 matrix's
     /// without its direct buffer's alignment and its shard's open probe, fall under their peaks;
@@ -1428,6 +1494,58 @@ pub(crate) mod tests {
         for p in &planned {
             let name = &p.info.name;
             let read_bytes = c.read_bytes(p).unwrap();
+            if name == "cf.weight" {
+                let placed = c.placed(&c.made[name]);
+                let input: u64 = stored(&placed)
+                    .map(|n| {
+                        c.folder.raw(n).unwrap().bytes.len() as u64 + (2 * DIRECT_ALIGN) as u64
+                    })
+                    .sum();
+                let decoded = c.folder.raw(placed[0].0).unwrap().bytes.len() as u64 / 8;
+                let words: u64 = placed[0]
+                    .1
+                    .companions
+                    .iter()
+                    .map(|n| {
+                        let raw = c.folder.raw(n).unwrap();
+                        if raw.dtype.size() > 1 {
+                            (raw.bytes.len() / raw.dtype.size() * 4) as u64
+                        } else {
+                            0
+                        }
+                    })
+                    .sum();
+                let bound =
+                    p.info.nbytes + input + decoded + words + (3 * DIRECT_ALIGN) as u64 + 16;
+                assert!(
+                    read_bytes <= bound,
+                    "{name}: {read_bytes} > one expert's scale bound {bound}"
+                );
+                // A run holds its experts while their stored bytes fit the limit, a run past it
+                // flushes before the next expert, and an expert alone over it is read whole.
+                let batches = |limit| c.nvfp4_batches(&placed, limit).unwrap();
+                assert_eq!(batches(input), [(0..2, input)]);
+                let runs = |limit| {
+                    batches(limit)
+                        .into_iter()
+                        .map(|(r, _)| r)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(runs(input - 1), [0..1, 1..2]);
+                assert_eq!(runs(1), [0..1, 1..2]);
+                let (whole_peak, whole) = peak(|| c.read_nvfp4(&placed, input).unwrap());
+                let (split_peak, split) = peak(|| c.read_nvfp4(&placed, 1).unwrap());
+                assert_eq!(
+                    split, whole,
+                    "bounded reads keep every expert's bytes and scales"
+                );
+                if direct {
+                    assert!(
+                        split_peak < whole_peak,
+                        "split read peak {split_peak} must be below whole read peak {whole_peak}"
+                    );
+                }
+            }
             let (held, part) = peak(|| c.read(p).unwrap());
             drop(part);
             assert!(read_bytes >= held, "{name}: {read_bytes} < {held}");
@@ -1455,6 +1573,38 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("v.weight")
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Three experts of which two fit the production read limit: the read holds two experts'
+        // stored bytes at most, and its read bytes count the larger first run, not the last.
+        let dir = temp_dir("read-peak-batches");
+        let c = stack(&dir, 3, 160 << 10);
+        let planned = c
+            .plan(|t: &str, _: GgmlType, _: &[u64]| {
+                Ok::<_, String>(if t == "ex.weight" {
+                    Take::Whole
+                } else {
+                    Take::Skip
+                })
+            })
+            .unwrap();
+        let p = &planned[0];
+        let expert: u64 = ["w", "s", "g", "i"]
+            .iter()
+            .map(|t| {
+                let raw = c.folder.raw(&format!("ex.0.{t}")).unwrap();
+                raw.bytes.len() as u64 + (2 * DIRECT_ALIGN) as u64
+            })
+            .sum();
+        assert!(2 * expert <= NVFP4_READ_MAX && 3 * expert > NVFP4_READ_MAX);
+        let read_bytes = c.read_bytes(p).unwrap();
+        assert!(
+            (p.info.nbytes + 2 * expert..p.info.nbytes + 3 * expert).contains(&read_bytes),
+            "{read_bytes} does not count two of three experts of {expert} bytes"
+        );
+        let (held, part) = peak(|| c.read(p).unwrap());
+        drop(part);
+        assert!(read_bytes >= held, "{read_bytes} < {held}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
