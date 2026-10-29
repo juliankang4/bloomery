@@ -45,7 +45,7 @@ use crate::engine::Tokenizer;
 
 /// The symbols a mark is made of: ASCII, so `tojson` and `repr` write them as they are, caseless, and
 /// none a special token's spelling is made of.
-const SYMBOLS: &[u8] = b"~^@#$%*+=;?!";
+pub(crate) const SYMBOLS: &[u8] = b"~^@#$%*+=;?!";
 
 /// Why a chat prompt could not be guarded.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -60,47 +60,21 @@ pub(crate) enum GuardError {
     Severed { mark: String },
 }
 
-/// The symbol pairs the strings of a request and its template hold, as a bitmap.
+/// Symbol pairs held by the request's strings.
 struct Pairs {
     seen: Vec<bool>,
-    longest_tilde_run: usize,
 }
 
 impl Pairs {
     fn new() -> Pairs {
         Pairs {
             seen: vec![false; 256 * 256],
-            longest_tilde_run: 0,
         }
     }
 
     fn add(&mut self, text: &str) {
-        let longest = text.split(|c| c != '~').map(str::len).max().unwrap_or(0);
-        self.longest_tilde_run = self.longest_tilde_run.max(longest);
         for w in text.as_bytes().windows(2) {
             self.seen[usize::from(w[0]) << 8 | usize::from(w[1])] = true;
-        }
-    }
-
-    fn add_value(&mut self, v: &Value) {
-        match v {
-            // A string that holds JSON is read back by the template as the object it writes, so
-            // the mark must not be in that text either: the pairs of the decoded text are held
-            // as well as the pairs of the string that carries it.
-            Value::String(s) => {
-                self.add(s);
-                if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-                    self.add_value(&parsed);
-                }
-            }
-            Value::Array(a) => a.iter().for_each(|x| self.add_value(x)),
-            Value::Object(o) => {
-                for (k, x) in o {
-                    self.add(k);
-                    self.add_value(x);
-                }
-            }
-            Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
     }
 
@@ -116,12 +90,76 @@ impl Pairs {
             .filter(|&[a, b]| !self.holds(a, b));
         Some([free.next()?, free.next()?])
     }
+}
 
-    /// Two absent pieces: short symbol pairs when available, otherwise runs longer than any input's.
-    fn mark(&self) -> String {
-        match self.free() {
-            Some(pairs) => pairs.into_iter().flatten().map(char::from).collect(),
-            None => "~".repeat(2 * (self.longest_tilde_run + 1)),
+fn add_value(v: &Value, add: &mut dyn FnMut(&str)) {
+    match v {
+        // Templates can decode JSON strings, so their decoded strings count as well.
+        Value::String(s) => {
+            add(s);
+            if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                add_value(&parsed, add);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| add_value(x, add)),
+        Value::Object(o) => {
+            for (k, x) in o {
+                add(k);
+                add_value(x, add);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// The least frequent extension of `prefix` across the same strings used for the pair search.
+fn extension(prefix: &[u8], scan: &impl Fn(&mut dyn FnMut(&str))) -> (u8, usize) {
+    let mut next = [0; SYMBOLS.len()];
+    scan(&mut |text| {
+        for w in text.as_bytes().windows(prefix.len() + 1) {
+            if w.starts_with(prefix)
+                && let Some(i) = SYMBOLS.iter().position(|&b| b == w[prefix.len()])
+            {
+                next[i] += 1;
+            }
+        }
+    });
+    let i = (0..SYMBOLS.len())
+        .min_by_key(|&i| (next[i], i))
+        .expect("the marker alphabet is non-empty");
+    (SYMBOLS[i], next[i])
+}
+
+/// Two absent pieces, preferring pairs. Following the least frequent extension makes the
+/// fallback's length logarithmic in the number of input bytes, even beside long symbol runs.
+fn choose_mark(body: &Map<String, Value>, strings: &[&str]) -> String {
+    let scan = |add: &mut dyn FnMut(&str)| {
+        for s in strings {
+            add(s);
+        }
+        for (k, v) in body {
+            add(k);
+            add_value(v, add);
+        }
+    };
+    let mut seen = Pairs::new();
+    scan(&mut |text| seen.add(text));
+    if let Some(pairs) = seen.free() {
+        return pairs.into_iter().flatten().map(char::from).collect();
+    }
+    drop(seen);
+    let mut prefix = vec![SYMBOLS[0]];
+    loop {
+        let (next, count) = extension(&prefix, &scan);
+        prefix.push(next);
+        if count == 0 {
+            let piece: String = prefix.into_iter().map(char::from).collect();
+            // Distinct endings keep the mark from sliding across a neighbouring symbol run.
+            return format!(
+                "{piece}{}{piece}{}",
+                char::from(SYMBOLS[0]),
+                char::from(SYMBOLS[1])
+            );
         }
     }
 }
@@ -141,7 +179,7 @@ pub(crate) struct Guard<'a> {
 impl<'a> Guard<'a> {
     /// A guard whose mark no string of `body` (the request), `strings` (the template's source and
     /// the server's own texts) holds. The mark is chosen only when client text needs guarding;
-    /// two absent symbol pairs are preferred, with a longer absent run when all pairs occur.
+    /// two absent symbol pairs are preferred, with a longer absent piece when the pairs run out.
     pub(crate) fn new(
         tok: &'a dyn Tokenizer,
         body: &'a Map<String, Value>,
@@ -182,17 +220,8 @@ impl<'a> Guard<'a> {
                 if matches!(self.tok.guard(text, "~"), Cow::Borrowed(_)) {
                     return Cow::Borrowed(text);
                 }
-                self.mark.get_or_init(|| {
-                    let mut seen = Pairs::new();
-                    for s in &self.strings {
-                        seen.add(s);
-                    }
-                    for (k, v) in self.body {
-                        seen.add(k);
-                        seen.add_value(v);
-                    }
-                    seen.mark()
-                })
+                self.mark
+                    .get_or_init(|| choose_mark(self.body, &self.strings))
             }
         };
         let guarded = self.tok.guard(text, mark);

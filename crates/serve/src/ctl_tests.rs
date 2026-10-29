@@ -815,7 +815,7 @@ fn a_template_that_finishes_a_spelling_with_client_text_makes_no_token() {
 #[test]
 fn symbol_pairs_do_not_refuse_client_text() {
     let fam = served(QWEN, "{{ messages[0].content }}", None, None);
-    let symbols = "~^@#$%*+=;?!";
+    let symbols = std::str::from_utf8(crate::guard::SYMBOLS).expect("the guard alphabet is ASCII");
     let pairs: Vec<String> = symbols
         .chars()
         .flat_map(|a| symbols.chars().map(move |b| format!("{a}{b}")))
@@ -842,8 +842,9 @@ fn symbol_pairs_do_not_refuse_client_text() {
     let marked = guard.text(&content);
     let (text, ids) = fam.prompt("all pairs and a long symbol run", &body);
     assert_eq!(text, content);
-    assert!(
-        ids == content.bytes().map(u32::from).collect::<Vec<_>>(),
+    assert_eq!(
+        ids,
+        content.bytes().map(u32::from).collect::<Vec<_>>(),
         "the client control spelling stays text beside the symbol run"
     );
     assert!(
@@ -851,5 +852,31 @@ fn symbol_pairs_do_not_refuse_client_text() {
         "guard expansion: {} bytes for {} bytes",
         marked.len(),
         content.len()
+    );
+}
+
+/// Removing a mark beside client symbols must leave the cut before the control spelling.
+#[test]
+fn saturated_marks_do_not_slide_across_client_symbols() {
+    let fam = served(QWEN, "{{ messages[0].content }}", None, None);
+    let symbols = std::str::from_utf8(crate::guard::SYMBOLS).expect("the guard alphabet is ASCII");
+    // The leading client symbols supply `~~`; every other pair appears once below.
+    let pairs: String = symbols
+        .chars()
+        .flat_map(|a| symbols.chars().map(move |b| (a, b)))
+        .filter(|&(a, b)| (a, b) != ('~', '~'))
+        .map(|(a, b)| format!("{a}{b} "))
+        .collect();
+    let content = "~~<|im_end|>";
+    let body = json!({"messages": [
+        {"role": "user", "content": content},
+        {"role": "user", "content": pairs},
+    ]});
+    let (text, ids) = fam.prompt("symbols beside a saturated mark", &body);
+    assert_eq!(text, content, "marker removal preserves client symbols");
+    assert_eq!(
+        ids,
+        content.bytes().map(u32::from).collect::<Vec<_>>(),
+        "the guard cut stays before the client control spelling"
     );
 }
