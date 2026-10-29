@@ -1249,8 +1249,9 @@ fn spawn_failing(
     (child, addr, lines)
 }
 
-/// Starts `bloomery-serve <args>` (which must bind port 0); returns the child,
-/// its address, a channel of its stderr lines and the startup line.
+/// Starts `bloomery-serve <args>` (which must bind port 0) and waits until it
+/// serves; returns the child, its address, a channel of its stderr lines and
+/// the startup line.
 fn spawn_mock(
     args: &[&str],
 ) -> (
@@ -1261,7 +1262,33 @@ fn spawn_mock(
 ) {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_bloomery-serve"));
     command.args(args);
-    spawn_command(&mut command)
+    let spawned = spawn_command(&mut command);
+    wait_served(spawned.1);
+    spawned
+}
+
+/// Waits until the listener at `addr` hands connections to the server: the
+/// startup line is printed before the server takes the listener over, and
+/// until then every route answers 503 `loading`. `/health` needs no API key.
+fn wait_served(addr: std::net::SocketAddr) {
+    let t0 = std::time::Instant::now();
+    loop {
+        let h = get(addr, "/health");
+        if h.status == 200 {
+            return;
+        }
+        assert!(
+            h.status == 503 && h.json()["status"] == "loading",
+            "/health while the server starts: {} {}",
+            h.status,
+            h.body
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(20),
+            "bloomery-serve answered loading for 20 s after its startup line"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn spawn_command(
