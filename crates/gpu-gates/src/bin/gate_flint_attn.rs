@@ -17,6 +17,11 @@
 //! the positive-finite scale) with no rotation. A host rotation of that
 //! result is far from the kernel's output. A position at `ctx` raises
 //! `cache_pos`, NaNs the token and appends nothing.
+//!
+//! Every head-128 append (plane and ring, with and without rope) raises
+//! `cache_value` for a key gain whose product rounds past f16 and for a NaN
+//! or past-f16 value, and stores NaN in exactly those cache lanes; every
+//! other lane holds the host's rounding of the same f32 source.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -32,6 +37,7 @@ mod gate {
     use bloomery_gpu::qk_rms::{HEAD as RMS_HEAD, QkRmsArgs, QkRmsKernels};
     use bloomery_gpu::rope_neox::NeoxArgs;
     use bloomery_gpu::{Gpu, GpuError, LAYER_NONE};
+    use bloomery_gpu_gates::rope_gate::cache_bits;
     use bloomery_gpu_gates::rounding::butterfly;
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
     use cuda_core::DeviceBuffer;
@@ -934,6 +940,105 @@ mod gate {
         Ok(ok)
     }
 
+    /// Every head-128 append path (plane and ring, with and without rope)
+    /// raises `cache_value` for a key gain that rounds past f16 and for a
+    /// NaN or past-f16 value, storing NaN in exactly those cache lanes.
+    fn cache_value_case(
+        gpu: &Gpu,
+        loaded: &LoadedAttention,
+        rotate: bool,
+        rows: usize,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let (ctx, kv, p) = (8usize, 1usize, 5usize);
+        let heads = kv * GROUP;
+        let mut table_h = vec![0.0f32; ctx * HEAD];
+        for q in 0..ctx {
+            for d in 0..HEAD / 2 {
+                let angle = q as f64 * 10000.0f64.powf(-((2 * d) as f64) / HEAD as f64);
+                table_h[q * HEAD + 2 * d] = angle.cos() as f32;
+                table_h[q * HEAD + 2 * d + 1] = angle.sin() as f32;
+            }
+        }
+        let q_h: Vec<f32> = (0..heads * HEAD)
+            .map(|i| sample(p, i / HEAD, i % HEAD, 3))
+            .collect();
+        let k_h = vec![1.0f32; kv * HEAD];
+        let clean_v: Vec<f32> = (0..kv * HEAD).map(|d| sample(p, 0, d, 29)).collect();
+        let mut bad_gain = vec![1.0f32; HEAD];
+        bad_gain[3] = 1.0e5;
+        let mut bad_v = clean_v.clone();
+        bad_v[5] = f32::NAN;
+        bad_v[70] = 65520.0;
+        let table = DeviceBuffer::from_host(stream, &table_h)?;
+        let pos = DeviceBuffer::from_host(stream, &[p as u32])?;
+        let gq = DeviceBuffer::from_host(stream, &vec![1.0f32; HEAD])?;
+        let sentinel = vec![SENTINEL; kv * rows * HEAD];
+        let row = (p % rows) * HEAD;
+        let mut ok = true;
+        for (name, gain_h, v_h) in [
+            ("key gain 1e5", &bad_gain, &clean_v),
+            ("value NaN and 65520", &vec![1.0f32; HEAD], &bad_v),
+        ] {
+            let mut q = DeviceBuffer::from_host(stream, &q_h)?;
+            let mut kd = DeviceBuffer::from_host(stream, &k_h)?;
+            let v = DeviceBuffer::from_host(stream, v_h)?;
+            let gk = DeviceBuffer::from_host(stream, gain_h)?;
+            let mut ck = DeviceBuffer::from_host(stream, &sentinel)?;
+            let mut cv = DeviceBuffer::from_host(stream, &sentinel)?;
+            gpu.take_fault()?;
+            // SAFETY: one token, so its position is distinct modulo rows.
+            unsafe {
+                loaded.enqueue_append(
+                    stream,
+                    NeoxArgs {
+                        q: &mut q,
+                        k: &mut kd,
+                        v: &v,
+                        gq: &gq,
+                        gk: &gk,
+                        table: &table,
+                        pos: &pos,
+                        eps: EPS,
+                        n_head: heads,
+                        n_kv: kv,
+                        ctx,
+                        m: 1,
+                        fault: gpu.unlabelled_sink(),
+                        cache_k: &mut ck,
+                        cache_v: &mut cv,
+                    },
+                    rows,
+                    rotate,
+                )?;
+            }
+            stream.synchronize()?;
+            let k_out = kd.to_host_vec(stream)?;
+            let mut want_k = sentinel.clone();
+            let mut want_v = sentinel.clone();
+            for d in 0..HEAD {
+                want_k[row + d] = cache_bits(k_out[d]);
+                want_v[row + d] = cache_bits(v_h[d]);
+            }
+            let marked = want_k
+                .iter()
+                .chain(&want_v)
+                .filter(|h| **h == 0x7e00)
+                .count();
+            let cache = ck.to_host_vec(stream)? == want_k && cv.to_host_vec(stream)? == want_v;
+            let fault = gpu.take_fault()?;
+            let want = Some(Fault::at(LAYER_NONE, FaultSite::CacheValue));
+            ok &= clause(
+                "append cache value",
+                cache && marked > 0 && fault == want,
+                &format!(
+                    "{name} rotate={rotate} rows={rows} ctx={ctx} nan_lanes={marked} cache={cache} fault={fault:?}"
+                ),
+            );
+        }
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let gpu = Gpu::new()?;
@@ -962,6 +1067,8 @@ mod gate {
             ok &= loaded_case(&gpu, &loaded, rotate, WINDOW, 1024, 512)?;
             ok &= loaded_case(&gpu, &loaded, rotate, 0, 3072, 3)?;
             ok &= loaded_case(&gpu, &loaded, rotate, WINDOW, 3072, 3)?;
+            ok &= cache_value_case(&gpu, &loaded, rotate, 8)?;
+            ok &= cache_value_case(&gpu, &loaded, rotate, 4)?;
         }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }

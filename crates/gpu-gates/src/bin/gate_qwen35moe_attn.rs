@@ -1,3 +1,5 @@
+//! `--kernel-faults` runs only the model-less f16 cache and QSA score-sum faults.
+//!
 //! GPU gate for the card kernels of Qwen3.6-35B-A3B's full-attention layers,
 //! model-less at the model's shapes: 16 query heads over 2 key/value heads
 //! (group 8) of 256 values, a NEOX rope over the first 64 values at θ 1e7,
@@ -24,6 +26,9 @@
 //!    values, packed by `weights::q8_0_planes`, a rerun bit for bit; and a
 //!    value holding a NaN refuses its block — `kv_quant`, a NaN scale and zero
 //!    codes, every other bit the clean run's.
+//!    The f16 store-only append raises `cache_value` on a non-finite K/V
+//!    value or f16 overflow, marking that value NaN; finite boundary inputs
+//!    retain the host conversion bits.
 //! 2. Decode flash (`flash_gqa::enqueue_pass_256`), both segment passes: each
 //!    output within its first-order bound of the exact attention computed here
 //!    in f64 on the same f16 keys and values (the model of
@@ -140,6 +145,8 @@
 //!     % 4 != 3`, they also take `3 − t` cells of the 513th pool in ggml's tie
 //!     order (`t` the tail's cells); these kernels do not (`runtime::qsa`'s
 //!     test of the two cuts).
+//!     A finite gain whose four finite head dots sum past f32 raises
+//!     `pool_select` and stores the overflowing sum as computed.
 //! 11. The selected flash (`flash_gqa::enqueue_pass_256_p12_sel`) at counts up
 //!     to 2,051, over the lists the selection wrote (every token), bit for bit
 //!     the dense pack-of-four tensor-core flash at those counts — one-row and
@@ -596,7 +603,7 @@ mod gate {
                 rope_run(kern, gpu.stream(), i, p, f)
             })?;
         let keys = rope_keys_alone(gpu, kern, (&inp, &pos), shape)?;
-        Ok(exact && overflow && keys)
+        Ok(exact && overflow && keys && cache_value_check(gpu, kern)?)
     }
 
     /// Clause 1's launch at no query head (`n_head` 0, a store's append): over
@@ -636,6 +643,94 @@ mod gate {
             verdict(pass)
         );
         Ok(pass)
+    }
+
+    /// A store-only append refuses non-finite and overflowing cache values,
+    /// leaving every other cache bit equal to the finite boundary run.
+    fn cache_value_check(gpu: &Gpu, kern: &RopeNeoxKernels) -> Result<bool, GateError> {
+        let (mut inp, _) = rope_inputs()?;
+        inp.k.fill(1.0);
+        inp.gk.fill(1.0);
+        let boundary = [
+            0.0,
+            -0.0,
+            65504.0,
+            -65504.0,
+            65519.0,
+            -65519.0,
+            f32::from_bits(0x3380_0000),
+            f32::from_bits(0x3300_0000),
+        ];
+        for (i, v) in inp.v.iter_mut().enumerate() {
+            *v = boundary[i % boundary.len()];
+        }
+        let pos = vec![0];
+        let shape = RopeShape {
+            head: HEAD,
+            n_head: N_HEAD,
+            n_kv: N_KV,
+            ctx: ROPE_CTX,
+            eps: 0.0,
+        };
+        let run = |inp: &RopeIn, fault| {
+            rope_gate::run(gpu.stream(), inp, &pos, shape, fault, |s, args| {
+                // SAFETY: the single token owns its cache position.
+                unsafe {
+                    kern.enqueue_head_norm_neox_append_256(s, PartialNeoxArgs { n_head: 0, ..args })
+                }
+            })
+        };
+        let clean = run(&inp, gpu.unlabelled_sink())?;
+        let want = rope_gate::expected::<HEAD, ROT, QG_HEAD>(&inp, &pos, shape);
+        let exact = clean.ck == want.ck && clean.cv == want.cv && gpu.fault()?.is_none();
+        println!(
+            "rope f16 cache finite boundaries: store-only cache bit_exact_host={exact} {}",
+            verdict(exact)
+        );
+        let mut ok = exact;
+        for key in [false, true] {
+            for dim in [64, 192] {
+                for (name, bad) in [
+                    ("NaN", f32::NAN),
+                    ("Inf", f32::INFINITY),
+                    ("65520", 65520.0),
+                    ("-65520", -65520.0),
+                ] {
+                    let mut bad_in = inp.clone();
+                    if key {
+                        bad_in.gk[dim] = bad;
+                    } else {
+                        bad_in.v[dim] = bad;
+                    }
+                    let before = gpu.fault()?;
+                    let out = run(&bad_in, gpu.layer_sink(LAYER)?)?;
+                    let raised = gpu.take_fault()?;
+                    let fault = Some(Fault::at(u32::try_from(LAYER)?, FaultSite::CacheValue));
+                    let mut ck = clean.ck.clone();
+                    let mut cv = clean.cv.clone();
+                    let mut marked = true;
+                    if key {
+                        for h in 0..N_KV {
+                            let at = h * ROPE_CTX * HEAD + dim;
+                            marked &= half_to_f32(out.ck[at]).is_nan();
+                            ck[at] = out.ck[at];
+                        }
+                    } else {
+                        marked = half_to_f32(out.cv[dim]).is_nan();
+                        cv[dim] = out.cv[dim];
+                    }
+                    let others = out.ck == ck && out.cv == cv;
+                    let pass = before.is_none() && raised == fault && marked && others;
+                    println!(
+                        "rope f16 cache fault: key={key} dim={dim} {name} word={raised:?} \
+                        want={fault:?} NaN={marked} other_bits={others} {}",
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+            }
+        }
+        Ok(ok)
     }
 
     /// The q8_0 append's launch (`head_norm_neox_append_256_q8`) read back:
@@ -3064,6 +3159,72 @@ mod gate {
             .iter()
             .map(|v| v * IDX_SCALE)
             .collect()
+    }
+
+    /// Each head's dot is finite while the four-head score overflows f32.
+    fn score_sum_check(gpu: &Gpu, qk: &QsaKernels) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let ctx = (KEPT + 1) * POOL;
+        let mut idx = idx_inputs(stream, ctx, 561, false)?;
+        for cs in idx.table.as_chunks_mut::<2>().0 {
+            *cs = [1.0, 0.0];
+        }
+        idx.table_d = DeviceBuffer::from_host(stream, &idx.table)?;
+        let pooled = DeviceBuffer::from_host(
+            stream,
+            &vec![f32_to_f16_bits(1.0); pools_for(ctx) * IDX_DIM],
+        )?;
+        let q = vec![1.0; IDX_HEADS * IDX_DIM];
+        let mut scratch = QsaScratch::new(stream, 1, ctx, KEPT)?;
+        let mut ok = true;
+        for (gain, overflow) in [(1.0e35, false), (1.0e36, true)] {
+            idx.gq.fill(gain);
+            idx.gq_d = DeviceBuffer::from_host(stream, &idx.gq)?;
+            let before = gpu.fault()?;
+            let out = run_select(
+                qk,
+                stream,
+                gpu.layer_sink(LAYER)?,
+                &idx,
+                &pooled,
+                &q,
+                &[u32::try_from(ctx)?],
+                &mut scratch,
+            )?;
+            let raised = gpu.take_fault()?;
+            let dots: Vec<f32> = out
+                .q_out
+                .as_chunks::<IDX_DIM>()
+                .0
+                .iter()
+                .map(|head| {
+                    let mut a = [0.0f32; 4];
+                    for wd in (0..IDX_DIM / 2).step_by(4) {
+                        for p in 0..4 {
+                            a[p] = head[2 * (wd + p)].mul_add(1.0, a[p]);
+                            a[p] = head[2 * (wd + p) + 1].mul_add(1.0, a[p]);
+                        }
+                    }
+                    (a[0] + a[1]) + (a[2] + a[3])
+                })
+                .collect();
+            let finite = dots.iter().all(|d| d.is_finite() && *d > 0.0);
+            let sum = in_order([dots[0], dots[1], dots[2], dots[3]]);
+            let scores = out.scores.iter().all(|s| s.to_bits() == sum.to_bits());
+            let want = overflow.then_some(Fault::at(u32::try_from(LAYER)?, FaultSite::PoolSelect));
+            let pass = before.is_none()
+                && raised == want
+                && finite
+                && scores
+                && sum.is_infinite() == overflow;
+            println!(
+                "qsa score sum: gain={gain:e} dots={dots:?} sum={sum:e} \
+                finite_heads={finite} stored_sum={scores} word={raised:?} want={want:?} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
     }
 
     /// Every row's selection checks against the host: the query heads bit for
@@ -5760,6 +5921,19 @@ mod gate {
         let gpu = Gpu::new()?;
         let ctx = gpu.context();
         let rope = RopeNeoxKernels::load(ctx)?;
+        if std::env::args().any(|a| a == "--kernel-faults") {
+            println!(
+                "gate_qwen35moe_attn: PARTIAL run, the kernel-fault clauses only, not the gate"
+            );
+            let qk = QsaKernels::load(ctx)?;
+            let cache = cache_value_check(&gpu, &rope)?;
+            let score = score_sum_check(&gpu, &qk)?;
+            return if cache && score {
+                Ok(())
+            } else {
+                checks_failed()
+            };
+        }
         let rope_norm = RopeNormKernels::load(ctx)?;
         let k = FlashGqaKernels::load(ctx)?;
         let kp = FlashGqaPrefill::load(ctx)?;
@@ -5839,7 +6013,7 @@ mod gate {
         println!("qsa pool {}", verdict(s));
         ok &= s;
         tier::sc("10 qsa select: the score pass and the top-k")?;
-        let s = select_check(&gpu, &qk)?;
+        let s = select_check(&gpu, &qk)? && score_sum_check(&gpu, &qk)?;
         println!("qsa select {}", verdict(s));
         ok &= s;
         tier::sc("11-13 qsa selected flash: against the dense flash and the exact attention")?;
