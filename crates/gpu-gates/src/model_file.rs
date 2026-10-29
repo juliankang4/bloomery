@@ -22,7 +22,8 @@ use crate::GateError;
 mod fetch;
 #[cfg(feature = "hf")]
 pub use fetch::{
-    fetch_exact, hf_projector, hf_repo, name, quantized_from, resolve, sentence_prompts, take,
+    fetch_exact, hf_projector, hf_repo, name, quantized_from, repo_architecture, resolve,
+    sentence_prompts, take,
 };
 
 /// The refusal when nothing names the model.
@@ -103,9 +104,11 @@ fn folder_header(path: &Path) -> Result<Split, GateError> {
 }
 
 /// A present decision marker is a string; malformed metadata is not an absent head.
-pub fn decision_type(file: &Split) -> Result<Option<&str>, GateError> {
-    let key = file.arch_key("decision.type");
-    file.value(&key)
+pub fn decision_type<'a>(
+    key: &str,
+    value: Option<&'a gguf::Value>,
+) -> Result<Option<&'a str>, GateError> {
+    value
         .map(|value| {
             value
                 .as_str()
@@ -118,12 +121,12 @@ pub fn decision_type(file: &Split) -> Result<Option<&str>, GateError> {
 /// the decide seat's, whatever trunk it shares with a generative family. A marker that is not a
 /// string is `decision_type`'s error.
 pub fn refuse_decision_model(file: &Split) -> Result<(), GateError> {
-    match decision_type(file)? {
+    let key = file.arch_key("decision.type");
+    match decision_type(&key, file.value(&key))? {
         None => Ok(()),
         Some(kind) => Err(format!(
-            "a {} file declares {} = {kind}: a decision model is the decide seat's, not generation",
+            "a {} file declares {key} = {kind}: a decision model is the decide seat's, not generation",
             file.architecture().unwrap_or("<missing>"),
-            file.arch_key("decision.type")
         )
         .into()),
     }
@@ -245,9 +248,15 @@ mod tests {
                 std::process::id()
             ));
             let split = marked_header(&path, marker);
+            let key = split.arch_key("decision.type");
             match expected {
-                Ok(value) => assert_eq!(decision_type(&split).unwrap(), value),
-                Err(error) => assert_eq!(decision_type(&split).unwrap_err().to_string(), error),
+                Ok(value) => assert_eq!(decision_type(&key, split.value(&key)).unwrap(), value),
+                Err(error) => assert_eq!(
+                    decision_type(&key, split.value(&key))
+                        .unwrap_err()
+                        .to_string(),
+                    error
+                ),
             }
             drop(split);
             std::fs::remove_file(path).unwrap();

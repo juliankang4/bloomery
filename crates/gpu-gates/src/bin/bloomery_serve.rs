@@ -81,11 +81,14 @@
 //! prints the seat's usage, `--levers` its lever table, and a flag, value or lever the seat refuses
 //! ends the start with the seat's own refusal; beside llama-server's placement flags, whose levers
 //! are known once the cards are read, the levers wait for the seat's run. A `--head` selects the
-//! decide seat; without it or `--model`, the model file picks the seat, so only arguments every
-//! seat refuses end the start there, each
-//! refusal once with the seats that give it, and the picked seat reads them again once the file is
-//! known. What needs the model (its architecture, its context, its draft) is checked after the
-//! fetch.
+//! decide seat; without it or `--model`, the model file picks the seat: arguments every seat
+//! refuses end the start there, and arguments only some seats refuse read the `--hf` repo's
+//! listing and the architecture of the file it would fetch (a set's first shard's header by HTTP
+//! Range, a checkpoint's `config.json`) and end the start when the seats that may serve it refuse
+//! them (`drive::any_seat`), each refusal once with the seats that give it; a repo that cannot be
+//! read that way (`HF_HUB_OFFLINE`, no network) leaves the arguments to the picked seat, which
+//! reads them again once the file is known. What needs the rest of the model (its context, its
+//! draft) is checked after the fetch.
 //! Each seat's flags, records, `/props` fields and exit codes are its
 //! module's doc; `bloomery-serve-ds41` and `bloomery-serve-qwen38` are this
 //! binary's ds41 and qwen38 seats alone.
@@ -313,19 +316,24 @@ models (the --model word is optional with a model file: the file's architecture 
             }
         }
 
-        /// Whether the file whose first shard is `file` is this seat's. The qwen3 seat
-        /// serves a file by the program that runs its description's layers
-        /// ([`bloomery_gpu_gates::qwen_seat::Family::of`]); the other seats read the file's
-        /// `general.architecture` string: `qwen4exp` is not an `Arch` name, which is why
-        /// the seat of such a file is read from the string, and the glm seat takes both
-        /// spellings of its architecture through [`Arch::from_name`].
+        /// Whether the file whose first shard is `file` is this seat's ([`Model::serves_arch`]).
         fn serves(self, file: &Split) -> bool {
             let arch = file.architecture().unwrap_or("<missing>");
-            match self {
+            self.serves_arch(arch, Some(file)) == Some(true)
+        }
+
+        /// Whether a file of the `general.architecture` `arch` is this seat's. The qwen3 seat
+        /// serves a file by the program that runs its description's layers
+        /// ([`bloomery_gpu_gates::qwen_seat::Family::of`]), so it answers `None` without the
+        /// first shard `file`; the other seats by the architecture alone. `qwen4exp` is not an
+        /// `Arch` name, which is why the seat of such a file is read from the string, and the glm
+        /// seat takes both spellings of its architecture through [`Arch::from_name`].
+        fn serves_arch(self, arch: &str, file: Option<&Split>) -> Option<bool> {
+            Some(match self {
                 Model::Ds41 => matches!(arch, "deepseek41" | DEEPSEEK4),
                 Model::Qwen38 => arch == "qwen4exp",
                 Model::Glm => matches!(Arch::from_name(arch), Ok(Arch::Glm5next)),
-                Model::Qwen3 => bloomery_gpu_gates::qwen_seat::Family::of(file).is_ok(),
+                Model::Qwen3 => file.map(bloomery_gpu_gates::qwen_seat::Family::of)?.is_ok(),
                 Model::Mimo2 => arch == "mimo2",
                 Model::Solar2 => matches!(Arch::from_name(arch), Ok(Arch::SolarOpen2)),
                 Model::MinimaxM3 => matches!(Arch::from_name(arch), Ok(Arch::MiniMaxM3)),
@@ -336,7 +344,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Raon1 => matches!(Arch::from_name(arch), Ok(Arch::Raon1)),
                 Model::MuseSpark => matches!(Arch::from_name(arch), Ok(Arch::MuseSpark)),
                 Model::Flint => matches!(Arch::from_name(arch), Ok(Arch::Flint)),
-            }
+            })
         }
     }
 
@@ -445,6 +453,32 @@ models (the --model word is optional with a model file: the file's architecture 
         })?
     }
 
+    /// The seats a start with no `--model` and no `--head` may come to on a file whose
+    /// `general.architecture` is `arch` and decision type `decision`, both read before the fetch:
+    /// the decide seat alone for a file that carries a decision row's head
+    /// ([`serve::decide::pick`]); else the generative seat the architecture names
+    /// ([`Model::serves_arch`]), or the seats that take a file by its description, and
+    /// beside it the decide seat when the architecture is a row's backbone, which the repo's card
+    /// may seat there.
+    fn seats_of(arch: &str, decision: Option<&str>) -> Vec<Word> {
+        if decision.is_some() || decide::ROWS.iter().any(|r| r.in_file_arch(arch)) {
+            return vec![Word::Decide];
+        }
+        let named = |want| {
+            Model::ALL
+                .into_iter()
+                .filter(move |m| m.serves_arch(arch, None) == want)
+        };
+        let mut seats: Vec<Word> = match named(Some(true)).next() {
+            Some(seat) => vec![Word::Seat(seat)],
+            None => named(None).map(Word::Seat).collect(),
+        };
+        if decide::ROWS.iter().any(|r| r.backbones.contains(&arch)) {
+            seats.push(Word::Decide);
+        }
+        seats
+    }
+
     /// The refusal of a file of architecture `a` that no seat serves: what no
     /// program runs of it (the coverage list the plans refuse a file with)
     /// when the model reader describes it, else the seat words, with the
@@ -476,7 +510,8 @@ models (the --model word is optional with a model file: the file's architecture 
     fn file_facts() -> Result<(String, Option<String>, bool), GateError> {
         let path = ref_model_path()?;
         model_file::with_header(&path, |split| {
-            let decision = model_file::decision_type(split)?.map(str::to_owned);
+            let key = split.arch_key("decision.type");
+            let decision = model_file::decision_type(&key, split.value(&key))?.map(str::to_owned);
             Ok((
                 split.architecture().unwrap_or("<missing>").to_owned(),
                 decision,
@@ -560,7 +595,12 @@ models (the --model word is optional with a model file: the file's architecture 
             // No seat chosen yet; the seat's own usage follows once one is.
             return exit_with(NAME, Err(format!("{USAGE}\n{MODELS}").into()));
         }
-        if let Err(e) = early(word, &rest, std::env::vars_os()) {
+        if let Err(e) = early(
+            word,
+            &rest,
+            std::env::vars_os(),
+            &model_file::repo_architecture,
+        ) {
             return exit_with(NAME, Err(e));
         }
         // A driver that cannot run the CUDA 13 code ends the start before any
@@ -643,6 +683,8 @@ models (the --model word is optional with a model file: the file's architecture 
     type Run = fn(&[String], &side_seat::Flags) -> Result<ServeError, GateError>;
     /// A generative seat's `check` before the fetch ([`early`]).
     type Check = fn(&[String], bool, bool) -> Result<(), GateError>;
+    /// A `--hf` repo's model as [`early`] reads it: the architecture and the decision type.
+    type Held = Result<(String, Option<String>), GateError>;
 
     /// The entries of `seat`'s module: the start runs the one and [`early`] asks the other.
     fn entries(seat: Model) -> (Run, Check) {
@@ -684,11 +726,13 @@ models (the --model word is optional with a model file: the file's architecture 
     /// `--list-devices` and `--records-schema` are left to the start, and so is `--levers` where no
     /// seat is named or, at a generative seat, the placement flags hand levers over once the census
     /// is read. `vars` supplies the reference model and the llama-server variables the seats read as
-    /// flags.
+    /// flags, and `held` the architecture and decision type of a `--hf` repo's model, which narrow
+    /// the seats a start with no seat word may come to ([`any_seat`]).
     fn early(
         word: Option<Word>,
         args: &[String],
         vars: impl IntoIterator<Item = (OsString, OsString)>,
+        held: &dyn Fn(&hf::RepoRef) -> Held,
     ) -> Result<(), GateError> {
         let asked = |flag: &str| llama_launch::serve_option(args, flag);
         if asked(llama_place::LIST_DEVICES) || asked("--records-schema") {
@@ -743,9 +787,16 @@ models (the --model word is optional with a model file: the file's architecture 
             }
             (Word::Seat(_), Err(e)) => Err(e.to_string().into()),
         };
+        let seats = || match &source {
+            Some(hf::source::Source::Hf(r)) => held(r).ok().map(|(arch, decision)| {
+                let seats = seats_of(&arch, decision.as_deref());
+                (format!("--hf {r} holds a {arch} model"), seats)
+            }),
+            _ => None,
+        };
         match word {
             Some(word) => check(word),
-            None => any_seat(check),
+            None => any_seat(check, seats),
         }?;
         if source.is_none() {
             return Err(model_file::NONE.into());
@@ -754,29 +805,60 @@ models (the --model word is optional with a model file: the file's architecture 
     }
 
     /// `check` at every seat, for a start whose model file picks the seat ([`early`]): `Ok` when
-    /// one seat takes the arguments, else each refusal once, with the seats that give it.
-    fn any_seat(check: impl Fn(Word) -> Result<(), GateError>) -> Result<(), GateError> {
-        let mut refused: Vec<(String, Vec<&str>)> = Vec::new();
+    /// every seat takes the arguments. When only some do, `held` names the model and the seats it
+    /// may come to ([`seats_of`]), and the start ends unless one of those takes them; a model
+    /// `held` cannot name before the fetch (no `--hf`, no listing, a set it cannot read) leaves
+    /// the fetch to go on, and the seat the file picks reads the arguments after it. Each refusal
+    /// is said once, with the seats that give it.
+    fn any_seat(
+        check: impl Fn(Word) -> Result<(), GateError>,
+        held: impl FnOnce() -> Option<(String, Vec<Word>)>,
+    ) -> Result<(), GateError> {
         let words = Model::ALL.iter().map(|&m| Word::Seat(m));
-        for word in words.chain([Word::Decide]) {
-            let Err(e) = check(word) else {
-                return Ok(());
-            };
-            let e = e.to_string();
-            match refused.iter_mut().find(|(text, _)| *text == e) {
+        let refused: Vec<(Word, String)> = words
+            .chain([Word::Decide])
+            .filter_map(|word| check(word).err().map(|e| (word, e.to_string())))
+            .collect();
+        if refused.is_empty() {
+            return Ok(());
+        }
+        if refused.len() == Model::ALL.len() + 1 {
+            return Err(each_refusal("no seat takes these arguments", &refused));
+        }
+        let Some((model, seats)) = held() else {
+            return Ok(());
+        };
+        let refused: Vec<(Word, String)> = refused
+            .into_iter()
+            .filter(|(word, _)| seats.contains(word))
+            .collect();
+        if refused.len() < seats.len() {
+            return Ok(());
+        }
+        Err(each_refusal(
+            &format!("{model}, and no seat that may serve it takes these arguments"),
+            &refused,
+        ))
+    }
+
+    /// `head`, then each refusal of `refused` once, with the seats that give it.
+    fn each_refusal(head: &str, refused: &[(Word, String)]) -> GateError {
+        let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
+        for (word, e) in refused {
+            match grouped.iter_mut().find(|(text, _)| text == e) {
                 Some((_, seats)) => seats.push(word.word()),
-                None => refused.push((e, vec![word.word()])),
+                None => grouped.push((e, vec![word.word()])),
             }
         }
-        let lines: Vec<String> = refused
+        let lines: Vec<String> = grouped
             .iter()
             .map(|(e, seats)| format!("  --model {}: {e}", seats.join(", ")))
             .collect();
-        Err(format!(
-            "no seat takes these arguments, each refusing them as follows (--model names the seat):\n{}",
+        format!(
+            "{head}, each refusing them as follows (--model names the seat):\n{}",
             lines.join("\n")
         )
-        .into())
+        .into()
     }
 
     /// The process's exit for a seat's end, the decide seat's and the
@@ -799,6 +881,68 @@ models (the --model word is optional with a model file: the file's architecture 
 
         fn line(s: &str) -> Vec<String> {
             s.split_whitespace().map(str::to_owned).collect()
+        }
+
+        /// [`super::early`] where no `--hf` repo can be read before the fetch: the tests reach
+        /// no hub.
+        fn early(
+            word: Option<Word>,
+            args: &[String],
+            vars: impl IntoIterator<Item = (OsString, OsString)>,
+        ) -> Result<(), GateError> {
+            super::early(word, args, vars, &|r| Err(format!("{r}: no hub").into()))
+        }
+
+        /// A start with no seat word on a `--hf` repo whose model is read before the fetch
+        /// ([`seats_of`]): arguments some seats refuse end the start when the seats the model
+        /// may come to all refuse them, the model is not read for arguments every seat takes, and
+        /// a model that cannot be read leaves them to the seat after the fetch.
+        #[test]
+        fn a_repo_s_model_picks_the_seats_that_check_before_the_fetch() {
+            let held = |arch: &'static str, decision: Option<&'static str>| {
+                move |_: &hf::RepoRef| -> Held {
+                    Ok((arch.to_owned(), decision.map(str::to_owned)))
+                }
+            };
+            let start =
+                |arch, decision, s: &str| super::early(None, &line(s), [], &held(arch, decision));
+            for (arch, s, why) in [
+                ("qwen4exp", "--hf o/r --prefill steps", "--model qwen38: "),
+                (
+                    "nemotron_h",
+                    "--hf o/r --parallel 2",
+                    "--model nemotron: --parallel 2: the nemotron body holds one sequence",
+                ),
+            ] {
+                let e = start(arch, None, s).expect_err(s).to_string();
+                assert!(
+                    e.starts_with(&format!("--hf o/r holds a {arch} model")),
+                    "{s}: {e}"
+                );
+                assert!(e.contains(why), "{s}: {e}");
+                assert_eq!(e.lines().count(), 2, "{s}: one seat refuses: {e}");
+                early(None, &line(s), []).expect("an unread model leaves the fetch to go on");
+            }
+            start("glm5next", None, "--hf o/r --prefill steps").expect("the glm seat takes it");
+            start("nemotron_h", None, "--hf o/r --parallel 1").expect("one sequence");
+            let backbone = start("qwen35", None, "--hf o/r --prefill steps")
+                .expect_err("both the generative and card-selected decision seats refuse steps")
+                .to_string();
+            assert!(backbone.contains("--model qwen3: "), "{backbone}");
+            assert!(backbone.contains("--model decide: "), "{backbone}");
+            let decision = start("qwen35", Some("lev"), "--hf o/r --prefill steps")
+                .expect_err("a file with a decision type is the decide seat's")
+                .to_string();
+            assert!(
+                decision.lines().nth(1).is_some_and(|l| l
+                    .trim_start()
+                    .starts_with(&format!("--model {}: ", serve::decide::WORD))),
+                "{decision}"
+            );
+            super::early(None, &line("--hf o/r --ctx-size 8192"), [], &|_| {
+                panic!("arguments every seat takes need no model")
+            })
+            .expect("every seat takes it");
         }
 
         #[test]

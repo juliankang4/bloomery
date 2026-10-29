@@ -15,10 +15,12 @@ pub mod qwen3moe;
 mod section;
 mod trunk;
 
-/// A folder map's row in [`MAPS`]: the `model_type`s it reads and the open of a folder it reads.
+/// A folder map's row in [`MAPS`]: the `model_type`s it reads, the open of a folder it reads and
+/// the architecture it reads a config as.
 pub struct MapRow {
     pub model_types: &'static [&'static str],
     pub open: fn(&Path, &Json) -> Result<folder::Opened, folder::Error>,
+    pub architecture: fn(&Json) -> Result<&'static str, folder::Error>,
 }
 
 /// Every checkpoint folder map ([`FolderMap`]): [`folder::open`] picks the row whose `model_type`
@@ -27,22 +29,27 @@ pub const MAPS: &[MapRow] = &[
     MapRow {
         model_types: <qwen35moe::Checkpoint as FolderMap>::MODEL_TYPES,
         open: folder::open_as::<qwen35moe::Checkpoint>,
+        architecture: folder::architecture_as::<qwen35moe::Checkpoint>,
     },
     MapRow {
         model_types: <minimaxm3::Checkpoint as FolderMap>::MODEL_TYPES,
         open: folder::open_as::<minimaxm3::Checkpoint>,
+        architecture: folder::architecture_as::<minimaxm3::Checkpoint>,
     },
     MapRow {
         model_types: <qwen3moe::Checkpoint as FolderMap>::MODEL_TYPES,
         open: folder::open_as::<qwen3moe::Checkpoint>,
+        architecture: folder::architecture_as::<qwen3moe::Checkpoint>,
     },
     MapRow {
         model_types: <lfm3::Checkpoint as FolderMap>::MODEL_TYPES,
         open: folder::open_as::<lfm3::Checkpoint>,
+        architecture: folder::architecture_as::<lfm3::Checkpoint>,
     },
     MapRow {
         model_types: <nemotron_h::Checkpoint as FolderMap>::MODEL_TYPES,
         open: folder::open_as::<nemotron_h::Checkpoint>,
+        architecture: folder::architecture_as::<nemotron_h::Checkpoint>,
     },
 ];
 

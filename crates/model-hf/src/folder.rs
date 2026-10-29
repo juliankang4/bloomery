@@ -82,6 +82,10 @@ pub trait FolderMap: Sized {
     /// by name.
     fn parse(config: &Json) -> Result<Self, Error>;
 
+    /// The header's `general.architecture`: the config's alone, so a model is seated by it before
+    /// its files are read ([`architecture`]).
+    fn architecture(&self) -> &'static str;
+
     /// The class of the weight module `module`, for a quantization config that targets classes;
     /// `None` for another or unknown role.
     fn module_class(&self, module: &str) -> Option<ModuleClass>;
@@ -431,9 +435,31 @@ pub struct Opened {
 /// folder's.
 pub fn open(dir: &Path) -> Result<Opened, Error> {
     let config = read_config(dir)?;
-    let model_type = model_type_of(&config)
-        .ok_or_else(|| format!("{}: config.json names no model_type", dir.display()))?;
-    let row = crate::arch::MAPS
+    (map_of(&config, &dir.display())?.open)(dir, &config)
+}
+
+/// The `general.architecture` the header of a folder whose `config.json` holds `config` names,
+/// read from the config by the map [`open`] would pick ([`FolderMap::architecture`]).
+pub fn architecture(config: &[u8]) -> Result<&'static str, Error> {
+    let config: Json =
+        serde_json::from_slice(config).map_err(|e| Error::Refused(format!("config.json: {e}")))?;
+    (map_of(&config, &"config.json")?.architecture)(&config)
+}
+
+/// The architecture the map `M` reads `config` as ([`architecture`]).
+pub fn architecture_as<M: FolderMap>(config: &Json) -> Result<&'static str, Error> {
+    Ok(M::parse(config)?.architecture())
+}
+
+/// The row of [`crate::arch::MAPS`] that reads a folder whose config is `config`, by its
+/// `model_type`; `at` names the folder in a refusal.
+fn map_of(
+    config: &Json,
+    at: &dyn std::fmt::Display,
+) -> Result<&'static crate::arch::MapRow, Error> {
+    let model_type =
+        model_type_of(config).ok_or_else(|| format!("{at}: config.json names no model_type"))?;
+    crate::arch::MAPS
         .iter()
         .find(|row| row.model_types.contains(&model_type))
         .ok_or_else(|| {
@@ -441,12 +467,9 @@ pub fn open(dir: &Path) -> Result<Opened, Error> {
                 .iter()
                 .flat_map(|row| row.model_types.iter().copied())
                 .collect();
-            format!(
-                "{}: model_type {model_type:?} has no folder map; the maps read {known:?}",
-                dir.display()
-            )
-        })?;
-    (row.open)(dir, &config)
+            format!("{at}: model_type {model_type:?} has no folder map; the maps read {known:?}")
+                .into()
+        })
 }
 
 /// The model type of the folder `dir`'s `config.json`, which [`open`] picks its map by.
@@ -1516,10 +1539,14 @@ mod tests {
             (!steps.is_empty()).then(|| Box::new(|_: &mut Normal| Ok(())) as part::Step)
         }
 
+        fn architecture(&self) -> &'static str {
+            "toy"
+        }
+
         fn header(&self, _: &[(&str, &[u64])], _: &Folder) -> Result<Vec<(String, Value)>, Error> {
             Ok(vec![(
                 gguf::GENERAL_ARCHITECTURE.into(),
-                Value::String("toy".into()),
+                Value::String(self.architecture().into()),
             )])
         }
 

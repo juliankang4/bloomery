@@ -172,6 +172,10 @@ impl FolderMap for Checkpoint {
         steps.first().map(|&never| match never {})
     }
 
+    fn architecture(&self) -> &'static str {
+        ARCHITECTURE
+    }
+
     fn header(
         &self,
         _planned: &[(&str, &[u64])],
@@ -729,6 +733,8 @@ mod tests {
         }
         write_folder(&dir, &t, &config, &tokenizer("qwen2"));
         let opened = crate::folder::open(&dir).unwrap();
+        let named = crate::folder::architecture(config.to_string().as_bytes()).unwrap();
+        assert_eq!(Some(named), opened.header.architecture());
         let hp = Hparams::read(&opened.header).unwrap();
         assert_eq!(
             (hp.n_layer, hp.n_embd, hp.n_head, hp.n_head_kv),

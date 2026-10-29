@@ -184,6 +184,12 @@ mod tests {
         want.sort_unstable();
         let eh_proj = "blk.48.nextn.eh_proj.weight".to_string();
         let o = write(Some("BF16")).expect("a folder with a BF16 MTP layer");
+        let config = std::fs::read(dir.join("config.json")).unwrap();
+        let named = crate::folder::architecture(&config).unwrap();
+        assert_eq!(
+            (named, o.header.architecture()),
+            ("qwen4exp", Some("qwen4exp"))
+        );
         let draft = o
             .draft
             .as_ref()

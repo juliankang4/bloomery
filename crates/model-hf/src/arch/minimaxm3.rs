@@ -676,19 +676,24 @@ impl FolderMap for Checkpoint {
         })
     }
 
+    fn architecture(&self) -> &'static str {
+        "minimax-m3"
+    }
+
     fn header(
         &self,
         _planned: &[(&str, &[u64])],
         _folder: &Folder,
     ) -> Result<Vec<(String, Value)>, Error> {
+        let arch = self.architecture();
         let mut keys = vec![(
             gguf::GENERAL_ARCHITECTURE.to_string(),
-            Value::String("minimax-m3".into()),
+            Value::String(arch.into()),
         )];
         keys.extend(
             self.keys
                 .iter()
-                .map(|(suffix, v)| (format!("minimax-m3.{suffix}"), v.clone())),
+                .map(|(suffix, v)| (format!("{arch}.{suffix}"), v.clone())),
         );
         Ok(keys)
     }

@@ -705,7 +705,7 @@ impl Checkpoint {
 
     /// The header's keys: the architecture and the model keys under its name.
     fn keys(&self) -> Vec<(String, Value)> {
-        let arch = Arch::Moe.name();
+        let arch = self.architecture();
         let mut keys = vec![(
             gguf::GENERAL_ARCHITECTURE.to_string(),
             Value::String(arch.into()),
@@ -1042,6 +1042,10 @@ impl FolderMap for Checkpoint {
                     .try_for_each(|s| s.apply(n).map_err(|why| format!("{name}: {why}")))
             }) as part::Step
         })
+    }
+
+    fn architecture(&self) -> &'static str {
+        Arch::Moe.name()
     }
 
     fn header(

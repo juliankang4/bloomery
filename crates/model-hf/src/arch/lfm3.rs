@@ -424,6 +424,10 @@ impl FolderMap for Checkpoint {
         })
     }
 
+    fn architecture(&self) -> &'static str {
+        ARCHITECTURE
+    }
+
     fn header(
         &self,
         _planned: &[(&str, &[u64])],
