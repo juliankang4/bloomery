@@ -1,9 +1,11 @@
 //! Ring-addressed head-128 primitives. Logical positions index RoPE; only KV addresses wrap.
+//! The f16 appends raise [`FaultSite::CacheValue`] on a non-finite source or
+//! f16 overflow and mark that cache value NaN.
 
 use crate::GpuError;
 use crate::elem::rms_scale_of_mean_checked;
 use crate::fault::{FaultSink, FaultSite};
-use crate::flash::f32_to_f16_bits;
+use crate::flash::cache_f16_pair;
 use crate::flash::{MERGE_BATCH, online_fold};
 use crate::flash_gqa::{
     GROUP, HEAD, KEY_TILE, SEG_KEYS, merge_sink_body, seg_span, window_cut, window_segments,
@@ -161,11 +163,16 @@ mod append_kernels {
         // base + tid + 64 is inside v. One thread per pair. The tokens of
         // one launch hold distinct positions, so no two blocks write one row.
         unsafe {
-            *cache_k.get_unchecked_mut(row + tid) = f32_to_f16_bits(n0);
-            *cache_k.get_unchecked_mut(row + tid + THREADS) = f32_to_f16_bits(n1);
-            *cache_v.get_unchecked_mut(row + tid) = f32_to_f16_bits(*v.get_unchecked(base + tid));
-            *cache_v.get_unchecked_mut(row + tid + THREADS) =
-                f32_to_f16_bits(*v.get_unchecked(base + tid + THREADS));
+            let (k0, k1) = cache_f16_pair(n0, n1, fault);
+            let (v0, v1) = cache_f16_pair(
+                *v.get_unchecked(base + tid),
+                *v.get_unchecked(base + tid + THREADS),
+                fault,
+            );
+            *cache_k.get_unchecked_mut(row + tid) = k0;
+            *cache_k.get_unchecked_mut(row + tid + THREADS) = k1;
+            *cache_v.get_unchecked_mut(row + tid) = v0;
+            *cache_v.get_unchecked_mut(row + tid + THREADS) = v1;
         }
     }
 
@@ -317,11 +324,16 @@ mod append_kernels {
         // positions (the launch contract; the engine's embedding launch
         // writes consecutive ones), so no two blocks write one row.
         unsafe {
-            *cache_k.get_unchecked_mut(row + tid) = f32_to_f16_bits(y0);
-            *cache_k.get_unchecked_mut(row + tid + THREADS) = f32_to_f16_bits(y1);
-            *cache_v.get_unchecked_mut(row + tid) = f32_to_f16_bits(*v.get_unchecked(base + tid));
-            *cache_v.get_unchecked_mut(row + tid + THREADS) =
-                f32_to_f16_bits(*v.get_unchecked(base + tid + THREADS));
+            let (k0, k1) = cache_f16_pair(y0, y1, fault);
+            let (v0, v1) = cache_f16_pair(
+                *v.get_unchecked(base + tid),
+                *v.get_unchecked(base + tid + THREADS),
+                fault,
+            );
+            *cache_k.get_unchecked_mut(row + tid) = k0;
+            *cache_k.get_unchecked_mut(row + tid + THREADS) = k1;
+            *cache_v.get_unchecked_mut(row + tid) = v0;
+            *cache_v.get_unchecked_mut(row + tid + THREADS) = v1;
         }
     }
 }

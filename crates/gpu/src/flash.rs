@@ -97,6 +97,23 @@ pub(crate) fn f16_finite(h: u16) -> bool {
     h & 0x7c00 != 0x7c00
 }
 
+/// Round a cache pair once to f16; a non-finite source or rounded value
+/// raises the cache fault and leaves that lane marked NaN.
+#[inline(always)]
+pub(crate) fn cache_f16_pair(lo: f32, hi: f32, fault: FaultSink) -> (u16, u16) {
+    let bits = f32x2_to_f16x2_bits(lo, hi);
+    let (l, h) = (bits as u16, (bits >> 16) as u16);
+    let bad_lo = !lo.is_finite() || !f16_finite(l);
+    let bad_hi = !hi.is_finite() || !f16_finite(h);
+    if bad_lo || bad_hi {
+        fault.raise(FaultSite::CacheValue);
+    }
+    (
+        if bad_lo { 0x7e00 } else { l },
+        if bad_hi { 0x7e00 } else { h },
+    )
+}
+
 /// Latent tail this kernel family's geometry is built for, and so the block's
 /// thread count: one thread per latent dim. `enqueue_flash_latent` rejects
 /// any other latent width.
@@ -788,7 +805,8 @@ mod flash_kernels {
     /// past `dst_rows` (the cache's allocated height) is refused: `pos`
     /// comes from device memory, so that bound cannot be a launch contract;
     /// the row is stored nowhere and raises [`FaultSite::CachePos`] on
-    /// `fault`.
+    /// `fault`. A non-finite source or f16 overflow raises
+    /// [`FaultSite::CacheValue`] and stores NaN in that lane.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -828,7 +846,8 @@ mod flash_kernels {
         // SAFETY: i < total <= src.len(); pos + row < dst_rows and col <
         // width, so the store index is < dst_rows * width <= dst.len().
         unsafe {
-            *dst.get_unchecked_mut((pos + row) * w + col) = f32_to_f16_bits(*src.get_unchecked(i));
+            *dst.get_unchecked_mut((pos + row) * w + col) =
+                cache_f16_pair(*src.get_unchecked(i), 0.0, fault).0;
         }
     }
 
@@ -1908,7 +1927,9 @@ impl FlashKernels {
     /// `pos_buf[0]` on the device at run time — the captured-graph form: the
     /// graph replays unchanged while the position advances through the
     /// buffer. A row past the cache's height is refused in-kernel: stored
-    /// nowhere, it raises [`FaultSite::CachePos`] on `fault`. `pos_buf`
+    /// nowhere, it raises [`FaultSite::CachePos`] on `fault`. Non-finite
+    /// sources and f16 overflow raise [`FaultSite::CacheValue`] and store
+    /// NaN in the affected lanes. `pos_buf`
     /// must stay allocated and in place for as long as a captured graph
     /// replaying this launch lives. Asynchronous, allocation-free,
     /// capturable.

@@ -848,6 +848,9 @@ mod qsa_kernels {
                             + *ws.add(2 * POOL_TILE + lane))
                             + *ws.add(3 * POOL_TILE + lane)
                     };
+                    if !s.is_finite() {
+                        fault.raise(FaultSite::PoolSelect);
+                    }
                     let pool = p0 + lane;
                     // SAFETY: pool < nb <= ctx/4 <= pools and r0 + t < m, so
                     // (r0 + t)·pools + pool < m·pools <= scores.len(); one

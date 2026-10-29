@@ -701,7 +701,9 @@ gguf 7 2 0
 # and narrows its projection, ring and gain reads to separate unsafe scopes (2 additional blocks).
 # The pool's count reads and qsa_key_append's position and projection reads each have one scope per read
 # (1 and 2 additional blocks, respectively).
-gpu 2812 381 10
+# PIN(2026-10-29): gpu 2812 -> 2814 blocks: the f16 cache fault checks read their value pair before storing
+# (rope_neox.rs F16Sink::append and head_norm_neox_append), each under its source bounds with a SAFETY line.
+gpu 2814 381 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -810,7 +812,11 @@ gpu-flint 2 0 0
 # PIN(2026-10-27): gpu-gates 109 -> 114 blocks, new code, not old code relaxed: oxart_jit --cubin's driver link of a
 # bundle's PTX (cuLinkCreate, cuLinkAddData, cuLinkComplete, the copy of the linked image, cuLinkDestroy), one call a
 # block, each with its SAFETY line.
-gpu-gates 114 5 1
+# PIN(2026-10-29): gpu-gates 114 -> 115 blocks: the f16 cache boundary clause launches the store-only head-256
+# append over the distinct positions checked by rope_gate::run, with its SAFETY line.
+# PIN(2026-10-29): gpu-gates 115 -> 116 blocks: gate_flint_attn's cache-value clause launches the head-128 append of
+# one token (distinct modulo rows), with its SAFETY line.
+gpu-gates 116 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of

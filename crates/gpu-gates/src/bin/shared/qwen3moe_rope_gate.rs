@@ -64,10 +64,11 @@
 //! with every other block and both whole K planes the clean run's bits, and
 //! the word clean after a clean rerun. And a head of values whose squares
 //! overflow the f32 products (query head 0 and key head 0 of token 0 at
-//! `1e20`), through both entries: the named `FaultSite::F32Product` (with
-//! `KvQuant` beside it on the q8_0 entry), that head's values NaN and its key
-//! row stored as NaN, never the zeros an infinite sum scales it to, every
-//! other head and plane word the clean run's bits.
+//! `1e20`), through both entries: the named `FaultSite::F32Product`, with
+//! `CacheValue` beside it on the f16 entry and `KvQuant` on the q8_0 entry,
+//! that head's values NaN and its key row stored as NaN, never the zeros an
+//! infinite sum scales it to, every other head and plane word the clean run's
+//! bits.
 
 use bloomery_gpu::rope_neox::{RopeNeoxKernels, q8_plane_lens};
 use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable, ggml_rope_cache};
@@ -656,7 +657,10 @@ fn overflow_clause(
     let q8 = run_neox_q8(k, stream, sink, &rows, gq, gk, tab, hp.rms_eps, ctx)?;
     let word8 = gpu.take_fault()?;
     let layer = u32::try_from(layer)?;
-    let want = Some(Fault::at(layer, FaultSite::F32Product));
+    let want = Some(Fault::of_sites(
+        layer,
+        &[FaultSite::F32Product, FaultSite::CacheValue],
+    ));
     let want8 = Some(Fault::of_sites(
         layer,
         &[FaultSite::F32Product, FaultSite::KvQuant],

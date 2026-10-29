@@ -39,7 +39,7 @@ mod gate {
     use bloomery_gpu::{Gpu, GpuError, LAYER_NONE};
     use bloomery_gpu_gates::rope_gate::cache_bits;
     use bloomery_gpu_gates::rounding::butterfly;
-    use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
+    use bloomery_gpu_gates::{GateError, NAN_F16, bits_equal, checks_failed, verdict};
     use cuda_core::DeviceBuffer;
     use gguf::quant::{f32_to_f16_bits, half_to_f32};
 
@@ -1023,7 +1023,7 @@ mod gate {
             let marked = want_k
                 .iter()
                 .chain(&want_v)
-                .filter(|h| **h == 0x7e00)
+                .filter(|h| **h == NAN_F16)
                 .count();
             let cache = ck.to_host_vec(stream)? == want_k && cv.to_host_vec(stream)? == want_v;
             let fault = gpu.take_fault()?;
