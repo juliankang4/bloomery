@@ -22,7 +22,9 @@ use model::arch::models::{DraftSpec, MtpDraft, MtpSource};
 const Q38: &str = "/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
 /// The draft that uses the target's embedding and output matrix.
 const SHARED: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
-/// The draft that carries its own.
+/// The draft that carries its own, at the hub's revision 38bb39ee (sha256 cd87e5d1…). From
+/// revision efc50b7c on, the file (sha256 58a47d6a…) sets `compress_ratios[48]` to 4, a selecting
+/// MTP layer, which `mtp_of` refuses; the load refuses either by its own matrices.
 const OWN: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-Q8_0.gguf";
 
 // PIN(2026-09-28): the draft's description, both files alike but for the source line [the header

@@ -1044,11 +1044,8 @@ mod tests {
             c
         }
 
-        fn read_with(
-            &self,
-            tag: &str,
-            edit: impl FnOnce(&mut ModelSpec),
-        ) -> Result<MtpDraft, String> {
+        /// The target's and the draft's headers written and opened.
+        fn files(&self, tag: &str) -> (gguf::Split, gguf::Split) {
             let tpath = header_typed(
                 &format!("{tag}-t"),
                 "qwen4exp",
@@ -1063,15 +1060,24 @@ mod tests {
                 &self.global,
                 &self.tensors,
             );
-            let target = gguf::Split::open(&tpath).expect("the synthetic target opens");
-            let draft = gguf::Split::open(&dpath).expect("the synthetic draft opens");
+            (
+                gguf::Split::open(&tpath).expect("the synthetic target opens"),
+                gguf::Split::open(&dpath).expect("the synthetic draft opens"),
+            )
+        }
+
+        fn read_with(
+            &self,
+            tag: &str,
+            edit: impl FnOnce(&mut ModelSpec),
+        ) -> Result<MtpDraft, String> {
+            let (target, draft) = self.files(tag);
             let mut spec = super::super::spec::read(&target)
                 .expect("the target reads")
                 .spec;
             edit(&mut spec);
             let out = mtp_of(&draft, &target, &spec).map_err(|e| e.to_string());
-            let _ = std::fs::remove_file(&tpath);
-            let _ = std::fs::remove_file(&dpath);
+            remove(&target, &draft);
             out.map(|d| match d {
                 DraftSpec::Mtp(m) => *m,
                 DraftSpec::Block(_) => panic!("an MTP file read as a block draft"),
@@ -1085,6 +1091,15 @@ mod tests {
         fn refused(&self, tag: &str, want: &str) {
             let err = self.read(tag).expect_err("the draft is refused");
             assert!(err.contains(want), "want {want:?} in: {err}");
+        }
+    }
+
+    /// The header files [`Case::files`] wrote.
+    fn remove(target: &gguf::Split, draft: &gguf::Split) {
+        for split in [target, draft] {
+            if let Some(path) = split.shard_path(0) {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 
@@ -1154,6 +1169,37 @@ mod tests {
             "mtp-r5-sel",
             "gives the MTP layer 4 a pool of 4: a selecting MTP layer is not built",
         );
+    }
+
+    /// The load refuses a draft that carries its own matrices by them, before
+    /// its layer is read: a dense layer and a selecting one alike.
+    #[test]
+    fn the_load_refuses_a_self_contained_draft_by_its_matrices() {
+        use super::super::place::{MtpInputs, PlanInputs};
+        use crate::placement::workstation::HostRead;
+        use models::headpick::HeadSet;
+
+        for (tag, own) in [("mtp-load-dense", 0), ("mtp-load-sel", 4)] {
+            let mut c = Case::unshared();
+            c.kv = with(
+                c.kv,
+                "attention.compress_ratios",
+                Some(V::I32s(vec![0, 0, 0, 4, own])),
+            );
+            let (target, draft) = c.files(tag);
+            let inputs = PlanInputs::describe_in(&target, (u64::MAX, HostRead::Given))
+                .expect("the target describes");
+            let out = MtpInputs::read(&draft, &target, &inputs, HeadSet::Full);
+            remove(&target, &draft);
+            let err = out
+                .expect_err("the self-contained draft is refused")
+                .to_string();
+            assert!(
+                err.contains("tensor token_embd.weight: is in the draft file")
+                    && err.contains("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
+                "pool {own}: {err}"
+            );
+        }
     }
 
     /// An array of the main layers' values makes the layer inherit the last one's.

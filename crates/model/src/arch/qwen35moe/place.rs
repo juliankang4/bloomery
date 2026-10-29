@@ -45,7 +45,7 @@ use gguf::{GgmlType, Split};
 use models::headpick::{HeadRowsError, HeadSet, vocab_sha256};
 use models::{
     DeltaKind, DeltaRule, DraftSpec, EngramSpec, Extra, Ffn, HcKind, Mixer, ModelSpec, MtpDraft,
-    MtpSource, NgramRule, OutGate, Role, Selector,
+    NgramRule, OutGate, Role, Selector,
 };
 
 use super::hparams::Kind;
@@ -2299,10 +2299,11 @@ impl MtpInputs {
     /// The MTP draft `draft` read against the target `target` that `inputs`
     /// describes (`mtp::mtp_of`), its head scoring `rows`. Refused by name:
     /// a target whose borrowed matrices are not the draft's format
-    /// ([`PlanInputs::mtp_borrows`]); what `mtp_of` refuses; a draft file that carries its own `token_embd`
-    /// or `output` (this load borrows the target's); a row list of another
-    /// tokenizer than the target's; and what [`MtpInputs::from_parts`]
-    /// refuses.
+    /// ([`PlanInputs::mtp_borrows`]); a draft file that carries its own
+    /// `token_embd` or `output` (this load borrows the target's), before its
+    /// layer is read, so a self-contained file of any revision names that
+    /// reason; what `mtp_of` refuses; a row list of another tokenizer than
+    /// the target's; and what [`MtpInputs::from_parts`] refuses.
     pub fn read(
         draft: &Split,
         target: &Split,
@@ -2310,23 +2311,7 @@ impl MtpInputs {
         rows: HeadSet,
     ) -> Result<MtpInputs, PlaceError> {
         inputs.mtp_borrows()?;
-        let d = match mtp::mtp_of(draft, target, &inputs.spec)? {
-            DraftSpec::Mtp(d) => *d,
-            DraftSpec::Block(_) => {
-                return Err(PlacementError::Metadata {
-                    key: "mtp draft".to_string(),
-                    detail: "reads as a block draft, not an MTP layer".to_string(),
-                }
-                .into());
-            }
-        };
-        let MtpSource::File { borrows, .. } = &d.source else {
-            return Err(PlacementError::Metadata {
-                key: "mtp source".to_string(),
-                detail: "the layer is in the target's file; this load reads a draft file".into(),
-            }
-            .into());
-        };
+        let borrows = crate::arch::draft::borrows(draft)?;
         let carried: Vec<&str> = [
             ("token_embd.weight", borrows.embedding),
             ("output.weight", borrows.head),
@@ -2340,12 +2325,24 @@ impl MtpInputs {
                 name: (*first).to_string(),
                 detail: format!(
                     "is in the draft file ({}); this load borrows the target's token_embd and \
-                     output, which its card holds: a shared draft file",
-                    carried.join(", ")
+                     output, which its card holds: a shared draft file \
+                     (MTP/{})",
+                    carried.join(", "),
+                    super::fixture::DRAFT_FILE,
                 ),
             }
             .into());
         }
+        let d = match mtp::mtp_of(draft, target, &inputs.spec)? {
+            DraftSpec::Mtp(d) => *d,
+            DraftSpec::Block(_) => {
+                return Err(PlacementError::Metadata {
+                    key: "mtp draft".to_string(),
+                    detail: "reads as a block draft, not an MTP layer".to_string(),
+                }
+                .into());
+            }
+        };
         if let HeadSet::List { digest, .. } = &rows {
             let want = vocab_sha256(target)?;
             if *digest != want {
