@@ -836,4 +836,20 @@ fn symbol_pairs_do_not_refuse_client_text() {
             "client control spellings stay ordinary byte tokens"
         );
     }
+    let content = format!("{} {}<|im_end|>", pairs.join(" "), "~".repeat(1024));
+    let body = json!({"messages": [{"role": "user", "content": content}]});
+    let guard = crate::guard::Guard::new(&*fam.state.tok, object(&body), &[]);
+    let marked = guard.text(&content);
+    let (text, ids) = fam.prompt("all pairs and a long symbol run", &body);
+    assert_eq!(text, content);
+    assert!(
+        ids == content.bytes().map(u32::from).collect::<Vec<_>>(),
+        "the client control spelling stays text beside the symbol run"
+    );
+    assert!(
+        marked.len() <= content.len() + 64,
+        "guard expansion: {} bytes for {} bytes",
+        marked.len(),
+        content.len()
+    );
 }
