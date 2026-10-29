@@ -19,19 +19,20 @@
 //! pass that would run past the context is not run; the positions left take
 //! one step each, so the ids end where a plain run's end. `timings` then carry
 //! llama-server's `draft_n` and `draft_n_accepted`: the ids the passes proposed
-//! and kept. A request that draws (it samples, or bans an id: `ignore_eos`'s
-//! draw is the row with the stop ids at -inf, then its sampler or the argmax)
-//! takes its passes through [`Engine::advance_sampled`] on an engine that
-//! drafts sampled requests ([`Engine::drafts_sampled`]), its draw taking each
-//! kept id from the verified rows. Beside another busy slot its pass is a row
-//! of the round's [`Engine::advance_slots`] with its draw ([`Gen::pass_row`]),
-//! its ids the ones its pass alone draws. On another drafting engine such a
-//! request reads the logits row every token, which a pass does not give, so it
+//! and kept. A request that draws (it samples, or changes its rows: its
+//! `logit_bias` added and, under `ignore_eos`, the stop ids at -inf, then its
+//! sampler or the argmax, [`biased`]) takes its passes through
+//! [`Engine::advance_sampled`] on an engine that drafts sampled requests
+//! ([`Engine::drafts_sampled`]), its draw taking each kept id from the
+//! verified rows. Beside another busy slot its pass is a row of the round's
+//! [`Engine::advance_slots`] with its draw ([`Gen::pass_row`]), its ids the
+//! ones its pass alone draws. On another drafting engine such a request
+//! reads the logits row every token, which a pass does not give, so it
 //! takes one [`Engine::next`] a token and carries no draft counts.
 //!
 //! A request that asks for probabilities ([`GenParams::logprobs`]) reads the
 //! row every token too, so it also takes one [`Engine::next`] a token, greedy
-//! or not: each row is read before the loop bans an id in it, and each taken
+//! or not: each row is read before the loop changes it, and each taken
 //! id's value goes to the request's log with the text it released
 //! ([`crate::api::logprobs`]). Its stream sends one event a token, the text possibly
 //! empty, and the end of generation's own; a request that asks for nothing
@@ -42,7 +43,10 @@
 //! [`Engine::next`] a token, greedy: each token is the program's pick from the
 //! row ([`crate::constrain::Walk`]) — a forced id as it stands, otherwise the
 //! largest logit among the ids the program allows there — and once the program
-//! is spent the vocabulary's stop ids are the only ones left. The row is read
+//! is spent the vocabulary's stop ids are the only ones left. The request's
+//! `logit_bias` is added to the row before the pick and the program's mask
+//! comes after it, so a bias reorders the allowed ids and never lets in
+//! another one; an id the program fixes takes no bias. The row is read
 //! only where the pick needs it: a token the program fixes (a forced id, the
 //! only child of a choice's node) asks the engine for none unless the request
 //! wants probabilities. A pick the program cannot make ends the request with a
@@ -140,6 +144,9 @@ pub(crate) struct GenParams {
     /// text. Its request decodes greedily: every token is the largest logit
     /// among the ids the program allows.
     pub constraint: Option<Constraint>,
+    /// OpenAI's `logit_bias`: each id's addition to its logit before every
+    /// pick, by id, none zero; empty changes nothing.
+    pub logit_bias: Vec<(u32, f32)>,
 }
 
 /// llama-server's `timings` object, as the server clocked it.
@@ -359,29 +366,64 @@ fn prompt_tail(held: &Held, n: usize) -> Vec<u32> {
     tail
 }
 
-/// The draw of a request that bans ids (the stop ids under `ignore_eos`, as
-/// llama-server's `logit_bias_eog`): a copy of the row with each banned id's
-/// logit at -inf, then `draw` on it, or for a greedy request the copy's
-/// largest logit (first of equals). A step's row ([`Gen::answer`], where a
-/// greedy request whose argmax is not banned keeps it unread) and a pass's
-/// verified row ([`Engine::advance_sampled`]) are drawn from alike, so a pass
-/// never keeps a banned id: where the draft proposed one, the draw takes
-/// another and the pass stops there.
-fn banning(mut draw: Option<Sampler>, banned: Vec<u32>) -> Sampler {
-    let greedy = draw.is_none();
-    let mut row: Vec<f32> = Vec::new();
-    Box::new(move |logits: &[f32], history: &[u32]| {
+/// What a request does to every row before its pick: `logit_bias`'s
+/// additions ([`GenParams::logit_bias`]), then -inf at each banned id (the
+/// stop ids under `ignore_eos`, as llama-server's `logit_bias_eog`).
+#[derive(Clone, Debug)]
+struct Bias {
+    add: Vec<(u32, f32)>,
+    banned: Vec<u32>,
+}
+
+impl Bias {
+    fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.banned.is_empty()
+    }
+
+    /// Whether the changed row's largest logit can be another id than the
+    /// row's own argmax `g`: an addition that raises some id, or one that
+    /// changes `g`. Lowering other ids keeps `g` first.
+    fn moves(&self, g: u32) -> bool {
+        self.banned.contains(&g) || self.add.iter().any(|&(id, b)| b > 0.0 || id == g)
+    }
+
+    /// `logits` changed into `row`. A greedy draw's copy reads -0 as +0, so
+    /// its largest logit ties the two by id as the engine's argmax does; any
+    /// other copy keeps the signs.
+    fn apply(&self, logits: &[f32], greedy: bool, row: &mut Vec<f32>) {
         row.clear();
         row.extend(
             logits
                 .iter()
                 .map(|&l| if greedy && l == 0.0 { 0.0 } else { l }),
         );
-        for &b in &banned {
-            if let Some(l) = usize::try_from(b).ok().and_then(|i| row.get_mut(i)) {
+        let at = |id: u32| usize::try_from(id).ok();
+        for &(id, b) in &self.add {
+            if let Some(l) = at(id).and_then(|i| row.get_mut(i)) {
+                *l += b;
+            }
+        }
+        for &id in &self.banned {
+            if let Some(l) = at(id).and_then(|i| row.get_mut(i)) {
                 *l = f32::NEG_INFINITY;
             }
         }
+    }
+}
+
+/// The draw of a request that changes its rows ([`Bias`]): `draw` on the
+/// changed copy of each row, or for a greedy request the copy's largest
+/// logit (first of equals). A step's row ([`Gen::answer`], where a greedy
+/// request whose argmax the change keeps first takes it unread) and a pass's
+/// verified row ([`Engine::advance_sampled`]) are drawn from alike, so a
+/// drafted run takes the ids a plain run takes and a pass never keeps a
+/// banned id: where the draft proposed another id than the draw, the draw's
+/// id is kept and the pass stops there.
+fn biased(mut draw: Option<Sampler>, bias: Bias) -> Sampler {
+    let greedy = draw.is_none();
+    let mut row: Vec<f32> = Vec::new();
+    Box::new(move |logits: &[f32], history: &[u32]| {
+        bias.apply(logits, greedy, &mut row);
         match &mut draw {
             Some(s) => s(&row, history),
             None => sampling::argmax(&row),
@@ -393,7 +435,7 @@ fn banning(mut draw: Option<Sampler>, banned: Vec<u32>) -> Sampler {
 /// passes when the engine drafts: one that asks for no probabilities
 /// (`asks`) and follows no program (`constrained`, whose every token is
 /// picked from its own row), greedy ([`Engine::advance`]) or drawing (it
-/// samples or bans an id, [`banning`]) on an engine that drafts sampled
+/// samples or changes its rows, [`biased`]) on an engine that drafts sampled
 /// requests ([`Engine::advance_sampled`]).
 fn takes_passes(
     sampler: Option<&Sampler>,
@@ -1706,13 +1748,18 @@ pub(crate) struct Gen {
     ctx_max: usize,
     sampler: Option<Sampler>,
     stops: Vec<u32>,
-    /// The stop ids under `ignore_eos`, else empty.
-    banned: Vec<u32>,
-    /// Whether the request is greedy: one that bans an id draws through
-    /// [`banning`] only where the engine's argmax is banned.
+    /// The request's change to its rows: its `logit_bias`, and the stop ids
+    /// under `ignore_eos`.
+    bias: Bias,
+    /// Whether the request is greedy: one that changes its rows draws
+    /// through [`biased`] only where the change can move the engine's argmax
+    /// ([`Bias::moves`]).
     greedy: bool,
     /// The engine's logits row, or empty on a greedy request.
     logits: Vec<f32>,
+    /// The biased copy of the row a program picks from, empty without a
+    /// `logit_bias`.
+    biased_row: Vec<f32>,
     tim: Timings,
     t1: Instant,
     budget: usize,
@@ -1730,7 +1777,8 @@ pub(crate) struct Gen {
     stopping_word: String,
     truncated: bool,
     /// A pass's rows; 1 steps. A request passes when it is greedy, or draws
-    /// (samples or bans an id) on an engine that drafts sampled requests.
+    /// (samples or changes its rows) on an engine that drafts sampled
+    /// requests.
     rows: usize,
     /// The last pass's kept tokens, and how many of them the loop has taken.
     kept: Vec<u32>,
@@ -1787,19 +1835,23 @@ impl Gen {
     pub(crate) fn new(slot: &Slot, sampler: Option<Sampler>, n: usize, p: &GenParams) -> Gen {
         let stops = slot.vocab.stops();
         let end = Some(slot.vocab.eos()).filter(|e| stops.contains(e));
-        let banned = if p.ignore_eos {
-            stops.clone()
-        } else {
-            Vec::new()
+        let bias = Bias {
+            add: p.logit_bias.clone(),
+            banned: if p.ignore_eos {
+                stops.clone()
+            } else {
+                Vec::new()
+            },
         };
         let greedy = sampler.is_none();
-        let sampler = if banned.is_empty() {
+        // A program picks from its own biased copy of the row ([`Gen::answer`]).
+        let sampler = if bias.is_empty() || p.constraint.is_some() {
             sampler
         } else {
-            Some(banning(sampler, banned.clone()))
+            Some(biased(sampler, bias.clone()))
         };
         let probs = p.logprobs.as_ref().map(Ask::collector);
-        // A greedy request that bans no id reads the logits only for the
+        // A greedy request that changes no row reads the logits only for the
         // probabilities it asked for, or to pick among the ids its program
         // allows.
         let logits = vec![
@@ -1825,9 +1877,10 @@ impl Gen {
             ctx_max: slot.engine.ctx_max(),
             sampler,
             stops,
-            banned,
+            bias,
             greedy,
             logits,
+            biased_row: Vec::new(),
             tim: Timings::default(),
             t1: Instant::now(),
             budget: usize::try_from(p.n_predict).unwrap_or(usize::MAX),
@@ -1892,10 +1945,11 @@ impl Gen {
     /// The id the loop takes for an engine answer `g`: the next forced close id
     /// while one is queued (the engine's answer is discarded — the loop never
     /// commits it, so nothing desyncs), else the request's draw from the row
-    /// (a sampled one, or one that bans an id: [`banning`] draws from a
+    /// (a sampled one, or one that changes its rows: [`biased`] draws from a
     /// copy) or the engine's argmax `g`, which a greedy request keeps unless
-    /// it is banned. A request that asks for probabilities reads the row as
-    /// the engine wrote it.
+    /// its change can move it. A program picks from the biased copy. A
+    /// request that asks for probabilities reads the row as the engine wrote
+    /// it.
     fn answer(&mut self, g: u32) -> u32 {
         if let Some(c) = self.probs.as_mut() {
             c.read(&self.logits);
@@ -1904,7 +1958,13 @@ impl Gen {
             return id;
         }
         if let Some(walk) = self.walk.as_mut() {
-            let picked = walk.choose(&self.logits);
+            let row = if self.bias.add.is_empty() || walk.fixed_next() {
+                &self.logits
+            } else {
+                self.bias.apply(&self.logits, false, &mut self.biased_row);
+                &self.biased_row
+            };
+            let picked = walk.choose(row);
             let picks = walk.picks();
             if let Some(j) = self.tim.jump.as_mut() {
                 j.decisions = picks.decisions;
@@ -1919,9 +1979,7 @@ impl Gen {
             };
         }
         match self.sampler.as_mut() {
-            Some(draw) if !self.greedy || self.banned.contains(&g) => {
-                draw(&self.logits, &self.history)
-            }
+            Some(draw) if !self.greedy || self.bias.moves(g) => draw(&self.logits, &self.history),
             _ => g,
         }
     }
@@ -2248,7 +2306,7 @@ impl Gen {
             return Ok(Need::Fill);
         }
         while let Some(tok) = self.tok.take() {
-            if self.banned.contains(&tok) {
+            if self.bias.banned.contains(&tok) {
                 return Err(GenError::Banned(tok));
             }
             self.generated.push(tok);
@@ -3027,6 +3085,7 @@ mod cache_tests {
             think: ThinkTags::THINK,
             logprobs: None,
             constraint: None,
+            logit_bias: Vec::new(),
         };
         let factory = sampling::reference_factory();
         let mut tim = Timings::default();
@@ -3193,6 +3252,7 @@ mod cache_tests {
             think: ThinkTags::THINK,
             logprobs: None,
             constraint: None,
+            logit_bias: Vec::new(),
         };
         let mut tim = Timings::default();
         let r = generate(
@@ -3295,6 +3355,7 @@ mod cache_tests {
             think: ThinkTags::THINK,
             logprobs: None,
             constraint: None,
+            logit_bias: Vec::new(),
         };
         let factory = sampling::reference_factory();
         let mut tim = Timings::default();
@@ -3335,6 +3396,7 @@ mod cache_tests {
             think: ThinkTags::THINK,
             logprobs: Some(Ask::new(2, MockTokenizer.n_vocab())),
             constraint: None,
+            logit_bias: Vec::new(),
         };
         let mut tim = Timings::default();
         generate(
@@ -3932,6 +3994,7 @@ mod media_tests {
             think: ThinkTags::THINK,
             logprobs: None,
             constraint: None,
+            logit_bias: Vec::new(),
         };
         let factory = sampling::reference_factory();
         let sampler = sampler_of(&factory, &params).expect("the reference refuses none");
@@ -4239,6 +4302,7 @@ mod think_tests {
             think: ThinkTags::THINK,
             logprobs: None,
             constraint: None,
+            logit_bias: Vec::new(),
         };
         let mut tim = Timings::default();
         let o = generate(
@@ -4354,33 +4418,47 @@ mod think_tests {
 mod sampled_tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{GenParams, Slot, Timings, banning, generate};
+    use super::{Bias, GenParams, Slot, Timings, biased, generate};
     use crate::engine::{Drafted, Engine, EngineError, Sampler, SamplingParams, Tokenizer};
     use crate::mock::{DraftMock, MockTokenizer};
     use crate::reasoning::{ThinkEntry, ThinkTags};
     use crate::sampling;
 
-    #[test]
-    fn a_greedy_banning_draw_ties_signed_zeros_by_id() {
-        let mut draw = banning(None, vec![2]);
-        for row in [[-0.0, 0.0, -1.0], [0.0, -0.0, -1.0]] {
-            assert_eq!(draw(&row, &[]), 0);
+    fn ban(ids: &[u32]) -> Bias {
+        Bias {
+            add: Vec::new(),
+            banned: ids.to_vec(),
         }
-        let mut draw = banning(None, vec![0]);
-        assert_eq!(draw(&[1.0, -0.0, 0.0], &[]), 1);
     }
 
     #[test]
-    fn a_sampled_banning_draw_keeps_the_rows_zero_signs() {
+    fn a_greedy_banning_draw_ties_signed_zeros_by_id() {
+        let mut draw = biased(None, ban(&[2]));
+        for row in [[-0.0, 0.0, -1.0], [0.0, -0.0, -1.0]] {
+            assert_eq!(draw(&row, &[]), 0);
+        }
+        let mut draw = biased(None, ban(&[0]));
+        assert_eq!(draw(&[1.0, -0.0, 0.0], &[]), 1);
+    }
+
+    /// A draw's copy keeps the row's zero signs, adds each bias and puts a
+    /// banned id at -inf whatever its bias.
+    #[test]
+    fn a_sampled_biased_draw_keeps_the_rows_zero_signs() {
         let sampler: Sampler = Box::new(|row, history| {
             assert_eq!(row[0].to_bits(), (-0.0f32).to_bits());
             assert_eq!(row[1].to_bits(), 0.0f32.to_bits());
             assert_eq!(row[2], f32::NEG_INFINITY);
+            assert_eq!(row[3], 1.5);
             assert_eq!(history, [4, 5]);
             sampling::argmax(row)
         });
-        let mut draw = banning(Some(sampler), vec![2]);
-        assert_eq!(draw(&[-0.0, 0.0, -1.0], &[4, 5]), 1);
+        let bias = Bias {
+            add: vec![(2, 5.0), (3, 2.5)],
+            banned: vec![2],
+        };
+        let mut draw = biased(Some(sampler), bias);
+        assert_eq!(draw(&[-0.0, 0.0, -1.0, -1.0], &[4, 5]), 3);
     }
 
     /// [`DraftMock`] that logs what each request tells [`Engine::will_reply`].
@@ -4466,6 +4544,7 @@ mod sampled_tests {
                 think: ThinkTags::THINK,
                 logprobs: None,
                 constraint: None,
+                logit_bias: Vec::new(),
             };
             let mut tim = Timings::default();
             generate(

@@ -41,6 +41,8 @@ sha2.workspace = true
 # `preserve_order`: an object keeps the key order it was parsed or built in, as a Python dict
 # does, so a chat template's `tojson` and `.items()` see a request's objects as jinja2 does.
 serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+# A `logit_bias` key named twice, which `serde_json`'s map keeps only the last of.
+serde = "=1.0.229"
 thiserror.workspace = true
 # The orderly stop's signal handlers: `sigaction`, a `write` a handler makes,
 # a `read` the reader thread blocks on. The workspace's pinned version.

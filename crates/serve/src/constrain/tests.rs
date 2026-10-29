@@ -223,6 +223,7 @@ fn params(constraint: Option<Constraint>, think: ThinkEntry) -> GenParams {
         think: ThinkTags::THINK,
         logprobs: None,
         constraint,
+        logit_bias: Vec::new(),
     }
 }
 
@@ -353,6 +354,46 @@ fn the_mask_holds_when_greedy_does_not() {
     assert!(v["ok"].is_boolean());
     assert_eq!(v["kind"], "weather");
     assert_eq!(v["note"], "ZZZZZZZZ");
+    assert_eq!(o.stop, StopKind::Eos);
+}
+
+/// A `logit_bias` is added to the row before the mask: it reorders the ids
+/// the program allows and lets in no other. +20 on `f` turns both of its
+/// choices (`fahrenheit`, `false`), +100 on `Z` fills the free string alone,
+/// and the document still follows the schema.
+#[test]
+fn a_bias_reorders_the_allowed_ids_and_lets_in_none() {
+    let tok = bytes_tok();
+    let c = build(&tok, ToolFormat::Hermes, &schema_body(&weather_schema())).expect("served");
+    let mut slot = Slot::new(Box::new(Rows {
+        tok: Arc::clone(&tok),
+        want: ids(&tok, WEATHER),
+        k: 0,
+        read: Arc::new(Mutex::new(Vec::new())),
+    }))
+    .schema_jump(false);
+    let mut p = params(Some(c), ThinkEntry::Closed);
+    p.logit_bias = vec![
+        (BYTES + u32::from(b'Z'), 100.0),
+        (BYTES + u32::from(b'f'), 20.0),
+    ];
+    let o = generate(
+        &mut slot,
+        &sampling::reference_factory(),
+        &tok.encode("hi"),
+        &p,
+        &mut |_| Ok(()),
+        &mut |_| {},
+        &mut Timings::default(),
+    )
+    .expect("a generation");
+    let v: Value =
+        serde_json::from_str(&o.content).unwrap_or_else(|e| panic!("{e}: {}", o.content));
+    assert_eq!(v["unit"], "fahrenheit", "{v}");
+    assert_eq!(v["ok"], false, "{v}");
+    assert!([1, 2, 3].contains(&v["day"].as_i64().expect("day")), "{v}");
+    assert_eq!(v["kind"], "weather", "{v}");
+    assert_eq!(v["note"], "ZZZZZZZZ", "{v}");
     assert_eq!(o.stop, StopKind::Eos);
 }
 

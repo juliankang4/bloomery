@@ -1,12 +1,13 @@
 //! Gate: the repetition, frequency and presence penalties as llama-server takes
 //! them — its field names and defaults, llama.cpp's checks on the values, and
-//! the penalties reaching the sampled ids — over the mock engine.
+//! the penalties reaching the sampled ids — and OpenAI's `logit_bias`, over the
+//! mock engine.
 
 mod common;
 
 use std::net::SocketAddr;
 
-use common::{Reply, get, post, start};
+use common::{Reply, call, get, post, start};
 use serde_json::{Value, json};
 use serve::Tokenizer;
 
@@ -91,6 +92,14 @@ fn hw_bad_penalties_are_named_400s() {
         (json!({"repeat_last_n": "64"}), "repeat_last_n"),
         (json!({"logit_bias": [[7, 1.0]]}), "logit_bias"),
         (json!({"logit_bias": {"7": false}}), "logit_bias"),
+        (json!({"logit_bias": 7}), "logit_bias"),
+        (json!({"logit_bias": {"7": 100.5}}), "logit_bias"),
+        (json!({"logit_bias": {"7": "1"}}), "logit_bias"),
+        (json!({"logit_bias": {"a": 1}}), "logit_bias"),
+        (json!({"logit_bias": {"-7": 1}}), "logit_bias"),
+        (json!({"logit_bias": {"+7": 1}}), "logit_bias"),
+        (json!({"logit_bias": {"262": 1}}), "logit_bias"),
+        (json!({"logit_bias": {"7": 1, "07": 2}}), "logit_bias"),
     ];
     for (extra, field) in refused {
         let r = short(addr, &extra);
@@ -102,9 +111,33 @@ fn hw_bad_penalties_are_named_400s() {
             "{extra}: the message names {field}: {e}"
         );
     }
+    // A key named twice, sent as raw text: a `json!` body keeps only the last.
+    let twice = r#""logit_bias":{"7":-100,"7":0}"#;
+    for (path, body) in [
+        ("/completion", r#""prompt":"ab","n_predict":1"#),
+        ("/v1/completions", r#""prompt":"ab","max_tokens":1"#),
+        (
+            "/v1/chat/completions",
+            r#""messages":[{"role":"user","content":"ab"}],"max_tokens":1"#,
+        ),
+        ("/v1/responses", r#""input":"ab","max_output_tokens":1"#),
+        ("/responses", r#""input":"ab","max_output_tokens":1"#),
+    ] {
+        let r = call(addr, "POST", path, Some(&format!("{{{body},{twice}}}")));
+        assert_eq!(r.status, 400, "{path}: {}", r.body);
+        let e = &r.json()["error"];
+        assert!(
+            e["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("logit_bias")),
+            "{path}: the message names logit_bias: {e}"
+        );
+    }
     let passed = [
         json!({"logit_bias": []}),
         json!({"logit_bias": {}}),
+        json!({"logit_bias": null}),
+        json!({"logit_bias": {"261": -100, "7": 100}}),
         json!({"temperature": 0, "presence_penalty": 1.5}),
         json!({"temperature": 0, "presence_penalty": 1.5, "repeat_last_n": 0}),
         json!({"temperature": 0, "presence_penalty": 0, "repeat_penalty": 1}),
@@ -154,6 +187,82 @@ fn hw_presence_penalty_changes_the_sampled_ids() {
         "greedy, presence 20"
     );
     println!("presence: {plain} neutral, {penalized} at 20");
+}
+
+/// `logit_bias` adds to each named id's logit before every pick, on the
+/// greedy path (whose argmax a bias can move) and the sampled one, and on
+/// `/completion`, `/v1/completions` and `/v1/chat/completions` alike: -100 on
+/// the mock's echoed `b` keeps it out of the reply, +100 on `z` makes every
+/// id `z`, and a zero bias answers the plain ids. `generation_settings`
+/// reports the bias as llama-server does.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_logit_bias_moves_the_picked_ids() {
+    let addr = start(N_CTX);
+    let id = |c: &str| u64::from(serve::MockTokenizer.encode(c)[0]);
+    let (b, z) = (id("b"), id("z"));
+    let reply = |extra: Value| -> Value {
+        let base = json!({"prompt": "abababab", "n_predict": 6, "return_tokens": true});
+        let body = with(base, &extra);
+        let r = post(addr, "/completion", &body);
+        assert_eq!(r.status, 200, "{body}: {}", r.body);
+        r.json()
+    };
+    let ids = |extra: Value| -> Vec<u64> {
+        let v = reply(extra);
+        v["tokens"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no tokens: {v}"))
+            .iter()
+            .map(|t| t.as_u64().expect("an id"))
+            .collect()
+    };
+    for sampling in [
+        json!({"temperature": 0}),
+        json!({"temperature": 1.0, "seed": 1}),
+    ] {
+        let at = |what: &str| format!("{sampling}: {what}");
+        let plain = ids(sampling.clone());
+        assert!(plain.contains(&b), "{}: {plain:?}", at("the echo holds b"));
+        let bias = |m: Value| with(sampling.clone(), &json!({"logit_bias": m}));
+        assert_eq!(
+            ids(bias(json!({b.to_string(): 0}))),
+            plain,
+            "{}",
+            at("zero")
+        );
+        let banned = ids(bias(json!({b.to_string(): -100})));
+        assert!(!banned.contains(&b), "{}: {banned:?}", at("-100 on b"));
+        assert_eq!(
+            ids(bias(json!({z.to_string(): 100}))),
+            [z; 6],
+            "{}",
+            at("+100 on z")
+        );
+    }
+    let s = &reply(json!({"logit_bias": {b.to_string(): -100, z.to_string(): 0}}))["generation_settings"];
+    assert_eq!(
+        s["logit_bias"],
+        json!([{"bias": -100.0, "token": b}]),
+        "{s}"
+    );
+    let zs = json!({"logit_bias": {z.to_string(): 100}, "max_tokens": 3, "temperature": 0});
+    let r = post(
+        addr,
+        "/v1/completions",
+        &with(json!({"prompt": "abab"}), &zs),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["choices"][0]["text"], "zzz", "{}", r.body);
+    let chat = json!({"messages": [{"role": "user", "content": "abab"}]});
+    let r = post(addr, "/v1/chat/completions", &with(chat, &zs));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        r.json()["choices"][0]["message"]["content"],
+        "zzz",
+        "{}",
+        r.body
+    );
 }
 
 /// The penalty window opens on the prompt's ids, as llama-server's

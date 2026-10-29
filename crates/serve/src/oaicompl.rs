@@ -53,15 +53,15 @@ use serde_json::{Map, Value, json};
 
 use super::{
     ApiError, CompletionPlan, State, body, chat_input, choice_params, completion_plan,
-    finish_stream, get_i, invalid, progress, run_choices, run_whole_choices, send_error, send_json,
-    sse, take_choices, unix_now, usage,
+    finish_stream, gen_body, get_i, invalid, progress, run_choices, run_whole_choices, send_error,
+    send_json, sse, take_choices, unix_now, usage,
 };
 use crate::genloop::{Event, Outcome};
 use crate::http::{EventStream, Request};
 
 /// `POST /v1/completions`: the completion path's generation, OpenAI's answer.
 pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    let parsed = body(req).and_then(|mut b| {
+    let parsed = gen_body(req).and_then(|mut b| {
         openai_fields(&b)?;
         let n = take_choices(state, &mut b)?;
         Ok((completion_plan(state, &b)?, n, b))

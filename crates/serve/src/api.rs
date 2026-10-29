@@ -1659,6 +1659,63 @@ fn body(req: &Request) -> Result<Map<String, Value>, ApiError> {
     }
 }
 
+/// The body of a route that reads [`logit_bias`]: [`body`], and a 400 for a
+/// `logit_bias` key named twice, which the parse into a map keeps only the
+/// last of.
+fn gen_body(req: &Request) -> Result<Map<String, Value>, ApiError> {
+    use serde::de::{Deserialize, Deserializer, Error, IgnoredAny, MapAccess, Visitor};
+
+    /// The body's top level, which reads only its `logit_bias`.
+    struct Top;
+    /// A `logit_bias` object, each key once.
+    struct Keys;
+    impl<'de> Visitor<'de> for Top {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<(), A::Error> {
+            while let Some(k) = m.next_key::<String>()? {
+                if k == "logit_bias" {
+                    m.next_value::<Keys>()?;
+                } else {
+                    m.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(())
+        }
+    }
+    impl<'de> Visitor<'de> for Keys {
+        type Value = Keys;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("logit_bias as an object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Keys, A::Error> {
+            let mut seen = std::collections::HashSet::new();
+            while let Some(k) = m.next_key::<String>()? {
+                m.next_value::<IgnoredAny>()?;
+                if !seen.insert(k) {
+                    return Err(A::Error::custom("logit_bias names one key twice"));
+                }
+            }
+            Ok(Keys)
+        }
+    }
+    impl<'de> Deserialize<'de> for Keys {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Keys, D::Error> {
+            d.deserialize_map(Keys)
+        }
+    }
+
+    let b = body(req)?;
+    if matches!(b.get("logit_bias"), Some(Value::Object(_))) {
+        serde_json::Deserializer::from_slice(&req.body)
+            .deserialize_map(Top)
+            .map_err(|e| invalid(format!("invalid JSON body: {e}")))?;
+    }
+    Ok(b)
+}
+
 // ---------------------------------------------------------------- field helpers
 
 /// A field of another type than it takes: a 400 naming the field, the type it
@@ -1903,10 +1960,9 @@ fn sampler_order(o: &Map<String, Value>, sp: &SamplingParams) -> Result<(), ApiE
 /// A field this server cannot honor is a 400 naming it, never a 200 that ignores it:
 /// `n_probs > 0`, a non-empty `grammar`, `logprobs` other than `false` (a bool, or
 /// OpenAI's text completion count), `top_logprobs > 0`, `n > 1` (the OpenAI
-/// chat and text completion routes take it out first, [`take_choices`]), a non-empty
-/// `logit_bias`, the samplers [`unserved_samplers`] names, and a `samplers` other
+/// chat and text completion routes take it out first, [`take_choices`]), the samplers [`unserved_samplers`] names, and a `samplers` other
 /// than this server's order ([`sampler_order`]). `null` counts as absent. Other
-/// unknown fields are ignored.
+/// unknown fields are ignored. `logit_bias` is read by [`logit_bias`].
 ///
 /// Structured output ([`constrain::request`]) is served for a `response_format`
 /// of type `json_schema` in the subset it reads, and for `tool_choice`
@@ -1946,14 +2002,6 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             get_i(o, "top_logprobs")?.is_some_and(|n| n > 0),
         ),
         ("n", get_i(o, "n")?.is_some_and(|n| n > 1)),
-        (
-            "logit_bias",
-            set("logit_bias").is_some_and(|v| match v {
-                Value::Array(a) => !a.is_empty(),
-                Value::Object(m) => !m.is_empty(),
-                _ => true,
-            }),
-        ),
     ];
     if let Some((field, _)) = refused.iter().find(|(_, hit)| *hit) {
         return Err(invalid(format!("{field} is not supported by this server")));
@@ -2040,6 +2088,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
     sampler_order(o, &sampling)?;
     let ignore_eos = get_b(o, "ignore_eos")?.unwrap_or(false);
     let reasoning_budget = reasoning_budget(o)?;
+    let logit_bias = logit_bias(o, state.info.n_vocab)?;
     if constraint.is_some() {
         greedy_only(&sampling, ignore_eos, reasoning_budget)?;
     }
@@ -2062,8 +2111,57 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         think: state.think,
         logprobs: None,
         constraint,
+        logit_bias,
     };
     Ok(p)
+}
+
+/// OpenAI's `logit_bias`: an object from token ids (decimal strings) to
+/// numbers in `-100..=100`, each added to its id's logit before every pick,
+/// on greedy, sampled and structured requests alike. Absent, `null`, `{}`
+/// and `[]` change nothing, and a zero bias is dropped. llama-server's other
+/// forms (an array of pairs, `false` or a token's text), a key that is not an
+/// id below `n_vocab`, a value out of range and one id named twice (`"7"`
+/// and `"07"`, or `"7"` twice, which [`gen_body`] finds) are 400s naming the
+/// field.
+fn logit_bias(o: &Map<String, Value>, n_vocab: usize) -> Result<Vec<(u32, f32)>, ApiError> {
+    let m = match o.get("logit_bias") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(a)) if a.is_empty() => return Ok(Vec::new()),
+        Some(Value::Object(m)) => m,
+        Some(v) => {
+            return Err(invalid(format!(
+                "logit_bias must be an object of token ids to numbers in -100..=100, not {v}"
+            )));
+        }
+    };
+    let mut bias = std::collections::BTreeMap::new();
+    for (k, v) in m {
+        let id = k
+            .parse::<u32>()
+            .ok()
+            .filter(|&id| {
+                k.bytes().all(|c| c.is_ascii_digit())
+                    && usize::try_from(id).is_ok_and(|i| i < n_vocab)
+            })
+            .ok_or_else(|| {
+                invalid(format!(
+                    "logit_bias key {k:?} is not a token id below the vocabulary's {n_vocab}"
+                ))
+            })?;
+        let b = v
+            .as_f64()
+            .filter(|b| (-100.0..=100.0).contains(b))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "logit_bias[{k:?}] must be a number in -100..=100, not {v}"
+                ))
+            })?;
+        if bias.insert(id, b as f32).is_some() {
+            return Err(invalid(format!("logit_bias names token id {id} twice")));
+        }
+    }
+    Ok(bias.into_iter().filter(|&(_, b)| b != 0.0).collect())
 }
 
 /// What a structured-output request leaves out: its pick is the largest
@@ -2152,6 +2250,11 @@ fn gate_reasoning_budget(p: &mut GenParams, prompt: &str) {
 /// llama-server's `generation_settings`, with the values this server applies.
 /// Knobs it does not implement are reported at their neutral setting.
 fn generation_settings(state: &State, p: &GenParams) -> Value {
+    let logit_bias: Vec<Value> = p
+        .logit_bias
+        .iter()
+        .map(|&(token, bias)| json!({"bias": bias, "token": token}))
+        .collect();
     let mut v = json!({
         "n_ctx": state.info.ctx_max,
         "n_predict": p.n_predict,
@@ -2181,7 +2284,7 @@ fn generation_settings(state: &State, p: &GenParams) -> Value {
         "n_discard": 0,
         "ignore_eos": p.ignore_eos,
         "stream": p.stream,
-        "logit_bias": [],
+        "logit_bias": logit_bias,
         "n_probs": p.logprobs.as_ref().map_or(0, logprobs::Ask::asked),
         "min_keep": 0,
         "grammar": "",
@@ -2221,6 +2324,7 @@ fn default_params(state: &State) -> GenParams {
         think: state.think,
         logprobs: None,
         constraint: None,
+        logit_bias: Vec::new(),
     }
 }
 
@@ -4069,7 +4173,7 @@ fn completion_plan_logprobs(
 }
 
 fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    let plan = match body(req).and_then(|mut b| completion_plan_logprobs(state, &mut b)) {
+    let plan = match gen_body(req).and_then(|mut b| completion_plan_logprobs(state, &mut b)) {
         Ok(x) => x,
         Err(e) => return send_error(w, req, &e),
     };
@@ -4419,7 +4523,7 @@ fn chat_plan_logprobs(state: &State, b: &mut Map<String, Value>) -> Result<ChatP
 }
 
 fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    let parsed = body(req).and_then(|mut b| {
+    let parsed = gen_body(req).and_then(|mut b| {
         let n = take_choices(state, &mut b)?;
         let plan = chat_plan_logprobs(state, &mut b)?;
         Ok((b, n, plan))

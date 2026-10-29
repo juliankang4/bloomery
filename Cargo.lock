@@ -543,6 +543,7 @@ dependencies = [
  "bloomery-tokenizer",
  "bloomery-vision",
  "libc",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",
