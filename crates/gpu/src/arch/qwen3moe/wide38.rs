@@ -1090,6 +1090,10 @@ impl CardRoute38 {
             && card.all_hostless()
             && act.has_native_form()
             && card.routed_types().all(|(_, down)| down == GgmlType::NVFP4);
+        let fused = act.has_native_form()
+            && card.blocks32_gate_up()
+            && card.routed_types().all(|(gate, _)| gate == GgmlType::NVFP4);
+        let product_cells = if fused { 0 } else { slots * geo::FF };
         Ok(CardRoute38 {
             run,
             ids: DeviceBuffer::zeroed(stream, slots)?,
@@ -1104,8 +1108,8 @@ impl CardRoute38 {
             } else {
                 RouteX::Q8_1(Box::new(GemmAct::new(stream, run, geo::HIDDEN)?))
             },
-            g: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
-            u: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
+            g: DeviceBuffer::zeroed(stream, product_cells)?,
+            u: DeviceBuffer::zeroed(stream, product_cells)?,
             act,
             down: if bf16_down {
                 Down38::Bf16(DeviceBuffer::zeroed(stream, kept * geo::HIDDEN)?)

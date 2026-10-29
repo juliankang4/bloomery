@@ -51,6 +51,8 @@ pub struct GemmAct32 {
     pub(super) q: DeviceBuffer<u32>,
     pub(super) d: DeviceBuffer<f32>,
     pub(super) s: DeviceBuffer<i32>,
+    /// Whether the declared consumers include a Q8 reader.
+    pub(super) q8_required: bool,
     pub(super) cols: usize,
     pub(super) k: usize,
     /// The column count of the last enqueued quantizer launch; 0 before one.
@@ -109,6 +111,7 @@ impl GemmAct32 {
             q: DeviceBuffer::zeroed(stream, cols * 16 * steps)?,
             d: DeviceBuffer::zeroed(stream, cols * 2 * steps)?,
             s: DeviceBuffer::zeroed(stream, cols * 2 * steps)?,
+            q8_required: true,
             cols,
             k,
             filled: 0,
@@ -254,18 +257,26 @@ impl GemmAct32 {
         Ok(act)
     }
 
-    /// Scratch for the resident routed formats. Other formats keep only their Q8 representation.
+    /// Scratch for the resident routed formats. FP4-only consumers skip Q8
+    /// stores in the input quantizer; other formats require the Q8 planes.
     pub fn new_routed_for(
         stream: &CudaStream,
         cols: usize,
         k: usize,
         types: impl IntoIterator<Item = GgmlType>,
     ) -> Result<Self, GpuError> {
-        if types.into_iter().any(|ty| ty == GgmlType::NVFP4) {
-            Self::new_routed(stream, cols, k)
-        } else {
-            Self::new(stream, cols, k)
+        let (mut native, mut q8) = (false, false);
+        for ty in types {
+            native |= ty == GgmlType::NVFP4;
+            q8 |= ty != GgmlType::NVFP4;
         }
+        let mut act = if native {
+            Self::new_routed(stream, cols, k)?
+        } else {
+            Self::new(stream, cols, k)?
+        };
+        act.q8_required = q8 || !act.has_native_form();
+        Ok(act)
     }
 
     /// Whether the scratch holds the native FP4 form beside the 32-value one
@@ -495,6 +506,12 @@ impl Gemm32Kernels {
                 format!("x.len() {} < n_cols*k = {n_cols}*{}", x.len(), act.k),
             ));
         }
+        #[cfg(bloomery_nvfp4_mma)]
+        if act.native.is_some() {
+            self.native.quantize_input(stream, x, m, act, fault)?;
+            act.fill(n_cols);
+            return Ok(());
+        }
         let prep = self
             .module
             .prepare_quantize_gemm32(LaunchConfig1D::new(grid, 32, 0))?;
@@ -503,7 +520,7 @@ impl Gemm32Kernels {
         )?;
         act.fill(n_cols);
         #[cfg(bloomery_nvfp4_mma)]
-        self.native.quantize(stream, act)?;
+        self.native.quantize(stream, act, None)?;
         Ok(())
     }
 
@@ -538,7 +555,7 @@ impl Gemm32Kernels {
         )?;
         act.fill(n_cols);
         #[cfg(bloomery_nvfp4_mma)]
-        self.native.quantize(stream, act)?;
+        self.native.quantize(stream, act, None)?;
         Ok(())
     }
 

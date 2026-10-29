@@ -1492,7 +1492,8 @@ pub struct Gemm32Args<'a, Y = f32> {
 /// gate and up stacks `w` of `rows_per_expert` rows each over the activations
 /// `x` (read per `input`) through `route`'s last fill, the slots' places
 /// `sel` (those below `n_card` are the card's), the products' scratch `g` and
-/// `u` (`Gemm32Args::y`'s layout), and the down's activations `act`.
+/// `u` (`Gemm32Args::y`'s layout, empty for native fused gate/up), and the
+/// down's activations `act`.
 pub struct GateUp32Args<'a> {
     pub w: [Gemm32Weight<'a>; 2],
     pub rows_per_expert: usize,
@@ -1535,20 +1536,42 @@ impl Gemm32Launch {
     /// stack's layout at the activations' K, whole tokens of `top_k`, room in
     /// `act` and `y` for every slot; then every launch argument in `u32`.
     fn check<Y>(what: &'static str, a: &Gemm32Args<'_, Y>) -> Result<Gemm32Launch, GpuError> {
-        let n_slots = a
-            .route
+        let l = Self::operands(what, a.w, a.rows_per_expert, a.act, a.route, a.input)?;
+        let n_slots = l.n_slots as usize;
+        let rows = a.rows_per_expert;
+        if a.y.len() < n_slots * rows {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "y.len() {} < n_slots*rows_per_expert = {n_slots}*{rows}",
+                    a.y.len()
+                ),
+            ));
+        }
+        Ok(l)
+    }
+
+    /// Check the weight, activations and route independently of an output buffer.
+    fn operands(
+        what: &'static str,
+        w: Gemm32Weight<'_>,
+        rows: usize,
+        act: &GemmAct32,
+        route: &GemmRoute,
+        input: GemmInput,
+    ) -> Result<Gemm32Launch, GpuError> {
+        let n_slots = route
             .filled
             .ok_or_else(|| GpuError::state(what, "a filled route table (enqueue_route first)"))?;
-        let rows = a.rows_per_expert;
         if rows == 0 || !rows.is_multiple_of(16) {
             return Err(GpuError::shape(
                 what,
                 format!("rows_per_expert must be a positive multiple of 16, got {rows}"),
             ));
         }
-        let n_rows = a.route.n_experts * rows;
-        let (k, kb) = (a.act.k(), a.act.blocks());
-        let stack_rows = match a.w {
+        let n_rows = route.n_experts * rows;
+        let (k, kb) = (act.k(), act.blocks());
+        let stack_rows = match w {
             Gemm32Weight::Q8_0Plane { qs, .. }
             | Gemm32Weight::Q8_0File(qs)
             | Gemm32Weight::Q5_1File(qs)
@@ -1561,11 +1584,11 @@ impl Gemm32Launch {
                 what,
                 format!(
                     "the stack has {stack_rows} rows, the route {} experts of {rows} rows",
-                    a.route.n_experts
+                    route.n_experts
                 ),
             ));
         }
-        match a.w {
+        match w {
             Gemm32Weight::Q8_0Plane { qs, d } => {
                 if d.rows() != n_rows
                     || qs.cols() != k / 4
@@ -1649,7 +1672,13 @@ impl Gemm32Launch {
                 planes.experts(what, k, rows)?;
             }
         }
-        let slot_div = match a.input {
+        if !act.q8_required && !matches!(w, Gemm32Weight::Nvfp4Planes(_)) {
+            return Err(GpuError::shape(
+                what,
+                "a Q8 consumer requires Q8 activation planes",
+            ));
+        }
+        let slot_div = match input {
             GemmInput::Shared { top_k } => {
                 if top_k == 0 || !n_slots.is_multiple_of(top_k) {
                     return Err(GpuError::shape(
@@ -1661,45 +1690,36 @@ impl Gemm32Launch {
             }
             GemmInput::PerSlot => 1,
         };
-        if a.act.cols() < n_slots / slot_div {
+        if act.cols() < n_slots / slot_div {
             return Err(GpuError::shape(
                 what,
                 format!(
                     "{n_slots} slots read {} activation columns, act holds {}",
                     n_slots / slot_div,
-                    a.act.cols()
+                    act.cols()
                 ),
             ));
         }
-        if a.act.filled() < n_slots / slot_div {
+        if act.filled() < n_slots / slot_div {
             return Err(GpuError::shape(
                 what,
                 format!(
                     "{n_slots} slots read {} activation columns, the last quantizer launch \
                      wrote {}",
                     n_slots / slot_div,
-                    a.act.filled()
+                    act.filled()
                 ),
             ));
         }
-        if a.y.len() < n_slots * rows {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "y.len() {} < n_slots*rows_per_expert = {n_slots}*{rows}",
-                    a.y.len()
-                ),
-            ));
-        }
-        let max_tiles = gemm_max_tiles(n_slots, a.route.n_experts);
+        let max_tiles = gemm_max_tiles(n_slots, route.n_experts);
         let row_tiles = rows.div_ceil(GEMM_BM);
         Ok(Gemm32Launch {
             grid: launch_u32(what, "grid", row_tiles * max_tiles)?,
-            n_experts: launch_u32(what, "n_experts", a.route.n_experts)?,
+            n_experts: launch_u32(what, "n_experts", route.n_experts)?,
             rows: launch_u32(what, "rows_per_expert", rows)?,
             kb: launch_u32(what, "blocks", kb)?,
-            steps: launch_u32(what, "steps", a.act.steps())?,
-            act_cols: launch_u32(what, "act_cols", a.act.cols())?,
+            steps: launch_u32(what, "steps", act.steps())?,
+            act_cols: launch_u32(what, "act_cols", act.cols())?,
             n_slots: launch_u32(what, "n_slots", n_slots)?,
             max_tiles: launch_u32(what, "max_tiles", max_tiles)?,
             slot_div: launch_u32(what, "slot_div", slot_div)?,
@@ -2018,28 +2038,8 @@ impl Gemm32Kernels {
             && act.native.is_some()
         {
             const WHAT: &str = "Gemm32Kernels::enqueue_gate_up_sel32";
-            let l = Gemm32Launch::check(
-                WHAT,
-                &Gemm32Args {
-                    w: gate,
-                    rows_per_expert,
-                    act: x,
-                    route,
-                    input,
-                    y: g,
-                },
-            )?;
-            Gemm32Launch::check(
-                WHAT,
-                &Gemm32Args {
-                    w: up,
-                    rows_per_expert,
-                    act: x,
-                    route,
-                    input,
-                    y: u,
-                },
-            )?;
+            let l = Gemm32Launch::operands(WHAT, gate, rows_per_expert, x, route, input)?;
+            Gemm32Launch::operands(WHAT, up, rows_per_expert, x, route, input)?;
             act.quant_launch(WHAT, l.n_slots as usize)?;
             return self.native.gate_up(
                 stream,

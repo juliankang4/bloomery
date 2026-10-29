@@ -117,9 +117,10 @@ fn nvfp4_pack_q8(words: [u32; 4], d: f32, gs: f32) -> ([u32; 2], u32) {
     (packed, scale)
 }
 
-// Bound each block's cache to 32 KiB. Wider rows recompute the uncached quads.
-const ACT_CACHE_VALUES: usize = 8192;
-const _: () = assert!((ACT_CACHE_VALUES + 2) * 4 == 32776);
+// The column's Q8 words, block scales and two warp maxima fit in shared memory.
+const ACT_SHARED_MAX: usize =
+    (crate::tensor::Q8ACT_MAX_K / 4 + crate::tensor::Q8ACT_MAX_K / 32 + 2) * 4;
+const _: () = assert!(ACT_SHARED_MAX == 24776);
 
 /// # Safety
 /// Both inputs contain the aligned four-value span at `base`.
@@ -127,6 +128,9 @@ const _: () = assert!((ACT_CACHE_VALUES + 2) * 4 == 32776);
 unsafe fn act_quad(g: &[f32], u: &[f32], base: usize, code: u32, limit: f32) -> [f32; 4] {
     // SAFETY: the caller supplies an aligned, in-bounds gate quad.
     let g = unsafe { (*g.as_ptr().add(base).cast::<cuda_device::vector::F32x4>()).0 };
+    if code == u32::MAX {
+        return g;
+    }
     // SAFETY: the caller supplies an aligned, in-bounds up quad.
     let u = unsafe { (*u.as_ptr().add(base).cast::<cuda_device::vector::F32x4>()).0 };
     if crate::fault::quad_finite(g) & crate::fault::quad_finite(u) {
@@ -156,6 +160,7 @@ mod swiglu {
         code: u32,
         limit: f32,
         k: u32,
+        write_q8: bool,
         mut q: DisjointSlice<u32>,
         mut d: DisjointSlice<f32>,
         mut sums: DisjointSlice<i32>,
@@ -168,30 +173,50 @@ mod swiglu {
         let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
         let k = k as usize;
-        let cached = k.min(ACT_CACHE_VALUES);
-        let cache = cuda_device::DynamicSharedArray::<f32>::get();
+        let blocks = k / 32;
+        let steps = k / 64;
+        let words = k / 4;
+        let cache = cuda_device::DynamicSharedArray::<u32>::get();
         let mut largest = 0.0f32;
-        let mut at = 4 * tid;
-        while at < k {
-            // SAFETY: K divides 64; the loop's aligned quad is inside both checked input columns.
+        let mut group = tid / 32;
+        while group < blocks.div_ceil(4) {
+            let block = 4 * group + (lane >> 3);
+            let source = block.min(blocks - 1);
+            let at = 32 * source + 4 * (lane & 7);
+            // SAFETY: K divides 64; this aligned quad is inside the checked input column.
             let v = unsafe { act_quad(g, u, col * k + at, code, limit) };
-            if at < cached {
-                // SAFETY: this thread owns the aligned quad inside the allocated shared prefix.
-                unsafe {
-                    *cache.add(at).cast::<cuda_device::vector::F32x4>() =
-                        cuda_device::vector::F32x4::new(v);
+            let (word, sum, dv, refused) = crate::gemm::act32::quant32_lane(v, lane);
+            if block < blocks {
+                let at = 8 * block + (lane & 7);
+                // SAFETY: this lane owns one word in the column's shared Q8 cache.
+                unsafe { *cache.add(at) = word };
+                if lane & 7 == 0 {
+                    // SAFETY: this octet owns one block scale after the cached words.
+                    unsafe { *cache.add(words + block) = dv.to_bits() };
+                    if refused {
+                        fault.raise(crate::FaultSite::QuantColumn);
+                    }
                 }
+                if write_q8 {
+                    // SAFETY: the checked column's Q8 planes; this lane owns its word.
+                    unsafe { *q.get_unchecked_mut(col * words + at) = word };
+                    if lane & 7 == 0 {
+                        // SAFETY: the octet owns this block's scale and code sum.
+                        unsafe {
+                            *d.get_unchecked_mut(col * blocks + block) = dv;
+                            *sums.get_unchecked_mut(col * blocks + block) = sum;
+                        }
+                    }
+                }
+                largest = if refused {
+                    f32::INFINITY
+                } else if word != 0 {
+                    largest.max(dv)
+                } else {
+                    largest
+                };
             }
-            largest = if crate::fault::quad_finite(v) {
-                largest
-                    .max(v[0].abs())
-                    .max(v[1].abs())
-                    .max(v[2].abs())
-                    .max(v[3].abs())
-            } else {
-                f32::INFINITY
-            };
-            at += 256;
+            group += 2;
         }
         let mut delta = 16;
         while delta > 0 {
@@ -201,19 +226,19 @@ mod swiglu {
         if lane == 0 {
             // SAFETY: each warp owns one of the two shared reduction words after the cached prefix.
             unsafe {
-                *cache.add(cached + tid / 32) = largest;
+                *cache.add(words + blocks + tid / 32) = largest.to_bits();
             }
         }
         thread::sync_threads();
         // SAFETY: the first warp published its maximum in the first reduction word.
-        let first = unsafe { *cache.add(cached) };
+        let first = f32::from_bits(unsafe { *cache.add(words + blocks) });
         // SAFETY: the second warp published its maximum in the second reduction word.
-        let second = unsafe { *cache.add(cached + 1) };
+        let second = f32::from_bits(unsafe { *cache.add(words + blocks + 1) });
         let largest = first.max(second);
         let gs = if !largest.is_finite() {
             f32::NAN
         } else if largest > 0.0 {
-            (largest / 127.0) * (127.0 / 6.0)
+            largest * (127.0 / 6.0)
         } else {
             1.0
         };
@@ -223,40 +248,14 @@ mod swiglu {
                 *global.get_unchecked_mut(col) = gs;
             }
         }
-        let blocks = k / 32;
-        let steps = k / 64;
-        let mut group = tid / 32;
-        while group < blocks.div_ceil(4) {
-            let block = (4 * group + (lane >> 3)).min(blocks - 1);
-            let at = 32 * block + 4 * (lane & 7);
-            let v = if at < cached {
-                // SAFETY: this aligned quad is inside the published shared prefix.
-                unsafe { (*cache.add(at).cast::<cuda_device::vector::F32x4>()).0 }
-            } else {
-                // SAFETY: this aligned quad is inside both checked input columns.
-                unsafe { act_quad(g, u, col * k + at, code, limit) }
-            };
-            // SAFETY: each warp owns one group of four 32-value blocks in this checked column.
-            let refused = unsafe {
-                crate::gemm::act32::quant32_group(
-                    v, col, group, blocks, steps, lane, &mut q, &mut d, &mut sums,
-                )
-            };
-            if refused && lane & 7 == 0 {
-                fault.raise(crate::FaultSite::QuantColumn);
-            }
-            group += 2;
-        }
-        thread::sync_threads();
         let mut block = tid;
         while block - lane < k / 16 {
             let source = block.min(k / 16 - 1);
-            let at = col * steps * 16 + source * 4;
-            // SAFETY: this aligned four-word block is in the column's published Q8 plane.
-            let words = unsafe { (*q.as_mut_ptr().add(at).cast::<cuda_device::vector::U32x4>()).0 };
-            // SAFETY: the block barrier published this checked column's Q8 scales.
-            let dx = unsafe { *d.as_mut_ptr().add(col * 2 * steps + source / 2) };
-            let (packed, scale) = nvfp4_pack_q8(words, dx, gs);
+            // SAFETY: this aligned four-word block is in the column's published shared cache.
+            let q8 = unsafe { (*cache.add(source * 4).cast::<cuda_device::vector::U32x4>()).0 };
+            // SAFETY: the block barrier published the cached scale of this 32-value block.
+            let dx = f32::from_bits(unsafe { *cache.add(words + source / 2) });
+            let (packed, scale) = nvfp4_pack_q8(q8, dx, gs);
             if block < k / 16 {
                 // SAFETY: this lane owns the first word of the live 16-value sub-block.
                 unsafe {
@@ -1037,7 +1036,7 @@ mod native {
     )]
     #[kernel]
     #[launch_bounds(64)]
-    #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (264, 32776))]
+    #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (80, 24776))]
     pub fn swiglu_nvfp4_32(
         g: &[f32],
         u: &[f32],
@@ -1052,7 +1051,9 @@ mod native {
         global: DisjointSlice<f32>,
         fault: crate::fault::FaultSink,
     ) {
-        fused_swiglu(g, u, code, limit, k, q, d, sums, out, scales, global, fault);
+        fused_swiglu(
+            g, u, code, limit, k, true, q, d, sums, out, scales, global, fault,
+        );
     }
 
     #[allow(
@@ -1061,7 +1062,7 @@ mod native {
     )]
     #[kernel]
     #[launch_bounds(64)]
-    #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (264, 32776))]
+    #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (80, 24776))]
     pub fn swiglu_nvfp4_32_sel(
         g: &[f32],
         u: &[f32],
@@ -1088,9 +1089,51 @@ mod native {
             }
             return;
         }
-        fused_swiglu(g, u, code, limit, k, q, d, sums, out, scales, global, fault);
+        fused_swiglu(
+            g, u, code, limit, k, true, q, d, sums, out, scales, global, fault,
+        );
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(64)]
+    #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (80, 24776))]
+    pub fn quantize_native_32(
+        x: &[f32],
+        k: u32,
+        write_q8: bool,
+        q: DisjointSlice<u32>,
+        d: DisjointSlice<f32>,
+        sums: DisjointSlice<i32>,
+        out: DisjointSlice<u32>,
+        scales: DisjointSlice<u32>,
+        global: DisjointSlice<f32>,
+        fault: crate::fault::FaultSink,
+    ) {
+        fused_swiglu(
+            x,
+            x,
+            u32::MAX,
+            0.0,
+            k,
+            write_q8,
+            q,
+            d,
+            sums,
+            out,
+            scales,
+            global,
+            fault,
+        );
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(32)]
     #[launch_contract(domain = 1, block = (32, 1, 1))]
@@ -1098,11 +1141,28 @@ mod native {
         q: &[u32],
         d: &[f32],
         steps: u32,
+        cols: &[u32],
+        tiles: &[u32],
+        ntiles: &[u32],
+        routed: bool,
         mut out: DisjointSlice<u32>,
         mut scales: DisjointSlice<u32>,
         mut global: DisjointSlice<f32>,
     ) {
-        let col = thread::blockIdx_x() as usize;
+        let index = thread::blockIdx_x() as usize;
+        let col = if routed {
+            let count = ntiles[0] as usize;
+            if count == 0 {
+                return;
+            }
+            let (start, len) = super::super::route::tile_parts(tiles[2 * count - 1]);
+            if index >= (start + len) as usize {
+                return;
+            }
+            cols[index] as usize
+        } else {
+            index
+        };
         let lane = warp::lane_id() as usize;
         let steps = steps as usize;
         let mut max = 0.0f32;
@@ -1684,7 +1744,7 @@ mod native {
             } else {
                 [0.0; 4]
             };
-            let (word, sum, dv, refused) = super::super::act32::quant32_lane(v, lane);
+            let (word, sum, dv, refused) = super::crate::gemm::act32::quant32_lane(v, lane);
             if let Some(slot) = slot {
                 let b = 2 * rt + blk;
                 // SAFETY: one lane owns word i of block b < 2·osteps of this live slot's column.
@@ -1999,6 +2059,7 @@ impl Kernels {
         &self,
         stream: &CudaStream,
         act: &mut GemmAct32,
+        route: Option<&GemmRoute>,
     ) -> Result<(), GpuError> {
         let filled = act.filled() as u32;
         if let Some(out) = act.native.as_mut() {
@@ -2011,11 +2072,49 @@ impl Kernels {
                 &act.q,
                 &act.d,
                 (act.k / 64) as u32,
+                route.map_or(&act.q, |r| &r.cols),
+                route.map_or(&act.q, |r| &r.tiles),
+                route.map_or(&act.q, |r| &r.n_tiles),
+                route.is_some(),
                 &mut out.q,
                 &mut out.e,
                 &mut out.scale,
             )?;
         }
+        Ok(())
+    }
+
+    pub(super) fn quantize_input(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        cols: u32,
+        act: &mut GemmAct32,
+        fault: crate::fault::FaultSink,
+    ) -> Result<(), GpuError> {
+        crate::tensor::check_alignment::<F32x4, _>("NVFP4 activation", "x", x)?;
+        let shared = ((act.k / 4 + act.k / 32 + 2) * 4) as u32;
+        let prep = self
+            .module
+            .prepare_quantize_native_32(LaunchConfig1D::new(cols, 64, shared))?;
+        let out = act
+            .native
+            .as_mut()
+            .ok_or_else(|| GpuError::shape("NVFP4 activation", "native scratch required"))?;
+        self.module.quantize_native_32(
+            stream,
+            &prep,
+            x,
+            act.k as u32,
+            act.q8_required,
+            &mut act.q,
+            &mut act.d,
+            &mut act.s,
+            &mut out.q,
+            &mut out.e,
+            &mut out.scale,
+            fault,
+        )?;
         Ok(())
     }
 
@@ -2045,7 +2144,7 @@ impl Kernels {
             u,
         )?;
         let k = act.k as u32;
-        let shared = ((act.k.min(ACT_CACHE_VALUES) + 2) * 4) as u32;
+        let shared = ((act.k / 4 + act.k / 32 + 2) * 4) as u32;
         let out = act
             .native
             .as_mut()
@@ -2096,8 +2195,8 @@ impl Kernels {
     /// Enqueue the gate and up of `a.route`'s card slots over `a.x` in one
     /// launch (`gate_up_nvfp4_mma`), the SwiGLU of each (slot, row) and its
     /// 32-value Q8 into `a.act` (the bytes `swiglu` stores for the slot),
-    /// then `a.act`'s FP4 from that Q8 ([`Kernels::quantize`]) over its first
-    /// `a.n_cols` columns. A slot the route does not list keeps its Q8 bytes.
+    /// then `a.act`'s FP4 from that Q8 ([`Kernels::quantize`]) for the route's
+    /// listed slots. Other slots keep every activation plane untouched.
     pub(super) fn gate_up(
         &self,
         stream: &CudaStream,
@@ -2160,7 +2259,7 @@ impl Kernels {
             fault,
         )?;
         act.fill(n_cols);
-        self.quantize(stream, act)
+        self.quantize(stream, act, Some(route))
     }
 
     pub(super) fn product(&self, stream: &CudaStream, a: ProductArgs<'_>) -> Result<(), GpuError> {
@@ -2309,6 +2408,135 @@ impl Kernels {
             stream, &prep, w, lo, lo_words, lo_refused, xn, hidden, m, fault, g, mixed, qs, e,
             refused,
         )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gemm::Gemm32Kernels;
+    use gguf::GgmlType;
+
+    #[test]
+    #[ignore = "needs a native FP4 card"]
+    fn hw_native_activation_planes() -> Result<(), GpuError> {
+        let gpu = crate::Gpu::new()?;
+        let stream = gpu.stream();
+        let kernels = Gemm32Kernels::load(gpu.context())?;
+        let sink = gpu.unlabelled_sink();
+        let bits = |xs: Vec<f32>| xs.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+        let cols = 7;
+        for k in [64, 128, 192, 448, 2560, crate::tensor::Q8ACT_MAX_K] {
+            let values: Vec<f32> = (0..cols * k)
+                .map(|i| match i / k {
+                    0 => 0.0,
+                    1 => ((i * 37 % 257) as f32 - 128.0) / 64.0,
+                    2 => f32::from_bits(1) * (i % 127) as f32,
+                    3 => {
+                        if i % k == 3 {
+                            f32::NAN
+                        } else {
+                            0.0
+                        }
+                    }
+                    4 => {
+                        if i % k == 5 {
+                            f32::INFINITY
+                        } else {
+                            1.0
+                        }
+                    }
+                    5 => f32::MAX * ((i % 3) as f32 - 1.0),
+                    _ => ((i % 31) as f32 - 15.0) * 2.0f32.powi(-120),
+                })
+                .collect();
+            let input = DeviceBuffer::from_host(stream, &values)?;
+            let mut reference = GemmAct32::new(stream, cols, k)?;
+            kernels.enqueue_quantize_gemm32(stream, &input, cols, &mut reference, sink)?;
+            let reference_fault = gpu.take_fault()?;
+            reference.native = Some(Act::new(stream, cols, k)?);
+            kernels.native.quantize(stream, &mut reference, None)?;
+            for only_native in [false, true] {
+                let mut act = if only_native {
+                    GemmAct32::new_routed_for(stream, cols, k, [GgmlType::NVFP4])?
+                } else {
+                    GemmAct32::new_routed(stream, cols, k)?
+                };
+                let graph = gpu.capture(|s| {
+                    kernels.enqueue_quantize_gemm32(s, &input, cols, &mut act, sink)
+                })?;
+                assert_eq!(
+                    graph.node_count(),
+                    1,
+                    "native input uses one quantizer launch"
+                );
+                graph.launch(stream)?;
+                assert_eq!(gpu.take_fault()?, reference_fault);
+                let (want, got) = (
+                    reference.native.as_ref().unwrap(),
+                    act.native.as_ref().unwrap(),
+                );
+                assert_eq!(got.q.to_host_vec(stream)?, want.q.to_host_vec(stream)?);
+                assert_eq!(got.e.to_host_vec(stream)?, want.e.to_host_vec(stream)?);
+                assert_eq!(
+                    bits(got.scale.to_host_vec(stream)?),
+                    bits(want.scale.to_host_vec(stream)?)
+                );
+                if only_native {
+                    assert!(act.q.to_host_vec(stream)?.iter().all(|&v| v == 0));
+                    assert!(act.d.to_host_vec(stream)?.iter().all(|&v| v == 0.0));
+                    assert!(act.s.to_host_vec(stream)?.iter().all(|&v| v == 0));
+                } else {
+                    assert_eq!(act.q.to_host_vec(stream)?, reference.q.to_host_vec(stream)?);
+                    assert_eq!(
+                        bits(act.d.to_host_vec(stream)?),
+                        bits(reference.d.to_host_vec(stream)?)
+                    );
+                    assert_eq!(act.s.to_host_vec(stream)?, reference.s.to_host_vec(stream)?);
+                }
+                println!(
+                    "native_activation k={k} cols={cols} only_native={only_native} fp4_codes_scales_equal=true quantizer_nodes=1 PASS"
+                );
+            }
+            // Remapped routes leave HOST holes between the listed prefix and refused suffix.
+            let ids = DeviceBuffer::from_host(stream, &[0u32, 1, 2, 0, 1, 2, 3])?;
+            let map = DeviceBuffer::from_host(stream, &[0u32, crate::hybrid::HOST, 1, 9])?;
+            let mut route = GemmRoute::new(stream, cols, 2)?;
+            kernels.enqueue_route_remap(stream, &ids, &map, cols, &mut route, sink)?;
+            let _ = gpu.take_fault()?;
+            let out = reference.native.as_mut().unwrap();
+            out.q
+                .copy_from_host(stream, &vec![0xdead_beef; cols * k / 8])?;
+            out.e
+                .copy_from_host(stream, &vec![0xdead_beef; cols * k / 64])?;
+            out.scale.copy_from_host(stream, &vec![-123.0; cols])?;
+            kernels
+                .native
+                .quantize(stream, &mut reference, Some(&route))?;
+            let out = reference.native.as_ref().unwrap();
+            let (q, e, scale) = (
+                out.q.to_host_vec(stream)?,
+                out.e.to_host_vec(stream)?,
+                out.scale.to_host_vec(stream)?,
+            );
+            for slot in [1, 4, 6] {
+                assert!(
+                    q[slot * k / 8..(slot + 1) * k / 8]
+                        .iter()
+                        .all(|&v| v == 0xdead_beef)
+                );
+                assert!(
+                    e[slot * k / 64..(slot + 1) * k / 64]
+                        .iter()
+                        .all(|&v| v == 0xdead_beef)
+                );
+                assert_eq!(scale[slot], -123.0);
+            }
+            println!(
+                "native_activation k={k} routed_listed=4 host=2 refused=1 inactive_planes_untouched=true PASS"
+            );
+        }
         Ok(())
     }
 }
