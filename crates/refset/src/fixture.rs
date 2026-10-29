@@ -500,17 +500,9 @@ pub fn keys(first_shard: &Path) -> Result<String, RefError> {
     Ok(parts.join(" "))
 }
 
-/// `keys`, the fixture keys of a file sorted, are one value each, hold the version key and no subset key.
+/// `keys`, the fixture keys of a file (each once: both header readers refuse duplicate keys),
+/// hold the version key and no subset key.
 fn check_held(first_shard: &Path, file: &str, keys: &[&str]) -> Result<(), RefError> {
-    if let Some(w) = keys.windows(2).find(|w| w[0] == w[1]) {
-        return Err(RefError::malformed(
-            format!("fixture: {file}"),
-            format!(
-                "{} is given twice, so the file states two values for it",
-                w[0]
-            ),
-        ));
-    }
     if !keys.contains(&KEY_VERSION) {
         return Err(RefError::missing(
             first_shard,
@@ -535,21 +527,13 @@ fn check_held(first_shard: &Path, file: &str, keys: &[&str]) -> Result<(), RefEr
 fn folder_keys(first_shard: &Path) -> Result<String, RefError> {
     let file = first_shard.display().to_string();
     let bad = |why: String| RefError::malformed(format!("fixture: {file}"), why);
-    let (pairs, text) = shard_metadata(first_shard)?;
+    let pairs = shard_metadata(first_shard)?;
     let mut held: Vec<(&str, &str)> = pairs
         .iter()
         .filter(|(k, _)| k.starts_with(KEY_PREFIX))
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     held.sort_by(|a, b| a.0.cmp(b.0));
-    if let Some((k, _)) = held
-        .iter()
-        .find(|(k, _)| text.matches(&format!("{}:", json_text(k))).count() > 1)
-    {
-        return Err(bad(format!(
-            "{k} is given twice, so the file states two values for it"
-        )));
-    }
     check_held(
         first_shard,
         &file,
@@ -574,14 +558,9 @@ fn folder_keys(first_shard: &Path) -> Result<String, RefError> {
     Ok(parts.join(" "))
 }
 
-/// `s` as a JSON string, quotes included.
-fn json_text(s: &str) -> String {
-    serde_json::Value::from(s).to_string()
-}
-
-/// A safetensors shard's `__metadata__` entries (every `bloomery.fixture.` one a string) and its
-/// header text; the tensors' table is not read.
-fn shard_metadata(shard: &Path) -> Result<(Vec<(String, String)>, String), RefError> {
+/// A safetensors shard's `__metadata__` entries (every `bloomery.fixture.` one a string);
+/// the tensors' table is not read.
+fn shard_metadata(shard: &Path) -> Result<Vec<(String, String)>, RefError> {
     use std::io::Read;
     let file = shard.display().to_string();
     let bad = |why: String| RefError::malformed(format!("fixture: {file}"), why);
@@ -604,7 +583,7 @@ fn shard_metadata(shard: &Path) -> Result<(Vec<(String, String)>, String), RefEr
     f.read_exact(&mut text)
         .map_err(|e| bad(format!("not a readable safetensors header: {e}")))?;
     let text = String::from_utf8(text).map_err(|_| bad("the header is not UTF-8".to_string()))?;
-    let v: serde_json::Value = serde_json::from_str(&text)
+    let v = safetensors::parse_unique("the header", &text)
         .map_err(|e| bad(format!("not a readable safetensors header: {e}")))?;
     let Some(header) = v.as_object() else {
         return Err(bad(
@@ -612,7 +591,7 @@ fn shard_metadata(shard: &Path) -> Result<(Vec<(String, String)>, String), RefEr
         ));
     };
     let Some(meta) = header.get("__metadata__") else {
-        return Ok((Vec::new(), text));
+        return Ok(Vec::new());
     };
     let Some(meta) = meta.as_object() else {
         return Err(bad("__metadata__ is not an object".to_string()));
@@ -629,7 +608,7 @@ fn shard_metadata(shard: &Path) -> Result<(Vec<(String, String)>, String), RefEr
             None => {}
         }
     }
-    Ok((pairs, text))
+    Ok(pairs)
 }
 
 /// The text of value `v` of `key` in the line: see [`keys`].

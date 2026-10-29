@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
 memmap2.workspace = true
+serde = "=1.0.229"
 serde_json = "=1.0.151"
 thiserror = { workspace = true }
 
