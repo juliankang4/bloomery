@@ -152,6 +152,17 @@ pub fn flip_cap(band: f64, row: &[f32]) -> f64 {
     head_cap(band, row)
 }
 
+/// The pair cap [`Flip::allowed`] takes for a flip with `cap` its layer's [`flip_cap`]: `cap` for
+/// a flip first on its path, none for one past an earlier flip on its path (an earlier layer, at
+/// its token or before). `cap` bounds the error of a layer whose input took the same experts
+/// below; past a flip the input carries other experts' outputs, so the error is not rounding
+/// and only the gap-within-error rule holds.
+#[must_use]
+pub fn path_cap(cap: f64, past_a_flip: bool) -> f64 {
+    // PIN(2026-10-29): prior flips change expert outputs outside the rounding model.
+    if past_a_flip { f64::INFINITY } else { cap }
+}
+
 /// The widest gap between two of a row's values the errors can cross: `band` times the row's
 /// spread, three deviations each.
 #[must_use]
@@ -205,6 +216,30 @@ mod tests {
         assert!(!wrong.allowed(10.0), "gap 0.40 past err 0.02: {wrong:?}");
         assert!(wrong.line("free", 10.0).contains("gap past our error"));
         assert!(Flip::between((3, 1), (&[0], &ours), (&[0], &ik), 0.0).is_none());
+    }
+
+    /// A flip first on its path is held to its cap; one past an earlier flip on its path only to
+    /// the gap-within-error rule. Mutant: the cap kept past a flip, or the gap rule dropped.
+    #[test]
+    fn a_flip_past_an_earlier_flip_has_no_pair_cap() {
+        let ik = [0.50f32, 0.49, 0.10];
+        let far = [0.42f32, 0.57, 0.10];
+        let f =
+            Flip::between((1, 0), (&[1], &far), (&[0], &ik), margin(&ik, &[0])).expect("a flip");
+        assert!(
+            !f.allowed(path_cap(0.1, false)),
+            "err 0.16 past cap 0.1: {f:?}"
+        );
+        assert!(
+            f.allowed(path_cap(0.1, true)),
+            "past a flip, gap 0.01 within err 0.16: {f:?}"
+        );
+        let ours = [0.48f32, 0.51, 0.10];
+        let wrong = Flip::between((1, 0), (&[2], &ours), (&[0], &ik), 0.0).expect("a flip");
+        assert!(
+            !wrong.allowed(path_cap(0.1, true)),
+            "gap 0.40 past err 0.02: {wrong:?}"
+        );
     }
 
     /// The tie is judged against the head input's own distance, not a band

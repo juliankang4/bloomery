@@ -177,11 +177,13 @@
 //!   reset in two arms. The free arm routes by its own router: its last
 //!   argmax equal to ik's; its route taps each the top ten of their own
 //!   logits; each flip against the pass's routing (the eager steps' taps)
-//!   excused only while every pair's gap lies within our error and that
-//!   error within six deviations of the error model's router error
-//!   ([`flip::flip_cap`]), and — where no earlier flip lies on its path — only at
+//!   excused only while every pair's gap lies within our error, and — where
+//!   no earlier flip lies on its path — only while that error lies within six
+//!   deviations of the error model's router error ([`flip::flip_cap`]) and at
 //!   a gap within six deviations of the router's error over the logits'
-//!   spread ([`flip::margin_cap`]); its logits and stores printed. The forced arm
+//!   spread ([`flip::margin_cap`]): past a flip the layer's input carries
+//!   other experts' outputs, which the error model does not bound
+//!   ([`flip::path_cap`]); its logits and stores printed. The forced arm
 //!   takes the pass's routes (`Body38::plant_ubatch_routes`), so no flip
 //!   can happen: every id the pass's, its last argmax equal to ik's, the
 //!   last logits and every layer's live store and the PLE ring within the
@@ -2620,9 +2622,11 @@ mod gate {
     }
 
     /// The flips of `ours` against `theirs` (each `[token][layer]`), each
-    /// printed with `arm`: excused by the pair rule under [`flip::flip_cap`] and,
-    /// where no earlier flip lies on its path, only at a gap within
-    /// [`flip::margin_cap`], both at the layer's `band`.
+    /// printed with `arm`: excused by the pair rule, and where no earlier flip
+    /// lies on its path only under [`flip::flip_cap`] and at a gap within
+    /// [`flip::margin_cap`], both at the layer's `band` ([`flip::path_cap`]:
+    /// past a flip the layer's input carries other experts' outputs, which
+    /// the band does not bound).
     fn judge_flips(
         arm: &str,
         ours: &[Vec<RouteTap>],
@@ -2657,14 +2661,17 @@ mod gate {
                 .map(|p| p.2)
                 .fold(f64::NEG_INFINITY, f64::max);
             let at_wide = !prior && (widest > *bound || widest.is_nan());
-            refused += usize::from(!f.allowed(*cap));
+            // PIN(2026-10-29): prior flips add expert-choice error outside the rounding band.
+            let cap = flip::path_cap(*cap, prior);
+            refused += usize::from(!f.allowed(cap));
             first += usize::from(!prior);
             wide += usize::from(at_wide);
             println!(
                 "{}; {}",
-                f.line(arm, *cap),
+                f.line(arm, cap),
                 if prior {
-                    "past an earlier flip on its path (margin rule not applied)".to_owned()
+                    "past an earlier flip on its path (pair cap and margin rule not applied)"
+                        .to_owned()
                 } else {
                     format!(
                         "first on its path: widest gap {widest:.3e} (margin bound {bound:.3e}) {}",
