@@ -25,7 +25,9 @@
 //!   positions around the window (127, 128, 129) and the cache's end, both rope
 //!   bases and both key-head counts; every other plane row keeps its sentinel;
 //!   a position at the cache height raises `cache_pos`, NaNs its token and
-//!   appends nothing;
+//!   appends nothing; a key past f16 after the turn and a NaN or past-f16
+//!   value raise `cache_value` through the plane and the ring entry and store
+//!   NaN in exactly those lanes (A3);
 //! - flash on a full layer (F1, 64 heads over 4 key heads, two blocks a group):
 //!   inside the band at counts around every tile and segment edge up to 5,121,
 //!   a rerun and NaN rows past the count bit-identical, [`ROWS`] rows one launch
@@ -94,6 +96,7 @@ mod gate {
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_gates::qwen3moe::f16_logical_bits;
+    use bloomery_gpu_gates::rope_gate::cache_bits;
     use bloomery_gpu_gates::rounding::{U, gamma};
     use bloomery_gpu_gates::{
         GateError, RefManifest, activations, bits_equal, checks_failed, mask_bits_in,
@@ -1509,11 +1512,11 @@ mod gate {
                 let turned = host_turn(&qkv[at..at + HEAD_K192], trow);
                 out.qkv[at..at + HEAD_K192].copy_from_slice(&turned);
                 for (d, &x) in turned.iter().enumerate() {
-                    out.kc[(j * ctx + p) * HEAD_K192 + d] = f32_to_f16_bits(x);
+                    out.kc[(j * ctx + p) * HEAD_K192 + d] = cache_bits(x);
                 }
                 let vat = t * row + (n_head + n_kv) * HEAD_K192 + j * HEAD;
                 for d in 0..HEAD {
-                    out.vc[(j * ctx + p) * HEAD + d] = f32_to_f16_bits(qkv[vat + d] * v_scale);
+                    out.vc[(j * ctx + p) * HEAD + d] = cache_bits(qkv[vat + d] * v_scale);
                 }
             }
         }
@@ -1625,6 +1628,53 @@ mod gate {
             verdict(a2)
         );
         ok &= a2;
+
+        // A3: a key past f16 after the turn, and a NaN and a past-f16 value,
+        // through the plane and the ring entry.
+        let ctx3 = 256usize;
+        let table3 = table_for(1.0e7, ctx3)?;
+        let g = (N_HEAD, KV_FULL, ctx3);
+        let pos = [5u32];
+        let row = N_HEAD * HEAD_K192 + KV_FULL * (HEAD_K192 + HEAD);
+        let (clean, ..) = fused(1, N_HEAD, KV_FULL, 31);
+        let mut bad_k = clean.clone();
+        bad_k[N_HEAD * HEAD_K192 + 3] = 1.0e5;
+        let mut bad_v = clean;
+        bad_v[row - KV_FULL * HEAD + 5] = f32::NAN;
+        bad_v[row - KV_FULL * HEAD + 70] = 1.0e5;
+        for (name, qkv) in [("key 1e5", &bad_k), ("value NaN and 1e5", &bad_v)] {
+            let want = host_append(g, qkv, &table3, &pos, V_SCALE, &[]);
+            let marked = want
+                .kc
+                .iter()
+                .chain(&want.vc)
+                .filter(|h| **h == NAN16)
+                .count();
+            for rows in [None, Some(ctx3)] {
+                let got = append_launch(
+                    a,
+                    gpu,
+                    gpu.layer_sink(layer)?,
+                    g,
+                    rows,
+                    qkv,
+                    &table3,
+                    &pos,
+                    V_SCALE,
+                )?;
+                let raised = gpu.take_fault()?;
+                let fault = Some(Fault::at(u32::try_from(layer)?, FaultSite::CacheValue));
+                let same = appended_equal(&got, &want);
+                let a3 = raised == fault && marked > 0 && same;
+                println!(
+                    "A3 cache value {name} ring={}: word {raised:?} (want {fault:?}), {marked} NaN lanes, \
+                     the host transcription {same} {}",
+                    rows.is_some(),
+                    verdict(a3)
+                );
+                ok &= a3;
+            }
+        }
 
         // Refusals by name.
         let table_d = DeviceBuffer::from_host(gpu.stream(), table)?;

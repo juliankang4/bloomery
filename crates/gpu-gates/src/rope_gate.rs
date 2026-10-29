@@ -113,12 +113,24 @@ pub fn expected<const H: usize, const R: usize, const Q: usize>(
             out.k[at..at + H].copy_from_slice(&y);
             let row = (h * ctx + p as usize) * H;
             for (d, &yd) in y.iter().enumerate().take(H) {
-                out.ck[row + d] = gguf::quant::f32_to_f16_bits(yd);
-                out.cv[row + d] = gguf::quant::f32_to_f16_bits(inp.v[at + d]);
+                out.ck[row + d] = cache_bits(yd);
+                out.cv[row + d] = cache_bits(inp.v[at + d]);
             }
         }
     }
     out
+}
+
+/// The f16 cache value a checked append stores for `x`: its rounding, or NaN
+/// for a non-finite source or a rounding past f16's range.
+#[must_use]
+pub fn cache_bits(x: f32) -> u16 {
+    let h = gguf::quant::f32_to_f16_bits(x);
+    if x.is_finite() && gguf::quant::half_to_f32(h).is_finite() {
+        h
+    } else {
+        0x7e00
+    }
 }
 
 /// Check exact NeoX output, reruns and isolated cache-position faults.
