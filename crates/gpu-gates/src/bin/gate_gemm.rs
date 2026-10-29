@@ -9302,18 +9302,27 @@ mod gate {
             let map = [0u32, HOST, 1, 2, 7];
             let map_d = DeviceBuffer::from_host(stream, &map)?;
             let mut ok = true;
-            for (rows, k, tokens, refused, poison) in [
-                (64usize, 64usize, 9usize, false, None),
-                (128, 128, 50, true, None),
-                (64, 192, 23, false, None),
-                (64, 448, 23, false, None),
-                (192, 256, 37, false, Some(5usize)),
-                (640, 2560, 131, false, None),
+            for (rows, k, tokens, refused, poison, varied) in [
+                (64usize, 64usize, 9usize, false, None, false),
+                (128, 128, 50, true, None, false),
+                (64, 192, 23, false, None, false),
+                (64, 448, 23, false, None, false),
+                (192, 256, 37, false, Some(5usize), false),
+                (640, 2560, 131, false, None, false),
+                // Varied columns force the gate/up walk's 1, 2, 4, 6 and 8 live-fragment arms.
+                (128, 128, 8, false, None, true),
+                (128, 128, 16, false, None, true),
+                (128, 128, 32, false, None, true),
+                (128, 128, 48, false, None, true),
+                (128, 128, 64, false, None, true),
             ] {
                 let slots = tokens * top_k;
                 let mut lcg = Lcg(0x5eed ^ (rows * k + tokens) as u64);
                 let ids: Vec<u32> = (0..tokens)
                     .flat_map(|_| {
+                        if varied {
+                            return [0, 1];
+                        }
                         let a = lcg.below(4 + usize::from(refused)) as u32;
                         let b = (a + 1 + lcg.below(3) as u32) % (4 + u32::from(refused));
                         [a, b]
@@ -9377,8 +9386,9 @@ mod gate {
                 let blank = DeviceBuffer::from_host(stream, &vec![0.0f32; slots * rows])?;
                 let mut runs = Vec::new();
                 for fused in [false, true] {
-                    let mut g = DeviceBuffer::from_host(stream, &vec![SENT; slots * rows])?;
-                    let mut u = DeviceBuffer::from_host(stream, &vec![SENT; slots * rows])?;
+                    let scratch_cells = if fused { 0 } else { slots * rows };
+                    let mut g = DeviceBuffer::from_host(stream, &vec![SENT; scratch_cells])?;
+                    let mut u = DeviceBuffer::from_host(stream, &vec![SENT; scratch_cells])?;
                     let mut act = GemmAct32::new_routed(stream, slots, rows)?;
                     let mut y = DeviceBuffer::from_host(stream, &vec![SENT; slots * hidden])?;
                     let mut enqueue = |s: &cuda_core::CudaStream,
@@ -9497,7 +9507,8 @@ mod gate {
                     && !plain.3
                     && x_fault == poison.map(|_| Fault::at(LAYER_NONE, FaultSite::QuantColumn));
                 println!(
-                    "gemm32 case=nvfp4_gate_up rows={rows} k={k} slots={slots} refused={refused} poison={poison:?} q8_off={q8_off} y_eq={y_eq} eager_graph_eq={replay_eq} fault={:?} replay_fault_eq={} native={} {}",
+                    "gemm32 case=nvfp4_gate_up rows={rows} k={k} slots={slots} varied={varied} scratch_saved_bytes={} refused={refused} poison={poison:?} q8_off={q8_off} y_eq={y_eq} eager_graph_eq={replay_eq} fault={:?} replay_fault_eq={} native={} {}",
+                    2 * slots * rows * size_of::<f32>(),
                     fused.2,
                     plain.4 && fused.4,
                     fused.3,
