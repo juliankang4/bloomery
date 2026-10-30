@@ -24,15 +24,17 @@
 //! scan has opened and not closed is reported as it is read
 //! ([`Scanned::open`]): its name and `arguments` object once their start is
 //! read, and the compact JSON of the object so far, a prefix of the arguments
-//! the call closes with. Every decision depends on the text only, never on how
-//! it was cut into pieces.
+//! the call closes with. Every decision is independent of how the text and
+//! special-token offsets were cut into pieces. A call tag held as one special token is markup
+//! only where that token wrote it; ordinary tokens spelling it stay text.
 
 use serde_json::Value;
 
 use crate::callstream::{self, Progress};
 use crate::constrain::{Fun, Part, Refusal, call};
 use crate::dsml::{Scanned, ToolCall};
-use crate::reasoning::partial_suffix;
+use crate::engine::Tokenizer;
+use crate::reasoning::{Marked, SpecialTags, partial_suffix};
 
 /// Opens a call.
 pub const CALL_OPEN: &str = "<tool_call>";
@@ -92,44 +94,61 @@ pub struct HermesScan {
     /// writes its calls one newline apart.
     after_call: bool,
     /// Text not yet decided.
-    buf: String,
+    buf: Marked,
+    specials: SpecialTags,
     calls: usize,
 }
 
 impl HermesScan {
+    /// Reads call tags only where their special tokens wrote them, for those
+    /// `tok` holds as one special token.
+    pub(crate) fn read_specials(&mut self, tok: &dyn Tokenizer) {
+        self.specials = SpecialTags::of(tok, &[CALL_OPEN, CALL_CLOSE]);
+    }
+
     /// Feeds text; returns the content that may be sent and the calls that
     /// closed.
     pub fn push(&mut self, piece: &str) -> Result<Scanned, HermesError> {
-        self.buf.push_str(piece);
+        self.push_marked(piece, &[])
+    }
+
+    /// Feeds text whose special tokens start at `specials` (byte offsets,
+    /// ascending).
+    pub(crate) fn push_marked(
+        &mut self,
+        piece: &str,
+        specials: &[usize],
+    ) -> Result<Scanned, HermesError> {
+        self.buf.push(piece, specials);
         let mut out = Scanned::default();
         loop {
             if self.inside {
-                let Some(end) = self.buf.find(CALL_CLOSE) else {
-                    out.open = partial_call(&self.buf).map(|(name, args)| Progress {
+                let Some(end) = self.specials.find(&self.buf, CALL_CLOSE) else {
+                    out.open = partial_call(&self.buf.text).map(|(name, args)| Progress {
                         index: self.calls,
                         name,
                         args,
                     });
                     return Ok(out);
                 };
-                let (name, arguments) = parse_call(&self.buf[..end], self.calls)?;
+                let (name, arguments) = parse_call(&self.buf.text[..end], self.calls)?;
                 out.calls.push(ToolCall {
                     index: self.calls,
                     name,
                     arguments,
                 });
                 self.calls += 1;
-                self.buf.drain(..end + CALL_CLOSE.len());
+                self.buf.take_front(end + CALL_CLOSE.len());
                 self.inside = false;
                 self.after_call = true;
             } else if self.after_call {
-                let ws = self.buf.len() - self.buf.trim_start().len();
-                let rest = &self.buf[ws..];
+                let ws = self.buf.text.len() - self.buf.text.trim_start().len();
+                let rest = &self.buf.text[ws..];
                 if rest.len() < CALL_OPEN.len() && CALL_OPEN.starts_with(rest) {
                     return Ok(out);
                 }
-                if rest.starts_with(CALL_OPEN) {
-                    self.buf.drain(..ws + CALL_OPEN.len());
+                if self.specials.at(&self.buf, ws, CALL_OPEN) {
+                    self.buf.take_front(ws + CALL_OPEN.len());
                     self.inside = true;
                     self.after_call = false;
                 } else {
@@ -137,14 +156,13 @@ impl HermesScan {
                     // whitespace with it.
                     self.after_call = false;
                 }
-            } else if let Some(at) = self.buf.find(CALL_OPEN) {
-                out.content.push_str(&self.buf[..at]);
-                self.buf.drain(..at + CALL_OPEN.len());
+            } else if let Some(at) = self.specials.find(&self.buf, CALL_OPEN) {
+                out.content.push_str(&self.buf.take_front(at).text);
+                self.buf.take_front(CALL_OPEN.len());
                 self.inside = true;
             } else {
-                let upto = self.buf.len() - partial_suffix(&self.buf, CALL_OPEN);
-                out.content.push_str(&self.buf[..upto]);
-                self.buf.drain(..upto);
+                let upto = self.buf.text.len() - partial_suffix(&self.buf.text, CALL_OPEN);
+                out.content.push_str(&self.buf.take_front(upto).text);
                 return Ok(out);
             }
         }
@@ -154,7 +172,7 @@ impl HermesScan {
     /// an error, an incomplete opening tag is text, and the whitespace a
     /// closed call's layout left is nothing.
     pub fn finish(&mut self) -> Result<Scanned, HermesError> {
-        let rest = std::mem::take(&mut self.buf);
+        let rest = std::mem::take(&mut self.buf).text;
         if self.inside {
             return Err(HermesError::Unterminated {
                 index: self.calls,

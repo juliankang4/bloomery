@@ -42,8 +42,8 @@
 //! The call a scan has opened and not closed is reported as it is read
 //! ([`Scanned::open`]): its name once `<function=NAME>` is whole, and the
 //! arguments so far, a prefix of the arguments the call closes with, the text
-//! of a string parameter as it arrives. Every decision depends on the text
-//! only, never on how it was cut into pieces. A `<tool_call>` or `</tool_call>`
+//! of a string parameter as it arrives. Every decision is independent of how
+//! the text and special-token offsets were cut into pieces. A `<tool_call>` or `</tool_call>`
 //! the vocabulary holds as one special token is markup only where that token
 //! wrote it ([`SpecialTags`]): spelled in ordinary tokens it is text, content
 //! outside a call and no close inside one.
