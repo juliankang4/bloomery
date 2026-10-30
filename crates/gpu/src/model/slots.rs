@@ -305,10 +305,15 @@ impl SlotSet {
     /// The slots of a pass's ranges (distinct, at most [`MAX_PASS_ROWS`]:
     /// [`GpuModel::step_slots`] refuses any other set before it runs).
     fn of(rows: &[SlotRange]) -> SlotSet {
+        SlotSet::of_slots(rows.iter().map(|r| r.slot))
+    }
+
+    /// The slots `slots` names, as [`SlotSet::of`] takes a pass's.
+    fn of_slots(slots: impl ExactSizeIterator<Item = usize>) -> SlotSet {
         let mut ids = [0; MAX_PASS_ROWS];
-        let len = rows.len().min(MAX_PASS_ROWS);
-        for (id, r) in ids.iter_mut().zip(rows) {
-            *id = r.slot;
+        let len = slots.len().min(MAX_PASS_ROWS);
+        for (id, slot) in ids.iter_mut().zip(slots) {
+            *id = slot;
         }
         ids[..len].sort_unstable();
         SlotSet { ids, len }
@@ -561,6 +566,44 @@ where
             self.selected = slot;
         }
         Ok(())
+    }
+
+    /// `f` over several resident slots at once, the homes made canonical
+    /// first — slot 0 selected, so every slot's state sits in its home — as
+    /// a pass of several slots binds them ([`SlotRows::enqueue_slots`]):
+    /// handed the card, the weights, the body with slot 0's sequence live
+    /// and every slot of `slots` but slot 0 its parked sequence, in `slots`
+    /// order. A fault `f` returns poisons every slot of `slots`. Refused by
+    /// name before `f` runs: as [`GpuModel::select_slot`] refuses, no slot
+    /// or more than a pass binds ([`MAX_PASS_ROWS`]), a slot named twice,
+    /// and a slot past the model's slots.
+    pub fn on_slots<T>(
+        &mut self,
+        slots: &[usize],
+        what: &'static str,
+        f: impl FnOnce(&Gpu, &Weights, &mut B, &mut [&mut B::Seq]) -> Result<T, GpuError>,
+    ) -> Result<T, GpuError> {
+        if slots.is_empty() || slots.len() > MAX_PASS_ROWS {
+            return Err(GpuError::shape(
+                what,
+                format!("{} slots; one call binds 1 to {MAX_PASS_ROWS}", slots.len()),
+            ));
+        }
+        // `parked_seqs` takes each parked slot's home once; slot 0 has none.
+        if slots.iter().filter(|&&s| s == 0).count() > 1 {
+            return Err(slot_twice(what, 0));
+        }
+        self.select_slot(0)?;
+        let GpuModel {
+            parked,
+            body,
+            weights,
+            gpu,
+            ..
+        } = self;
+        let r = parked_seqs(parked, slots.iter().copied(), what)
+            .and_then(|mut seqs| f(gpu, weights, body.as_mut(), &mut seqs));
+        self.note_fault_in(what, r, SlotSet::of_slots(slots.iter().copied()))
     }
 
     /// Exchange the live slot's state with parked entry `i`'s: the sequence
@@ -1065,7 +1108,7 @@ where
             let GpuModel {
                 parked, body, gpu, ..
             } = self;
-            let mut seqs = parked_seqs(parked, &ranges, what)?;
+            let mut seqs = parked_seqs(parked, ranges.iter().map(|r| r.slot), what)?;
             body.plan_slots(gpu.stream(), &mut seqs, &ranges, &ids)?;
         }
         if self.mode == StepMode::Graph && self.slot_graphs.get(key_of(&ranges)).is_none() {
@@ -1310,30 +1353,29 @@ fn enqueue_ranges<B: SlotRows>(
 where
     B::Seq: 'static,
 {
-    let mut seqs = parked_seqs(parked, rows, what)?;
+    let mut seqs = parked_seqs(parked, rows.iter().map(|r| r.slot), what)?;
     body.enqueue_slots(gpu, w, heads, &mut seqs, rows)
 }
 
-/// Each busy slot's parked sequence but slot 0's, typed, in `rows` order:
+/// Each busy slot's parked sequence but slot 0's, typed, in `slots` order:
 /// with the homes canonical, slot `s > 0` sits in parked entry `s − 1`,
 /// and slot 0 is the live one.
 fn parked_seqs<'p, B: Slots>(
     parked: &'p mut [ParkedSlot<B>],
-    rows: &[SlotRange],
+    slots: impl Iterator<Item = usize>,
     what: &'static str,
 ) -> Result<Vec<&'p mut B::Seq>, GpuError>
 where
     B::Seq: 'static,
 {
     let mut homes: Vec<Option<&mut ParkedSlot<B>>> = parked.iter_mut().map(Some).collect();
-    let mut seqs = Vec::with_capacity(rows.len());
-    for r in rows.iter().filter(|r| r.slot != 0) {
-        let p = r
-            .slot
+    let mut seqs = Vec::with_capacity(homes.len());
+    for slot in slots.filter(|&s| s != 0) {
+        let p = slot
             .checked_sub(1)
             .and_then(|i| homes.get_mut(i))
             .and_then(Option::take)
-            .ok_or_else(|| no_home(r.slot, what))?;
+            .ok_or_else(|| no_home(slot, what))?;
         // Called by name, as `swap_parked` calls `exchange`.
         seqs.push(ParkedSeq::<B>::seq(p.seq.as_mut()));
     }

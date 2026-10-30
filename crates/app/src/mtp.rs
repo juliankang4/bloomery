@@ -345,6 +345,49 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
         out: &mut [u32],
         p: Option<&mut [f32]>,
     ) -> Result<usize, GpuError>;
+
+    /// Several resident sequences' window chains in one call, every slot
+    /// named once: each [`SlotChain`] the chain [`MtpBody::chain`] runs with
+    /// its slot selected, its proposal written to the front of its `out` and,
+    /// when it holds `p`, each id's probability to the front of `p`, bit for
+    /// bit what that chain alone writes. Returns each chain's proposal
+    /// length, in order. The default runs the chains in turn and leaves the
+    /// selected slot selected; a body whose walks run several sequences'
+    /// rows at once overrides it and may leave another slot selected.
+    fn chain_slots(
+        m: &mut GpuModel<Self>,
+        chains: &mut [SlotChain<'_, Self::Arena>],
+        head: DraftHead,
+        mode: WalkMode,
+    ) -> Result<Vec<usize>, GpuError>
+    where
+        Self: Slots,
+        Self::Seq: 'static,
+    {
+        let home = m.selected();
+        let mut lens = Vec::with_capacity(chains.len());
+        let ran = chains.iter_mut().try_for_each(|c| {
+            m.select_slot(c.slot)?;
+            let n = Self::chain(m, c.refresh, c.own, head, mode, c.out, c.p.as_deref_mut())?;
+            lens.push(n);
+            Ok(())
+        });
+        let back = m.select_slot(home);
+        ran.and(back).map(|()| lens)
+    }
+}
+
+/// One slot's window chain of a round of several slots' chains
+/// ([`MtpBody::chain_slots`]): the slot, the refresh its draft recorded (its
+/// last row the token at the slot's position), the own walks after it, the
+/// room of its proposal and, when its draft reads them, of each id's
+/// probability.
+pub struct SlotChain<'a, A> {
+    pub slot: usize,
+    pub refresh: Feed<'a, A>,
+    pub own: usize,
+    pub out: &'a mut [u32],
+    pub p: Option<&'a mut [f32]>,
 }
 
 /// One drafted window as the draft saw it ([`MtpDraft::keep_windows`]): the
@@ -805,8 +848,13 @@ pub type Draw<'a> = &'a mut dyn FnMut(&[f32]) -> u32;
 /// window's in turn as [`runtime::Speculative`]'s pass runs it for one
 /// sequence, the verifies of the windows run together:
 /// - each window's slot selected and its draft's proposal made, at most its
-///   `depth` ids ([`Draft::propose`] into that much room), every window's
-///   before any pass: a pass may write the arena whose rows a draft walks;
+///   `depth` ids (the chain [`Draft::propose`] runs into that much room),
+///   every window's before any pass: a pass may write the arena whose rows a
+///   draft walks. The chains whose refresh reads the step's or the verify's
+///   arena, which a select keeps, run together once every window's chain is
+///   decided ([`MtpBody::chain_slots`]: one walk a depth over every slot's
+///   rows, on a body that runs them so); any other chain runs at once, before
+///   the next select;
 /// - the windows' rows — the token at its slot's position, then the
 ///   proposal — cut between windows into passes of at most
 ///   [`SlotRows::MAX_ROWS`] rows and [`SlotRows::MAX_SLOTS`] sequences,
@@ -845,9 +893,11 @@ where
     B::Seq: 'static,
 {
     let mut rows: Vec<Vec<u32>> = Vec::with_capacity(windows.len());
+    let mut lens = Vec::with_capacity(windows.len());
     let mut firsts = Vec::with_capacity(windows.len());
     let mut plain = SlotWalks::default();
-    for w in windows.iter_mut() {
+    let mut batch = Vec::new();
+    for (i, w) in windows.iter_mut().enumerate() {
         t.select_slot(w.slot)?;
         let pos = t.pos();
         let mut ids = vec![w.last; 1 + w.depth.min(B::WIDTH)];
@@ -855,7 +905,15 @@ where
             w.draft.gather(t, w.last, &mut plain)?;
             0
         } else {
-            Draft::propose(w.draft, t, w.last, &mut ids[1..])?
+            let read_p = w.draft.windows.is_some();
+            match w.draft.policy.chain(pos, t.ctx(), w.last, ids.len() - 1)? {
+                None => 0,
+                Some(c) if c.refresh.walk == B::STEP_ARENA || c.refresh.walk == B::VERIFY_ARENA => {
+                    batch.push((i, c));
+                    0
+                }
+                Some(c) => w.draft.run_chain(t, &c, &mut ids[1..], read_p)?,
+            }
         };
         if t.pos() != pos {
             return Err(SessionError::Refused(format!(
@@ -864,6 +922,17 @@ where
                 t.pos()
             )));
         }
+        rows.push(ids);
+        lens.push(n);
+        firsts.push(pos);
+    }
+    for ((i, _), n) in batch
+        .iter()
+        .zip(slot_chains(t, windows, &mut rows, &batch)?)
+    {
+        lens[*i] = n;
+    }
+    for ((w, ids), &n) in windows.iter().zip(&mut rows).zip(&lens) {
         if n == 0 && w.depth > 0 && !w.draft.skipping() {
             return Err(SessionError::Refused(format!(
                 "{WHAT}: slot {}'s draft proposed nothing while it drafts",
@@ -871,8 +940,6 @@ where
             )));
         }
         ids.truncate(1 + n);
-        rows.push(ids);
-        firsts.push(pos);
     }
     plain.run(t)?;
     let cuts = crate::round_passes(
@@ -943,6 +1010,67 @@ where
     Ok((done, cuts.len()))
 }
 
+/// The chains of a pass's windows that [`pass_slots`] held for one call,
+/// `batch` each window's index and the chain its policy decided, run
+/// together ([`MtpBody::chain_slots`]), each proposal into its window's
+/// `rows` after the token at its slot's position, kept by its draft as its
+/// own chain keeps it. A lone chain, or chains of two heads or two walk
+/// modes, run in turn on their own slots. Returns each chain's proposal
+/// length, in `batch`'s order.
+fn slot_chains<B>(
+    t: &mut Session<B>,
+    windows: &mut [SlotWindow<'_, B>],
+    rows: &mut [Vec<u32>],
+    batch: &[(usize, policy::Chain<B::Arena>)],
+) -> Result<Vec<usize>, SessionError>
+where
+    B: MtpBody + Slots,
+    B::Seq: 'static,
+{
+    let Some(&(first, ref c0)) = batch.first() else {
+        return Ok(Vec::new());
+    };
+    let (head, mode) = (windows[first].draft.head, c0.mode);
+    // One chain, or chains of drafts opened with different heads or walk
+    // modes, run in turn: each slot selected, its arenas kept by the select.
+    if batch.len() == 1
+        || batch
+            .iter()
+            .any(|(i, c)| windows[*i].draft.head != head || c.mode != mode)
+    {
+        let mut lens = Vec::with_capacity(batch.len());
+        for (i, c) in batch {
+            let w = &mut windows[*i];
+            t.select_slot(w.slot)?;
+            let read_p = w.draft.windows.is_some();
+            lens.push(w.draft.run_chain(t, c, &mut rows[*i][1..], read_p)?);
+        }
+        return Ok(lens);
+    }
+    let lens = {
+        let mut next = batch.iter().peekable();
+        let mut chains = Vec::with_capacity(batch.len());
+        for (i, (w, ids)) in windows.iter_mut().zip(rows.iter_mut()).enumerate() {
+            let Some((_, c)) = next.next_if(|(j, _)| *j == i) else {
+                continue;
+            };
+            let read_p = w.draft.windows.is_some();
+            chains.push(SlotChain {
+                slot: w.slot,
+                refresh: c.refresh.feed(),
+                own: c.own,
+                out: &mut ids[1..],
+                p: read_p.then_some(&mut w.draft.p[..]),
+            });
+        }
+        B::chain_slots(t.model_mut(), &mut chains, head, mode)?
+    };
+    for ((i, _), &n) in batch.iter().zip(&lens) {
+        windows[*i].draft.proposed(&rows[*i][1..1 + n]);
+    }
+    Ok(lens)
+}
+
 impl<B: MtpBody> MtpDraft<B> {
     /// One chain, one readback (the module doc): the recorded refresh's
     /// walk — its last row `last`, the token at the target's position, whose
@@ -961,9 +1089,22 @@ impl<B: MtpBody> MtpDraft<B> {
         out: &mut [u32],
         read_p: bool,
     ) -> Result<usize, SessionError> {
-        let Some(c) = self.policy.chain(t.pos(), t.ctx(), last, out.len())? else {
-            return Ok(0);
-        };
+        match self.policy.chain(t.pos(), t.ctx(), last, out.len())? {
+            None => Ok(0),
+            Some(c) => self.run_chain(t, &c, out, read_p),
+        }
+    }
+
+    /// The chain `c` the policy decided, run on the session's selected
+    /// slot ([`MtpBody::chain`]) into `out`, with each id's probability into
+    /// the draft's own `p` when `read_p`, and kept ([`MtpDraft::proposed`]).
+    fn run_chain(
+        &mut self,
+        t: &mut Session<B>,
+        c: &policy::Chain<B::Arena>,
+        out: &mut [u32],
+        read_p: bool,
+    ) -> Result<usize, SessionError> {
         let n = B::chain(
             t.model_mut(),
             c.refresh.feed(),
@@ -973,10 +1114,16 @@ impl<B: MtpBody> MtpDraft<B> {
             out,
             read_p.then_some(&mut self.p[..]),
         )?;
-        if let Some(w) = &mut self.windows {
-            w.pending = Some((out[..n].to_vec(), self.p[..n].to_vec()));
-        }
+        self.proposed(&out[..n]);
         Ok(n)
+    }
+
+    /// The proposal `ids` a chain made, its probabilities in the draft's
+    /// own `p`, kept until its accept under [`MtpDraft::keep_windows`].
+    fn proposed(&mut self, ids: &[u32]) {
+        if let Some(w) = &mut self.windows {
+            w.pending = Some((ids.to_vec(), self.p[..ids.len()].to_vec()));
+        }
     }
 }
 

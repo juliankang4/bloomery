@@ -5729,7 +5729,18 @@ mod gate {
         for (depth, refs) in DEPTHS.into_iter().zip(&capped) {
             z_ok &= z_red(
                 &format!("depth {depth}"),
-                one_pass_windows(&mut s, [a, b], depth, ROUNDS, refs, uneven),
+                one_pass_windows(&mut s, [a, b], [depth; 2], ROUNDS, refs.each_ref(), uneven),
+            );
+        }
+        // Unequal depths, in both orders: one slot's chain ends while the
+        // other's own walks go on, so a walk past the first takes fewer
+        // blocks than the round staged.
+        for (x, y) in [(0, 1), (1, 0)] {
+            let depths = [DEPTHS[x], DEPTHS[y]];
+            let refs = [&capped[x][0], &capped[y][1]];
+            z_ok &= z_red(
+                &format!("depths {depths:?}"),
+                one_pass_windows(&mut s, [a, b], depths, ROUNDS, refs, uneven),
             );
         }
         z_ok &= z_red("waiting", waiting_select(&mut s));
@@ -6332,7 +6343,7 @@ mod gate {
         s: &mut app::Session<Body38>,
         windows: [&[u32]; 2],
         rounds: &[(Option<usize>, Option<usize>)],
-        refs: &[Drafted; 2],
+        refs: [&Drafted; 2],
     ) -> Result<SlotRounds, GateError> {
         let mut drafts = [fresh_draft(s)?, fresh_draft(s)?];
         let mut outs = [Vec::new(), Vec::new()];
@@ -6417,23 +6428,27 @@ mod gate {
         }
     }
 
-    /// (z) at `depth`: each window's request started alone on its own slot
-    /// (slot 0 window A, slot 1 window B, in the server's order), then
-    /// `rounds` passes of both slots' drafted rows in one pass
+    /// (z) at `depths`, a slot's each: each window's request started alone
+    /// on its own slot (slot 0 window A, slot 1 window B, in the server's
+    /// order), then `rounds` passes of both slots' drafted rows in one pass
     /// ([`app::mtp::pass_slots`]), each slot's draft its own; against
-    /// `refs`, each window's [`capped_run`]. `uneven` holds the passes to
+    /// `refs`, each window's [`capped_run`] at its slot's depth. Unequal
+    /// depths run chains of unequal own walks in one round. Mutant: a
+    /// continuing chain's rows at its staged block (`b.block` for `next` in
+    /// `chain_rows`). `uneven` holds the passes to
     /// the module doc's coverage of a pass keeping different counts on the
     /// two slots: the real tier's, where the shipped draft's proposals are
     /// accepted unevenly.
     fn one_pass_windows(
         s: &mut app::Session<Body38>,
         windows: [&[u32]; 2],
-        depth: usize,
+        depths: [usize; 2],
         rounds: usize,
-        refs: &[Drafted; 2],
+        refs: [&Drafted; 2],
         uneven: bool,
     ) -> Result<bool, GateError> {
-        let (done, off) = slot_rounds(s, windows, &vec![(Some(depth), Some(depth)); rounds], refs)?;
+        let [d0, d1] = depths;
+        let (done, off) = slot_rounds(s, windows, &vec![(Some(d0), Some(d1)); rounds], refs)?;
         let (mut rejected, mut apart) = (0usize, 0usize);
         for pass in &done {
             rejected += pass.iter().filter(|(_, c)| c.kept < c.rows).count();
@@ -6444,10 +6459,10 @@ mod gate {
         let same = off.is_empty();
         let ok = same && rejected > 0 && (!uneven || apart > 0);
         println!(
-            "(z) two slots in one pass at depth {depth} (a pass of {} rows): {rounds} passes; \
-             {}; {rejected} slot passes kept fewer rows than they ran, {apart} passes kept \
-             different counts on the two slots{} {}",
-            2 * (depth + 1),
+            "(z) two slots in one pass at depths {d0} and {d1} (a pass of {} rows): {rounds} \
+             passes; {}; {rejected} slot passes kept fewer rows than they ran, {apart} passes \
+             kept different counts on the two slots{} {}",
+            d0 + d1 + 2,
             alone_runs(&off),
             if uneven {
                 ""
@@ -6502,7 +6517,7 @@ mod gate {
         refs: &[Drafted; 2],
         wide: bool,
     ) -> Result<bool, GateError> {
-        let (done, off) = slot_rounds(s, windows, &PLAIN_ROUNDS, refs)?;
+        let (done, off) = slot_rounds(s, windows, &PLAIN_ROUNDS, refs.each_ref())?;
         let key = [(1, 4)];
         let nodes = s.model_mut().capture_slots(&key)?;
         let own = s.model().body("(z) plain rounds")?.slots_launches(&key);
