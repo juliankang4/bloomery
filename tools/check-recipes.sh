@@ -923,7 +923,8 @@ blk_orphan() {
 }
 
 # The justfile reads and exports the shared architecture selection. Every recipe uses that value.
-# PIN(2026-10-24): GB10 selects sm_121a through arch.sh; recipes keep no independent target default.
+# PIN(2026-10-31): a machine whose cards are all cc 12.0 selects sm_120a and all cc 12.1 sm_121a through arch.sh, cards of
+# different capabilities sm_86; recipes keep no independent target default.
 blk_archowner() {
   python3 - "$JF" "$B" << 'PY'
 import os
@@ -1012,7 +1013,10 @@ cases = [
     ('12.1\n12.1', None, 'sm_121a', 0),
     ('12.1\n12.0', None, 'sm_86', 0),
     (None, None, 'sm_86', 0),
-    ('12.0', None, 'sm_86', 0),
+    ('12.0', None, 'sm_120a', 0),
+    ('12.0\n12.0', None, 'sm_120a', 0),
+    ('12.0\n8.6', None, 'sm_86', 0),
+    ('8.6\n12.0', None, 'sm_86', 0),
     ('8.6', None, 'sm_86', 0),
     ('12.1', 'sm_121', 'sm_121', 0),
     ('error', 'sm_86', 'sm_86', 0),

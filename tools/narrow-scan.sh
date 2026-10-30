@@ -92,7 +92,8 @@
 # contention: run again, BLOOMERY_BOX_WAIT=3600 waits longer). BLOOMERY_CARD, BLOOMERY_BOX_ENV and BLOOMERY_TIER are
 # unset for the box calls, so nothing card-related reaches the box, and so are BLOOMERY_BOX_QUEUE and the queue's
 # settings: the runner goes over stdin and the stop signals pids the direct path records, and a queued job has neither.
-# A runner that arrives empty ends the side 65 by name, never an empty scan read as rc 0. The scans are sm_86's: a BLOOMERY_ARCH naming another
+# A runner that arrives empty ends the side 65 by name, never an empty scan read as rc 0. Both sides build and scan at one arch,
+# tools/arch.sh's (BLOOMERY_ARCH, unset: the selection from this machine's cards), exported to the box calls; a value that is no
 # arch is refused (64) before anything runs.
 #
 # DIR (default ~/.cache/bloomery/narrow/<tree>/<base8>-<head8>, <base8>-worktree under `--worktree`) keeps: scan-set.tsv (the head
@@ -111,8 +112,9 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 source "$ROOT/tools/nightly/units.sh" # tree_commit labels the head tree, archive_tree reads a base commit
 # shellcheck source=tools/gate-bound.sh
 source "$ROOT/tools/gate-bound.sh"
+# shellcheck source=tools/arch.sh
+source "$ROOT/tools/arch.sh" # bloomery_arch sets ARCH, the arch both sides build and scan at
 PKG=bloomery-gpu-gates # the package the ptx-scan recipe builds; tools/recipes.py SCAN_PACKAGE
-ARCH=sm_86 # the arch of the scans, the recipes' default (BLOOMERY_ARCH, tools/arch.sh); the pairs are built at no other
 USAGE="usage: narrow-scan.sh BASE [HEAD | --worktree] [--out DIR] [--dry-run] [--keep-ptx] [--scan-only] | --self-test"
 
 die() { # die <rc> <message>
@@ -595,7 +597,8 @@ run_side() {
 
 self_test() {
   local t n=0 bad=0 want rc got
-  unset BLOOMERY_ARCH
+  export BLOOMERY_ARCH=sm_86 # the fixture arch, whatever cards this machine has
+  ARCH=$BLOOMERY_ARCH
   # macOS tar stores extended attributes as `._*` members, which the ptx decoder refuses as no mod<N>.ptx; the box's
   # GNU tar writes none, so the cases tar as the box does.
   export COPYFILE_DISABLE=1
@@ -952,9 +955,9 @@ NARROW_HELD_EOF
   grep -qF "cargo oxide build --arch {{arch}} -- -p $PKG --features {{FEATURES}} --release --bin {{BIN}}" <<< "$recipe"; ok "drift: the ptx-scan recipe still builds with this runner's cargo oxide line" $?
   grep -qF "cargo build --release -p $PKG --bin oxart_ptx && bash tools/ptx-scan.sh" <<< "$recipe"; ok "drift: the ptx-scan recipe still builds the extractor as this runner does" $?
   grep -qF "NARROW_PTX_SCAN_EOF" "$ROOT/tools/ptx-scan.sh"; [ $? = 1 ]; ok "drift: ptx-scan.sh does not hold the runner's here-document marker" $?
-  # another arch is refused by name before any git or box call, and the scan's own arch is not
-  got=$(env BLOOMERY_ARCH=sm_121 bash "$0" HEAD --dry-run 2>&1); rc=$?
-  [ "$rc" = 64 ] && grep -qF "narrow-scan: BLOOMERY_ARCH is 'sm_121': the scan pairs are sm_86's" <<< "$got"; ok "arch: another BLOOMERY_ARCH is refused by name (64)" $?
+  # a BLOOMERY_ARCH that is no arch is refused by name before any git or box call
+  got=$(env BLOOMERY_ARCH=sm121 bash "$0" HEAD --dry-run 2>&1); rc=$?
+  [ "$rc" = 64 ] && grep -qF "narrow-scan.sh: BLOOMERY_ARCH is a CUDA arch" <<< "$got"; ok "arch: a BLOOMERY_ARCH that is no arch is refused by name (64)" $?
   # --worktree: this script in a throwaway repository beside stub tools (no box, no card), so the whole run goes through
   # the real argument handling, the side loop and the affected call. The box stub logs which content each side synced.
   w=$t/bloomery-wt
@@ -1039,6 +1042,7 @@ NARROW_STUB_EOF
   mkdir -p "$w/tools/nightly"
   cp "$ROOT/tools/nightly/units.sh" "$w/tools/nightly/units.sh"
   cp "$ROOT/tools/gate-bound.sh" "$w/tools/gate-bound.sh"
+  cp "$ROOT/tools/arch.sh" "$w/tools/arch.sh"
   git -C "$w" init -q && git -C "$w" config user.email test@test && git -C "$w" config user.name test && git -C "$w" config commit.gpgsign false
   echo base > "$w/marker.txt"
   git -C "$w" add -A && git -C "$w" commit -q -m base
@@ -1177,6 +1181,11 @@ NARROW_STUB_EOF
   rm -rf "$ent/base/gate_x.ptx"
   cache_run "$ch" "$t/c8.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c8-out"
   [ "$rc" = 0 ] && grep -qF "cache entry $ent is corrupt" <<< "$got" && grep -qF "gate_x.ptx" <<< "$got" && grep -q '^base rb ' "$t/c8.log" && [ -s "$ent/base/gate_x.ptx/mod1.ptx" ]; ok "cache: a keep entry with no modules for a bin is named, removed and rebuilt" $?
+  # the arch is part of the key: the first run's key at another arch misses, and both sides build at that arch
+  BLOOMERY_ARCH=sm_120a cache_run "$ch" "$t/c11.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c11-out"
+  [ "$rc" = 0 ] && grep -q '^base rb ' "$t/c11.log" && [ "$(nent "$cr")" = 4 ] && grep -qx 'arch=sm_120a' "$t/c11-out/base-cache.key" \
+    && grep -q '^cargo oxide build --arch sm_120a -- ' "$t/c11-out/runner.sh" && ! grep -q -- '--arch sm_86' "$t/c11-out/runner.sh"
+  ok "cache: the arch is part of the key: BLOOMERY_ARCH=sm_120a misses the sm_86 entries, and the runner builds at sm_120a" $?
   STUB_NOPTX=1 cache_run "$t/chome2" "$t/c9.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c9-out"
   [ "$rc" = 1 ] && [ "$(nent "$t/chome2/.cache/bloomery/narrow-base")" = 0 ]; ok "cache: a base side with no ptx block fails and is not cached" $?
   STUB_SCANRC=1 cache_run "$t/chome2" "$t/c10.log" "$wb" --worktree --scan-only --out "$t/c10-out"
@@ -1325,9 +1334,8 @@ if [ "${1:-}" = --self-test ]; then
   exit
 fi
 
-# The scan pairs are sm_86's (ARCH): the runner builds both sides at ARCH, so a narrowing asked at another arch would read
-# scans of the wrong code.
-[ "${BLOOMERY_ARCH-$ARCH}" = "$ARCH" ] || die 64 "BLOOMERY_ARCH is '$BLOOMERY_ARCH': the scan pairs are $ARCH's (this script builds both sides at $ARCH only)"
+# The runner builds both sides at ARCH, and the box calls get it exported, so the scans are of the code that arch builds.
+bloomery_arch narrow-scan.sh || exit $?
 
 BASE='' HEAD_REV='' OUT='' DRY=0 WORKTREE=0 KEEP=0 SCAN_ONLY=0
 while [ $# -gt 0 ]; do

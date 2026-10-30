@@ -5,11 +5,13 @@
 #
 # The release is the building machine's platform (uname -m) and CUDA arch (BLOOMERY_ARCH, tools/arch.sh), one archive each:
 #   - x86_64, sm_86: bloomery-<v>-linux-x86_64-cuda-sm86, sm_86 PTX the driver compiles for any card of cc 8.6 or newer,
-#     host code for x86-64-v3; built on the box, BLOOMERY_ARCH unset;
+#     host code for x86-64-v3; built on the box with BLOOMERY_ARCH=sm_86, the selection on a machine whose cards are not
+#     all cc 12.0;
 #   - x86_64, sm_120a: bloomery-<v>-linux-x86_64-cuda-sm120a, sm_120a PTX (the Blackwell consumer parts' native FP4 and
-#     MXFP8 kernels, which load on cc 12.0 alone), the same host code; built on the box with BLOOMERY_ARCH=sm_120a, into
-#     its own target dir (target/portable-sm120a) so neither archive's build rebuilds the other's. A build machine with no
-#     cc 12.0 card cannot compile the PTX to cubins, so it stays PTX and the driver compiles it on the card's first start;
+#     MXFP8 kernels, which load on cc 12.0 alone), the same host code; built on the box with BLOOMERY_ARCH=sm_120a (the
+#     selection on a machine whose every card is cc 12.0), into its own target dir (target/portable-sm120a) so neither
+#     archive's build rebuilds the other's. A build machine with no cc 12.0 card cannot compile the PTX to cubins, so it
+#     stays PTX and the driver compiles it on the card's first start;
 #   - aarch64: bloomery-<v>-linux-aarch64-cuda-sm121a, sm_121a PTX (GB10's native FP4, which loads on cc 12.1 alone),
 #     host code for GB10's cores; built on a GB10 (BLOOMERY_BOX names one, or BLOOMERY_BOX_LOCAL=1 on the Spark itself).
 #     The packed binary carries the driver's JIT of that PTX as cubins: oxart_jit --cubin links each `.oxart` bundle on
@@ -118,7 +120,7 @@ set_platform() {
         sm_86) PLATFORM=linux-x86_64-cuda-sm86 TARGET_DIR=portable ;;
         sm_120a) PLATFORM=linux-x86_64-cuda-sm120a TARGET_DIR=portable-sm120a ;;
         *)
-          echo "release: no x86_64 archive for $arch; the x86_64 archives are sm_86 (BLOOMERY_ARCH unset) and sm_120a" >&2
+          echo "release: no x86_64 archive for $arch; the x86_64 archives are sm_86 and sm_120a" >&2
           return 64 ;;
       esac
       RELEASE_ARCH=${arch:-sm_86} ;;
@@ -225,8 +227,8 @@ self_test() {
   expect_platform x86-default x86_64 '' 0 "linux-x86_64-cuda-sm86 sm_86 $x86 portable $x86_tail"
   expect_platform x86-sm86 x86_64 sm_86 0 "linux-x86_64-cuda-sm86 sm_86 $x86 portable $x86_tail"
   expect_platform x86-sm120a x86_64 sm_120a 0 "linux-x86_64-cuda-sm120a sm_120a $x86 portable-sm120a $x86_tail"
-  expect_platform x86-sm121a x86_64 sm_121a 64 "release: no x86_64 archive for sm_121a; the x86_64 archives are sm_86 (BLOOMERY_ARCH unset) and sm_120a"
-  expect_platform x86-sm120f x86_64 sm_120f 64 "release: no x86_64 archive for sm_120f; the x86_64 archives are sm_86 (BLOOMERY_ARCH unset) and sm_120a"
+  expect_platform x86-sm121a x86_64 sm_121a 64 "release: no x86_64 archive for sm_121a; the x86_64 archives are sm_86 and sm_120a"
+  expect_platform x86-sm120f x86_64 sm_120f 64 "release: no x86_64 archive for sm_120f; the x86_64 archives are sm_86 and sm_120a"
   expect_platform arm-default aarch64 '' 0 "linux-aarch64-cuda-sm121a sm_121a gb10 portable v3= glibc=2.39 cubin=1"
   expect_platform arm-sm121a aarch64 sm_121a 0 "linux-aarch64-cuda-sm121a sm_121a gb10 portable v3= glibc=2.39 cubin=1"
   expect_platform arm-sm86 aarch64 sm_86 64 "release: no aarch64 archive for sm_86; the aarch64 archive is sm_121a (BLOOMERY_ARCH unset on a GB10)"

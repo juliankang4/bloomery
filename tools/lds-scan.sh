@@ -13,7 +13,7 @@
 #   with ptxas for the card's arch and disassembles that entry alone (cuobjdump -sass -fun). The recipe
 #   (`just lds-scan <binary> [entry substring]`; `--features deepseek41` for a V4.1 binary) builds the
 #   binary and the extractor first; it needs no card. LDS_SCAN_PTXAS and LDS_SCAN_CUOBJDUMP (default
-#   the box env's CUDA_TOOLKIT_PATH, else /usr/local/cuda), LDS_SCAN_ARCH (default BLOOMERY_ARCH, sm_86 unset: tools/arch.sh) and
+#   the box env's CUDA_TOOLKIT_PATH, else /usr/local/cuda), LDS_SCAN_ARCH (default BLOOMERY_ARCH, unset: tools/arch.sh's selection) and
 #   LDS_SCAN_EXTRACT (default target/release/oxart_ptx) override the tools.
 #
 # Output: a banner `lds-scan bin=… ptxas=… ptxas-version=… arch=… modules=N entries=M`, then per matching

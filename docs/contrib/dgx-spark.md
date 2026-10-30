@@ -77,8 +77,8 @@ turns on the native FP4 routed prompt path for NVFP4 and FP4-Local weights (`cra
 plain `sm_121` does not build it): both weights and activations use FP4 tensor cores. Dense MXFP8 prompt products use
 FP8 tensor cores the same way: each block of 32 activation values is rounded once to E4M3 with a shared power-of-two
 scale. Other routed formats keep their activation format, and decode is unchanged. An explicit `BLOOMERY_ARCH` still
-overrides the detected target; set it when invoking recipes from a machine without the target GPU. Other machines keep
-the `sm_86` default.
+overrides the detected target; set it when invoking recipes from a machine without the target GPU. A machine whose every
+card is compute capability 12.0 (the RTX 50 series) builds `sm_120a`, and other machines keep `sm_86`.
 
 The release's GB10 archive (`bloomery-<version>-linux-aarch64-cuda-sm121a.tar.gz`) is this build, packed: `sm_121a`
 and the features above, `checkpoint` among them. Its kernels are compiled for the GB10 when it is built (`oxart_jit
@@ -382,7 +382,7 @@ is settled by reading.
 ## 6. The card
 
 GB10 recipes build for `sm_121a`, the native FP4 target of section 2.1, and the driver compiles that PTX at the first
-start. The release archive and every other machine keep `sm_86`.
+start. A machine whose every card is cc 12.0 builds `sm_120a`, and every other machine `sm_86`.
 
 - **Targets today.** Recipes pass `--arch {{arch}}` from `tools/arch.sh` and export the selected `BLOOMERY_ARCH` to
   their tools. `tools/gate.sh`, `tools/lds-scan.sh` and `tools/sass-scan.sh` use the same selector. `tools/ptx-scan.sh`
@@ -1642,7 +1642,7 @@ result bullets, lines 197 to 200). Their line numbers are stale; the citations h
 |---|---|---|
 | `sparkprep` S1: cfg guards on the x86 bodies | `qdot`, `deepseek2/attn`, one bin | done in [#14](https://github.com/midagedev/bloomery/pull/14) (P0): every AVX2 item under `cfg(target_arch = "x86_64")`, design R off it |
 | `sparkprep` S2: per-triple `extra-rustflags` | `tools/oxide-host.sh` | done: `.cargo/config.toml` carries `znver3` for x86_64 and `native` for aarch64; `tools/oxide-host.sh` writes the flat `.cargo/cuda-oxide.toml` cargo-oxide reads for the triple a build is for, and `tools/check-rustflags.sh` holds both triples (the fork patch that did this is gone with the fork) |
-| `sparkprep` S3 / `archkey`: one owner of `--arch` | 139 recipe lines | done: the justfile's `arch` variable reads `BLOOMERY_ARCH` (unset: `sm_121a` on a GB10 and `sm_86` elsewhere), the tools that run on the box read it through `tools/arch.sh`, `tools/box.sh` forwards it, and `tools/check-recipes.sh` fails on an arch literal. `just narrow` and `release-build` refuse another arch by name; `ptx-scan` also takes `sm_120` and `sm_121`, and `gate-ptx-spill` reads a table per arch and card capability (section 6) |
+| `sparkprep` S3 / `archkey`: one owner of `--arch` | 139 recipe lines | done: the justfile's `arch` variable reads `BLOOMERY_ARCH` (unset: `sm_121a` on a GB10, `sm_120a` when every card is cc 12.0 and `sm_86` elsewhere), the tools that run on the box read it through `tools/arch.sh`, `tools/box.sh` forwards it, and `tools/check-recipes.sh` fails on an arch literal. `just narrow` and `ptx-compare` build both sides at that arch and `release-build` refuses an arch it has no archive for; `ptx-scan` also takes `sm_120` and `sm_121`, and `gate-ptx-spill` reads a table per arch and card capability (section 6) |
 | `sparkprep` S4: tools for N cards | `cards.sh`, `timing-card.sh`, `gpu-gate.sh` | ~~not done: `tools/ref/cards.sh:31-35` names two cards~~ partly: local mode ([#38](https://github.com/midagedev/bloomery/pull/38)) and the single-card timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)) run on one local card; `tools/ref/cards.sh:33-34` still names the box's two |
 | `isarefuse`: CPU check at `main` | x86-64-v3 refusal | partly: `crates/serve/src/preflight.rs` and `crates/gpu-gates/src/bin/bloomery_serve.rs:70-71` (`cpu_gate`, x86-only); no other bin calls it |
 
