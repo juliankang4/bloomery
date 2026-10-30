@@ -17,13 +17,17 @@
 # PIN(2026-10-25): HC up BF16 input: sm_86 spill 484 -> 608 B, GB10 JIT local unchanged at 88 B; native sm_121/sm_121a spill 364 -> 332 B; deferred flags and u32 columns each measured 532 B spill / 96 B JIT local.
 # PIN(2026-10-28): 332 -> 252 spill bytes, 88 -> 64 JIT local bytes (ptxas 13.3.73 sm_121a, GB10 driver
 # 595.84): the mix reads the normed streams as BF16 words, not F32 values.
-generate_ds41 hc_gated_up_mma_mix_4 252 64
+# PIN(2026-10-31): 252 -> 56 spill bytes, 64 -> 24 JIT local bytes (ptxas 13.3.73 sm_121a, GB10 driver 595.84):
+# the up-mix's passes split the warp's columns, so a mix step holds fewer stream values live.
+generate_ds41 hc_gated_up_mma_mix_4 56 24
 # PIN(2026-10-25): the HC up/mix entries that also write mixed's BF16 or MXFP8 form, spill and GB10 JIT local
 # measured with ptxas 13.3.73, driver 595.84, sm_121a.
 # PIN(2026-10-28): _bf16 348 -> 292 and _mxfp8 348 -> 276 spill bytes, both 88 -> 56 JIT local bytes (ptxas
 # 13.3.73 sm_121a, GB10 driver 595.84): the mix reads the normed streams as BF16 words, not F32 values.
-generate_ds41 hc_gated_up_mma_mix_4_bf16 292 56
-generate_ds41 hc_gated_up_mma_mix_4_mxfp8 276 56
+# PIN(2026-10-31): _bf16 292 -> 56 and _mxfp8 276 -> 56 spill bytes, both 56 -> 24 JIT local bytes (ptxas 13.3.73
+# sm_121a, GB10 driver 595.84): the same column split.
+generate_ds41 hc_gated_up_mma_mix_4_bf16 56 24
+generate_ds41 hc_gated_up_mma_mix_4_mxfp8 56 24
 generate_ds41 mamba2_steps 0 0
 generate_ds41 nvfp4_gemv_sel_f32 0 0
 # PIN(2026-10-23): measured on sm_121a, GB10, driver 595.84, CUDA 13.3.1. Shared GEMM epilogues retain exceptional range; the native 4K pair showed no throughput loss.
@@ -349,7 +353,9 @@ generate_ds41 mxfp8_gemv_mcol 0 0
 generate_ds41 mxfp8_gemv_mcol_staged 0 0
 generate_ds41 mxfp8_mma_gemm 0 0
 generate_ds41 mxfp8_tile_gemm 0 0
-generate_ds41 mxfp8_w8a8_gemm 0 0
+# PIN(2026-10-31): JIT local 0 -> 8 bytes (cc 12.1 JIT on GB10 driver 595.84; ptxas 13.3.73 sm_121a spills 0), read
+# after the tile's last device-code change, which takes its stages by TMA on stage barriers.
+generate_ds41 mxfp8_w8a8_gemm 0 8
 # PIN(2026-10-25): MXFP8 W8A8 norm-gate spill and GB10 JIT local measured with ptxas 13.3.73, driver 595.84, sm_121a.
 # PIN(2026-10-25): 376 -> 364 spill bytes (ptxas 13.3.73 sm_121a, GB10 driver 595.84) when the epilogue also writes
 # the output's MXFP8 form. JIT local bytes remain unchanged.
