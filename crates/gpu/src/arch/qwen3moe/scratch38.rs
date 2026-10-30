@@ -369,10 +369,6 @@ pub(super) struct Arena38 {
     /// The mixer's rows before the output projection: the gated norm's, or
     /// the attention's under its gate.
     pub(super) attn: DeviceBuffer<f32>,
-    /// The selected flash's output before its gate: a pass's rows, none in a
-    /// ubatch walk's arena (its prefill flash stores into `attn` under the
-    /// gate).
-    pub(super) flash: DeviceBuffer<f32>,
     pub(super) gdn: Gdn38,
     pub(super) qsa: Qsa38,
     pub(super) ple: Ple38,
@@ -426,8 +422,8 @@ impl Arena38 {
     /// of `ctx` positions, `fin` the walk's [`final_res`]: every token-major
     /// buffer for `rows` tokens (the stream buffer other than `fin` in BF16), the
     /// selection's scratch for a run of [`select_run`] rows (its selecting
-    /// rows run in runs of that many) and no selected-flash queries, partials
-    /// or output, the router's buffers for [`ROUTE_ROWS`] (it routes in runs of that many).
+    /// rows run in runs of that many) and no selected-flash queries or
+    /// partials, the router's buffers for [`ROUTE_ROWS`] (it routes in runs of that many).
     /// Load-time only.
     pub(super) fn wide(
         stream: &CudaStream,
@@ -465,7 +461,7 @@ impl Arena38 {
 
     /// The buffers for `rows` tokens (stream buffer `bf16`, when named, at a
     /// halfword a value), the selection's for `sel` rows and the selected
-    /// flash's queries, partials and output for `parts`, the router's `route`.
+    /// flash's queries and partials for `parts`, the router's `route`.
     fn alloc(
         stream: &CudaStream,
         (rows, bf16): (usize, Option<usize>),
@@ -493,7 +489,6 @@ impl Arena38 {
             y: f(h)?,
             hc: HcScratch::new(stream, geometry)?,
             attn: f(geo::ATTN)?,
-            flash: DeviceBuffer::zeroed(stream, parts * geo::ATTN)?,
             gdn: Gdn38 {
                 x: f(s.channels())?,
                 z: f(s.n_v * linear::HEAD)?,
@@ -559,7 +554,6 @@ impl Arena38 {
             &self.mixed,
             &self.y,
             &self.attn,
-            &self.flash,
             &g.x,
             &g.z,
             &g.ba,

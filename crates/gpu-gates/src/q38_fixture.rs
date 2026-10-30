@@ -27,8 +27,10 @@ const EMBED_LAUNCHES: usize = 1;
 /// delta step, the gated norm, the output projection) and the block's 9 (the router, the handoff,
 /// the go, the shared expert's four, the wait, the gated sum).
 const GDN_LAYER_LAUNCHES: usize = 6 + 7 + 9;
-/// Launches of a selecting layer: the same 6 and 9 around the mixer's 14.
-const QSA_LAYER_LAUNCHES: usize = 6 + 14 + 9;
+/// Launches of a selecting layer: the same 6 and 9 around the mixer's 13.
+/// PIN(2026-10-30): the selected flash's merge applies the out gate, so the mixer runs 13 launches
+/// (14 before).
+const QSA_LAYER_LAUNCHES: usize = 6 + 13 + 9;
 /// Launches of the PLE site: the combine, key and value, the gate and the conv.
 const PLE_SITE_LAUNCHES: usize = 5;
 /// Launches of the head: its mix's three, the gemv and the argmax; a K-quant `output` quantizes
@@ -246,28 +248,28 @@ mod tests {
         let every_fourth = (0..12).map(|i| 4 * i + 3).collect();
         let real = Shape::from_layers(48, every_fourth, Some(1), Some(248_056)).expect("real");
         assert_eq!((real.n_qsa(), real.n_gdn()), (12, 36));
-        assert_eq!(real.nodes_decode(), 1151);
+        assert_eq!(real.nodes_decode(), 1139);
         assert_eq!(real.memops(), 96);
-        assert_eq!(real.nodes_verify(), 1189);
+        assert_eq!(real.nodes_verify(), 1177);
         assert_eq!(real.nodes_slot(), 171);
-        assert_eq!(real.nodes_decode_card(48), 1391);
-        assert_eq!(real.nodes_verify_card(48), 1429);
+        assert_eq!(real.nodes_decode_card(48), 1379);
+        assert_eq!(real.nodes_verify_card(48), 1417);
         assert_eq!((real.memops_card(0), real.memops_card(48)), (96, 0));
         let fix = Shape::from_layers(4, vec![1, 3], Some(2), Some(248_056)).expect("fixture");
         assert_eq!((fix.n_qsa(), fix.n_gdn()), (2, 2));
-        assert_eq!(fix.nodes_decode(), 1 + 2 * 22 + 2 * 29 + 5 + 5);
-        assert_eq!(fix.nodes_decode(), 113);
-        assert_eq!(fix.nodes_verify(), 117);
+        assert_eq!(fix.nodes_decode(), 1 + 2 * 22 + 2 * 28 + 5 + 5);
+        assert_eq!(fix.nodes_decode(), 111);
+        assert_eq!(fix.nodes_verify(), 115);
         assert_eq!(fix.nodes_slot(), 23);
-        assert_eq!(fix.nodes_decode_card(4), 133);
-        assert_eq!(fix.nodes_verify_card(4), 137);
+        assert_eq!(fix.nodes_decode_card(4), 131);
+        assert_eq!(fix.nodes_verify_card(4), 135);
         let kq = fix.clone().with_head(Head {
             quantizes: true,
             copies_rows: false,
         });
-        assert_eq!(kq.nodes_decode(), 114);
-        assert_eq!(kq.nodes_verify(), 118);
-        assert_eq!(kq.nodes_decode_card(4), 134);
+        assert_eq!(kq.nodes_decode(), 112);
+        assert_eq!(kq.nodes_verify(), 116);
+        assert_eq!(kq.nodes_decode_card(4), 132);
         assert_eq!(kq.nodes_slot(), fix.nodes_slot());
         // A Q5_K head also copies its token-major logits past one row: the decode step at one
         // row is the K-quant head's, the verify one launch more.
@@ -275,9 +277,9 @@ mod tests {
             quantizes: true,
             copies_rows: true,
         });
-        assert_eq!(q5.nodes_decode(), 114);
-        assert_eq!(q5.nodes_verify(), 119);
-        assert_eq!(q5.nodes_verify_card(4), 139);
+        assert_eq!(q5.nodes_decode(), 112);
+        assert_eq!(q5.nodes_verify(), 117);
+        assert_eq!(q5.nodes_verify_card(4), 137);
         assert_eq!(q5.nodes_slot(), fix.nodes_slot());
         // Dense sites that read q8_1 rows: a delta layer's q·k·v, z and output and the shared
         // expert's gate and up (five sites) and a selecting layer's six and the same two (eight)
@@ -287,10 +289,10 @@ mod tests {
             rows: 2 * 5 + 2 * 8 + 3 + 4,
             slot: 2,
         });
-        assert_eq!(by.nodes_decode(), 113 + 26);
-        assert_eq!(by.nodes_verify(), 117 + 26 + 7);
+        assert_eq!(by.nodes_decode(), 111 + 26);
+        assert_eq!(by.nodes_verify(), 115 + 26 + 7);
         assert_eq!(by.nodes_slot(), 23 + 2);
-        assert_eq!(by.nodes_decode_card(4), 133 + 26);
+        assert_eq!(by.nodes_decode_card(4), 131 + 26);
     }
 
     /// A description no gate can read a shape from is a named error, and a file with no PLE site
@@ -302,8 +304,8 @@ mod tests {
         assert!(Shape::from_layers(4, vec![3, 1], None, None).is_err());
         assert!(Shape::from_layers(4, vec![1, 3], Some(4), None).is_err());
         let bare = Shape::from_layers(4, vec![1, 3], None, None).expect("no site");
-        assert_eq!(bare.nodes_decode(), 108);
+        assert_eq!(bare.nodes_decode(), 106);
         assert_eq!(bare.nodes_slot(), 22);
-        assert_eq!((bare.nodes_verify(), bare.arrivals()), (110, 0));
+        assert_eq!((bare.nodes_verify(), bare.arrivals()), (108, 0));
     }
 }

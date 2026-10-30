@@ -199,6 +199,7 @@ use crate::flash::{
     MERGE_BATCH, MMA_K, MMA_NTILE, MMA_ROWS, dev_exp, f32_to_f16_bits, f32x2_to_f16x2_bits,
     half_bits_to_f32, mma_row_words, online_fold,
 };
+use crate::flash_gqa_prefill::{OutGate, SigmoidGate, Ungated};
 use crate::launch_u32;
 use crate::rope_neox::q8_plane_lens;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -2673,16 +2674,17 @@ unsafe fn seg_mma_ps<
 /// `HEAD` values: block `b = t·n_head + h`, thread `d` owning dim `d`, the
 /// live segments folded ascending through `online_fold` in batches of
 /// [`MERGE_BATCH`] loads, a refused row raising [`FaultSite::KeyCount`] and
-/// NaN in every dim.
+/// NaN in every dim, each value written through `gate` ([`OutGate::apply`]
+/// at row `b`, the refused row's NaN included).
 ///
 /// SAFETY: the entry's launch contract at `HEAD` and a block of `HEAD`
-/// threads.
+/// threads, and `gate`'s.
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
     reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
 )]
-unsafe fn merge_body<const HEAD: usize>(
+unsafe fn merge_body<const HEAD: usize, G: OutGate>(
     part_v: &[f32],
     part_ms: &[f32],
     n_keys_buf: &[u32],
@@ -2692,6 +2694,7 @@ unsafe fn merge_body<const HEAD: usize>(
     seg_keys: u32,
     m: u32,
     fault: FaultSink,
+    gate: G,
     mut y: DisjointSlice<f32>,
 ) {
     let b = thread::blockIdx_x() as usize;
@@ -2709,7 +2712,8 @@ unsafe fn merge_body<const HEAD: usize>(
             fault.raise(FaultSite::KeyCount);
         }
         // SAFETY: b·HEAD + d < m·n_head·HEAD <= y.len(); thread d owns it.
-        unsafe { *y.get_unchecked_mut(b * HEAD + d) = f32::NAN };
+        // b < m·n_head and d < HEAD are the gate's row and value.
+        unsafe { *y.get_unchecked_mut(b * HEAD + d) = gate.apply(b, d, f32::NAN) };
         return; // block-uniform: the row is the block's
     }
     // seg_span keeps ⌈limit / span⌉ <= segs (its const check), so the walk
@@ -2745,7 +2749,8 @@ unsafe fn merge_body<const HEAD: usize>(
         j += MERGE_BATCH;
     }
     // SAFETY: b·HEAD + d < m·n_head·HEAD <= y.len(); thread d owns it.
-    unsafe { *y.get_unchecked_mut(b * HEAD + d) = acc * (1.0 / s) };
+    // b < m·n_head and d < HEAD are the gate's row and value.
+    unsafe { *y.get_unchecked_mut(b * HEAD + d) = gate.apply(b, d, acc * (1.0 / s)) };
 }
 
 // ------------------------------------------------------------ the ring run body
@@ -4662,8 +4667,55 @@ mod flash_gqa_kernels {
         // SAFETY: the launch contract is `merge_body`'s at HEAD_256, and the
         // block is HEAD_256 threads.
         unsafe {
-            merge_body::<HEAD_256>(
-                part_v, part_ms, n_keys_buf, n_head, ctx, segs, seg_keys, m, fault, y,
+            merge_body::<HEAD_256, _>(
+                part_v, part_ms, n_keys_buf, n_head, ctx, segs, seg_keys, m, fault, Ungated, y,
+            )
+        };
+    }
+
+    /// [`gqa_flash_merge_256`] with each value written under its sigmoid
+    /// gate (`SigmoidGate`): the gate of row `b`'s value `d` at
+    /// `qg[b·2·256 + 256 + d]` of the query projection's `[q | gate]` rows,
+    /// the product `q38`'s `gqa_out_gate_f32` writes over the merge's value,
+    /// bit for bit, and its [`FaultSite::F32Product`] raised the same way.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            segs >= 1,
+            part_v.len() >= m * n_head * segs * 256,
+            part_ms.len() >= m * n_head * segs * 2,
+            qg.len() >= m * n_head * 512,
+            y.len() >= m * n_head * 256
+        )
+    )]
+    pub fn gqa_flash_merge_256_gated(
+        part_v: &[f32],
+        part_ms: &[f32],
+        n_keys_buf: &[u32],
+        qg: &[f32],
+        n_head: u32,
+        ctx: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        let gate = SigmoidGate { qg, fault };
+        // SAFETY: the launch contract is `merge_body`'s at HEAD_256 and the
+        // gate's (qg holds m·n_head rows of 2·HEAD_256), and the block is
+        // HEAD_256 threads.
+        unsafe {
+            merge_body::<HEAD_256, _>(
+                part_v, part_ms, n_keys_buf, n_head, ctx, segs, seg_keys, m, fault, gate, y,
             )
         };
     }
@@ -6176,11 +6228,14 @@ pub struct GqaRingArgs<'a> {
 }
 
 /// [`FlashGqaKernels::enqueue_pass_256_p12_sel`]'s arguments: the shared
-/// [`GqaListArgs`] and the segment partials.
+/// [`GqaListArgs`], the segment partials and, for an output under the
+/// sigmoid gate, the query projection's `[q | gate]` rows (`gate`, `m ·
+/// n_head · 2 · 256` values).
 pub struct GqaSelArgs<'a> {
     pub attn: GqaListArgs<'a>,
     pub part_v: &'a mut DeviceBuffer<f32>,
     pub part_ms: &'a mut DeviceBuffer<f32>,
+    pub gate: Option<&'a DeviceBuffer<f32>>,
 }
 
 /// A layer's cache as a launch reads it: the f16 planes, or the q8_0
@@ -7095,7 +7150,11 @@ impl FlashGqaKernels {
     /// count `n`, and the gate holds the two passes to the same bits there.
     /// A q8_0 cache ([`CachePlanes::Q8`]) runs `gqa_flash_seg_mma_256_p12_sel_q8`,
     /// whose tiles stage the dequantized values (the module doc's `_q8`
-    /// paragraph). Asynchronous, allocation-free, capturable.
+    /// paragraph). With `args.gate` the merge writes each value under its
+    /// sigmoid gate (`gqa_flash_merge_256_gated`): `q38`'s out gate over the
+    /// merged value bit for bit, with its fault, in the same two launches; a
+    /// gate buffer shorter than `m · n_head · 2 · 256` is refused by name.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_pass_256_p12_sel(
         &self,
         stream: &CudaStream,
@@ -7107,6 +7166,7 @@ impl FlashGqaKernels {
             attn,
             part_v,
             part_ms,
+            gate,
         } = args;
         let segs = check_listed_256(what, &attn, n_head)?;
         let GqaListArgs {
@@ -7132,6 +7192,11 @@ impl FlashGqaKernels {
                 "part_ms",
                 part_ms.len(),
                 listed_partials_ms_len(m, n_head, width),
+            ),
+            (
+                "gate",
+                gate.map_or(usize::MAX, DeviceBuffer::len),
+                m * n_head * 2 * HEAD_256,
             ),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
@@ -7168,12 +7233,23 @@ impl FlashGqaKernels {
         }
         // The merge reads a row's count through the same rule at the list's
         // width: its `ctx` argument is the width.
-        let prep = self
-            .module
-            .prepare_gqa_flash_merge_256(LaunchConfig1D::new(merge_grid, MERGE_THREADS_256, 0))?;
-        self.module.gqa_flash_merge_256(
-            stream, &prep, part_v, part_ms, n_sel, heads, width, segs, seg_keys, m, fault, y,
-        )?;
+        let cfg = LaunchConfig1D::new(merge_grid, MERGE_THREADS_256, 0);
+        match gate {
+            None => {
+                let prep = self.module.prepare_gqa_flash_merge_256(cfg)?;
+                self.module.gqa_flash_merge_256(
+                    stream, &prep, part_v, part_ms, n_sel, heads, width, segs, seg_keys, m, fault,
+                    y,
+                )?;
+            }
+            Some(qg) => {
+                let prep = self.module.prepare_gqa_flash_merge_256_gated(cfg)?;
+                self.module.gqa_flash_merge_256_gated(
+                    stream, &prep, part_v, part_ms, n_sel, qg, heads, width, segs, seg_keys, m,
+                    fault, y,
+                )?;
+            }
+        }
         Ok(())
     }
 

@@ -215,6 +215,7 @@ generate_ds41   glm5next_router                          0           0
 generate_ds41   glm5next_router_pick                     0           0
 generate_ds41   gqa_flash_merge                          0           0
 generate_ds41   gqa_flash_merge_256                      0           0
+generate_ds41   gqa_flash_merge_256_gated                0           0
 generate_ds41   gqa_flash_merge_h128_swa                0           0
 generate_ds41   gqa_flash_merge_h128_swa_nosink         0           0
 generate_ds41   gqa_flash_merge_sink                     0           0

@@ -463,11 +463,13 @@ mod gate {
     /// gated sum); the PLE site's 5 on layer 1 (the combine, key and value,
     /// gate, conv); the head's 5 (its mix's three, the q8_0 gemv, the argmax):
     /// 1 + 36·22 + 12·29 + 5 + 5.
+    /// PIN(2026-10-30): the selected flash's merge writes under the out gate,
+    /// so a selecting layer's mixer is 13 launches: 1 + 36·22 + 12·28 + 5 + 5.
     const REAL_N_LAYER: usize = 48;
     const REAL_PLE_LAYER: usize = 1;
     const REAL_N_QSA: usize = 12;
     const REAL_N_GDN: usize = 36;
-    const REAL_NODES_DECODE: usize = 1151;
+    const REAL_NODES_DECODE: usize = 1139;
 
     /// PIN(2026-09-27): each layer's go and wait.
     const REAL_MEMOPS: usize = 2 * REAL_N_LAYER;
@@ -487,7 +489,8 @@ mod gate {
     /// PIN(2026-10-27): the verify's PLE rows arrive at its PLE site after
     /// its launch: the wait on the host's flag and the rows' copy, two nodes
     /// more: 1151 + 36·1 + 2.
-    const REAL_NODES_VERIFY: usize = 1189;
+    /// PIN(2026-10-30): the step's 1139 (the gated merge): 1139 + 36·1 + 2.
+    const REAL_NODES_VERIFY: usize = 1177;
 
     /// PIN(2026-10-05): the nodes one more busy slot adds to a captured pass
     /// of several slots' rows, derived before the pass was built: the
@@ -523,8 +526,9 @@ mod gate {
     /// each whatever its types: 1151 + 5·48 and 1235 + 5·48.
     /// PIN(2026-10-22): the verify's [`REAL_NODES_VERIFY`]: 1187 + 5·48.
     /// PIN(2026-10-27): the verify's [`REAL_NODES_VERIFY`]: 1189 + 5·48.
-    const REAL_NODES_DECODE_CARD: usize = 1391;
-    const REAL_NODES_VERIFY_CARD: usize = 1429;
+    /// PIN(2026-10-30): the gated merge: 1139 + 5·48 and 1177 + 5·48.
+    const REAL_NODES_DECODE_CARD: usize = 1379;
+    const REAL_NODES_VERIFY_CARD: usize = 1417;
 
     // PIN(2026-10-11): the split prompt walk moves none of the counts
     // above: it orders the eager ubatch walk's parts (`GROUP_WALK_ORDER`), and
