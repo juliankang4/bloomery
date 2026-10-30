@@ -165,7 +165,8 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **`reasoning_budget`**, per request on `/v1/chat/completions` and `/completion`: llama-server's
   `--reasoning-budget` — the think span's budget in generated ids taken while the span is open, `0` closing it at
   once, `-1` or absent unrestricted, and silently ignored when the template already closed the span.
-  A Qwen3-Coder `<tool_call>` ends the span too, so the budget never forces a close inside its arguments.
+  A Qwen3-Coder `<tool_call>` ends the span too, so the budget never forces a close inside its arguments; a
+  finite budget beside a forced `tool_choice` is a 400 (structured output, below).
 - **`reasoning_loop`**, per request on every generating route (`/completion`, `/v1/completions`,
   `/v1/chat/completions`, `/v1/responses`, `/v1/messages`): `true` ends a generation whose open think span
   repeats itself. The span's last ids repeat a cycle of up to 1,024 ids when each of them equals the id one cycle
@@ -175,9 +176,9 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   `reasoning_loop`. Absent, `null` or `false` turns it off; any other type is a 400 naming the field. Text after
   the span closes is never read, and like `reasoning_budget` the field is ignored when the template already
   closed the span. On `/completion`, read `stop_type` for the cause: a reasoning loop leaves
-  `stopped_eos`, `stopped_word` and `stopped_limit` all `false`. Structured output may enable the guard too;
-  its program closes an open think span before generating the document. One id costs one compare per cycle
-  length, at most 1,024.
+  `stopped_eos`, `stopped_word` and `stopped_limit` all `false`. Structured output may enable the guard too:
+  a JSON document's program closes an open think span before it starts, and a forced call's reasoning is
+  guarded until the model closes the span. One id costs one compare per cycle length, at most 1,024.
 - **`developer` messages** reach the chat template as `system`, the mapping llama-server applies before it — every
   template but GPT-OSS's, whose `<|channel|>` marker in the template source keeps the role. A template with no
   branch for the role would drop the message, and OpenAI clients send one every turn.
@@ -961,6 +962,18 @@ and the model fits) states no need and consults no hook; a set hook is named on 
   the ids the schema allows). A positive `temperature` or a penalty draws with the request's sampler from the row with
   every id the schema does not allow masked out, so `top_k`, `top_p`, `min_p` and `seed` apply as on free text.
   Arrays, numbers and `json_object` have no length bound; reaching the token or context limit can leave incomplete JSON with a `length` finish reason.
+- A prompt that leaves the think span open (thinking on) is read by what the program writes. A JSON `response_format`
+  closes the span at once and writes the document after it. A `tool_choice` that forces a call lets the model reason
+  freely, with the request's sampling and `logit_bias`, until it generates the span's close itself, and the call's
+  program starts after that close; only the close tag ends the span there (a call tag inside it is reasoning, on
+  every route and in the stream). Its reasoning is in `reasoning_content`, or in the text on `/completion` and
+  `/v1/completions`, which read an open span in the prompt for a forced call too. The token or context limit, a
+  `stop` word and `reasoning_loop` end such a generation as any other, with no call; a model that ends its
+  generation before it closes the span is a 500 naming the missing call, and so is a close spelled in ordinary
+  tokens whose last token also writes text past it, except the parser's ASCII whitespace. Incomplete UTF-8
+  bytes still held by the decoder at that close are refused before the close is emitted, even at the token limit;
+  a matched stop word discards them as usual. A prompt that closed the span, or leaves it to the model, starts
+  the program at once.
 - Two arms follow the schema. The step arm is one `next` an id. The jump arm is the default: the fixed text that opens
   the answer rides the prompt's call, and each later run of ids the schema fixes (forced text, the rest of a chosen
   option) is fed as one call that also steps its last id, so the next decision is read from that call's row. Free

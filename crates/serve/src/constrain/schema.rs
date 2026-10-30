@@ -908,6 +908,7 @@ pub(crate) fn request(
     } else {
         Style::Json
     };
+    let call = forces.is_some();
     let (prog, rules) = match (reply, &forces) {
         (Reply::Text, None) => return Ok(None),
         (Reply::Schema(_) | Reply::Object, Some(_)) => {
@@ -939,10 +940,11 @@ pub(crate) fn request(
             Vec::new(),
         ),
     };
-    Ok(Some(Constraint::new(
+    let c = Constraint::new(
         prog,
         rules,
         ask.tok.encode(&format!("{}\n\n", ask.think.close)),
         Arc::clone(ask.vocab),
-    )))
+    );
+    Ok(Some(if call { c.following_reasoning() } else { c }))
 }

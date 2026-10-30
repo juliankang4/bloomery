@@ -403,6 +403,14 @@ pub(crate) enum GenError {
     /// The program of a constrained request allows no id at a step.
     #[error(transparent)]
     Constrained(#[from] StepError),
+    /// The model of a forced tool call ended its generation inside the think
+    /// span the call follows ([`Constraint::follows_reasoning`]): no call was
+    /// made.
+    #[error(
+        "constrained output: the generation ended inside the think span, before the forced tool \
+         call"
+    )]
+    Unclosed,
 }
 
 pub(crate) fn ms_since(t: Instant) -> f64 {
@@ -2014,8 +2022,13 @@ pub(crate) struct Gen {
     /// What reads each row and writes the request's probabilities, `None` on
     /// a request that asks for none.
     probs: Option<Collector>,
-    /// The request's position in its program, `None` for free text.
+    /// The request's position in its program, `None` for free text and
+    /// while the program is held.
     walk: Option<Walk>,
+    /// The program held while the model reasons in the span the prompt left
+    /// open ([`Constraint::follows_reasoning`]): it becomes the walk once the
+    /// model's own close is taken ([`Gen::spend`]).
+    held: Option<Walk>,
     /// The row a sampled request's walk draws from, the ids its program does
     /// not allow masked ([`Draw::Sampled`]), kept for its capacity.
     masked: Vec<f32>,
@@ -2074,6 +2087,11 @@ impl Gen {
             Some(biased(sampler, bias.clone()))
         };
         let probs = p.logprobs.as_ref().map(Ask::collector);
+        let open = p.think_entry == ThinkEntry::Open;
+        let (walk, held) = match &p.constraint {
+            Some(c) if open && c.follows_reasoning() => (None, Some(Walk::new(c, false))),
+            c => (c.as_ref().map(|c| Walk::new(c, open)), None),
+        };
         // A greedy request that changes no row reads the logits only for the
         // probabilities it asked for, or to pick among the ids its program
         // allows.
@@ -2122,22 +2140,22 @@ impl Gen {
             taken: 0,
             lent: Vec::new(),
             tok: None,
-            think: (p.reasoning_budget.is_some() || p.reasoning_loop).then(|| {
-                Think::new(
-                    p.think_split.clone().unwrap_or_else(|| {
-                        ThinkSplit::for_entry_with(p.think_entry, p.think)
-                            .reading_specials(&*slot.vocab)
-                    }),
-                    p.reasoning_budget,
-                    slot.vocab.encode(p.think.close),
-                    p.reasoning_loop,
-                )
-            }),
+            think: (p.reasoning_budget.is_some() || p.reasoning_loop || held.is_some()).then(
+                || {
+                    Think::new(
+                        p.think_split.clone().unwrap_or_else(|| {
+                            ThinkSplit::for_entry_with(p.think_entry, p.think)
+                                .reading_specials(&*slot.vocab)
+                        }),
+                        p.reasoning_budget,
+                        slot.vocab.encode(p.think.close),
+                        p.reasoning_loop,
+                    )
+                },
+            ),
             probs,
-            walk: p
-                .constraint
-                .as_ref()
-                .map(|c| Walk::new(c, p.think_entry == ThinkEntry::Open)),
+            walk,
+            held,
             masked: Vec::new(),
             refused: None,
             // A think budget's forced close would compete with a run for the
@@ -2172,8 +2190,12 @@ impl Gen {
 
     /// The logits buffer a step writes, or `None` on a greedy request and on
     /// a step whose token the program fixes, unless probabilities were asked.
+    /// Nor does a greedy request that changes no row while its program is
+    /// held: its reasoning takes the engine's argmax.
     pub(crate) fn logits_out(&mut self) -> Option<&mut [f32]> {
-        if self.walk.as_mut().is_some_and(Walk::fixed_next) && self.probs.is_none() {
+        let unread = self.walk.as_mut().is_some_and(Walk::fixed_next)
+            || (self.held.is_some() && self.greedy && self.bias.add.is_empty());
+        if unread && self.probs.is_none() {
             return None;
         }
         out(&mut self.logits)
@@ -2225,8 +2247,22 @@ impl Gen {
                 }
             };
         }
+        // A held program's request keeps its bias out of its sampler, as
+        // the walk applies it ([`Gen::new`]): its reasoning draws from the
+        // biased copy here.
+        let biased = self.held.is_some()
+            && !self.bias.add.is_empty()
+            && (!self.greedy || self.bias.moves(g));
+        let row = if biased {
+            self.bias
+                .apply(&self.logits, self.greedy, &mut self.biased_row);
+            &self.biased_row
+        } else {
+            &self.logits
+        };
         match self.sampler.as_mut() {
-            Some(draw) if !self.greedy || self.bias.moves(g) => draw(&self.logits, &self.history),
+            Some(draw) if !self.greedy || self.bias.moves(g) => draw(row, &self.history),
+            None if biased => sampling::argmax(row),
             _ => g,
         }
     }
@@ -2258,29 +2294,53 @@ impl Gen {
 
     /// One taken id against the think budget and the loop guard: its text
     /// first — a piece that closes the span retires the tracker, the closing
-    /// id spending nothing, and a piece that opens a model-opened span
-    /// spending nothing either and starting the guard's span after it — then,
-    /// only for a span already open, the count, which arms the forced close
-    /// at zero, and the guard. Whether the guard found a loop.
-    fn spend(&mut self, piece: Option<&str>, special: Option<(usize, usize)>) -> bool {
+    /// id spending nothing, and starts a held program; a piece that opens a
+    /// model-opened span spends nothing either and starts the guard's span
+    /// after it — then, only for a span already open, the count, which arms
+    /// the forced close at zero, and the guard. Whether the guard found a
+    /// loop, or the refusal of a close whose piece also wrote text past it
+    /// that the held program did not pick.
+    fn spend(
+        &mut self,
+        piece: Option<&str>,
+        special: Option<(usize, usize)>,
+        stop: Option<&str>,
+    ) -> Result<bool, StepError> {
         let Some(t) = self.think.as_mut() else {
-            return false;
+            return Ok(false);
         };
         if let Some(text) = piece {
             let s = t.split.push(text, special.as_slice());
+            // The splitter sees even the stop scan's unsent prefix. At
+            // handoff no unchosen text may remain there or in the decoder;
+            // a matched stop discards the decoder tail instead of sending it.
+            if self.held.is_some()
+                && (!s
+                    .content
+                    .trim_matches(crate::reasoning::is_space)
+                    .is_empty()
+                    || (s.closed && stop.is_none() && !self.dec.flush().is_empty()))
+            {
+                return Err(StepError::NoAllowed {
+                    taken: self.generated.len(),
+                    why: "the think span's close also wrote text outside the forced call's program"
+                        .to_owned(),
+                });
+            }
             if s.closed || !s.content.is_empty() {
                 self.think = None;
-                return false;
+                self.walk = self.walk.take().or_else(|| self.held.take());
+                return Ok(false);
             }
             if s.opened {
                 if let Some(r) = t.repeats.as_mut() {
                     r.from = self.generated.len();
                 }
-                return false;
+                return Ok(false);
             }
         }
         if !t.split.in_span() {
-            return false;
+            return Ok(false);
         }
         if t.left > 0 {
             t.left -= 1;
@@ -2288,10 +2348,10 @@ impl Gen {
                 t.at = 0;
             }
         }
-        t.repeats.as_mut().is_some_and(|r| {
+        Ok(t.repeats.as_mut().is_some_and(|r| {
             let from = r.from;
             r.looped(&self.generated[from..])
-        })
+        }))
     }
 
     /// The prompt on the selected slot: what the cache keeps of it (`held`),
@@ -2332,7 +2392,7 @@ impl Gen {
         let passes = takes_passes(
             self.sampler.as_ref(),
             self.probs.is_some(),
-            self.walk.is_some(),
+            self.walk.is_some() || self.held.is_some(),
             slot.engine.as_ref(),
         );
         slot.engine.will_reply(match usize::try_from(p.n_predict) {
@@ -2529,7 +2589,7 @@ impl Gen {
             cache_n: kept.cache_n,
             cache_ms: kept.cache_ms,
             n_prompt: n,
-            jump: self.walk.is_some().then(|| Jump {
+            jump: (self.walk.is_some() || self.held.is_some()).then(|| Jump {
                 arm: self.jump,
                 lead: self.lead.len(),
                 ..Jump::default()
@@ -2585,6 +2645,9 @@ impl Gen {
             self.tim.predicted_ms = ms_since(self.t1);
             tick(&self.tim);
             if self.stops.contains(&tok) {
+                if self.held.is_some() {
+                    return Err(GenError::Unclosed);
+                }
                 self.stop = StopKind::Eos;
                 break;
             }
@@ -2605,42 +2668,42 @@ impl Gen {
             if let Some((at, len)) = special {
                 self.specials.push((self.scan.text().len() + at, len));
             }
+            let before = self.scan.text().len();
+            let pushed = match &piece {
+                Some(piece) => self.scan.push(piece),
+                None => Pushed {
+                    send: String::new(),
+                    stopped: None,
+                },
+            };
+            // The think budget and the loop guard read the token's text
+            // before it goes out, as far as a stop word keeps it, so a close
+            // the held program refuses sends nothing past it, and a stop word
+            // ends the generation before a loop does.
+            let kept = self.scan.text().len().saturating_sub(before);
+            let looped = self.spend(
+                piece.as_deref().map(|p| &p[..kept]),
+                special.filter(|&(at, len)| at + len <= kept),
+                pushed.stopped.as_deref(),
+            )? && pushed.stopped.is_none();
             // The token's text out. A request that asks for probabilities
             // sends an event a token, its value written first, the text
             // possibly empty; any other sends text alone, when there is some.
             if let Some(c) = self.probs.as_mut() {
-                let pushed = match &piece {
-                    Some(piece) => self.scan.push(piece),
-                    None => Pushed {
-                        send: String::new(),
-                        stopped: None,
-                    },
-                };
                 let token = self.generated.len() - 1;
                 c.take(tok, &self.logits, &pushed.send)
                     .map_err(|error| GenError::Logprobs { token, error })?;
+            }
+            if self.probs.is_some() || !pushed.send.is_empty() {
                 let specials = self.sending(&pushed.send);
                 sink(Event::Text(&pushed.send, &specials, &self.tim))?;
-                if let Some(w) = pushed.stopped {
-                    self.stop = StopKind::Word;
-                    self.stopping_word = w;
-                    break;
-                }
-            } else if let Some(piece) = &piece {
-                let pushed = self.scan.push(piece);
-                if !pushed.send.is_empty() {
-                    let specials = self.sending(&pushed.send);
-                    sink(Event::Text(&pushed.send, &specials, &self.tim))?;
-                }
-                if let Some(w) = pushed.stopped {
-                    self.stop = StopKind::Word;
-                    self.stopping_word = w;
-                    break;
-                }
             }
-            // The think budget and the loop guard: the text first, then the
-            // count and the guard, whose loop ends the generation here.
-            if self.spend(piece.as_deref(), special) {
+            if let Some(w) = pushed.stopped {
+                self.stop = StopKind::Word;
+                self.stopping_word = w;
+                break;
+            }
+            if looped {
                 self.stop = StopKind::Loop;
                 break;
             }

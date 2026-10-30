@@ -312,6 +312,14 @@ impl ThinkSplit {
         self
     }
 
+    /// The same splitter, its span ended by the close tag alone
+    /// ([`ThinkSplit::ending_at`] undone).
+    #[must_use]
+    pub(crate) fn ending_only_at_close(mut self) -> Self {
+        self.ends_too = None;
+        self
+    }
+
     /// The same splitter, dropping the whitespace that opens the content on
     /// every path past the span: the span closed by the prompt, closed by
     /// `</think>`, or never opened. Qwen3-Coder's markup reads so in
@@ -457,7 +465,7 @@ impl ThinkSplit {
 
 /// The whitespace llama.cpp's parser skips between its parts: C's `isspace`
 /// over bytes, the six ASCII spaces and no other.
-fn is_space(c: char) -> bool {
+pub(crate) fn is_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r')
 }
 

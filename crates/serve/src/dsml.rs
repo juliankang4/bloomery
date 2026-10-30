@@ -882,6 +882,16 @@ impl ChatParser {
         self
     }
 
+    /// The same parser for a forced tool call that follows the model's own
+    /// reasoning ([`crate::constrain::Constraint::follows_reasoning`]): only
+    /// the close tag ends the span, so a call opener inside it is reasoning,
+    /// as the generation that holds the call until the close reads it.
+    #[must_use]
+    pub(crate) fn following_reasoning(mut self) -> Self {
+        self.think = self.think.take().map(ThinkSplit::ending_only_at_close);
+        self
+    }
+
     /// The same parser, its think split and call scan reading their tags
     /// only where their special tokens wrote them, for those `tok` holds as
     /// one special token (`SpecialTags`). The text it is fed then carries

@@ -2300,9 +2300,18 @@ fn logit_bias(o: &Map<String, Value>, n_vocab: usize) -> Result<Vec<(u32, f32)>,
     Ok(bias.into_iter().filter(|&(_, b)| b != 0.0).collect())
 }
 
+/// Whether `p`'s program is a forced tool call that starts after the model's
+/// own close of an open think span ([`constrain::Constraint::follows_reasoning`]).
+fn follows_reasoning(p: &GenParams) -> bool {
+    p.constraint
+        .as_ref()
+        .is_some_and(constrain::Constraint::follows_reasoning)
+}
+
 /// What a structured-output request leaves out: `ignore_eos` would ban the id
-/// its program ends on, and a think budget would force a close the program
-/// writes itself.
+/// its program ends on, and a think budget would force a close that competes
+/// with the program for the span's end: a JSON document closes an open span
+/// itself, and a forced tool call starts at the model's own close.
 fn program_ends_itself(ignore_eos: bool, budget: Option<usize>) -> Result<(), ApiError> {
     let (field, why) = if ignore_eos {
         (
@@ -2313,8 +2322,8 @@ fn program_ends_itself(ignore_eos: bool, budget: Option<usize>) -> Result<(), Ap
     } else if budget.is_some() {
         (
             "reasoning_budget",
-            "reasoning_budget is not supported with structured output: the program starts \
-             after the think span and closes an open one itself",
+            "reasoning_budget is not supported with structured output: a JSON response closes \
+             an open think span itself, and a forced tool call starts at the model's own close",
         )
     } else {
         return Ok(());
@@ -4511,13 +4520,15 @@ struct CompletionPlan {
 fn completion_plan(state: &State, b: &Map<String, Value>) -> Result<CompletionPlan, ApiError> {
     let mut p = gen_params(state, b)?;
     let ids = completion_prompt(state, b.get("prompt"))?;
-    if p.reasoning_budget.is_some() || p.reasoning_loop {
+    let call = follows_reasoning(&p);
+    if p.reasoning_budget.is_some() || p.reasoning_loop || call {
         let text = match b.get("prompt") {
             Some(Value::String(s)) => s.clone(),
             _ => state.tok.decode(&ids),
         };
         gate_think_span(&mut p, &text);
-        if let ToolFormat::QwenXml(framing) = state.tool_format {
+        // A forced call's span ends at its close alone ([`ChatParser::following_reasoning`]).
+        if let (ToolFormat::QwenXml(framing), false) = (state.tool_format, call) {
             p.think_split = ChatParser::with_tags(
                 &text,
                 ReasoningFormat::None,
@@ -4884,9 +4895,12 @@ fn chat_plan(
     let (text, input) = chat_input(state, b)?;
     let tools = tool_scan(state, b)?;
     gate_think_span(&mut p, &text);
-    let parser = ChatParser::with_tags(&text, format, tools, state.think)
-        .for_template(state.tool_format)
-        .reading_specials(&*state.tok);
+    let mut parser =
+        ChatParser::with_tags(&text, format, tools, state.think).for_template(state.tool_format);
+    if follows_reasoning(&p) {
+        parser = parser.following_reasoning();
+    }
+    let parser = parser.reading_specials(&*state.tok);
     // Without a reasoning split or tool scan, the guard still tracks the server's think tags.
     p.think_split.clone_from(&parser.think);
     Ok(ChatPlan {
