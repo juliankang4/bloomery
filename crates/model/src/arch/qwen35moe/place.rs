@@ -541,6 +541,28 @@ impl PlanInputs {
         coverage::check(&self.spec, &self.model)
     }
 
+    /// The form a load of the file holds its card route's runs in, on a
+    /// build that has the native FP4 products or not (`native_fp4`):
+    /// [`RouteForm::Native`] where every routed stack of the file's layers
+    /// is NVFP4, which the card's experts of any layers then read in one
+    /// native launch; [`RouteForm::Rows`] otherwise.
+    #[must_use]
+    pub fn route_form(&self, native_fp4: bool) -> RouteForm {
+        let nvfp4 = self
+            .model
+            .tensors
+            .iter()
+            .filter(|t| {
+                t.role == Role::RoutedExperts && t.layer.is_some_and(|l| l < self.model.layers)
+            })
+            .all(|t| t.ty == GgmlType::NVFP4);
+        if native_fp4 && nvfp4 {
+            RouteForm::Native
+        } else {
+            RouteForm::Rows
+        }
+    }
+
     /// The placement of the file on `machine` at `ctx_max` positions with
     /// prompt calls of up to `ubatch` positions under the placement's `levers`, every routed expert on the host and the PLE
     /// table where [`PlanInputs::room`] says ([`PlanInputs::plan_with`] under
@@ -1327,23 +1349,66 @@ pub const CARD_ROUTE_ROWS: u64 = 2_048;
 /// the ids compression 512 words = 1 B: 170,272 + 87.6 + 1, rounded up].
 pub const CARD_ROUTE_RUN_TOKEN_BYTES: u64 = 170_360;
 
+/// Card bytes a ubatch walk's card route holds a run token in
+/// [`RouteForm::Native`], an upper bound [derived: the compressed ids, the
+/// places and a landing batch's places 120 B (ten u32 each); the gate·up
+/// input's native FP4 form at K = 2,560, 1,444 B a column (codes 1,280,
+/// block scales 160, the column's scale 4), and no 32-value or q8_1 form;
+/// no gate or up rows; the SwiGLU `GemmAct32` at K = 640 with its native
+/// form, 1,164 B a column (800 + 364), 11,640 B; the down f32 rows
+/// 10 · 2,560 · 4 = 102,400 B (a load whose every layer runs without the
+/// host leg keeps them in BF16, half); two route tables — the cols list
+/// 2 · 40 B, the zero ids of a table over one expert 40 B, their tile
+/// words at the most experts 2 · 8 · (320 + 512) / 2,048 = 6.5 B, the
+/// counts; the identity map of the ids compression 512 words = 1 B:
+/// 115,724 + 6.5 + 1, rounded up]. The tables' expert tiles and the
+/// identity map are spread over a run of [`CARD_ROUTE_ROWS`] tokens, as in
+/// [`CARD_ROUTE_RUN_TOKEN_BYTES`].
+pub const NATIVE_ROUTE_RUN_TOKEN_BYTES: u64 = 115_732;
+
+/// How a load's card route holds a run's rows between the routing and the
+/// down GEMM, which the plan counts a run token by
+/// ([`card_route_scratch_bytes`]); a load reads its file's form
+/// ([`PlanInputs::route_form`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteForm {
+    /// The gate and up GEMMs read the run's rows in the q8_1 or the 32-value
+    /// form and write f32 rows ([`CARD_ROUTE_RUN_TOKEN_BYTES`]).
+    Rows,
+    /// One native FP4 launch runs the gate, the up and the SwiGLU over the
+    /// run's rows in the native FP4 form alone
+    /// ([`NATIVE_ROUTE_RUN_TOKEN_BYTES`]).
+    Native,
+}
+
+impl RouteForm {
+    /// The card bytes a run token of the route holds in this form.
+    #[must_use]
+    pub const fn run_token_bytes(self) -> u64 {
+        match self {
+            RouteForm::Rows => CARD_ROUTE_RUN_TOKEN_BYTES,
+            RouteForm::Native => NATIVE_ROUTE_RUN_TOKEN_BYTES,
+        }
+    }
+}
+
 /// Card bytes a ubatch walk's card route holds a token of the whole unit
 /// [derived: the card slots' weighted sums, `HIDDEN` f32 a row].
 pub const CARD_ROUTE_ACC_TOKEN_BYTES: u64 = 10_240;
 
-/// The card bytes a qwen4exp ubatch walk's card route holds at ubatches of
-/// up to `u` positions: the run buffers and route tables once
+/// The card bytes a qwen4exp ubatch walk's card route in `form` holds at
+/// ubatches of up to `u` positions: the run buffers and route tables once
 /// `min(u, CARD_ROUTE_ROWS)` run tokens, the sums a token of the whole
 /// unit. Counted under [`Experts::Card`] only
-/// ([`machine_for_experts`]): a host-routed plan's walk holds none of it.
+/// ([`machine_for_route`]): a host-routed plan's walk holds none of it.
 #[must_use]
-pub const fn card_route_scratch_bytes(u: u64) -> u64 {
+pub const fn card_route_scratch_bytes(u: u64, form: RouteForm) -> u64 {
     let run = if u < CARD_ROUTE_ROWS {
         u
     } else {
         CARD_ROUTE_ROWS
     };
-    run * CARD_ROUTE_RUN_TOKEN_BYTES + u * CARD_ROUTE_ACC_TOKEN_BYTES
+    run * form.run_token_bytes() + u * CARD_ROUTE_ACC_TOKEN_BYTES
 }
 
 /// Card bytes the ubatch walk's card route holds past
@@ -1367,7 +1432,7 @@ pub const fn card_tier_join_bytes(u: u64) -> u64 {
 /// Card bytes a tier layer's join keeps a token of the unit past the card
 /// route's run: its card slots' down rows and places [derived:
 /// 10 · 2,560 · 4 + 10 · 4], which a run holds a run token too
-/// ([`CARD_ROUTE_RUN_TOKEN_BYTES`]).
+/// ([`RouteForm::run_token_bytes`]).
 const JOIN_TOKEN_BYTES: u64 = 102_440;
 
 /// What a stage card's reserve for its card route's run of the whole
@@ -1377,20 +1442,20 @@ const JOIN_TOKEN_BYTES: u64 = 102_440;
 /// ([`card_route_run`]).
 const ROUTE_UNIT_RESERVE: &str = "card route's whole-ubatch run";
 
-/// The card bytes the card route's run of a whole ubatch of up to `u`
-/// positions holds past its runs of [`CARD_ROUTE_ROWS`] tokens: the
+/// The card bytes the card route's run in `form` of a whole ubatch of up
+/// to `u` positions holds past its runs of [`CARD_ROUTE_ROWS`] tokens: the
 /// `u − min(u, CARD_ROUTE_ROWS)` run tokens more
-/// ([`CARD_ROUTE_RUN_TOKEN_BYTES`]), less on a load with an expert tier
+/// ([`RouteForm::run_token_bytes`]), less on a load with an expert tier
 /// (`tiered`) the down rows and places the join already keeps for them
 /// ([`card_tier_join_bytes`]). 0 for a ubatch of one such run; saturated
 /// past u64 bytes, which no card holds.
 #[must_use]
-const fn route_unit_bytes(u: u64, tiered: bool) -> u64 {
+const fn route_unit_bytes(u: u64, tiered: bool, form: RouteForm) -> u64 {
     let past = u.saturating_sub(CARD_ROUTE_ROWS);
     let token = if tiered {
-        CARD_ROUTE_RUN_TOKEN_BYTES - JOIN_TOKEN_BYTES
+        form.run_token_bytes() - JOIN_TOKEN_BYTES
     } else {
-        CARD_ROUTE_RUN_TOKEN_BYTES
+        form.run_token_bytes()
     };
     past.saturating_mul(token)
 }
@@ -1414,11 +1479,11 @@ pub fn tensor_places(plan: &Plan<'_>) -> TensorPlaces {
 }
 
 /// `machine`, a qwen4exp machine for ubatches of up to `ubatch` positions
-/// ([`machine_for_experts`], [`machine_bp_on`]) whose card route runs in
-/// runs of [`CARD_ROUTE_ROWS`] tokens, with that run widened to the whole
-/// ubatch when nothing the plan places moves for it: its stage card then
-/// reserves [`route_unit_bytes`] as [`ROUTE_UNIT_RESERVE`], and a ubatch
-/// walk reads each card expert's weights once instead of once a run.
+/// ([`machine_for_route`], [`machine_bp_on`]) whose card route in `form`
+/// runs in runs of [`CARD_ROUTE_ROWS`] tokens, with that run widened to the
+/// whole ubatch when nothing the plan places moves for it: its stage card
+/// then reserves [`route_unit_bytes`] as [`ROUTE_UNIT_RESERVE`], and a
+/// ubatch walk reads each card expert's weights once instead of once a run.
 /// `plan` is the caller's plan of a machine ([`PlanInputs::plan_target`]):
 /// the run is widened when the stage card holds a routed expert and the plan
 /// of the widened machine places every tensor where the plan of `machine`
@@ -1437,13 +1502,14 @@ pub fn tensor_places(plan: &Plan<'_>) -> TensorPlaces {
 pub fn widen_card_route<T>(
     mut machine: Machine,
     ubatch: u64,
+    form: RouteForm,
     plan: impl Fn(&Machine, &mut dyn FnMut(&Plan<'_>)) -> Result<(), PlaceError>,
     read: impl Fn(&Plan<'_>) -> T,
 ) -> Result<(Machine, T), PlaceError> {
     let mut first = None;
     plan(&machine, &mut |p| first = Some((tensor_places(p), read(p))))?;
     let (held, held_read) = first.ok_or(PlaceError::MissingPlan)?;
-    let bytes = route_unit_bytes(ubatch, !machine.tiers.is_empty());
+    let bytes = route_unit_bytes(ubatch, !machine.tiers.is_empty(), form);
     let stage_expert = held.iter().flatten().any(|(device, _, experts)| {
         *device == Device::Card(0) && experts.as_ref().is_some_and(|e| !e.is_empty())
     });
@@ -1474,19 +1540,24 @@ pub fn widen_card_route<T>(
     }
 }
 
-/// The tokens one run of a load's card route takes at ubatches of up to `u`
-/// positions on `card`, the stage card of its plan's machine (`tiered`, a
-/// machine with an expert tier), and the card bytes its ubatch walk may hold
-/// past the m = 1 scratch: the whole ubatch with the run's reserve beside
-/// [`workstation::counted_arena_bytes`] on a card that holds
+/// The tokens one run of a load's card route in `form` takes at ubatches of
+/// up to `u` positions on `card`, the stage card of its plan's machine
+/// (`tiered`, a machine with an expert tier), and the card bytes its ubatch
+/// walk may hold past the m = 1 scratch: the whole ubatch with the run's
+/// reserve beside [`workstation::counted_arena_bytes`] on a card that holds
 /// [`ROUTE_UNIT_RESERVE`] ([`widen_card_route`]), else at most
 /// [`CARD_ROUTE_ROWS`] and the counted bytes alone. Refused by name: more
 /// than one such reserve, or one of other than [`route_unit_bytes`]'s
 /// bytes (none for a ubatch of one run).
-pub fn card_route_run(card: &Card, u: u64, tiered: bool) -> Result<(u64, u64), PlaceError> {
+pub fn card_route_run(
+    card: &Card,
+    u: u64,
+    tiered: bool,
+    form: RouteForm,
+) -> Result<(u64, u64), PlaceError> {
     let counted = workstation::counted_arena_bytes(card);
     let got = reserve_rows(card, ROUTE_UNIT_RESERVE);
-    let want = route_unit_bytes(u, tiered);
+    let want = route_unit_bytes(u, tiered, form);
     match *got.as_slice() {
         [] => return Ok((u.min(CARD_ROUTE_ROWS), counted)),
         [b] if b == want && want > 0 => return Ok((u, counted.saturating_add(b))),
@@ -1589,8 +1660,20 @@ pub fn machine(card: CardSpec, layers: usize, ubatch: u64) -> Machine {
     machine_for_experts(card, layers, ubatch, Experts::Host)
 }
 
+/// [`machine_for_route`] with the card route counted in [`RouteForm::Rows`],
+/// the larger form.
+#[must_use]
+pub fn machine_for_experts(
+    card: CardSpec,
+    layers: usize,
+    ubatch: u64,
+    experts: Experts,
+) -> Machine {
+    machine_for_route(card, layers, ubatch, experts, RouteForm::Rows)
+}
+
 /// [`machine`] for a plan whose routed experts go where `experts` says: under
-/// [`Experts::Card`] the ubatch walk's card route scratch
+/// [`Experts::Card`] the ubatch walk's card route scratch in `form`
 /// ([`card_route_scratch_bytes`]) is counted beside the ubatch's — the walk
 /// holds those buffers when the plan puts experts on the card. A unified
 /// card's stage reserves the activations' MMA forms
@@ -1600,15 +1683,16 @@ pub fn machine(card: CardSpec, layers: usize, ubatch: u64) -> Machine {
 /// those bytes unread. A discrete card reserves none, and its dense MMA
 /// tile, where its device runs it, converts the f32 rows in each tile.
 #[must_use]
-pub fn machine_for_experts(
+pub fn machine_for_route(
     card: CardSpec,
     layers: usize,
     ubatch: u64,
     experts: Experts,
+    form: RouteForm,
 ) -> Machine {
     let route = match experts {
         Experts::Host => 0,
-        Experts::Card => card_route_scratch_bytes(ubatch),
+        Experts::Card => card_route_scratch_bytes(ubatch, form),
     };
     let mut machine = workstation::placed_on(card, layers, card_scratch_bytes(ubatch) + route);
     if card.integrated {
@@ -3969,8 +4053,8 @@ mod tests {
 
         use super::super::{
             Beside, Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, ROUTE_UNIT_RESERVE,
-            UBATCH_PLANNED, card_route_run, draft_card_bytes, machine_bp, route_unit_bytes,
-            slot_resident_bytes, tier_batch_of, widen_card_route,
+            RouteForm, UBATCH_PLANNED, card_route_run, draft_card_bytes, machine_bp,
+            route_unit_bytes, slot_resident_bytes, tier_batch_of, widen_card_route,
         };
         use super::mtp::{draft, file};
         use crate::placement::workstation::HostRead;
@@ -5175,14 +5259,17 @@ mod tests {
         /// widens it. A load refuses by name a reserve of other bytes (a
         /// tiered load's run holds 2,048 · (170,360 − 102,440) B more, the
         /// join keeping the down rows and places), two of them, or one beside
-        /// a ubatch of one run, even of 0 B. What the caller reads of a plan
-        /// is read of the plan of the machine returned, widened or not.
+        /// a ubatch of one run, even of 0 B. In the native form the reserve
+        /// is 2,048 run tokens of 115,732 B (a tiered load's 115,732 −
+        /// 102,440), which a load reads back in that form and refuses in the
+        /// other. What the caller reads of a plan is read of the plan of the
+        /// machine returned, widened or not.
         #[test]
         fn the_card_route_runs_the_whole_ubatch_where_nothing_moves_for_it() {
             let inputs = routed(inputs());
             let levers = PlanLevers::default();
             assert!(matches!(
-                widen_card_route(machine(), 4096, |_, _| Ok(()), |_| ()),
+                widen_card_route(machine(), 4096, RouteForm::Rows, |_, _| Ok(()), |_| ()),
                 Err(super::super::PlaceError::MissingPlan)
             ));
             let calls = std::cell::Cell::new(0);
@@ -5190,6 +5277,7 @@ mod tests {
                 widen_card_route(
                     machine(),
                     4096,
+                    RouteForm::Rows,
                     |m, on| {
                         calls.set(calls.get() + 1);
                         if calls.get() == 1 {
@@ -5210,10 +5298,15 @@ mod tests {
                     Err(super::super::PlaceError::Ubatch { .. })
                 ));
             }
-            let widen_by = |inputs: &PlanInputs, machine: Machine, ub: u64, experts: Experts| {
+            let widen_in = |inputs: &PlanInputs,
+                            machine: Machine,
+                            ub: u64,
+                            experts: Experts,
+                            form: RouteForm| {
                 let (machine, read) = widen_card_route(
                     machine,
                     ub,
+                    form,
                     |m, on| {
                         inputs
                             .plan_with(m, (CTX, UBATCH_PLANNED.min(CTX)), &levers, experts)
@@ -5230,13 +5323,31 @@ mod tests {
                 assert_eq!(read, returned, "the read is of the machine returned");
                 machine
             };
+            let widen_by = |inputs: &PlanInputs, machine: Machine, ub: u64, experts: Experts| {
+                widen_in(inputs, machine, ub, experts, RouteForm::Rows)
+            };
             let widen = |machine: Machine, ub: u64, experts: Experts| {
                 widen_by(&inputs, machine, ub, experts)
             };
-            let unit = route_unit_bytes(4096, false);
+            let unit = route_unit_bytes(4096, false, RouteForm::Rows);
             assert_eq!(
-                (unit, route_unit_bytes(4096, true)),
+                (unit, route_unit_bytes(4096, true, RouteForm::Rows)),
                 (348_897_280, 139_100_160)
+            );
+            let native = route_unit_bytes(4096, false, RouteForm::Native);
+            assert_eq!(
+                (native, route_unit_bytes(4096, true, RouteForm::Native)),
+                (237_019_136, 27_222_016)
+            );
+            let whole_native = widen_in(&inputs, machine(), 4096, Experts::Card, RouteForm::Native);
+            assert_eq!(
+                whole_native.cards[0].reserves,
+                vec![(ROUTE_UNIT_RESERVE.to_string(), native)]
+            );
+            assert_eq!(
+                card_route_run(&whole_native.cards[0], 4096, false, RouteForm::Native)
+                    .expect("the native run"),
+                (4096, native)
             );
             let whole = widen(machine(), 4096, Experts::Card);
             assert_eq!(
@@ -5253,7 +5364,7 @@ mod tests {
                 .expect("the widened plan");
             assert_eq!(plan.n_l, vec![512; LAYERS]);
             assert_eq!(
-                card_route_run(&whole.cards[0], 4096, false).expect("the run"),
+                card_route_run(&whole.cards[0], 4096, false, RouteForm::Rows).expect("the run"),
                 (4096, unit)
             );
             let mut filled = machine();
@@ -5276,7 +5387,7 @@ mod tests {
                 let kept = widen(m, ub, experts);
                 assert!(kept.cards[0].reserves.is_empty(), "{ub} {experts:?}");
                 assert_eq!(
-                    card_route_run(&kept.cards[0], ub, false).expect("the run"),
+                    card_route_run(&kept.cards[0], ub, false, RouteForm::Rows).expect("the run"),
                     (2048, 0)
                 );
             }
@@ -5328,24 +5439,79 @@ mod tests {
                 vec![(ROUTE_UNIT_RESERVE.to_string(), unit)]
             );
             assert!(table_on_host(&tabled, &wide), "{} B of room", hi + unit);
-            let refused = |rows: Vec<u64>, ub: u64, tiered: bool| {
+            let refused_in = |rows: Vec<u64>, ub: u64, tiered: bool, form: RouteForm| {
                 let mut card = whole.cards[0].clone();
                 card.reserves = rows
                     .iter()
                     .map(|&b| (ROUTE_UNIT_RESERVE.to_string(), b))
                     .collect();
-                match card_route_run(&card, ub, tiered) {
+                match card_route_run(&card, ub, tiered, form) {
                     Err(PlaceError::RouteUnitReserve { got, u, want, .. }) => {
-                        assert_eq!((got, u, want), (rows, ub, route_unit_bytes(ub, tiered)));
+                        assert_eq!(
+                            (got, u, want),
+                            (rows, ub, route_unit_bytes(ub, tiered, form))
+                        );
                     }
                     other => panic!("{rows:?} at {ub}: not refused: {other:?}"),
                 }
+            };
+            let refused = |rows: Vec<u64>, ub: u64, tiered: bool| {
+                refused_in(rows, ub, tiered, RouteForm::Rows)
             };
             refused(vec![unit], 4096, true);
             refused(vec![unit + 1], 4096, false);
             refused(vec![unit, unit], 4096, false);
             refused(vec![unit], 2048, false);
             refused(vec![0], 2048, false);
+            refused(vec![native], 4096, false);
+            refused_in(vec![unit], 4096, false, RouteForm::Native);
+        }
+
+        /// A file's card route form ([`PlanInputs::route_form`]): native on a
+        /// native FP4 build over a file whose layers' routed stacks are all
+        /// NVFP4 (a stack past its layers, a draft's, not read), the rows'
+        /// form on another build or with one stack of another type; and a
+        /// card-experts machine counts its route in the form it is given,
+        /// 2,048 run tokens of 170,360 − 115,732 B fewer at U 4,096 in the
+        /// native one [derived: 111,878,144 B], a host-routed machine none.
+        #[test]
+        fn a_card_route_is_counted_in_its_files_form() {
+            use crate::placement::workstation::RTX_3090;
+            let mut inputs = routed(inputs());
+            assert_eq!(inputs.route_form(true), RouteForm::Rows);
+            for t in &mut inputs.model.tensors {
+                if t.role == Role::RoutedExperts {
+                    t.ty = GgmlType::NVFP4;
+                }
+            }
+            let mut past = inputs.model.tensors[inputs.model.tensors.len() - 1].clone();
+            past.layer = Some(LAYERS);
+            past.ty = GgmlType::Q8_0;
+            inputs.model.tensors.push(past);
+            assert_eq!(
+                (inputs.route_form(true), inputs.route_form(false)),
+                (RouteForm::Native, RouteForm::Rows)
+            );
+            let last = inputs.model.tensors.len() - 2;
+            inputs.model.tensors[last].ty = GgmlType::Q4_K;
+            assert_eq!(inputs.route_form(true), RouteForm::Rows);
+            let scratch = |experts: Experts, form: RouteForm| {
+                super::super::machine_for_route(RTX_3090, LAYERS, 4096, experts, form).cards[0]
+                    .scratch_bytes
+            };
+            assert_eq!(
+                scratch(Experts::Card, RouteForm::Rows) - scratch(Experts::Card, RouteForm::Native),
+                111_878_144
+            );
+            assert_eq!(
+                scratch(Experts::Card, RouteForm::Rows),
+                super::super::machine_for_experts(RTX_3090, LAYERS, 4096, Experts::Card).cards[0]
+                    .scratch_bytes
+            );
+            assert_eq!(
+                scratch(Experts::Host, RouteForm::Rows),
+                scratch(Experts::Host, RouteForm::Native)
+            );
         }
     }
 

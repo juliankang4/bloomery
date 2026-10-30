@@ -918,8 +918,10 @@ pub(super) fn down_weight<'a>(
 /// The run's normed rows in the gate and up GEMMs' input form, one a load
 /// ([`Card38::blocks32_gate_up`]): the K-quant GEMM's activation form (the
 /// same q8_1 bytes a `Q8Act` of the same values holds), or the 32-value
-/// GEMM's where that GEMM reads the card gate and up. The plan counts a run
-/// of the q8_1 form, the larger (`place::CARD_ROUTE_RUN_TOKEN_BYTES`).
+/// GEMM's where that GEMM reads the card gate and up, the native FP4 form
+/// alone where one native launch runs the gate and up
+/// (`GemmAct32::new_native_input`). The plan counts a run of the q8_1 form,
+/// the larger, or of the native form (`place::RouteForm`).
 enum RouteX {
     Q8_1(Box<GemmAct>),
     Blocks32(Box<GemmAct32>),

@@ -478,7 +478,7 @@ mod cli {
     use gguf::Split;
     use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
-        Experts, MtpInputs, PlanInputs, machine_for_experts, serve_ctx, tier_batch,
+        Experts, MtpInputs, PlanInputs, machine_for_route, serve_ctx, tier_batch,
     };
     use model::placement::accepts::{Program, program_of};
     use model::placement::workstation::HostRead;
@@ -1446,8 +1446,9 @@ mod cli {
     }
 
     /// The machine a plan of `inputs` at `ctx` positions per resident slot
-    /// and ubatches of `ub` under `experts` runs on, over `place`'s cards.
-    /// Every slot's room buffers and, under `drafts`, its draft's planes
+    /// and ubatches of `ub` under `experts` runs on, over `place`'s cards; a
+    /// one-card machine counts its card route in the form this build holds
+    /// the file's in (`PlanInputs::route_form`). Every slot's room buffers and, under `drafts`, its draft's planes
     /// reserve their page rounding before planning. `draft` is the MTP draft's card
     /// bytes when the draft runs beside the target, which plan (b′) reserves on
     /// its stage card (`q38place::machine_bp38`) and the one-card plans count in
@@ -1465,7 +1466,13 @@ mod cli {
             &[_, _] => {
                 q38place::machine_bp38(place, layers, ub, draft, tier_batch(&inputs.spec, ub))?
             }
-            &[stage] => machine_for_experts(stage, layers, ub, experts),
+            &[stage] => machine_for_route(
+                stage,
+                layers,
+                ub,
+                experts,
+                inputs.route_form(bloomery_gpu::NATIVE_FP4),
+            ),
             cards => {
                 return Err(format!(
                     "--place {}: a qwen4exp plan takes a stage card and at most one tier card, \

@@ -1,6 +1,7 @@
 //! The plan-then-open of a Qwen3.8 (`qwen4exp`) gate's load: the file described, the host's room
-//! read or given, the machine for where the routed experts sit (its card route's run widened to
-//! the whole ubatch when the plan keeps every card expert by it), the plan for the resident slots
+//! read or given, the machine for where the routed experts sit (its card route counted in the form
+//! this build holds the file's in, its run widened to the whole ubatch when the plan keeps every
+//! card expert by it), the plan for the resident slots
 //! ([`Open38::plan`]), then the body opened by it and its steps captured as graphs
 //! ([`Planned38::open`]). What a gate prints of the plan and of the load stays in the gate: it
 //! prints [`PlanFacts`] between the two calls, where the load's own lines to stderr follow it, and
@@ -21,7 +22,7 @@ use bloomery_gpu_gates::generate::stage_page;
 use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::qwen35moe::place::{
-    Experts, PlaceError, PlanInputs, card_route_run, machine_for_experts, widen_card_route,
+    Experts, PlaceError, PlanInputs, card_route_run, machine_for_route, widen_card_route,
 };
 use model::placement::workstation::{CardSpec, HostNeed, HostRead};
 use model::placement::{Device, Machine, Plan, PlanLevers};
@@ -118,8 +119,9 @@ impl<'a> Open38<'a> {
         }
         inputs.kv = inputs.kv.in_q8_if(self.kv == KvQ8::Q8);
         let ub = u64::try_from(self.ub)?;
+        let form = inputs.route_form(bloomery_gpu::NATIVE_FP4);
         let mut machine =
-            machine_for_experts(self.card, inputs.spec.layers.len(), ub, self.experts);
+            machine_for_route(self.card, inputs.spec.layers.len(), ub, self.experts, form);
         let drafts = false;
         inputs.reserve_room(
             &mut machine,
@@ -129,6 +131,7 @@ impl<'a> Open38<'a> {
         let (machine, ()) = widen_card_route(
             machine,
             ub,
+            form,
             |m, on| self.plan_of(&inputs, m).map(|p| on(&p)),
             |_| (),
         )?;
@@ -143,7 +146,7 @@ impl<'a> Open38<'a> {
             room: inputs.room.clone(),
             row_reserve_bytes: plan.host.row_reserve_bytes,
             host_need: HostNeed::of(&plan, 0),
-            route_run: card_route_run(&machine.cards[0], ub, !machine.tiers.is_empty())?.0,
+            route_run: card_route_run(&machine.cards[0], ub, !machine.tiers.is_empty(), form)?.0,
         };
         drop(plan);
         Ok(Planned38 {

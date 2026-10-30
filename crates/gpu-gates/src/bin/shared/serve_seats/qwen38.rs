@@ -464,7 +464,7 @@ use model::arch::models::headpick::HeadSet;
 use model::arch::models::{Mixer, ModelSpec};
 use model::arch::qwen35moe::head_list::{HeadPick, head_rows_of};
 use model::arch::qwen35moe::place::{
-    Experts, MtpInputs, PlaceError, PlanInputs, machine_for_experts, serve_ctx, tier_batch,
+    Experts, MtpInputs, PlaceError, PlanInputs, machine_for_route, serve_ctx, tier_batch,
     widen_card_route,
 };
 use model::placement::churn::ChurnPool;
@@ -696,7 +696,8 @@ impl Place38 {
     /// ([`POINT_ROWS_RESERVE`], one row a point, [`point_row_budget38`]), which the plan's host need, the NVMe tier's
     /// floor and its arena then count. The stage card carries the side model's reserve, the
     /// image encoder's when its tower sits there and, on a media load, a rotation table of `ctx`
-    /// rows for every slot ([`vision_seat::TABLES_RESERVE`]). Its card route runs the whole
+    /// rows for every slot ([`vision_seat::TABLES_RESERVE`]). Its card route is counted in the
+    /// form this build holds the file's in (`PlanInputs::route_form`) and runs the whole
     /// ubatch at once when the plan under `levers` keeps every card expert by it
     /// ([`widen_card_route`]).
     fn machine(
@@ -724,8 +725,9 @@ impl Place38 {
         read: impl Fn(&Plan<'_>) -> T,
     ) -> Result<(Machine, T), GateError> {
         let layers = inputs.spec.layers.len();
+        let form = inputs.route_form(bloomery_gpu::NATIVE_FP4);
         let mut machine = match self.kind {
-            Kind38::A | Kind38::Gate => machine_for_experts(self.spec()?, layers, ub, experts),
+            Kind38::A | Kind38::Gate => machine_for_route(self.spec()?, layers, ub, experts, form),
             Kind38::Bp => {
                 let draft = mtp.map(|m| m.card_bytes_of(ctx, slots)).transpose()?;
                 q38place::machine_bp38(self.cards, layers, ub, draft, tier_batch(&inputs.spec, ub))?
@@ -766,6 +768,7 @@ impl Place38 {
         Ok(widen_card_route(
             machine,
             ub,
+            form,
             |m, on| {
                 inputs
                     .plan_target(m, (ctx, ub), levers, experts, mtp, slots)
