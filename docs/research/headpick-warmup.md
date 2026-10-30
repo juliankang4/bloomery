@@ -68,7 +68,7 @@ Script: Appendix A (`python3 -I`, standard library only). Inputs: the 11 held-ou
   rows; after that the least-recently (or least-frequently) used seen row goes. R = 65,536 and 76,000; B = 32,768, 49,152
   (48K) and 65,536 (64K; = R is the static neutral list).
 - **A trial.** A random start offset in a set (200 per half, 400 per set, seed 7), then 4,352 ids walked in windows of
-  4 kept ids (`DELTA_LANES`): a window's ids are in the row set from the next window on. At t in {0, 64, 256, 1,024, 4,096}
+  4 kept ids (`DELTA_VERIFY_ROWS`): a window's ids are in the row set from the next window on. At t in {0, 64, 256, 1,024, 4,096}
   ids seen the miss is read over the next 256 ids (64 is in the json) two ways: **online** (prompt+accepted: the set keeps
   updating) and **prompt-only** (the set freezes at t). The ids before t are the prompt.
 - **Best static** = the better of `C` and `D` on that set and window (an oracle pick). The **pick** column is the headpick
@@ -573,7 +573,7 @@ Map writes per kept token (window 256 after t, online; a write = one id taking a
 | code-python | 0.025/0.020/0.012 | 0.007/0.006/0.003 |
 | code-c | 0.019/0.013/0.008 | 0.003/0.003/0.002 |
 
-A window keeps ~3.5 tokens (AL at q ~ .03) and at most 4 (`DELTA_LANES`), so `cblind` writes in <= 12 % of windows
+A window keeps ~3.5 tokens (AL at q ~ .03) and at most 4 (`DELTA_VERIFY_ROWS`), so `cblind` writes in <= 12 % of windows
 (.033 x 3.5) and never more than 4 words; the neutral base writes ~1 id a window early on.
 **Recommended path: one asynchronous host-to-card copy of the dirty span before the chain, nothing else.** The writable rows
 are one contiguous span of F rows, so the dirty span is inside F x 4 B (8 KB at F = 2,048); the pinned shadow map and a copied-event are the
@@ -836,7 +836,7 @@ CLASS = {"en": ["en-prose", "en-math"], "code": ["code-rust", "code-python", "co
          "zh/ja": ["zh-wiki", "zh-chat", "ja-wiki", "ja-chat"], "ko": ["ko-wiki", "ko-chat"]}
 VOCAB = 248320
 CONTROL_FROM = 248044          # the nine ids both lists hold above 248,000 (end, pad, chat-template, think tags): never writable
-BLOCK = 4                      # runtime::stores::DELTA_LANES = kept ids a window feeds back
+BLOCK = 4                      # runtime::stores::DELTA_VERIFY_ROWS = kept ids a window feeds back
 TS = (0, 64, 256, 1024, 4096)  # tokens seen
 WN = (64, 256)                 # the miss is read over the next WN ids
 TSET = frozenset(TS)

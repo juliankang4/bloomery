@@ -15,8 +15,9 @@ pub const F32_BYTES: u64 = 4;
 /// Bytes of a u32 word.
 pub const U32_BYTES: u64 = 4;
 
-/// u64 words of a delta replay table row: state, stamp, carry and layer.
-pub const DELTA_REPLAY_WORDS: usize = 4;
+/// u64 words of a delta replay table row: state, stamp, carry, layer and
+/// record.
+pub const DELTA_REPLAY_WORDS: usize = 5;
 /// Device bytes of one delta replay table row.
 pub const DELTA_REPLAY_BYTES: u64 = (DELTA_REPLAY_WORDS * std::mem::size_of::<u64>()) as u64;
 
@@ -178,11 +179,39 @@ pub const fn mamba2_bytes(d_inner: usize, d_state: usize, conv: usize, conv_dim:
     (state + ring) as u64 * F32_BYTES
 }
 
-/// Lanes of a gated-delta-rule layer's state on a model that verifies
-/// drafted rows (Qwen3.8's `Body38`): a verify of up to this many rows keeps
-/// the state after each of its rows in a lane of its own, and a commit moves
-/// the lane word instead of copying.
-pub const DELTA_LANES: usize = 4;
+/// Rows of a verify on a model whose gated-delta-rule layers record it
+/// (Qwen3.8's `Body38`): each row's key, update and head decay go into the
+/// layer's record ([`delta_record_bytes`]), and the commit replays the kept
+/// rows into the state's one lane.
+pub const DELTA_VERIFY_ROWS: usize = 4;
+
+/// F32s of a gated-delta-rule layer's verify record over `v_heads` value
+/// heads of `state` values for up to `rows` rows: per row and value head the
+/// key, the update and the head decay, `3·state` f32 (the decay's word
+/// padded to the key's alignment). `None` past `usize`.
+#[must_use]
+pub const fn delta_record_words(v_heads: usize, state: usize, rows: usize) -> Option<usize> {
+    let Some(row) = v_heads.checked_mul(state) else {
+        return None;
+    };
+    let Some(row) = row.checked_mul(3) else {
+        return None;
+    };
+    rows.checked_mul(row)
+}
+
+/// Bytes of [`delta_record_words`].
+///
+/// # Panics
+///
+/// A record past `usize`, by name.
+#[must_use]
+pub const fn delta_record_bytes(v_heads: usize, state: usize, rows: usize) -> u64 {
+    match delta_record_words(v_heads, state, rows) {
+        Some(words) => words as u64 * F32_BYTES,
+        None => panic!("delta_record_bytes: a record past usize"),
+    }
+}
 
 /// Bytes a gated-delta-rule layer holds past [`recurrent_bytes`]' one state
 /// lane when it keeps `lanes` lanes (at least one) over `v_heads` value
@@ -324,11 +353,11 @@ pub const fn selecting_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        DELTA_LANES, PROMPT_BATCH, RING_ALIGN, Rows, conv_ring_bytes, conv_ring_rows,
-        cut_depth_keeps, delta_carry_bytes, delta_lane_bytes, dense_kv_bytes, index_ring_bytes,
-        index_ring_rows, kv_plane_bytes, kv_row_bytes, mamba2_bytes, mamba2_lens, ple_ring_bytes,
-        ple_ring_rows, pooled_rows, recurrent_bytes, ring_rows, selecting_bytes,
-        selecting_rows_bytes, window_rows,
+        DELTA_VERIFY_ROWS, PROMPT_BATCH, RING_ALIGN, Rows, conv_ring_bytes, conv_ring_rows,
+        cut_depth_keeps, delta_carry_bytes, delta_lane_bytes, delta_record_bytes,
+        delta_record_words, dense_kv_bytes, index_ring_bytes, index_ring_rows, kv_plane_bytes,
+        kv_row_bytes, mamba2_bytes, mamba2_lens, ple_ring_bytes, ple_ring_rows, pooled_rows,
+        recurrent_bytes, ring_rows, selecting_bytes, selecting_rows_bytes, window_rows,
     };
 
     /// A GQA layer's planes over `ctx` positions are `ctx` rows of the layout asked for: f16 K and V,
@@ -407,17 +436,18 @@ mod tests {
         assert_eq!(dense_kv_bytes(2, 256, 0), 0);
     }
 
-    /// Qwen3.8's lanes: past the one lane `recurrent_bytes` counts, three
-    /// more lanes of 48 heads of 128 × 128 f32 and four u32 stamps; one lane
-    /// adds only its stamp.
+    /// Qwen3.8's delta store past the one lane `recurrent_bytes` counts: the
+    /// lane's u32 stamp and a record of four verify rows, 48 heads of 3 × 128
+    /// f32 a row.
     #[test]
-    fn qwen38_lanes() {
-        assert_eq!(DELTA_LANES, 4);
-        assert_eq!(
-            delta_lane_bytes(48, 128, DELTA_LANES),
-            3 * 3_145_728 + 4 * 4
-        );
+    fn qwen38_lane_and_record() {
+        assert_eq!(DELTA_VERIFY_ROWS, 4);
         assert_eq!(delta_lane_bytes(48, 128, 1), 4);
+        assert_eq!(
+            delta_record_bytes(48, 128, DELTA_VERIFY_ROWS),
+            4 * 48 * 384 * 4
+        );
+        assert_eq!(delta_record_words(usize::MAX, 128, 1), None);
     }
 
     #[test]

@@ -223,7 +223,7 @@ fn hw_qwen4exp_mtp_plan() {
     };
     use model::placement::workstation::{A6000, RTX_3090};
     use model::placement::{PlanLevers, STEP_PORT_COLUMNS, Violation};
-    use runtime::stores::DELTA_LANES;
+    use runtime::stores::DELTA_VERIFY_ROWS;
 
     let mut o = String::new();
     let mut b: Vec<String> = Vec::new();
@@ -254,7 +254,7 @@ fn hw_qwen4exp_mtp_plan() {
     )
     .unwrap_or_else(|e| panic!("MtpInputs::read with a list: {e}"));
     let levers = PlanLevers::default();
-    // A drafted plan steps `DELTA_LANES` columns a slot through the arena's floor
+    // A drafted plan steps `DELTA_VERIFY_ROWS` columns a slot through the arena's floor
     // (its verify rows), plan() one: the host terms compare without that field,
     // which is pinned apart below.
     let view = |p: &model::placement::Plan<'_>| {
@@ -302,11 +302,11 @@ fn hw_qwen4exp_mtp_plan() {
                 let headroom = plain.cards[0].headroom_bytes
                     - i128::from(with.draft_card_bytes() + with.arena_bytes);
                 // PIN(2026-10-25): the drafted plan counts its verify lanes in the
-                // paged arena's floor (`DELTA_LANES` columns a slot, capped at the
+                // paged arena's floor (`DELTA_VERIFY_ROWS` columns a slot, capped at the
                 // step port), plan() one column; before that the whole host terms
                 // were equal. The rest of the target's plan is still plan()'s.
                 let columns = (with.plan.host.arena_columns, plain.host.arena_columns);
-                let columns_want = (DELTA_LANES.min(STEP_PORT_COLUMNS) as u64, 1);
+                let columns_want = (DELTA_VERIFY_ROWS.min(STEP_PORT_COLUMNS) as u64, 1);
                 check(
                     &mut o,
                     format!(
