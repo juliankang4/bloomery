@@ -899,21 +899,23 @@ mod gate {
         println!("props engine {e}");
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
-        let inputs = PlanInputs::describe(&split)?;
+        // The card the server's `--place gate` resolved to (the 3090's spec
+        // on the 3090, a unified card's own elsewhere) and the room the
+        // server planned at: its free bytes and host room as its plan record
+        // names them. A reading beside the loaded server sees its bytes as
+        // taken; a unified card's pool is the free bytes, and the room
+        // places the row-gathered tables.
+        let plan_room = seat_log(err_log)?.one(&record::PLAN38)?.u64("plan_room")?;
+        let inputs = PlanInputs::describe_in(&split, (plan_room, HostRead::Given))?;
         let experts = experts38(levers)?;
         let ub = ubatch_for(CTX)?;
-        let mut machine = machine_for_experts(
-            RTX_3090,
-            inputs.spec.layers.len(),
-            u64::try_from(ub)?,
-            experts,
-        );
-        machine.cards[0].free_bytes = Some(server_card_free(err_log)?);
-        let page = bloomery_gpu_gates::generate::stage_page(
-            bloomery_gpu_gates::generate::Place::Gate
-                .on(&bloomery_gpu::census()?)?
-                .card_specs()?[0],
-        )?;
+        let mut stage = bloomery_gpu_gates::generate::Place::Gate
+            .on(&bloomery_gpu::census()?)?
+            .card_specs()?[0];
+        stage.free_bytes = Some(server_card_free(err_log)?);
+        let mut machine =
+            machine_for_experts(stage, inputs.spec.layers.len(), u64::try_from(ub)?, experts);
+        let page = bloomery_gpu_gates::generate::stage_page(stage)?;
         inputs.reserve_room(&mut machine, (u64::try_from(CTX)?, 1, mtp), page)?;
         // Under the draft the plan carries it (its granules, its store, its
         // row map and its program's arena beside the target's card terms),
