@@ -1246,15 +1246,17 @@ impl MtpPlan<'_> {
 pub const UBATCH_PLANNED: u64 = 4096;
 
 /// Card bytes a qwen4exp ubatch walk's arena holds a position: its
-/// token-major rows, 124,100 f32, 12 u32 and 1,440 u8 — the embedding, the two stream
-/// buffers, the mix and sub-layer outputs, the attention rows, the delta
+/// token-major rows, 113,860 f32, 10,240 BF16, 12 u32 and 1,440 u8 — the embedding, the
+/// F32 and the BF16 stream buffers, the mix and sub-layer outputs, the attention rows, the delta
 /// layer's, the selecting layer's and the PLE site's intermediates (with the
 /// NVFP4 rows' code and scale planes, 9 bytes a 16 values), the shared
 /// expert's; no selected-flash queries, partials or output. The
 /// arena's own allocation is held to it
 /// (`crates/gpu/src/arch/qwen3moe/scratch38.rs`'s `Arena38::wide`).
 // PIN(2026-10-29): 497,888 (was 496,448): the PLE site's NVFP4 planes, 1,440 B a position.
-pub const UBATCH_ARENA_TOKEN_BYTES: u64 = 497_888;
+// PIN(2026-10-30): 477,408 (was 497,888): the stream buffer the walk carries in BF16 holds a
+// halfword a value, 4 · 2,560 · 2 = 20,480 B a position less.
+pub const UBATCH_ARENA_TOKEN_BYTES: u64 = 477_408;
 
 /// Card bytes a qwen4exp ubatch walk holds a position [derived: the ubatch
 /// arena's, [`UBATCH_ARENA_TOKEN_BYTES`]; the walk's own

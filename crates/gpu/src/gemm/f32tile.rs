@@ -2576,6 +2576,25 @@ pub(crate) fn mma_launch(
     Ok(launch)
 }
 
+/// [`mma_launch`] over an `x` that holds its values as BF16 words, two a
+/// word: `x` holds `n·k / 2` words.
+pub(crate) fn mma_launch_words(
+    what: &'static str,
+    rows: usize,
+    k: usize,
+    x: &DeviceBuffer<f32>,
+    n: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<TileLaunch, GpuError> {
+    let values = x
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| GpuError::shape(what, "x's BF16 words to values overflows"))?;
+    let mut launch = tile_spans(what, rows, k, (values, x.cu_deviceptr()), n, y)?;
+    launch.grid = launch_u32(what, "grid", n.div_ceil(MMA_COLS) * rows.div_ceil(MMA_ROWS))?;
+    Ok(launch)
+}
+
 /// [`mma_launch`] for a BF16 weight's `rows × 2·cols` values. The tile copies
 /// its words in 16-byte pieces, so they must be 16-byte aligned; another is a
 /// named `Shape` error.
@@ -2657,6 +2676,18 @@ pub(crate) fn tile_launch(
     n: usize,
     y: &DeviceBuffer<f32>,
 ) -> Result<TileLaunch, GpuError> {
+    tile_spans(what, rows, k, (x.len(), x.cu_deviceptr()), n, y)
+}
+
+/// [`tile_launch`]'s checks over an `x` of `x_len` values at `x_at`.
+fn tile_spans(
+    what: &'static str,
+    rows: usize,
+    k: usize,
+    (x_len_values, x_at): (usize, cuda_core::sys::CUdeviceptr),
+    n: usize,
+    y: &DeviceBuffer<f32>,
+) -> Result<TileLaunch, GpuError> {
     if k == 0 || !k.is_multiple_of(LINE) {
         return Err(GpuError::shape(
             what,
@@ -2675,17 +2706,15 @@ pub(crate) fn tile_launch(
             format!("n*k = {n}*{k} or rows*n = {rows}*{n} overflows"),
         ));
     };
-    if x.len() < x_len || y.len() < y_len {
+    if x_len_values < x_len || y.len() < y_len {
         return Err(GpuError::shape(
             what,
             format!(
-                "x.len() {} >= n*k = {n}*{k}, y.len() {} >= rows*n = {rows}*{n}",
-                x.len(),
+                "x holds {x_len_values} values, want n*k = {n}*{k}; y.len() {} >= rows*n = {rows}*{n}",
                 y.len()
             ),
         ));
     }
-    let x_at = x.cu_deviceptr();
     if !x_at.is_multiple_of(16) {
         return Err(GpuError::shape(
             what,

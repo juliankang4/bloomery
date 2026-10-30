@@ -86,7 +86,7 @@ use crate::gemm::{
     Gemm32Weight, GemmAct32, GemmInput, GemmRoute, HcUpMixArgs, MMA_COLS, MMA_ROWS, MMA_THREADS,
     MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH, MmaCols, MmaForm, MmaRows, MmaTile, OutForm,
     STAGE_FLOATS, STAGES, TileRows, bf16_mma_body, bf16_mma_launch, bf16_mma_tile, form_col,
-    land_values, mma_launch, mma_tile_origin, store_refused,
+    land_values, mma_launch_words, mma_tile_origin, store_refused,
 };
 use crate::linear::{sigmoid, silu};
 use crate::q8f32::{
@@ -2648,7 +2648,8 @@ mod hc_wide_kernels {
 /// inject site's combine weights.
 pub struct HcWideScratch {
     /// `[m][streams][hidden]`: F32 values, or where a dense MMA card's BF16
-    /// down reads them, BF16 values in its first `m·streams·hidden` halfwords.
+    /// down reads them, BF16 values in its first `m·streams·hidden` halfwords
+    /// (a scratch made for BF16 alone holds only those).
     pub xn: DeviceBuffer<f32>,
     pub xq: GemmAct32,
     /// The down rows' and the inject rows' dots: `[m][RANK]`, then
@@ -2671,12 +2672,19 @@ pub struct HcWideScratch {
 }
 
 impl HcWideScratch {
-    /// Allocate for `geo` at `cols` (1..=`GEMM_MAX_SLOTS`) columns. Load-time
-    /// only.
-    pub fn new(stream: &CudaStream, geo: Geometry, cols: usize) -> Result<HcWideScratch, GpuError> {
+    /// Allocate for `geo` at `cols` (1..=`GEMM_MAX_SLOTS`) columns, the
+    /// normed streams at a halfword a value when `bf16_xn` (every mix the
+    /// scratch serves has a BF16 down on a dense MMA card; a mix that norms
+    /// into F32 values is then refused by name). Load-time only.
+    pub fn new(
+        stream: &CudaStream,
+        geo: Geometry,
+        cols: usize,
+        bf16_xn: bool,
+    ) -> Result<HcWideScratch, GpuError> {
         let z = geo.sizes(cols);
         Ok(HcWideScratch {
-            xn: DeviceBuffer::zeroed(stream, z.xn)?,
+            xn: DeviceBuffer::zeroed(stream, if bf16_xn { z.xn.div_ceil(2) } else { z.xn })?,
             xq: GemmAct32::new(stream, cols, geo.wide())?,
             down: DeviceBuffer::zeroed(stream, z.lo + z.wgt)?,
             lo: DeviceBuffer::zeroed(stream, z.lo)?,
@@ -2823,7 +2831,7 @@ impl HcWideKernels {
         let words = match a.w.down {
             HcMatrix::Bf16(down) if a.q8f32.dense_mma => {
                 let rows = r + geo.s() * inject as usize;
-                let t = mma_launch(what, rows, wide, &a.scratch.xn, m, &mut a.scratch.down)?;
+                let t = mma_launch_words(what, rows, wide, &a.scratch.xn, m, &mut a.scratch.down)?;
                 check_alignment::<U32x4, _>(what, "down", down.buf())?;
                 if let Some(inj) = a.w.inject {
                     check_alignment::<F32x4, _>(what, "inject", inj.buf())?;
@@ -2832,6 +2840,17 @@ impl HcWideKernels {
             }
             _ => None,
         };
+        if words.is_none() && a.scratch.xn.len() < z.xn {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the scratch's normed streams hold {} f32, made for BF16 words; an F32 norm \
+                     (no BF16 down on a dense MMA card) needs {}",
+                    a.scratch.xn.len(),
+                    z.xn
+                ),
+            ));
+        }
         let fused = if let HcMatrix::Bf16(w) = a.w.up
             && words.is_some()
             && m > MAX_COLS

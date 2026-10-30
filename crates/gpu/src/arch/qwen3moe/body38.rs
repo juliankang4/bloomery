@@ -2039,8 +2039,7 @@ impl Body38 {
         let wa = Arena38::wide(
             stream,
             router_dims,
-            ub,
-            UBATCH_MOST,
+            (ub, UBATCH_MOST, final_res(&plans)),
             ctx,
             (by_state(BY_NAME_COLS.min(ub))?, by_none()?),
         )?;
@@ -2092,7 +2091,7 @@ impl Body38 {
             model::arch::qwen35moe::place::act_forms_bytes(c, ub as u64)
                 .map_err(|e| GpuError::shape(WHAT, e.to_string()))
         })?;
-        let wide_forms = WideForms::of(gpu, w, &plans, forms > 0);
+        let wide_forms = WideForms::of(gpu, w, &plans, forms > 0)?;
         let mut wide = Wide38::new(stream, ub, route_run, &card, tier.is_some(), &wide_forms)?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
         let counted = counted + forms;
