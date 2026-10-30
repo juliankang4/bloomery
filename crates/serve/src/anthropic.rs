@@ -583,7 +583,7 @@ fn whole(
         prompt,
         mut parser,
     } = plan;
-    let (o, _) = match run_whole(state, &req.path, &prompt_ids, prompt, &p, w)? {
+    let (o, _) = match run_whole(state, &prompt_ids, prompt, &p, req, w)? {
         Err(e) => return send_error(w, req, &e),
         Ok(done) => done,
     };
@@ -849,7 +849,7 @@ fn stream(
             &prompt_ids,
             prompt,
             &p,
-            Client::of(peer),
+            Client::of(peer, req),
             &mut sink,
         )
         .map(|r| r.map(|(o, _)| o))

@@ -61,7 +61,7 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -69,6 +69,7 @@ use jinja::{ChatTemplate, TemplateError};
 use serde::de::{Deserialize, Deserializer, Error, IgnoredAny, MapAccess, Visitor};
 use serde_json::{Map, Value, json};
 
+use crate::admit;
 use crate::callstream::CallPiece;
 use crate::constrain;
 use crate::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools, parses_tools};
@@ -79,7 +80,7 @@ use crate::engine::{
 };
 use crate::event;
 use crate::exit::Code;
-use crate::flag::ApiKeys;
+use crate::flag::{ApiKeys, Denied};
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
 use crate::glmxml::ArgTypes;
 use crate::guard::{Guard, GuardError, Guarded};
@@ -1346,6 +1347,7 @@ pub(crate) fn closing() -> Request {
         headers: Vec::new(),
         body: Vec::new(),
         keep_alive: false,
+        lease: Mutex::default(),
     }
 }
 
@@ -1440,14 +1442,23 @@ pub(crate) fn keep_alive(
         if !next_request_arrives(&mut r) {
             return;
         }
-        let (req, unread) = match (|| -> io::Result<Option<(Request, bool)>> {
+        let (req, unread, meter) = match (|| -> io::Result<Option<(Request, bool, _)>> {
             let Some(mut req) = http::read_head(&mut r)? else {
                 return Ok(None);
             };
-            if key_denied(keys, &mut req, &mut w)? {
-                linger_close(r.get_ref());
-                return Ok(None);
-            }
+            let meter = match keys.check(
+                &req.method,
+                &req.path,
+                req.header("Authorization"),
+                req.header("X-Api-Key"),
+            ) {
+                Ok(meter) => meter,
+                Err(denied) => {
+                    refuse_key(denied, &mut req, &mut w)?;
+                    linger_close(r.get_ref());
+                    return Ok(None);
+                }
+            };
             let mut unread = false;
             if req.method == "OPTIONS" || matches!(req.path.as_str(), "/health" | "/v1/health") {
                 // These public handlers ignore bodies; unread framing cannot carry a next request.
@@ -1457,7 +1468,7 @@ pub(crate) fn keep_alive(
             } else {
                 http::read_body(&mut r, &mut w, &mut req)?;
             }
-            Ok(Some((req, unread)))
+            Ok(Some((req, unread, meter)))
         })() {
             Ok(Some(read)) => read,
             Ok(None) => return,
@@ -1480,7 +1491,19 @@ pub(crate) fn keep_alive(
         };
         let answered = {
             let _answering = answers.answering();
-            route(&req, &mut w)
+            // A decide server's seated route is a decision, whatever its path.
+            let takes_place = keys.inference_routes.contains(&req.path.as_str())
+                || !responses::store_call(&req.method, &req.path);
+            match meter
+                .map(|m| m.admit(Instant::now(), takes_place))
+                .transpose()
+            {
+                Ok(lease) => {
+                    *relock(&req.lease) = lease.flatten();
+                    route(&req, &mut w)
+                }
+                Err(refusal) => send_refusal(&mut w, &req, &refusal),
+            }
         };
         match answered {
             Ok(true) if req.keep_alive => {}
@@ -1595,39 +1618,58 @@ pub(crate) fn cors_preflight() -> [(&'static str, String); 2] {
 }
 
 /// The one stderr line a request the key check refuses writes: its method,
-/// path and peer, and never the key it sent.
-fn deny_line(method: &str, path: &str, peer: &str) -> String {
-    format!("{method} {path} from {peer}: refused, no valid API key")
+/// path, peer and why, and never the key it sent.
+fn deny_line(method: &str, path: &str, peer: &str, denied: Denied) -> String {
+    let why = match denied {
+        Denied::Key => "no valid API key",
+        Denied::Scope => "the API key's scope does not reach the route",
+    };
+    format!("{method} {path} from {peer}: refused, {why}")
 }
 
-/// Answers a denied request's headers with llama-server's 401 and marks the connection closed.
-/// The unread body is never drained or interpreted as another request.
-fn key_denied(keys: &ApiKeys, req: &mut Request, w: &mut TcpStream) -> io::Result<bool> {
-    if keys.allows(
-        &req.method,
-        &req.path,
-        req.header("Authorization"),
-        req.header("X-Api-Key"),
-    ) {
-        return Ok(false);
-    }
+/// Answers a denied request's headers and marks the connection closed: an
+/// unknown key with llama-server's 401, a key whose scope does not reach the
+/// route with a 403. The unread body is never drained or interpreted as
+/// another request.
+fn refuse_key(denied: Denied, req: &mut Request, w: &mut TcpStream) -> io::Result<()> {
     let peer = w
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|e| format!("a peer that cannot be read: {e}"));
-    eprintln!("{}", deny_line(&req.method, &req.path, &peer));
+    eprintln!("{}", deny_line(&req.method, &req.path, &peer, denied));
     req.keep_alive = false;
+    let (code, kind, message) = match denied {
+        Denied::Key => (401, "authentication_error", "Invalid API Key".to_owned()),
+        Denied::Scope => (
+            403,
+            "permission_error",
+            format!(
+                "this API key's scope does not reach {} {}",
+                req.method, req.path
+            ),
+        ),
+    };
     send_error(
         w,
         req,
         &ApiError {
             retry_after: false,
             param: None,
-            code: 401,
-            kind: "authentication_error",
-            message: "Invalid API Key".to_owned(),
+            code,
+            kind,
+            message,
         },
     )?;
+    Ok(())
+}
+
+/// Answers a request its key's limits refused ([`crate::admit`]) with a 429
+/// whose `Retry-After` is the refusal's wait; the body was read, so the
+/// connection may carry another request.
+fn send_refusal(w: &mut TcpStream, req: &Request, refusal: &admit::Refusal) -> io::Result<bool> {
+    let body = error_body(429, "rate_limit_error", &refusal.message()).to_string();
+    let retry = [("Retry-After", refusal.retry_after().to_string())];
+    http::respond(w, req, 429, JSON, &retry, body.as_bytes())?;
     Ok(true)
 }
 
@@ -1667,6 +1709,8 @@ pub(crate) const LISTED: [(&str, &str); 13] = [
 ];
 
 /// Dispatches one request; `Ok(true)` when the connection may carry another.
+/// A new model route or alias also belongs in `Scope::of`'s `MODEL_ROUTES`
+/// and the route list in `a_key_scope_reaches_its_routes_and_no_other`.
 fn route(state: &Arc<State>, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let r = match (req.method.as_str(), req.path.as_str()) {
         ("GET", path::HEALTH | "/v1/health") => return health(state, req, w),
@@ -3677,7 +3721,7 @@ fn run_choices(
                 settings: generation_settings(state, p),
                 media: input.feeds.clone(),
                 sampler,
-                events: Events::new(events.clone(), choice),
+                events: Events::new(events.clone(), choice, client.place.upgrade()),
                 client: Arc::clone(&client),
                 name: ReqName {
                     id: state.next_id(),
@@ -3788,14 +3832,18 @@ pub(crate) struct Client {
     /// connection waits on.
     stream: Option<TcpStream>,
     gone: Mutex<bool>,
+    /// The request's key place: each of its engine jobs holds a share until
+    /// it ends ([`Events`]). Weak, so the client itself holds none.
+    place: Weak<admit::Place>,
 }
 
 impl Client {
-    /// The client on the request's connection `stream`.
-    fn of(stream: TcpStream) -> Arc<Client> {
+    /// The client of `req` on the request's connection `stream`.
+    fn of(stream: TcpStream, req: &Request) -> Arc<Client> {
         Arc::new(Client {
             stream: Some(stream),
-            gone: Mutex::new(false),
+            place: Client::place(req),
+            ..Client::detached()
         })
     }
 
@@ -3804,7 +3852,15 @@ impl Client {
         Client {
             stream: None,
             gone: Mutex::new(false),
+            place: Weak::new(),
         }
+    }
+
+    /// `req`'s place, weak.
+    fn place(req: &Request) -> Weak<admit::Place> {
+        relock(&req.lease)
+            .as_ref()
+            .map_or_else(Weak::new, Arc::downgrade)
     }
 
     /// Ends the request at its next check, as a client that went away does.
@@ -3855,13 +3911,13 @@ fn probe_client(w: &TcpStream) -> io::Result<()> {
 /// [`run_whole_choices`] of a request of one choice.
 fn run_whole(
     state: &State,
-    route: &str,
     input: &Prompt,
     prompt: Value,
     p: &GenParams,
+    req: &Request,
     w: &TcpStream,
 ) -> io::Result<Result<(Outcome, usize), ApiError>> {
-    let ran = run_whole_choices(state, route, input, prompt, std::slice::from_ref(p), w)?;
+    let ran = run_whole_choices(state, input, prompt, std::slice::from_ref(p), req, w)?;
     Ok(ran.map(|mut all| all.swap_remove(0)))
 }
 
@@ -3872,19 +3928,19 @@ fn run_whole(
 /// inner one is the request's answer, an engine error a 500.
 fn run_whole_choices(
     state: &State,
-    route: &str,
     input: &Prompt,
     prompt: Value,
     ps: &[GenParams],
+    req: &Request,
     w: &TcpStream,
 ) -> io::Result<Result<Vec<(Outcome, usize)>, ApiError>> {
     match run_choices(
         state,
-        route,
+        &req.path,
         input,
         prompt,
         ps,
-        Client::of(w.try_clone()?),
+        Client::of(w.try_clone()?, req),
         &mut |_, _, _| Ok(()),
     ) {
         Err(e) => Ok(Err(e)),
@@ -4361,7 +4417,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
         return_tokens,
     } = plan;
     if !p.stream {
-        return match run_whole(state, &req.path, &input, prompt.clone(), &p, w)? {
+        return match run_whole(state, &input, prompt.clone(), &p, req, w)? {
             Err(e) => send_error(w, req, &e),
             Ok((o, slot)) => send_json(
                 w,
@@ -4417,7 +4473,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
             &input,
             prompt.clone(),
             &p,
-            Client::of(peer),
+            Client::of(peer, req),
             &mut sink,
         )
     };
@@ -4739,7 +4795,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     };
     let vocab = &*state.tok;
     if !p.stream {
-        let all = match run_whole_choices(state, &req.path, &input, prompt, &ps, w)? {
+        let all = match run_whole_choices(state, &input, prompt, &ps, req, w)? {
             Ok(all) => all,
             Err(e) => return send_error(w, req, &e),
         };
@@ -4832,7 +4888,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             &input,
             prompt,
             ps,
-            Client::of(peer),
+            Client::of(peer, req),
             &mut sink,
         )
     };
@@ -4977,7 +5033,7 @@ mod tests {
         media_error, needs_object_arguments, probe_thinking_off, shutdown_allowed,
     };
     use crate::engine::{DeviceProps, PlacementProps, SamplerRefused, SamplingParams};
-    use crate::flag::ApiKeys;
+    use crate::flag::{ApiKeys, Denied};
     use crate::media::{ExpandError, MediaError};
     use crate::reasoning::ThinkTags;
     use jinja::ChatTemplate;
@@ -6844,6 +6900,247 @@ mod tests {
         assert!(body.contains("content"), "the generation answered: {body}");
     }
 
+    /// A key file line's scope and limits over a real socket: a key whose
+    /// `scope=` does not reach the route is a 403 (`permission_error`) and a
+    /// route it reaches answers; `inflight=1` refuses a second request with a
+    /// 429 and `Retry-After: 1` while a background response the key started
+    /// still generates (a call on the stored response passes), and admits
+    /// again once it ends, and at once after each answer; `rate=1/m` refuses
+    /// the second request with the remaining wait rounded up in `Retry-After` on
+    /// the same keep-alive connection, which carries the next request after it.
+    #[test]
+    fn a_key_files_scope_and_limits_answer_403_and_429() {
+        use crate::mock::{DraftMock, Hold};
+        use std::io::{BufReader, Write};
+        use std::sync::Arc;
+        let (keys, _) = crate::flag::key_file(
+            "admit",
+            "sk-gen scope=inference inflight=1\nsk-look scope=read\nsk-slow rate=1/m\n",
+        );
+        let hold = Arc::new(Hold::default());
+        let mut config = super::testserve::mock_config();
+        config.api_keys = keys.expect("the key file");
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(DraftMock::new(4096).holding(Arc::clone(&hold))),
+            config,
+        );
+        // Each answer is bounded: a request the limits should refuse would
+        // otherwise wait for the held engine.
+        let call = |key: &str, method: &str, path: &str, body: &str| {
+            let bearer = format!("Bearer {key}");
+            let auth = [("Authorization", bearer.as_str())];
+            let mut s = super::testserve::send_request(addr, method, path, &auth, body);
+            s.set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut read = BufReader::new(&mut s);
+            let (status, head, body) = crate::http::read_test_response(&mut read);
+            assert_eq!(read.read(&mut [0]).expect("the connection closes"), 0);
+            (
+                status,
+                head,
+                String::from_utf8(body).expect("a UTF-8 response"),
+            )
+        };
+        let ask = r#"{"prompt":"abab","n_predict":2}"#;
+
+        let (status, head, body) = call("sk-look", "POST", "/completion", ask);
+        assert_eq!(status, 403, "{body}");
+        assert!(head.starts_with("HTTP/1.0 403 Forbidden\r\n"), "{head}");
+        let v: Value = serde_json::from_str(&body).expect("the 403's JSON");
+        assert_eq!(v["error"]["type"], "permission_error");
+        assert_eq!(
+            v["error"]["message"],
+            "this API key's scope does not reach POST /completion"
+        );
+        assert_eq!(call("sk-look", "GET", "/props", "").0, 200);
+        assert_eq!(call("sk-gen", "GET", "/props", "").0, 403);
+
+        let background = r#"{"input":"abab","background":true,"max_output_tokens":2}"#;
+        let (status, _, body) = call("sk-gen", "POST", "/v1/responses", background);
+        assert_eq!(status, 200, "{body}");
+        let id = serde_json::from_str::<Value>(&body).unwrap()["id"]
+            .as_str()
+            .expect("the response's id")
+            .to_owned();
+        assert!(
+            hold.reached(1, Duration::from_secs(10)),
+            "the background generation never reached the engine"
+        );
+        let (status, head, body) = call("sk-gen", "POST", "/completion", ask);
+        assert_eq!(status, 429, "{body}");
+        assert!(
+            head.starts_with("HTTP/1.0 429 Too Many Requests\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("Retry-After: 1\r\n"), "{head}");
+        let v: Value = serde_json::from_str(&body).expect("the 429's JSON");
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("in-flight limit (inflight=1)")),
+            "{body}"
+        );
+        assert_eq!(
+            call("sk-slow", "GET", "/props", "").0,
+            200,
+            "another key's room"
+        );
+        // A stored-response call runs no generation: it takes no place, so
+        // the key can read (or cancel) the response that holds its one.
+        let stored = format!("/v1/responses/{id}");
+        let (status, _, body) = call("sk-gen", "GET", &stored, "");
+        assert_eq!(status, 200, "{body}");
+        assert!(super::responses::store_call(
+            "POST",
+            &format!("{stored}/cancel")
+        ));
+        assert!(super::responses::store_call("DELETE", &stored));
+        assert!(!super::responses::store_call(
+            "POST",
+            "/v1/responses/input_tokens"
+        ));
+        hold.open();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (status, _, body) = call("sk-gen", "GET", &stored, "");
+            if status == 200 && body.contains(r#""status":"completed""#) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the background response never ended: {body}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(call("sk-gen", "POST", "/completion", ask).0, 200);
+        // The place is given back once the answer is written, before its
+        // connection closes, so a client that asks again at once is never
+        // refused.
+        for _ in 0..50 {
+            let (status, _, body) = call("sk-gen", "POST", "/tokenize", r#"{"content":"ab"}"#);
+            assert_eq!(status, 200, "{body}");
+        }
+
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        let mut read = BufReader::new(client.try_clone().expect("clone"));
+        let mut next = || {
+            write!(
+                client,
+                "POST /tokenize HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer sk-slow\r\n\
+                 Content-Length: 16\r\n\r\n{{\"content\":\"ab\"}}"
+            )
+            .expect("write");
+            crate::http::read_test_response(&mut read)
+        };
+        let (status, head, _) = next();
+        assert_eq!(status, 429, "the /props above spent sk-slow's one: {head}");
+        // PIN(2026-10-30): wall-clock requests accept elapsed time; admit's unit test pins exact rounding.
+        assert!(
+            (1..=60).any(|s| head.contains(&format!("Retry-After: {s}\r\n"))),
+            "{head}"
+        );
+        assert!(!head.contains("Connection: close"), "{head}");
+        assert_eq!(next().0, 429, "the connection carries the next request");
+    }
+
+    /// An answer holds its key's in-flight place while its write is blocked:
+    /// with `inflight=1`, a client that reads a large answer's head and then
+    /// stops reading keeps the key's one place, so another request of the
+    /// key is a 429 until that connection ends.
+    #[test]
+    fn a_blocked_answer_write_keeps_its_place() {
+        use crate::mock::{DraftMock, Hold};
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::Arc;
+
+        for background in [false, true] {
+            let (keys, _) = crate::flag::key_file("blocked", "sk-one inflight=1\n");
+            let mut config = super::testserve::mock_config();
+            config.api_keys = keys.expect("the key file");
+            let hold = Arc::new(Hold::default());
+            let (addr, state, _ended) = super::testserve::spawn(
+                Box::new(DraftMock::new(64).holding(Arc::clone(&hold))),
+                config,
+            );
+            let auth = [("Authorization", "Bearer sk-one")];
+            let small = r#"{"content":"ab"}"#;
+            // Both answers exceed the socket buffers, so a reader that
+            // stops after the head leaves the writer blocked.
+            let (path, large) = if background {
+                (
+                    "/v1/responses",
+                    json!({"input": "abab", "model": "m".repeat(8 << 20),
+                        "background": true, "max_output_tokens": 2})
+                    .to_string(),
+                )
+            } else {
+                (
+                    "/tokenize",
+                    json!({"content": "a".repeat(1 << 20), "with_pieces": true}).to_string(),
+                )
+            };
+            let mut big = std::net::TcpStream::connect(addr).expect("connect");
+            big.set_read_timeout(Some(Duration::from_secs(15)))
+                .expect("timeout");
+            write!(
+                big,
+                "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer sk-one\r\n\
+                 Content-Length: {}\r\n\r\n{large}",
+                large.len()
+            )
+            .expect("write");
+            let mut read = BufReader::new(big);
+            let mut status_line = String::new();
+            read.read_line(&mut status_line)
+                .expect("the large answer's head");
+            assert!(status_line.starts_with("HTTP/1.1 200"), "{status_line}");
+            if background {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(read.read_line(&mut line).expect("queued response head"), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                // The queued object's first field is its id. Read just
+                // that field, leaving the large model string unread.
+                let mut first = Vec::new();
+                read.read_until(b',', &mut first).expect("the response id");
+                assert_eq!(first.pop(), Some(b','));
+                first.push(b'}');
+                let first: Value = serde_json::from_slice(&first).expect("the id field");
+                let id = first["id"].as_str().expect("a response id");
+                assert!(hold.reached(1, Duration::from_secs(10)));
+                hold.open();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    let stored = state.responses.get(id).expect("the stored response");
+                    if matches!(stored["status"].as_str(), Some("completed" | "incomplete")) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the background generation never ended"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            let (status, head, body) =
+                super::testserve::roundtrip_head(addr, "POST", "/tokenize", &auth, small);
+            assert_eq!(
+                status, 429,
+                "the blocked write holds the place (background={background}): {head}{body}"
+            );
+            drop(read);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while super::testserve::roundtrip(addr, "POST", "/tokenize", &auth, small).0 != 200 {
+                assert!(Instant::now() < deadline, "the place never came back");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
     /// Sends `head`, then a body in pieces the server reads after it answered from the head,
     /// and returns the answer's status once the connection ends with EOF: an answer that
     /// closes with request bytes unread still reaches the client.
@@ -7369,7 +7666,7 @@ mod tests {
         assert_eq!(status, 400, "an error body to read: {body}");
         assert!(!body.contains(KEY), "the error body carries no key: {body}");
 
-        let line = deny_line("POST", "/completion", "127.0.0.1:54094");
+        let line = deny_line("POST", "/completion", "127.0.0.1:54094", Denied::Key);
         assert!(
             line.contains("POST /completion") && line.contains("127.0.0.1:54094"),
             "{line}"
@@ -7684,6 +7981,150 @@ mod tests {
             serde_json::from_str(raw.split_once("\r\n\r\n").expect("head").1).expect("JSON")
         }
 
+        /// An opened SSE stream holds its key's one place until completion
+        /// or disconnect, including while the next engine step is blocked.
+        #[cfg(unix)]
+        #[test]
+        fn a_stream_keeps_its_key_place_until_completion_or_disconnect() {
+            use std::io::{BufRead, BufReader};
+
+            for disconnect in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let (permit, permits) = mpsc::channel();
+                let (keys, _) = crate::flag::key_file("stream", "sk-stream inflight=1\n");
+                let mut config = testserve::mock_config();
+                config.api_keys = keys.expect("the key file");
+                let (addr, _state, _ended) = testserve::spawn(
+                    Box::new(Gated {
+                        inner: MockEngine::new(1024),
+                        calls: Arc::clone(&calls),
+                        permits,
+                        prefilled: Arc::new(AtomicUsize::new(0)),
+                    }),
+                    config,
+                );
+                let auth = [("Authorization", "Bearer sk-stream")];
+                let client = testserve::send_request(
+                    addr,
+                    "POST",
+                    "/completion",
+                    &auth,
+                    r#"{"prompt":"abab","temperature":0,"n_predict":2,"stream":true}"#,
+                );
+                client
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("timeout");
+                wait_for("the stream's first step", || {
+                    calls.load(Ordering::SeqCst) == 1
+                });
+                permit.send(()).expect("release the first token");
+                wait_for("the stream's next step", || {
+                    calls.load(Ordering::SeqCst) == 2
+                });
+                let mut read = BufReader::new(client);
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(read.read_line(&mut line).expect("stream head or event"), 0);
+                    if line.starts_with("data: ") {
+                        break;
+                    }
+                }
+                let probe = || {
+                    testserve::roundtrip_head(
+                        addr,
+                        "POST",
+                        "/tokenize",
+                        &auth,
+                        r#"{"content":"ab"}"#,
+                    )
+                };
+                let (status, head, body) = probe();
+                assert_eq!(
+                    status, 429,
+                    "the opened stream holds its place: {head}{body}"
+                );
+                assert!(head.contains("Retry-After: 1\r\n"), "{head}");
+                if disconnect {
+                    reset(read.into_inner());
+                } else {
+                    permit.send(()).expect("finish the stream");
+                    let mut rest = String::new();
+                    read.read_to_string(&mut rest).expect("the stream ends");
+                    assert!(rest.contains(r#""stop":true"#), "{rest}");
+                    assert_eq!(probe().0, 200, "completion returns the place before EOF");
+                    continue;
+                }
+                permit
+                    .send(())
+                    .expect("let the engine observe the disconnect");
+                wait_for("the disconnected stream's place", || probe().0 == 200);
+            }
+        }
+
+        /// A request its client leaves while the engine is in its prefill
+        /// holds its key's one place until the engine leaves that prefill:
+        /// a cancelled background response and a whole request whose
+        /// connection resets both keep it while the prefill is held, though
+        /// their request side ends at its next disconnect check, and give it back
+        /// once the prefill ends.
+        #[cfg(unix)]
+        #[test]
+        fn a_left_request_keeps_its_key_place_until_the_engine_leaves_it() {
+            use crate::mock::{DraftMock, Hold};
+
+            for background in [true, false] {
+                let (keys, _) = crate::flag::key_file("left", "sk-left inflight=1\n");
+                let mut config = testserve::mock_config();
+                config.api_keys = keys.expect("the key file");
+                let hold = Arc::new(Hold::default());
+                let (addr, _state, _ended) = testserve::spawn(
+                    Box::new(DraftMock::new(64).holding(Arc::clone(&hold))),
+                    config,
+                );
+                let auth = [("Authorization", "Bearer sk-left")];
+                let probe = || {
+                    testserve::roundtrip(addr, "POST", "/tokenize", &auth, r#"{"content":"ab"}"#).0
+                };
+                if background {
+                    let (status, body) = testserve::roundtrip(
+                        addr,
+                        "POST",
+                        "/v1/responses",
+                        &auth,
+                        r#"{"input":"abab","background":true,"max_output_tokens":2}"#,
+                    );
+                    assert_eq!(status, 200, "{body}");
+                    let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+                    let id = v["id"].as_str().expect("the response's id");
+                    assert!(hold.reached(1, Duration::from_secs(10)));
+                    let cancel = format!("/v1/responses/{id}/cancel");
+                    let (status, body) = testserve::roundtrip(addr, "POST", &cancel, &auth, "");
+                    assert_eq!(status, 200, "{body}");
+                } else {
+                    let client = testserve::send_request(
+                        addr,
+                        "POST",
+                        "/completion",
+                        &auth,
+                        r#"{"prompt":"abab","n_predict":2}"#,
+                    );
+                    assert!(hold.reached(1, Duration::from_secs(10)));
+                    reset(client);
+                }
+                let until = Instant::now() + Duration::from_secs(1);
+                while Instant::now() < until {
+                    assert_eq!(
+                        probe(),
+                        429,
+                        "the held prefill keeps the place (background={background})"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                hold.open();
+                wait_for("the place after the prefill", || probe() == 200);
+            }
+        }
+
         #[test]
         fn lifecycle_half_closed_request_receives_its_whole_answer() {
             let calls = Arc::new(AtomicUsize::new(0));
@@ -7799,7 +8240,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let peer = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
             let (stream, _) = listener.accept().expect("accept");
-            let client = Client::of(stream);
+            let client = Client::of(stream, &super::super::closing());
             let (probed, consumed) = mpsc::channel();
             let (resume, resumed) = mpsc::channel();
             reset(peer);
@@ -7838,7 +8279,7 @@ mod tests {
                         settings: serde_json::Value::Null,
                         media: Vec::new(),
                         sampler: None,
-                        events: crate::worker::Events::new(events, 0),
+                        events: crate::worker::Events::new(events, 0, None),
                         name: ReqName {
                             id: 0,
                             route: "/completion".to_owned(),
