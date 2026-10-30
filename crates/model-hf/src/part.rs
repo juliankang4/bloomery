@@ -164,18 +164,19 @@ impl Checkpoint {
             .collect()
     }
 
-    /// The sources part `p` of `name`, made as `m`, reads its values from: a stack's experts'
-    /// own, along its experts or by a list; every source for any other part and for a tensor the
-    /// model moves after normalizing, which is made whole.
-    fn read_from<'s>(
+    /// The sources part `p` of `name`, made as `m`, reads whole: every source of a whole tensor,
+    /// a stack's experts along its experts or by a list; `None` for a part that cuts its sources'
+    /// rows and for a tensor the model moves after normalizing.
+    fn whole_sources<'s>(
         &'s self,
         name: &str,
         m: &'s Made,
         p: &Planned,
-    ) -> Result<Vec<(&'s str, &'s Placed)>, Error> {
+    ) -> Result<Option<Vec<(&'s str, &'s Placed)>>, Error> {
         let placed = self.placed(m);
         match (&p.at, &m.step) {
-            (Some(At::Experts(list)), None) => self.listed(name, m, list),
+            (None, None) => Ok(Some(placed)),
+            (Some(At::Experts(list)), None) => self.listed(name, m, list).map(Some),
             (Some(At::Along(2, r)), None)
                 if m.dims.len() == 3 && placed.len() as u64 == m.dims[2] =>
             {
@@ -183,10 +184,40 @@ impl Checkpoint {
                     .ok()
                     .zip(usize::try_from(r.end).ok());
                 r.and_then(|(a, b)| placed.get(a..b))
-                    .map(<[_]>::to_vec)
+                    .map(|s| Some(s.to_vec()))
                     .ok_or_else(|| refuse(name, format!("experts {:?} of its sources", p.at)))
             }
-            _ => Ok(placed),
+            _ => Ok(None),
+        }
+    }
+
+    /// The sources part `p` of `name`, made as `m`, reads its values from: those it reads whole
+    /// ([`Checkpoint::whole_sources`]), every source for any other part and for a tensor the
+    /// model moves after normalizing, which is made whole.
+    fn read_from<'s>(
+        &'s self,
+        name: &str,
+        m: &'s Made,
+        p: &Planned,
+    ) -> Result<Vec<(&'s str, &'s Placed)>, Error> {
+        Ok(self
+            .whole_sources(name, m, p)?
+            .unwrap_or_else(|| self.placed(m)))
+    }
+
+    /// The sources an NVFP4 part `p` of `name`, made as `m` in type `ty`, streams in bounded
+    /// direct reads ([`Checkpoint::read_nvfp4`]): the whole tensor or whole experts of its
+    /// stack; `None` for any other type and for a part that cuts rows.
+    fn streamed<'s>(
+        &'s self,
+        name: &str,
+        m: &'s Made,
+        ty: GgmlType,
+        p: &Planned,
+    ) -> Result<Option<Vec<(&'s str, &'s Placed)>>, Error> {
+        match ty == GgmlType::NVFP4 {
+            true => self.whole_sources(name, m, p),
+            false => Ok(None),
         }
     }
 
@@ -360,13 +391,13 @@ impl Source for Checkpoint {
         // A direct read's buffer is aligned within one more block, and opening a shard for direct
         // reads probes it with two ([`DirectFile::open`]), one shard at a time.
         let direct = (3 * DIRECT_ALIGN) as u64;
-        if ty == GgmlType::NVFP4 && p.at.is_none() && m.step.is_none() {
+        if let Some(sources) = self.streamed(name, m, ty, p)? {
             // One bounded batch of stored inputs, the current expert's decoded scales and
-            // widened companion words, and the stack's single output allocation coexist.
+            // widened companion words, and the part's single output allocation coexist.
             let mut peak = 0;
-            for (run, held) in self.nvfp4_batches(&placed, NVFP4_READ_MAX)? {
+            for (run, held) in self.nvfp4_batches(&sources, NVFP4_READ_MAX)? {
                 let mut scratch = 0;
-                for &(source, pl) in &placed[run] {
+                for &(source, pl) in &sources[run] {
                     let mut words = 0;
                     for n in stored(&[(source, pl)]).filter(|&n| n != source) {
                         let dtype = self.folder.raw(n)?.dtype.size() as u64;
@@ -385,10 +416,10 @@ impl Source for Checkpoint {
                 }
                 peak = peak.max(sum(sum(direct, held)?, scratch)?);
             }
-            let scales = (placed.len() as u64)
+            let scales = (sources.len() as u64)
                 .checked_mul(8)
                 .ok_or_else(|| refuse(name, "read bytes pass u64"))?;
-            return sum(peak, sum(whole.nbytes, scales)?);
+            return sum(peak, sum(p.info.nbytes, scales)?);
         }
 
         // Direct inputs, or growing cut buffers; decoded companion words and widened plain
@@ -451,16 +482,17 @@ impl Source for Checkpoint {
             .ok_or_else(|| refuse(name, "is not one the map makes"))?;
         let placed = self.placed(m);
         let ty = self.card_type(name, m)?;
-        // A whole tensor's stored bytes are read into memory of the read's own ([`Wholes::read`]);
-        // a part reads only its rows through the mapping.
-        let streamed = ty == GgmlType::NVFP4 && p.at.is_none() && m.step.is_none();
-        let read = match !streamed && (p.at.is_none() || m.step.is_some()) {
+        // A whole tensor's stored bytes are read into memory of the read's own ([`Wholes::read`]),
+        // as are an NVFP4 part's whole experts; a part that cuts rows reads only its rows through
+        // the mapping.
+        let streamed = self.streamed(name, m, ty, p)?;
+        let read = match streamed.is_none() && (p.at.is_none() || m.step.is_some()) {
             true => Wholes::read(&self.folder, stored(&placed))?,
             false => None,
         };
         let get = |n: &str| self.raw(read.as_ref(), n);
-        let n = if streamed {
-            self.read_nvfp4(&placed, NVFP4_READ_MAX)?
+        let n = if let Some(sources) = &streamed {
+            self.read_nvfp4(sources, NVFP4_READ_MAX)?
         } else {
             match (&p.at, &m.step) {
                 (Some(At::Along(dim, r)), None) => {
@@ -1348,8 +1380,11 @@ pub(crate) mod tests {
     /// leaves out unread; one expert is the stack's cut along its experts. A list on a tensor
     /// that is no stack, and one naming an expert past the stack, are refused by name by both
     /// sources before a value is read. Releasing the listed part releases the listed experts'
-    /// sources alone. Mutants (`split-mutants/`): the folder's list read in reverse, the
-    /// GGUF's listed scales left whole, the release of a listed part over every source.
+    /// sources alone. A listed part reads its experts' stored bytes past the page cache, giving
+    /// the bytes and scales the mapping gives and holding no more than its read bytes count.
+    /// Mutants (`split-mutants/`): the folder's list read in reverse, the GGUF's listed scales
+    /// left whole, the release of a listed part over every source. FAIL-first: a listed part read
+    /// through the mapping holds its read bytes' count less its stored bytes.
     #[test]
     fn a_stack_s_listed_experts_are_the_same_part_from_the_folder_and_its_gguf() {
         let dir = temp_dir("listed");
@@ -1416,13 +1451,28 @@ pub(crate) mod tests {
             panic!("one part planned")
         };
         let m = &f.made()["ex.weight"];
-        let from: Vec<&str> = f
-            .read_from("ex.weight", m, p)
-            .unwrap()
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        assert_eq!(from, ["ex.0.w", "ex.2.w"]);
+        let from = f.read_from("ex.weight", m, p).unwrap();
+        let names: Vec<&str> = from.iter().map(|&(s, _)| s).collect();
+        assert_eq!(names, ["ex.0.w", "ex.2.w"]);
+        let mapped = modelopt::normalize(|n| f.folder.raw(n), &from, m.role).unwrap();
+        let read_bytes = f.read_bytes(p).unwrap();
+        let (held, got) = peak(|| {
+            let part = f.read(p).unwrap();
+            (part.spans().concat(), part.scale)
+        });
+        assert_eq!(
+            got,
+            (mapped.bytes, Some(mapped.scale)),
+            "the mapping's part"
+        );
+        let (shard, _) = f.folder.file_range("ex.0.w").unwrap();
+        if DirectFile::open(&shard).is_ok() {
+            let align = (2 * stored(&from).count() as u64 + 3) * DIRECT_ALIGN as u64;
+            assert!(
+                read_bytes >= held && read_bytes - held <= align,
+                "the listed part holds {held}, its read bytes count {read_bytes}"
+            );
+        }
         f.release(p).unwrap();
         let again = read_one(&f, listed("ex.weight", list(&[0, 2], 4))).unwrap();
         assert_eq!(
