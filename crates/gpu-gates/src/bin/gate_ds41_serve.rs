@@ -91,7 +91,7 @@
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for. A server with no `--ctx` (`<dir>/ctx-default`, one slot)
 //! prints its one `ctx` line before its load: the seats' fit, its word
-//! held against this gate's own plans (`ctx_default_is_the_highest_rung_held`,
+//! held against this gate's own plans (`ctx_default_is_the_largest_step_held`,
 //! [`ctx_default`]). A server asked for [`SLOTS_OVER`] slots of [`GATE_CTX`]
 //! each (`<dir>/slots-over`, `--ctx` their total), whose plan counts that many
 //! sequences, ends before it loads (s4): no `plan` record, and the seats'
@@ -1355,7 +1355,7 @@ mod gate {
         let mut ok = true;
         check(
             &mut ok,
-            "ctx_default_is_the_highest_rung_held",
+            "ctx_default_is_the_largest_step_held",
             default_line_held(&line, 1, limit) == Some(true) && at_ctx && at_above != Some(true),
         );
         Ok(ok)

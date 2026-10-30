@@ -49,7 +49,7 @@
 //!   the trained context verified to `place::ORACLE_POSITIONS`, or a step
 //!   under it, `target` or `fitted`) and this gate's own plans agree: the
 //!   card holds the default, and not the step above it when it fitted
-//!   (`ctx_default_is_the_highest_rung_held`); the flag winning below the
+//!   (`ctx_default_is_the_largest_step_held`); the flag winning below the
 //!   floor; and a context past `place::ORACLE_POSITIONS` refused by name
 //!   before it listens. FAIL-first: a default that starts a step low names a
 //!   context whose step above the card holds;
@@ -1138,7 +1138,7 @@ mod gate {
         // holds the default, and not the step above it when it fitted.
         check(
             &mut ok,
-            "ctx_default_is_the_highest_rung_held",
+            "ctx_default_is_the_largest_step_held",
             default_line_held(&line, 1, limit) == Some(true)
                 && at_ctx.is_some()
                 && at_above.is_none_or(|a| a.is_none()),
