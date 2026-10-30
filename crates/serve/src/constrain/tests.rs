@@ -31,6 +31,13 @@ const SOLAR: ToolFormat = ToolFormat::KvMarkup(KvSpelling::Solar);
 const QWEN: ToolFormat = ToolFormat::QwenXml(Framing::Lines);
 const QWEN_COMPACT: ToolFormat = ToolFormat::QwenXml(Framing::Compact);
 
+const CALL_SPECIALS: [&str; 4] = [
+    CALL_OPEN,
+    CALL_CLOSE,
+    "<|tool_call:start|>",
+    "<|tool_call:end|>",
+];
+
 /// The mock's ids: its specials, then a byte each, then these pieces.
 const BYTES: u32 = SPECIALS.len() as u32;
 const PIECES: u32 = BYTES + 256;
@@ -174,7 +181,7 @@ impl Tokenizer for Pieces {
     /// The mock's specials, and the pieces that are call tags.
     fn is_special(&self, id: u32) -> bool {
         id < BYTES
-            || [CALL_OPEN, CALL_CLOSE]
+            || CALL_SPECIALS
                 .map(str::as_bytes)
                 .contains(&&*self.0.bytes_of(id))
     }
@@ -2543,7 +2550,7 @@ fn a_span_and_its_step_are_one_call() {
 /// budget forces the special close.
 #[test]
 fn a_tag_spelled_in_ordinary_ids_is_text() {
-    let pieces = Arc::new(PieceTok(&[CALL_OPEN, CALL_CLOSE]));
+    let pieces = Arc::new(PieceTok(&CALL_SPECIALS));
     let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::clone(&pieces)));
     let plain = |text: &str| -> Vec<u32> { text.bytes().map(|b| BYTES + u32::from(b)).collect() };
     let tools = json!([{"type": "function", "function": {"name": "f",
@@ -2554,7 +2561,10 @@ fn a_tag_spelled_in_ordinary_ids_is_text() {
             ToolFormat::QwenXml(framing) => {
                 Tools::QwenXml(framing, ParamKinds::of_tools(Some(&tools)))
             }
-            _ => unreachable!("the two call formats"),
+            ToolFormat::KvMarkup(spelling) => {
+                Tools::KvMarkup(spelling, ArgTypes::of_tools(Some(&tools)))
+            }
+            _ => unreachable!("the call formats with special tags"),
         };
         ChatParser::with_tools(prompt, ReasoningFormat::Deepseek, Some(tools))
             .for_template(format)
@@ -2598,27 +2608,34 @@ fn a_tag_spelled_in_ordinary_ids_is_text() {
         assert_eq!(whole.message(), stream.message());
         (o, whole.message().clone())
     };
-    for (format, call) in [
-        (QWEN, "\n<function=f>\n</function>\n"),
-        (ToolFormat::Hermes, "\n{\"name\":\"f\",\"arguments\":{}}\n"),
+    for (format, open, close, call) in [
+        (QWEN, CALL_OPEN, CALL_CLOSE, "\n<function=f>\n</function>\n"),
+        (
+            ToolFormat::Hermes,
+            CALL_OPEN,
+            CALL_CLOSE,
+            "\n{\"name\":\"f\",\"arguments\":{}}\n",
+        ),
+        (GLM, CALL_OPEN, CALL_CLOSE, "f"),
+        (SOLAR, CALL_SPECIALS[2], CALL_SPECIALS[3], "f\n"),
     ] {
-        let quoted = "quote </think> and <tool_call>";
-        let copied = format!("{CALL_OPEN}{call}{CALL_CLOSE}\n");
-        let mut want = plain(quoted);
+        let quoted = format!("quote </think> and {open}");
+        let copied = format!("{open}{call}{close}\n");
+        let mut want = plain(&quoted);
         want.extend(ids(&tok, "</think>\n\n"));
         want.extend(plain(&copied));
-        want.push(pieces.piece(CALL_OPEN));
+        want.push(pieces.piece(open));
         want.extend(plain(call));
-        want.push(pieces.piece(CALL_CLOSE));
+        want.push(pieces.piece(close));
         let (o, m) = parsed("<think>\n", ThinkEntry::Open, &want, format);
-        let content = if format == ToolFormat::Hermes {
-            format!("\n\n{copied}")
-        } else {
+        let content = if format == QWEN {
             copied
+        } else {
+            format!("\n\n{copied}")
         };
         assert_eq!(
             (m.reasoning.as_str(), m.content.as_str()),
-            (quoted, content.as_str())
+            (quoted.as_str(), content.as_str())
         );
         assert_eq!(m.calls.len(), 1);
         assert_eq!(
@@ -2748,26 +2765,43 @@ fn constrained_calls_keep_special_markers_whole() {
 /// after the function is unexpected markup; in Hermes it leaves the call open.
 #[test]
 fn an_ordinary_call_close_cannot_close_a_special_call() {
-    let tok = Pieces(Arc::new(PieceTok(&[CALL_OPEN, CALL_CLOSE])));
+    let tok = Pieces(Arc::new(PieceTok(&CALL_SPECIALS)));
     let tools = json!([{"type": "function", "function": {"name": "f",
         "parameters": {"type": "object", "properties": {}}}}]);
-    for (tools, body, expected) in [
+    for (tools, open, close, body, expected) in [
         (
             Tools::QwenXml(Framing::Lines, ParamKinds::of_tools(Some(&tools))),
+            CALL_OPEN,
+            CALL_CLOSE,
             "\n<function=f>\n</function>\n",
             "expected </tool_call>",
         ),
         (
             Tools::Hermes,
+            CALL_OPEN,
+            CALL_CLOSE,
             "\n{\"name\":\"f\",\"arguments\":{}}\n",
+            "not closed",
+        ),
+        (
+            Tools::KvMarkup(KvSpelling::Glm, ArgTypes::of_tools(Some(&tools))),
+            CALL_OPEN,
+            CALL_CLOSE,
+            "f",
+            "not closed",
+        ),
+        (
+            Tools::KvMarkup(KvSpelling::Solar, ArgTypes::of_tools(Some(&tools))),
+            CALL_SPECIALS[2],
+            CALL_SPECIALS[3],
+            "f\n",
             "not closed",
         ),
     ] {
         let mut p = ChatParser::with_tools("assistant\n", ReasoningFormat::None, Some(tools))
             .reading_specials(&tok);
-        p.try_push(CALL_OPEN, &[0])
-            .expect("the special opens a call");
-        p.try_push(&format!("{body}{CALL_CLOSE}"), &[])
+        p.try_push(open, &[0]).expect("the special opens a call");
+        p.try_push(&format!("{body}{close}"), &[])
             .expect("a short error waits for end of generation");
         let error = p
             .try_finish()
