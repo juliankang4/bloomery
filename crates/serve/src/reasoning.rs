@@ -94,6 +94,17 @@ impl Marked {
         };
         std::mem::replace(self, rest)
     }
+
+    /// Releases a text prefix, transferring its allocation into an empty
+    /// output instead of copying it before the prefix is dropped.
+    pub(crate) fn take_text_into(&mut self, n: usize, out: &mut String) {
+        let front = self.take_front(n).text;
+        if out.is_empty() {
+            *out = front;
+        } else {
+            out.push_str(&front);
+        }
+    }
 }
 
 /// The two tags of a think span: the text the model writes to open its
