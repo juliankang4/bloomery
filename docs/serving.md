@@ -144,13 +144,16 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   generation that ends inside the call) ends the stream with an error event naming the call: the non-streamed answer
   keeps DSML's raw text as content, and a stream cannot take its fragments back. `/v1/messages` and `/v1/responses`
   streams send a call when it closes.
-  Hermes treats a complete `<tool_call>` opener at EOF as an unterminated call, including immediately after a
+  Hermes treats a complete markup `<tool_call>` opener at EOF as an unterminated call, including immediately after a
   previous call closed. Only a proper prefix of that opener remains text at EOF; neither decision depends on
   stream chunk boundaries.
-  A think tag or a Qwen3-Coder `<tool_call>` or `</tool_call>` that the vocabulary holds as one special token is
-  markup only where the model generated that token. The same characters written in ordinary tokens (a quoted
+  A think tag or a Qwen3-Coder or Hermes call tag (`<tool_call>`, `</tool_call>`) held as one special token is markup
+  only where the model generated that token. The same characters written in ordinary tokens (a quoted
   `</think>`, a copied `<tool_call>` example) stay reasoning or content, streamed or not, and the
   `reasoning_budget` and `reasoning_loop` span below ends at the same place.
+  `bash tools/ref/serve-control-markers.sh URL OUTPUT_DIR` saves the copied-call and quoted-think reproductions
+  and a real tool-call request, whole and streamed, against a running model-backed server. The whole replies
+  include token logprobs so a diagnosis can distinguish a special id from ordinary tokens spelling its text.
 - **Refused by name** (a 400 naming the field): `samplers` in an order other than llama-server's default list for the
   stages that are on, or naming a sampler this server lacks; typical_p, mirostat, `dry_*`, `xtc_*`, `top_n_sigma` and
   `dynatemp_*` when a request turns them on; `n_predict` or `max_tokens` outside -1..=i32::MAX (-2 does not mean "no

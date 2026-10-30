@@ -146,7 +146,7 @@ impl Tokenizer for Pieces {
     fn n_vocab(&self) -> usize {
         PIECES as usize + self.0.0.len()
     }
-    /// The mock's specials, and the pieces that are Qwen3-Coder's call tags.
+    /// The mock's specials, and the pieces that are call tags.
     fn is_special(&self, id: u32) -> bool {
         id < BYTES
             || [CALL_OPEN, CALL_CLOSE]
@@ -2523,20 +2523,20 @@ fn a_tag_spelled_in_ordinary_ids_is_text() {
     let plain = |text: &str| -> Vec<u32> { text.bytes().map(|b| BYTES + u32::from(b)).collect() };
     let tools = json!([{"type": "function", "function": {"name": "f",
         "parameters": {"type": "object", "properties": {}}}}]);
-    let parser = |prompt: &str| {
-        ChatParser::with_tools(
-            prompt,
-            ReasoningFormat::Deepseek,
-            Some(Tools::QwenXml(
-                Framing::Lines,
-                ParamKinds::of_tools(Some(&tools)),
-            )),
-        )
-        .for_template(QWEN)
-        .reading_specials(&*tok)
+    let parser = |prompt: &str, format| {
+        let tools = match format {
+            ToolFormat::Hermes => Tools::Hermes,
+            ToolFormat::QwenXml(framing) => {
+                Tools::QwenXml(framing, ParamKinds::of_tools(Some(&tools)))
+            }
+            _ => unreachable!("the two call formats"),
+        };
+        ChatParser::with_tools(prompt, ReasoningFormat::Deepseek, Some(tools))
+            .for_template(format)
+            .reading_specials(&*tok)
     };
     // The message of `want` generated after `prompt`, whole and streamed.
-    let parsed = |prompt: &str, entry: ThinkEntry, want: &[u32]| {
+    let parsed = |prompt: &str, entry: ThinkEntry, want: &[u32], format| {
         let mut events: Vec<(String, Vec<usize>)> = Vec::new();
         let mut slot = Slot::new(Box::new(Rows {
             tok: Arc::clone(&tok),
@@ -2560,12 +2560,12 @@ fn a_tag_spelled_in_ordinary_ids_is_text() {
         )
         .expect("a generation");
         assert_eq!(o.tokens, with_eos(&tok, want.to_vec()));
-        let mut whole = parser(prompt).keeping_cut_call();
+        let mut whole = parser(prompt, format).keeping_cut_call();
         whole
             .try_push(&o.content, &o.specials)
             .and_then(|_| whole.try_finish())
             .expect("the whole generation parses");
-        let mut stream = parser(prompt).streaming_calls();
+        let mut stream = parser(prompt, format).streaming_calls();
         for (text, specials) in &events {
             stream.try_push(text, specials).expect("a piece parses");
         }
@@ -2573,32 +2573,46 @@ fn a_tag_spelled_in_ordinary_ids_is_text() {
         assert_eq!(whole.message(), stream.message());
         (o, whole.message().clone())
     };
-    let call = "\n<function=f>\n</function>\n";
-    let quoted = "quote </think> and <tool_call>";
-    let copied = format!("{CALL_OPEN}{call}{CALL_CLOSE}\n");
-    let mut want = plain(quoted);
-    want.extend(ids(&tok, "</think>\n\n"));
-    want.extend(plain(&copied));
-    want.push(pieces.piece(CALL_OPEN));
-    want.extend(plain(call));
-    want.push(pieces.piece(CALL_CLOSE));
-    let (o, m) = parsed("<think>\n", ThinkEntry::Open, &want);
-    assert_eq!(
-        (m.reasoning.as_str(), m.content.as_str()),
-        (quoted, copied.as_str())
-    );
-    assert_eq!(m.calls.len(), 1);
-    assert_eq!(
-        (m.calls[0].name.as_str(), m.calls[0].arguments.as_str()),
-        ("f", "{}")
-    );
-    // Read by its text, the ordinary `</think>` ends the span early.
-    let mut by_text = ChatParser::with_tools("<think>\n", ReasoningFormat::Deepseek, None);
-    assert_eq!(by_text.push(&o.content).reasoning, "quote ");
-    // A prompt that leaves the span to the model: an ordinary `<think>` that
-    // ends the generation is content.
-    let (_, m) = parsed("assistant\n", ThinkEntry::MayOpen, &plain("<think>"));
-    assert_eq!((m.reasoning.as_str(), m.content.as_str()), ("", "<think>"));
+    for (format, call) in [
+        (QWEN, "\n<function=f>\n</function>\n"),
+        (ToolFormat::Hermes, "\n{\"name\":\"f\",\"arguments\":{}}\n"),
+    ] {
+        let quoted = "quote </think> and <tool_call>";
+        let copied = format!("{CALL_OPEN}{call}{CALL_CLOSE}\n");
+        let mut want = plain(quoted);
+        want.extend(ids(&tok, "</think>\n\n"));
+        want.extend(plain(&copied));
+        want.push(pieces.piece(CALL_OPEN));
+        want.extend(plain(call));
+        want.push(pieces.piece(CALL_CLOSE));
+        let (o, m) = parsed("<think>\n", ThinkEntry::Open, &want, format);
+        let content = if format == ToolFormat::Hermes {
+            format!("\n\n{copied}")
+        } else {
+            copied
+        };
+        assert_eq!(
+            (m.reasoning.as_str(), m.content.as_str()),
+            (quoted, content.as_str())
+        );
+        assert_eq!(m.calls.len(), 1);
+        assert_eq!(
+            (m.calls[0].name.as_str(), m.calls[0].arguments.as_str()),
+            ("f", "{}")
+        );
+        // Read by its text, the ordinary `</think>` ends the span early.
+        let mut by_text = ChatParser::with_tools("<think>\n", ReasoningFormat::Deepseek, None);
+        assert_eq!(by_text.push(&o.content).reasoning, "quote ");
+        // A prompt that leaves the span to the model: an ordinary `<think>` that
+        // ends the generation is content.
+        let (_, m) = parsed(
+            "assistant\n",
+            ThinkEntry::MayOpen,
+            &plain("<think>"),
+            format,
+        );
+        assert_eq!((m.reasoning.as_str(), m.content.as_str()), ("", "<think>"));
+    }
 
     let mut p = params(None, ThinkEntry::Open);
     p.reasoning_budget = Some(20);
@@ -2606,4 +2620,87 @@ fn a_tag_spelled_in_ordinary_ids_is_text() {
     want.extend(plain(&"z".repeat(40)));
     let o = run_read(&tok, &p, &want).0;
     assert_eq!(o.tokens[20], ids(&tok, "</think>")[0], "{:?}", o.content);
+}
+
+/// A special opener needs a special close. In Qwen XML an ordinary close
+/// after the function is unexpected markup; in Hermes it leaves the call open.
+#[test]
+fn an_ordinary_call_close_cannot_close_a_special_call() {
+    let tok = Pieces(Arc::new(PieceTok(&[CALL_OPEN, CALL_CLOSE])));
+    let tools = json!([{"type": "function", "function": {"name": "f",
+        "parameters": {"type": "object", "properties": {}}}}]);
+    for (tools, body, expected) in [
+        (
+            Tools::QwenXml(Framing::Lines, ParamKinds::of_tools(Some(&tools))),
+            "\n<function=f>\n</function>\n",
+            "expected </tool_call>",
+        ),
+        (
+            Tools::Hermes,
+            "\n{\"name\":\"f\",\"arguments\":{}}\n",
+            "not closed",
+        ),
+    ] {
+        let mut p = ChatParser::with_tools("assistant\n", ReasoningFormat::None, Some(tools))
+            .reading_specials(&tok);
+        p.try_push(CALL_OPEN, &[0])
+            .expect("the special opens a call");
+        p.try_push(&format!("{body}{CALL_CLOSE}"), &[])
+            .expect("a short error waits for end of generation");
+        let error = p
+            .try_finish()
+            .expect_err("ordinary text cannot close a call");
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(p.message().calls.is_empty(), "no call closed");
+    }
+}
+
+/// A stop prefix can hold one special back while a previous special is sent.
+/// Its offset belongs only to the event that releases its text, whether a
+/// later token breaks the stop prefix or the generation ends while it is held.
+#[test]
+fn a_held_special_is_reported_only_when_its_text_is_sent() {
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::new(PieceTok(&[CALL_OPEN, CALL_CLOSE]))));
+    for suffix in ["", "x"] {
+        let text = format!("{CALL_OPEN}{CALL_OPEN}{suffix}");
+        let want = tok.encode(&text);
+        let mut slot = Slot::new(Box::new(Rows {
+            tok: Arc::clone(&tok),
+            want,
+            k: 0,
+            read: Arc::default(),
+        }));
+        let mut p = params(None, ThinkEntry::Closed);
+        p.stop = vec![format!("{CALL_OPEN}!")];
+        let mut sent = String::new();
+        let mut offsets = Vec::new();
+        let o = generate(
+            &mut slot,
+            &sampling::reference_factory(),
+            &tok.encode("hi"),
+            &p,
+            &mut |ev| {
+                if let Event::Text(text, specials, _) = ev {
+                    assert!(
+                        specials.iter().all(|&at| at < text.len()),
+                        "{text:?}: {specials:?}"
+                    );
+                    offsets.extend(specials.iter().map(|at| sent.len() + at));
+                    sent.push_str(text);
+                }
+                Ok(())
+            },
+            &mut |_| {},
+            &mut Timings::default(),
+        )
+        .expect("the stop prefix is never completed");
+        assert_eq!(sent, text, "all held text is released");
+        assert_eq!(o.content, text, "whole and streamed text agree");
+        assert_eq!(
+            offsets,
+            vec![0, CALL_OPEN.len()],
+            "each special is sent once"
+        );
+        assert_eq!(o.specials, offsets, "whole and streamed offsets agree");
+    }
 }

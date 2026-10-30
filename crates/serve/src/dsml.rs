@@ -889,8 +889,10 @@ impl ChatParser {
     #[must_use]
     pub(crate) fn reading_specials(mut self, tok: &dyn Tokenizer) -> Self {
         self.think = self.think.take().map(|t| t.reading_specials(tok));
-        if let Some(Scan::Qwen(q)) = &mut self.scan {
-            q.read_specials(tok);
+        match &mut self.scan {
+            Some(Scan::Qwen(q)) => q.read_specials(tok),
+            Some(Scan::Hermes(h)) => h.read_specials(tok),
+            _ => {}
         }
         self
     }
@@ -951,7 +953,7 @@ impl ChatParser {
             None => None,
             Some(Scan::Dsml(d)) => Some(d.push_stream(&split.content)),
             Some(Scan::Kv(k)) => Some(k.push_stream(&split.content)?),
-            Some(Scan::Hermes(h)) => Some(h.push(&split.content)?),
+            Some(Scan::Hermes(h)) => Some(h.push_marked(&split.content, &split.specials)?),
             Some(Scan::Qwen(q)) => Some(q.push_stream(&split.content, &split.specials)?),
             Some(Scan::Muse(m)) => Some(m.push(&split.content)),
         };
