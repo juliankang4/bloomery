@@ -10,7 +10,7 @@
 //! and that host, the host reads the rest where the folder stores it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Condvar, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 
 use cuda_core::CudaStream;
 use gguf::{GgmlType, Place, Split, TensorInfo};
@@ -52,7 +52,7 @@ fn load_plan<S: Source + Sync>(
     room: &(u64, HostRead),
 ) -> Result<Weights, GpuError> {
     plan.check(room)?;
-    for p in &plan.parts {
+    for p in plan.parts.iter() {
         if let Some(format) = card(&p.info) {
             card_layout(&p.info, format)?;
         }
@@ -122,7 +122,7 @@ fn read_staged<'s, 'p, S: Source + Sync>(
     release: bool,
     mut stage: impl FnMut(&'p Planned, Part<'s>) -> Result<(), GpuError>,
 ) -> Result<(), GpuError> {
-    let parts = &plan.parts;
+    let parts: &[Planned] = &plan.parts;
     let pool = threads::pool();
     let cpus: Vec<u32> = pool.topology().concat();
     let shared = Mutex::new(Window::default());
@@ -248,30 +248,49 @@ fn read_staged<'s, 'p, S: Source + Sync>(
 pub(crate) struct PlacedSource<S> {
     pub(crate) source: S,
     pub(crate) in_place: InPlace,
-    /// The last host bytes answered, with the card, room and card tensors they were planned for:
-    /// a context search asks them of many plans that hold the same tensors on the card, and
-    /// planning the parts checks every part the source makes.
-    pub(crate) last: Mutex<Option<(MemoKey, u64)>>,
+    /// The last read planned, with the card and card tensors it was planned for: a context
+    /// search asks the host bytes of many plans that hold the same tensors on the card, the load
+    /// then reads that plan's parts, and planning the parts checks every part the source makes.
+    pub(crate) last: Mutex<Option<(MemoKey, u64, LoadPlan)>>,
 }
 
-/// The card share, the room and the card tensors a least read was planned for.
-type MemoKey = (usize, u64, OnCard);
+/// The card share and the card tensors a read was planned for.
+type MemoKey = (usize, OnCard);
 
-impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
-    fn host_bytes(&self, plan: &Plan<'_>, card: usize, room: u64) -> Result<u64, GpuError> {
-        let key = (card, room, OnCard::of_in_place(plan, card, &self.in_place)?);
+impl<S: Source> PlacedSource<S> {
+    /// The read of `plan`'s card `card` under `room`, and the card tensors it reads: the parts
+    /// and their costs are planned once for a card and its tensors (`last`), and a read under
+    /// another room takes their read-ahead again ([`LoadPlan::under`]).
+    fn reading(
+        &self,
+        plan: &Plan<'_>,
+        card: usize,
+        room: u64,
+    ) -> Result<(OnCard, LoadPlan), GpuError> {
+        let key = (card, OnCard::of_in_place(plan, card, &self.in_place)?);
         let mut last = self
             .last
             .lock()
-            .map_err(|_| refused("a part source's last host bytes lock is poisoned".into()))?;
-        if let Some((held, bytes)) = last.as_ref()
-            && *held == key
-        {
-            return Ok(*bytes);
-        }
-        let bytes = LoadPlan::reading(&self.source, plan, &key.2, room)?.host_bytes;
-        *last = Some((key, bytes));
-        Ok(bytes)
+            .map_err(|_| refused("a part source's last read lock is poisoned".into()))?;
+        let read = match last.as_ref() {
+            Some((held, at, read)) if *held == key && *at == room => read.clone(),
+            Some((held, _, read)) if *held == key => LoadPlan::under(
+                read.parts.clone(),
+                read.costs.clone(),
+                read.upload_bytes,
+                room,
+            )?,
+            _ => LoadPlan::reading(&self.source, plan, &key.1, room)?,
+        };
+        let on = key.1.clone();
+        *last = Some((key, room, read.clone()));
+        Ok((on, read))
+    }
+}
+
+impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
+    fn host_bytes(&self, plan: &Plan<'_>, card: usize, room: u64) -> Result<u64, GpuError> {
+        Ok(self.reading(plan, card, room)?.1.host_bytes)
     }
 
     fn load(
@@ -282,15 +301,18 @@ impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
         release: bool,
         room: u64,
     ) -> Result<Weights, GpuError> {
-        load_placed_in_place(
+        let (on, read) = self.reading(plan, card, room)?;
+        let (available, reading) = host_available_read().map_err(refused)?;
+        let w = load_plan(
             stream,
             &self.source,
-            plan,
-            card,
+            &read,
+            |t| on.format(t),
             release,
-            &self.in_place,
-            room,
-        )
+            &(available.min(room), reading),
+        )?;
+        on.check(&w)?;
+        Ok(w)
     }
 
     fn load_whole(&self, stream: &CudaStream, card: CardOf<'_>) -> Result<Weights, GpuError> {
@@ -306,9 +328,10 @@ impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
 
 /// Parts, their read costs, the owned read bytes they may hold at once, the peak owned host bytes
 /// reserved before loading and the least peak, one part at a time.
-struct LoadPlan {
-    parts: Vec<Planned>,
-    costs: Vec<(u64, u64)>,
+#[derive(Clone)]
+pub(crate) struct LoadPlan {
+    parts: Arc<[Planned]>,
+    costs: Arc<[(u64, u64)]>,
     /// The read-ahead: the most owned read and packing bytes the parts read and not yet staged
     /// hold at once ([`Self::admits`]), the largest a leading run of parts takes under the
     /// planned room.
@@ -392,6 +415,16 @@ impl LoadPlan {
                 .ok_or_else(|| refused(format!("{}: packing bytes pass u64", p.info.name)))?;
             costs.push((read, packing));
         }
+        Self::under(parts.into(), costs.into(), upload_bytes, room)
+    }
+
+    /// `parts` and their `costs`, `upload_bytes` staged in all, read under `room`.
+    fn under(
+        parts: Arc<[Planned]>,
+        costs: Arc<[(u64, u64)]>,
+        upload_bytes: usize,
+        room: u64,
+    ) -> Result<Self, GpuError> {
         let (mut window, mut serial_bytes) = (0, 0);
         for at in 0..parts.len() {
             // A part runs alone under no room.
@@ -425,18 +458,6 @@ impl LoadPlan {
             serial_bytes: with_ring(serial_bytes)?,
             upload_bytes,
         })
-    }
-
-    fn placed<S: Source>(
-        source: &S,
-        plan: &Plan<'_>,
-        card: usize,
-        in_place: &InPlace,
-        room: u64,
-    ) -> Result<(OnCard, Self), GpuError> {
-        let on = OnCard::of_in_place(plan, card, in_place)?;
-        let read = Self::reading(source, plan, &on, room)?;
-        Ok((on, read))
     }
 
     /// The parts of `plan`'s tensors that `on`, a card of it, reads from `source` under `room`.
@@ -516,7 +537,7 @@ impl InPlace {
 /// which the host reads there, and a tensor or stack of which this card holds nothing, which the
 /// other cards' loads read. A source fills no host set, so a tensor the plan splits otherwise, or
 /// holds on the host but the source alone makes, is refused by name.
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct OnCard {
     held: HashMap<String, OnThisCard>,
     skipped: HashSet<String>,
@@ -524,7 +545,7 @@ pub struct OnCard {
 
 /// A tensor the card holds ([`OnCard`]): the plan's card format and resident bytes, and the
 /// stack's experts the card holds of a split stack (`None` the whole tensor).
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct OnThisCard {
     format: CardFormat,
     bytes: u64,
@@ -673,32 +694,6 @@ impl OnCard {
         }
         Ok(())
     }
-}
-
-/// Card `card` of `plan` from `source` ([`OnCard::of_in_place`], [`load`], each part's pages
-/// released under `release`), checked against the plan; the host reads the tensors `in_place`
-/// names where they are stored.
-pub fn load_placed_in_place<S: Source + Sync>(
-    stream: &CudaStream,
-    source: &S,
-    plan: &Plan<'_>,
-    card: usize,
-    release: bool,
-    in_place: &InPlace,
-    room: u64,
-) -> Result<Weights, GpuError> {
-    let (on, read) = LoadPlan::placed(source, plan, card, in_place, room)?;
-    let (available, reading) = host_available_read().map_err(refused)?;
-    let w = load_plan(
-        stream,
-        source,
-        &read,
-        |t| on.format(t),
-        release,
-        &(available.min(room), reading),
-    )?;
-    on.check(&w)?;
-    Ok(w)
 }
 
 /// Whether `segments` put something on a card other than `card` and nothing on `card`, the rest
@@ -868,7 +863,7 @@ mod tests {
                     },
                 })
                 .collect(),
-            costs: vec![(4, 0); n as usize],
+            costs: vec![(4, 0); n as usize].into(),
             window,
             host_bytes: window + UploadRing::HOST_MAX,
             serial_bytes: 4 + UploadRing::HOST_MAX,
@@ -913,7 +908,7 @@ mod tests {
         );
         // Parts 0 and 1 need their 3 B of reads and part 0's 2 B packing, over the live 3 B.
         let mut tight = plan(2, 8, "t");
-        tight.costs = vec![(1, 2), (2, 0)];
+        tight.costs = vec![(1, 2), (2, 0)].into();
         let short = || Ok((3, HostRead::Given));
         let peak = peak_of(&mut || {
             read_staged(&slow, &tight, short, keep, &mut stage).unwrap();
@@ -1420,13 +1415,15 @@ mod tests {
         );
     }
 
-    /// A placed source plans a card's parts once for the plans that hold the same tensors on it
-    /// at one room, as a context search asks of plans at other contexts, and again at another
-    /// room or for a plan whose card tensors differ. Mutants: the last answer never read, so the
-    /// second ask plans the parts again; `OnCard` left out of the key, so the larger tensor
-    /// reuses the smaller one's answer.
+    /// A placed source plans a card's parts once for the plans that hold the same tensors on it,
+    /// as a context search asks of plans at other contexts and rooms and the load then reads at
+    /// its own room, and again for a plan whose card tensors differ; another room takes its
+    /// read-ahead again. Mutants: the last read never reused, so a second ask plans the parts
+    /// again; the last read reused at another room, or its read-ahead not taken again, so a room
+    /// for one part reads ahead as far as a room for both; `OnCard` left out of the key, so the
+    /// larger tensor reuses the smaller one's read.
     #[test]
-    fn a_placed_source_plans_a_cards_parts_once_a_room() {
+    fn a_placed_source_plans_a_cards_parts_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use model::placement::{KvBytes, ModelTensors, plan_with, workstation};
@@ -1447,16 +1444,20 @@ mod tests {
                 rule: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
             ) -> Result<Vec<Planned>, Self::Error> {
                 self.0.fetch_add(1, Ordering::Relaxed);
-                let info = TensorInfo {
-                    name: "output.weight".into(),
-                    ty: GgmlType::Q8_0,
-                    dims: vec![256, 16],
-                    offset: 0,
-                    nbytes: 4352,
-                };
-                rule(&info.name, info.ty, &info.dims)
+                rule("output.weight", GgmlType::Q8_0, &[256, 16])
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
-                Ok(vec![Planned { at: None, info }])
+                // Two halves of the rows, so a room can hold one part or both.
+                let half = |rows: std::ops::Range<u64>| Planned {
+                    at: Some(model::part::At::Along(1, rows)),
+                    info: TensorInfo {
+                        name: "output.weight".into(),
+                        ty: GgmlType::Q8_0,
+                        dims: vec![256, 8],
+                        offset: 0,
+                        nbytes: 2176,
+                    },
+                };
+                Ok(vec![half(0..8), half(8..16)])
             }
             fn read_bytes(&self, p: &Planned) -> Result<u64, Self::Error> {
                 Ok(p.info.nbytes)
@@ -1494,11 +1495,20 @@ mod tests {
         assert!(least > 0);
         assert_eq!(load.host_bytes(&plan(8192), 0, 0).unwrap(), least);
         assert_eq!(load.source.0.load(Ordering::Relaxed), 1);
-        load.host_bytes(&plan(4096), 0, 1 << 30).unwrap();
-        assert_eq!(load.source.0.load(Ordering::Relaxed), 2);
-        // A plan that holds other bytes of the tensor on the card is planned again at that room.
+        let (_, read) = load.reading(&plan(4096), 0, least).unwrap();
+        assert_eq!(read.host_bytes, least, "the load's read at its peak");
+        let (_, small) = load.reading(&plan(4096), 0, UploadRing::HOST_MAX).unwrap();
+        let (_, large) = load.reading(&plan(4096), 0, 1 << 30).unwrap();
+        assert!(
+            small.window < large.window,
+            "a room for one part reads ahead {} B, a room for both {} B",
+            small.window,
+            large.window
+        );
+        assert_eq!(load.source.0.load(Ordering::Relaxed), 1);
+        // A plan that holds other bytes of the tensor on the card is planned again.
         let other = plan_with(&larger, &machine, 4096, &NoKv, None).expect("a plan");
         load.host_bytes(&other, 0, 1 << 30).unwrap();
-        assert_eq!(load.source.0.load(Ordering::Relaxed), 3);
+        assert_eq!(load.source.0.load(Ordering::Relaxed), 2);
     }
 }

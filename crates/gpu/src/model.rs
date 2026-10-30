@@ -2264,7 +2264,7 @@ pub enum CardBytes<'a> {
     File,
     /// A part source's, for a file that is a checkpoint folder's header
     /// (`gguf::Split::header_only`): card `card` of `plan` loaded on the stream, each part's file
-    /// pages released when the host config's `card_dontneed` asks (`crate::parts::load_placed_in_place`).
+    /// pages released when the host config's `card_dontneed` asks (`crate::parts::PlacedSource`).
     Parts(&'a dyn PartsLoad),
 }
 
