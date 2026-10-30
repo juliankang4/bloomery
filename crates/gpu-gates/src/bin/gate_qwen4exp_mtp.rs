@@ -77,7 +77,9 @@
 //!   after a reset, no rows, nine rows eager, five captured, rows past the
 //!   store, a walk past the positions the store holds for the sequence, a
 //!   token past the vocabulary, a hidden slice of the wrong length, a walk and
-//!   a chain whose rows carry media rows, a capture with the taps armed; a store walk (`WalkMode::Store`) past its
+//!   a chain whose rows carry media rows and a store walk whose media rows are
+//!   not the embedding's width, a capture with the taps armed, a media load
+//!   (`enable_media`) after a captured draft walk, before and after a reset; a store walk (`WalkMode::Store`) past its
 //!   `MTP_STORE_ROWS` rows, read back or chained, and the own row and the
 //!   streams after one — and a NaN in a
 //!   hidden row raised on the fault word as the draft layer's `hc_mix`, the
@@ -2185,25 +2187,36 @@ mod gate {
             ),
             "hidden values for 2 rows",
         );
-        // The draft has no media prompt call: a walk and a chain whose rows
-        // carry media rows are refused, each through the one accessor.
-        let (at, span) = (0..1, vec![0u16; WIDE]);
-        let media = CallRows::new(0, WIDE, [(&at, &span[..])]).map_err(|e| e.to_string())?;
-        let with_media = DraftFeed::Rows(Feed {
-            tokens: &tokens[..1],
-            pos0: 0,
-            hidden: Hidden::Host(&states[..WIDE]),
-            media: Some(&media),
-        });
+        // Media rows are a store walk's alone, at the embedding's width: an
+        // eager walk and a chain whose rows carry them are refused, and so is
+        // a store walk whose rows are of another width, each through the one
+        // accessor.
+        let at = 0..1;
+        let (row, wide) = (vec![0u16; HIDDEN], vec![0u16; WIDE]);
+        let media = CallRows::new(0, HIDDEN, [(&at, &row[..])]).map_err(|e| e.to_string())?;
+        let too_wide = CallRows::new(0, WIDE, [(&at, &wide[..])]).map_err(|e| e.to_string())?;
+        let with = |media| {
+            DraftFeed::Rows(Feed {
+                tokens: &tokens[..1],
+                pos0: 0,
+                hidden: Hidden::Host(&states[..WIDE]),
+                media: Some(media),
+            })
+        };
         ok &= refused(
             "a walk with media rows",
-            m.mtp_draft(with_media, h, e),
-            "this body's draft has no media prompt call",
+            m.mtp_draft(with(&media), h, e),
+            "outside a store walk",
         );
         ok &= refused(
             "a chain with media rows",
-            m.mtp_chain(with_media, 1, h, e),
-            "this body's draft has no media prompt call",
+            m.mtp_chain(with(&media), 1, h, e),
+            "outside a store walk",
+        );
+        ok &= refused(
+            "a store walk with media rows of the hidden width",
+            m.mtp_walk(with(&too_wide), h, WalkMode::Store),
+            "media rows of 10240 values a row",
         );
         m.set_mtp_taps(true)?;
         ok &= refused(
@@ -2242,6 +2255,20 @@ mod gate {
             verdict(raised)
         );
         m.reset()?;
+        // A captured walk bakes the rotation table's address: a load whose draft has captured
+        // one is refused a media load, and still after a reset, which keeps the captures.
+        m.mtp_draft(feed(1, 0), h, WalkMode::Graph)?;
+        ok &= refused(
+            "a media load after a captured draft walk",
+            m.enable_media(),
+            "a load whose MTP draft has no captured walks",
+        );
+        m.reset()?;
+        ok &= refused(
+            "a media load after a captured draft walk and a reset",
+            m.enable_media(),
+            "a load whose MTP draft has no captured walks",
+        );
         ok &= refused(
             "the draft's own row after a reset",
             m.mtp_draft(DraftFeed::Own { pos0: 0 }, h, e),
@@ -2559,20 +2586,154 @@ mod gate {
         Ok(ok && ran)
     }
 
+    /// A continued image starts at call offset zero and crosses the draft's store block.
+    /// Its rows equal token 7's embedding, while its ids are 8: replaying the target's
+    /// hidden rows with token 7 gives an independent store reference without media splicing.
+    #[cfg(all(test, feature = "checkpoint"))]
+    fn media_prompt(mut m: Qwen38Model) -> Result<(Qwen38Model, bool), GateError> {
+        use bloomery_gpu::media::{ImageShape, ImageSpan, MediaSpan};
+        use bloomery_gpu::{Window, to_host};
+        const PREFIX: [u32; 4] = [1, 2, 3, 4];
+        const IMAGE: usize = MTP_STORE_ROWS + 8;
+        let ctx = m.body("media draft")?.ctx() as u32;
+        let embedding = {
+            let (gpu, w, _) = m.body_parts("media draft")?;
+            let table = w.bf16("media draft", "token_embd.weight")?;
+            let row = Window::<u16>::of(table.buf(), 7 * HIDDEN * 2, HIDDEN)?;
+            to_host(gpu.stream(), &row)?
+        };
+        let rows: Vec<u16> = embedding
+            .iter()
+            .copied()
+            .cycle()
+            .take(IMAGE * HIDDEN)
+            .collect();
+        let spans = [ImageSpan {
+            span: MediaSpan {
+                at: 0..IMAGE,
+                rows: &rows,
+            },
+            shape: ImageShape::Grid(8, IMAGE / 8),
+        }];
+        let mut ids = vec![8; IMAGE];
+        ids.extend_from_slice(&[5, 6]);
+        let mut hidden = vec![0.0; WIDE];
+        let mut tap = |m: &mut Qwen38Model, arena, first, count| {
+            assert_eq!(hidden.len() / WIDE - 1, first as usize);
+            hidden.extend(m.target_streams(arena, count)?);
+            Ok(())
+        };
+        m.prompt38_with(&PREFIX, Prompt38::Gemm, Some(&mut tap))?;
+        let first = m.media38_frame(&ids, &spans, |m| {
+            m.prompt38_with(&ids, Prompt38::Gemm, Some(&mut tap))
+        })?;
+        let rope = m.rope_saved()?;
+        let mut plain = vec![first];
+        slots_gate::greedy(&mut m, &mut plain, 7)?;
+        let mut reference_ids = PREFIX.to_vec();
+        reference_ids.extend(std::iter::repeat_n(7, IMAGE));
+        reference_ids.extend_from_slice(&[5, 6]);
+        let held = reference_ids.len() - 1;
+        // First read the text rotations as a contrast, then the prepared image rotations.
+        let mut stores = Vec::new();
+        for image in [false, true] {
+            m.reset()?;
+            if image {
+                m.rope_restore(rope.clone())?;
+            }
+            for (block, tokens) in reference_ids[..held].chunks(MTP_STORE_ROWS).enumerate() {
+                let from = block * MTP_STORE_ROWS;
+                m.mtp_walk(
+                    DraftFeed::Rows(Feed {
+                        tokens,
+                        pos0: from as u32,
+                        hidden: Hidden::Host(&hidden[from * WIDE..(from + tokens.len()) * WIDE]),
+                        media: None,
+                    }),
+                    DraftHead::Rows,
+                    WalkMode::Store,
+                )?;
+            }
+            stores.push(store_of(&m, held)?);
+        }
+        let rotated = stores[0].0 != stores[1].0;
+        let (mut session, mut spec) = drafted_session(m, step_cfg(Prompt38::Gemm), ctx)?;
+        spec.prompt(&mut session, &PREFIX)?;
+        let first = spec.draft_mut().prompt_media(&mut session, &ids, &spans)?;
+        let got = store_of(session.model(), held)?;
+        let same = same_rows(&got, &stores[1], held);
+        let store_ok = same.iter().all(|&same| same);
+        println!(
+            "(media-draft) image at call offset 0 after {} text ids, {} image rows across store \
+             blocks: {} of {held} store rows = embedding-token replay; image keys differ from \
+             text rotations {rotated} {}",
+            PREFIX.len(),
+            IMAGE,
+            same.iter().filter(|&&same| same).count(),
+            verdict(store_ok && rotated)
+        );
+        let mut kept = Kept::default();
+        let drafted = runtime::generate(
+            &mut session,
+            &mut spec,
+            &ids,
+            first,
+            &runtime::Stop::new(8, ctx)?,
+            &mut kept,
+        )?;
+        let ids_ok = drafted.tokens.get(..plain.len()) == Some(plain.as_slice());
+        let proposed = kept.proposed.iter().any(|&p| p);
+        println!(
+            "(media-draft) drafted ids = plain ids {ids_ok}, proposed {proposed} {}",
+            verdict(ids_ok && proposed)
+        );
+        Ok((
+            session.into_model(),
+            store_ok && rotated && ids_ok && proposed,
+        ))
+    }
+
     /// The input boundary on an existing checkpoint, without an oracle set or a server.
     #[cfg(all(test, feature = "checkpoint"))]
     #[test]
     #[ignore = "needs one NVIDIA card and a Qwen3.8 checkpoint folder with MTP at $BLOOMERY_QWEN38_FOLDER"]
     fn hw_mtp_input_validity() -> Result<(), GateError> {
         use bloomery_gpu::arch::qwen3moe::Folder38;
-        const CTX_INPUT: u64 = 64;
-        const UB: usize = 8;
+        const CTX_INPUT: u64 = 192;
+        const UB: usize = 128;
         let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
         let path = PathBuf::from(
             std::env::var_os("BLOOMERY_QWEN38_FOLDER")
                 .ok_or("$BLOOMERY_QWEN38_FOLDER names the checkpoint folder")?,
         );
         let mut f = bloomery_gpu_gates::model_file::open_folder(&path)?;
+        // Section zero reads z in zyxt: the first image key must use z=0.
+        let mut kvs: Vec<_> = f
+            .header
+            .iter_kv()
+            .map(|(k, v)| (k.to_owned(), v.clone()))
+            .collect();
+        let key = format!(
+            "{}.rope.section_order",
+            f.header.architecture().ok_or("no architecture")?
+        );
+        kvs.retain(|(k, _)| k != &key);
+        kvs.push((key, gguf::Value::String("zyxt".to_owned())));
+        let tensors = f
+            .header
+            .iter_tensors()
+            .map(|(_, t)| gguf::write::TensorDecl {
+                name: t.name.clone(),
+                dims: t.dims.clone(),
+                type_id: t.ty.as_u32(),
+                nbytes: t.nbytes,
+            })
+            .collect();
+        let layout = gguf::write::Layout::new(&kvs, tensors)?;
+        f.header = Split::header_only(
+            f.header.shard_path(0).ok_or("no first shard")?.to_owned(),
+            &layout,
+        )?;
         let inputs = PlanInputs::describe(&f.header)?;
         let draft = f.draft?.ok_or("the checkpoint has no MTP layer")?;
         let mtp = MtpInputs::read(
@@ -2618,6 +2779,9 @@ mod gate {
             &mtp,
             2,
         )?;
+        m.enable_media()?;
+        let (mut m, media_ok) = media_prompt(m)?;
+        m.reset()?;
         m.set_mode(bloomery_gpu::model::StepMode::Graph);
         let prompt = [1, 2, 3, 4];
         let rows_ok = completed_rows(&mut m, &prompt)?;
@@ -2645,7 +2809,7 @@ mod gate {
             drafted.tokens.len()
         );
         let own_ok = own_row(s.model_mut(), &prompt)?;
-        if rows_ok && own_ok && same {
+        if media_ok && rows_ok && own_ok && same {
             Ok(())
         } else {
             Err(checks_failed())

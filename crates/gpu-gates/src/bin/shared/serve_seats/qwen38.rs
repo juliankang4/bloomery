@@ -38,7 +38,7 @@
 //! Unless `BLOOMERY_MTP_DRAFT` names a file, its MTP draft is the folder's own
 //! MTP layer, under the draft rule below; a folder without the layer turns the
 //! unset draft off naming the folder and refuses `BLOOMERY_DRAFT=mtp` by name
-//! ([`draft_off_for`]).
+//! ([`folder_draft_for`]).
 //! The `plan` record, then the `load` and `capture` lines of the qwen4exp
 //! open, go to stderr as `generate_qwen3moe` prints them, then `listening on
 //! http://<addr>` once the model is loaded and the port is bound (`--port 0`
@@ -269,7 +269,7 @@
 //! by name when they differ ([`vision_seat::open_seat`]), before any plan. Without `--mmproj` the
 //! `--hf` repo's projector is the file where the draft rule's first word is off and the prompt is
 //! not fed a step an id ([`vision_of`]); it stays only where it costs the plan no expert and no
-//! context ([`vision_seat::kept`]), else a `vision_seat` record says it was dropped, and
+//! context ([`vision_seat::kept`], which prices the plan without the draft), else a `vision_seat` record says it was dropped, and
 //! `--mmproj`'s file is never dropped. The tower sits on the smallest card outside the plan, else
 //! as a named reserve of the stage card ([`vision_seat::EncoderSeat`]), which every plan counts
 //! and the `vision_seat` record names, printed with the plan (`--plan` too). The placement is the
@@ -283,11 +283,10 @@
 //! ([`Seat::prefill_media`]: the ubatch walk, eager). An image with no `--mmproj` is the server's
 //! own 400.
 //!
-//! An image load drafts nothing, the engine's media load refusing a load that carries the MTP
-//! draft ([`draft_off_for`]): `BLOOMERY_DRAFT=mtp` beside `--mmproj` is refused by name
-//! before the plan; unset, the draft goes off with a `load draft=off` record that names
-//! `--mmproj`, and the lever words that name the draft are then refused as they are on any
-//! server that drafts nothing. `BLOOMERY_PREFILL=steps` (one step an id) and the route trace
+//! An image load drafts as a text load does, by the same rule: the MTP draft's walks read each
+//! sequence's own rotation table, and a prompt call that holds images walks the draft's store
+//! over the media call's units, a span's positions reading the span's rows in place of the image
+//! token's embedding ([`SlotDrafts::prefill_media`]). `BLOOMERY_PREFILL=steps` (one step an id) and the route trace
 //! that needs it are refused by name beside `--mmproj` ([`refuse_media_feed`]). A sequence that
 //! holds an image is kept out of the prompt cache: its rotation table is no part of a saved
 //! state, so [`Seat::snapshot`] refuses it by name (the server keeps no state of it and serves
@@ -1068,47 +1067,14 @@ fn draft38(
     }
 }
 
-/// [`draft38`]'s answer `(mtp, off)` on a load that carries no MTP draft, for the reason `why`
-/// ([`Draft38Off::Media`]: an image load, whose sequences the engine's `GpuModel::enable_media`
-/// refuses a draft beside; [`Draft38Off::Folder`]: a checkpoint folder without an MTP layer;
-/// [`Draft38Off::FolderMtp`]: one whose MTP layer the draft does not read): `BLOOMERY_DRAFT=mtp`
-/// is refused by name; the other words keep the plain path, `off`
-/// as set, and a draft the rule would have run goes off with `why`, while a reason it was
-/// already off for stands. The lever words that name the draft are then refused by the seat's
-/// own rule (`refuse_mtp_levers`).
-pub(crate) fn draft_off_for(
-    why: Draft38Off,
-    word: Option<&str>,
-    (mtp, off): (bool, Option<Draft38Off>),
-) -> Result<(bool, Option<Draft38Off>), GateError> {
-    if word == Some("mtp") {
-        let load = match &why {
-            Draft38Off::Folder => "with a checkpoint folder that holds no MTP layer".to_string(),
-            Draft38Off::FolderMtp { why } => {
-                format!("with a checkpoint folder whose MTP layer the draft does not read ({why})")
-            }
-            _ => "with --mmproj: an image load carries no MTP draft (the media load refuses it); \
-                  drop --mmproj"
-                .to_string(),
-        };
-        return Err(format!(
-            "BLOOMERY_DRAFT=mtp {load}, or set BLOOMERY_DRAFT=off (unset, the draft goes off by \
-             itself)"
-        )
-        .into());
-    }
-    Ok(if mtp {
-        (false, Some(why))
-    } else {
-        (false, off)
-    })
-}
-
 /// [`draft38`]'s answer `(mtp, off)` on a load whose draft is the checkpoint folder's own MTP
 /// layer, `layer` as the folder prepared it (`Ok(None)`: the folder holds none; `Err`: the
 /// preparation's refusal): a prepared layer drafts when `reads`, the draft's reader, takes it,
-/// asked only while the draft is on; none, or one the preparation or the reader refuses, is
-/// [`draft_off_for`]'s ([`Draft38Off::Folder`], [`Draft38Off::FolderMtp`]).
+/// asked only while the draft is on; none, or one the preparation or the reader refuses
+/// ([`Draft38Off::Folder`], [`Draft38Off::FolderMtp`]), refuses `BLOOMERY_DRAFT=mtp` by name,
+/// keeps the plain path under the other words, `off` as set, and turns a draft the rule would
+/// have run off with that reason, while a reason it was already off for stands. The lever words
+/// that name the draft are then refused by the seat's own rule (`refuse_mtp_levers`).
 pub(crate) fn folder_draft_for(
     layer: &Result<Option<Split>, String>,
     reads: impl FnOnce(&Split) -> Result<(), GateError>,
@@ -1124,7 +1090,24 @@ pub(crate) fn folder_draft_for(
             Err(e) => Draft38Off::FolderMtp { why: e.to_string() },
         },
     };
-    draft_off_for(why, word, (mtp, off))
+    if word == Some("mtp") {
+        let load = match &why {
+            Draft38Off::FolderMtp { why } => {
+                format!("with a checkpoint folder whose MTP layer the draft does not read ({why})")
+            }
+            _ => "with a checkpoint folder that holds no MTP layer".to_string(),
+        };
+        return Err(format!(
+            "BLOOMERY_DRAFT=mtp {load}, or set BLOOMERY_DRAFT=off (unset, the draft goes off by \
+             itself)"
+        )
+        .into());
+    }
+    Ok(if mtp {
+        (false, Some(why))
+    } else {
+        (false, off)
+    })
 }
 
 /// The residency the load of `plan` at `place` runs: `set` (the word and
@@ -1612,11 +1595,6 @@ pub(crate) fn check(
             )?;
             if a.vision.mmproj()?.is_some() {
                 refuse_media_feed(feed)?;
-                draft_off_for(
-                    Draft38Off::Media,
-                    levers.draft(),
-                    (levers.draft() == Some("mtp"), None),
-                )?;
             }
             if levers.draft() == Some("mtp") {
                 let (slots, _) = slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)?;
@@ -1821,7 +1799,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // `--mmproj`'s encoder file, held against the text model and the vocabulary before anything
     // is planned. The `--hf` repo's projector is taken only where the load can serve images and
     // keep what it runs without them: the draft rule's first word is off and the prompt is not
-    // fed a step an id. An image load takes no MTP draft ([`draft_off_for`]).
+    // fed a step an id: the projector's cost is read of the plan without the draft
+    // ([`vision_seat::kept`]).
     let token = |id: u32| tok.text(id).map(str::to_owned);
     let vision = vision_of(
         &a.vision,
@@ -1829,12 +1808,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &inputs.spec,
         &token,
     )?;
-    let (mtp, draft_off) = if vision.is_some() {
+    if vision.is_some() {
         refuse_media_feed(feed)?;
-        draft_off_for(Draft38Off::Media, levers.draft(), (mtp, draft_off))?
-    } else {
-        (mtp, draft_off)
-    };
+    }
     let ChatSurface { template, name, .. } = ChatSurface::read(
         &path,
         split.value("tokenizer.chat_template"),
@@ -2415,10 +2391,7 @@ pub fn setup38(
     let draft = match off.filter(|_| !mtp && !lookup) {
         // These reasons name their own setting, or a set draft is refused beside them.
         Some(
-            why @ (Draft38Off::Paged { .. }
-            | Draft38Off::Media
-            | Draft38Off::Folder
-            | Draft38Off::FolderMtp { .. }),
+            why @ (Draft38Off::Paged { .. } | Draft38Off::Folder | Draft38Off::FolderMtp { .. }),
         ) => format!("the draft is off, {why}"),
         Some(why) => format!("the draft is off, {why}; {draft}"),
         None => draft.to_string(),
@@ -3291,12 +3264,15 @@ impl Seat for Q38 {
     /// call with the images spliced in: a patch grid is one row a cell and nothing around it
     /// ([`vision_seat::merged_cells`]: the tokens carry the delimiters), a tile group is refused
     /// by name by the encode ([`vision_seat::Resident::encode`]), and the call is the session's
-    /// media call ([`vision_seat::Encoded::prompt`]) — the ubatch walk, eager, the rows in place
-    /// of their positions' embeddings and the sequence's rotation table shifted by each image's
-    /// grid. An image load drafts nothing, so no draft is told. The encode binds the model's
-    /// card back before the prompt call.
+    /// media call ([`vision_seat::Encoded::prompt_by`]) — the ubatch walk, eager, the rows in
+    /// place of their positions' embeddings and the sequence's rotation table shifted by each
+    /// image's grid: under the draft the draft's own media prompt call
+    /// ([`SlotDrafts::prefill_media`]), its store walked over the call's units like a text
+    /// prompt's; without it, or while it is off, the session's ([`app::Session::prompt_media`]).
+    /// The encode binds the model's card back before the prompt call.
     #[cfg(feature = "vision")]
     fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
+        self.before_call();
         let Some(v) = self.vision.as_mut() else {
             return Err("no --mmproj: this seat serves no image".into());
         };
@@ -3306,7 +3282,11 @@ impl Seat for Q38 {
                 .iter()
                 .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
         )?;
-        let next = encoded.prompt(&mut self.s, ids, |rows| rows.image_spans())?;
+        let sel = self.s.selected();
+        let next = encoded.prompt_by::<Body38, _, _>(
+            |rows| rows.image_spans(),
+            |spans| self.drafts.prefill_media(&mut self.s, sel, ids, spans),
+        )?;
         self.print_passes()?;
         Ok(next)
     }

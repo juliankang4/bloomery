@@ -339,7 +339,7 @@ sequences. The short spellings `-c`, `-np`, `-ub`, `-a`, `-mm` and `-cram` are t
 ([The environment](#the-environment)).
 
 ¹ A build with the `vision` feature; the release has it, and another build refuses the image flags by name.
-² An image load runs no MTP draft: `BLOOMERY_DRAFT=mtp` beside `--mmproj` is refused by name.
+² An image load drafts by the same rule as a text load (`BLOOMERY_DRAFT`), and the MTP draft reads a prompt's image positions too. It refuses `BLOOMERY_PREFILL=steps` by name.
 ³ A file with routed experts takes `BLOOMERY_QWEN3_UBATCH` and refuses the flag by name.
 
 `-ub` on the qwen38 seat trades card memory for prompt speed. Each position of the size is about 0.81 MB of the

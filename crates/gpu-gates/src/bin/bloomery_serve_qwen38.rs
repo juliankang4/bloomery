@@ -72,8 +72,8 @@ mod tests {
     use model::placement::workstation::{A6000, RTX_3090};
 
     use super::qwen38::{
-        ACTS_ON, Feed38, Kind38, Place38, draft_off_for, folder_draft_for, prompt_cuts,
-        refuse_feed, refuse_lookup_feed, refuse_media_feed, setup38,
+        ACTS_ON, Feed38, Kind38, Place38, folder_draft_for, prompt_cuts, refuse_feed,
+        refuse_lookup_feed, refuse_media_feed, setup38,
     };
 
     const STEPS: Feed38 = Feed38 {
@@ -243,33 +243,9 @@ mod tests {
         refuse_media_feed(BATCH).expect("the ubatch walk takes a media call");
     }
 
-    /// The engine's media load carries no MTP draft: a set `mtp` beside `--mmproj` is refused by
-    /// name.
-    #[test]
-    fn a_media_load_refuses_a_set_mtp_draft() {
-        let why = draft_off_for(Draft38Off::Media, Some("mtp"), (true, None))
-            .expect_err("BLOOMERY_DRAFT=mtp beside --mmproj")
-            .to_string();
-        assert!(why.contains("BLOOMERY_DRAFT=mtp with --mmproj"), "{why}");
-    }
-
-    /// An unset draft the rule would have run goes off for the media load, naming it; a draft
-    /// already off keeps its own reason, and a set `off` is as set.
-    #[test]
-    fn a_media_load_turns_an_unset_draft_off_and_keeps_an_earlier_reason() {
-        let off = |word, run| {
-            draft_off_for(Draft38Off::Media, word, run).expect("a word the media load takes")
-        };
-        assert_eq!(off(None, (true, None)), (false, Some(Draft38Off::Media)));
-        assert_eq!(
-            off(None, (false, Some(Draft38Off::Gate))),
-            (false, Some(Draft38Off::Gate))
-        );
-        assert_eq!(
-            off(Some("off"), (false, Some(Draft38Off::Set))),
-            (false, Some(Draft38Off::Set))
-        );
-    }
+    // PIN(2026-10-30): the two cases that held a media load refusing a set `mtp` draft and turning
+    // an unset one off are gone with that rule: an image load drafts by the text load's rule, its
+    // draft walks reading each sequence's rotation table and a span's rows (`Mtp38::store_rows`).
 
     /// A checkpoint folder's own MTP layer drafts when the draft's reader takes it. A folder
     /// without one, a layer its preparation refuses, and a prepared layer the reader refuses

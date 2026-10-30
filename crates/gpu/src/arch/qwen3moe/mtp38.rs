@@ -78,7 +78,10 @@
 //! it, so the walk computes them alone. It runs over up to
 //! [`MTP_STORE_ROWS`] rows at once through the launches the ubatch walk
 //! (`wide38`) runs, in its own buffers:
-//! - the embedding rows and the input pack, as above;
+//! - the embedding rows, a media prompt call's span rows copied over the
+//!   rows of their positions (the row the target consumed there in place of
+//!   the image token's embedding, widened exactly), and the input pack, as
+//!   above;
 //! - the pack quantized to 32-value q8 blocks (`quantize_gemm32`) and
 //!   `eh_proj` as one 32-value GEMM (`gemm_q8_0p`) over the `4·m` packed
 //!   columns, through a one-expert table;
@@ -123,6 +126,7 @@ use crate::hc_gated::{
     Before, HcMatrix, HcScratch, HcWideScratch, SiteWeights, Streams, WideMixArgs,
 };
 use crate::host::handoff::Places;
+use crate::media::{CallRows, widen_bf16};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::{ArgmaxPArgs, MtpInputArgs};
 use crate::q6k_ids::{Q6kIdsArgs, Q6kIdsKernels};
@@ -937,11 +941,15 @@ pub(super) struct Target38<'a> {
 /// sequence. A walk of one sequence is one block at row 0; a store walk of
 /// several sequences' rows (`Body38`'s `mtp_store_slots`) lays a block a
 /// sequence, each appended to its own store ([`Mtp38::append_store`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct StoreBlock {
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StoreBlock<'a> {
     at: usize,
     m: usize,
     pos0: u32,
+    /// The media prompt call's span rows by position ([`Feed::media`]), which
+    /// stand in for the embedding rows of their positions; `None` on a text
+    /// call.
+    media: Option<&'a CallRows<'a>>,
 }
 
 /// A walk's hidden rows `hidden` copied into `h`, a row for each of its
@@ -1435,7 +1443,8 @@ impl Names {
 }
 
 /// What a walk reads besides the draft: the card, the target's weights,
-/// the kernels, the norms' epsilon and the rope table.
+/// the kernels, the norms' epsilon and the rotation table of the sequence
+/// it walks (a media load's own, the load's plain one on a text load).
 pub(super) struct MtpCtx<'a> {
     pub(super) gpu: &'a Gpu,
     pub(super) tw: &'a Weights,
@@ -1640,8 +1649,8 @@ impl Mtp38 {
     /// own row before any walk of this sequence, a walk starting past the
     /// positions the store holds for the sequence, a row-list head on a
     /// full-head load, a captured walk with the taps armed, a store walk
-    /// ([`WalkMode::Store`] reads nothing back), a walk whose rows carry
-    /// media rows. A fault a launch raised is [`GpuError::Fault`], not a
+    /// ([`WalkMode::Store`] reads nothing back), media rows ([`call_rows`]).
+    /// A fault a launch raised is [`GpuError::Fault`], not a
     /// token.
     pub(super) fn run(
         &mut self,
@@ -1689,7 +1698,12 @@ impl Mtp38 {
         self.store.fit(pos0 as usize + m)?;
         self.store.own_from(pos0 as usize)?;
         if mode == WalkMode::Store {
-            let b = StoreBlock { at: 0, m, pos0 };
+            let b = StoreBlock {
+                at: 0,
+                m,
+                pos0,
+                media: w.rows.and_then(|f| f.media),
+            };
             self.stage_hidden(stream, &w, b)?;
             let ids = w.rows.map_or(&[][..], |f| f.tokens);
             self.store_rows(c, ids, &[b], w.rows.is_none())?;
@@ -1741,7 +1755,7 @@ impl Mtp38 {
     /// a token past the vocabulary, a host hidden slice of other than
     /// the rows' values, target rows that do not hold the positions before
     /// the rows' ([`Held::check_read`]) or were not completed by the last layer,
-    /// media rows.
+    /// media rows outside a store walk or of another width ([`call_rows`]).
     fn checked<'f, 't>(
         &self,
         target: Option<Target38<'t>>,
@@ -1749,7 +1763,7 @@ impl Mtp38 {
         mode: WalkMode,
     ) -> Result<Checked<'f, 't>, GpuError> {
         let ctx = self.ctx;
-        let rows = media_free_rows(feed)?;
+        let rows = call_rows(feed, mode)?;
         let (m, own, pos0) = (feed.count(), rows.is_none(), feed.pos0());
         refuse_rows::<Mtp38>(WHAT, mode, m)?;
         if pos0 as usize + m > ctx {
@@ -1828,14 +1842,14 @@ impl Mtp38 {
     /// name as [`Mtp38::run_walk`] refuses a store walk, and for rows past
     /// the store arena's [`MTP_STORE_ROWS`]; nothing but the arena's scratch
     /// moves.
-    pub(super) fn stage_store(
+    pub(super) fn stage_store<'f>(
         &mut self,
         stream: &CudaStream,
         target: Option<Target38<'_>>,
-        feed: Feed<'_, TargetRows>,
+        feed: Feed<'f, TargetRows>,
         head: DraftHead,
         at: usize,
-    ) -> Result<StoreBlock, GpuError> {
+    ) -> Result<StoreBlock<'f>, GpuError> {
         head.check_opened(WHAT, self.head.rows.is_some())?;
         let w = self.checked(target, DraftFeed::Rows(feed), WalkMode::Store)?;
         if at + w.m > MTP_STORE_ROWS {
@@ -1853,6 +1867,7 @@ impl Mtp38 {
             at,
             m: w.m,
             pos0: w.pos0,
+            media: feed.media,
         };
         self.stage_hidden(stream, &w, b)?;
         Ok(b)
@@ -1865,7 +1880,7 @@ impl Mtp38 {
         &mut self,
         stream: &CudaStream,
         w: &Checked<'_, '_>,
-        b: StoreBlock,
+        b: StoreBlock<'_>,
     ) -> Result<(), GpuError> {
         let Some(f) = w.rows else {
             return Ok(());
@@ -1900,7 +1915,7 @@ impl Mtp38 {
             mode,
             "a chain's walks with a head (WalkMode::Store writes the store alone)",
         )?;
-        let Some(f) = media_free_rows(refresh)? else {
+        let Some(f) = call_rows(refresh, mode)? else {
             return Err(GpuError::shape(
                 WHAT,
                 format!("a chain's refresh {refresh:?}: the rows the target kept"),
@@ -2449,7 +2464,8 @@ impl Mtp38 {
     /// The launches of a store walk before its append (module doc) over
     /// `blocks`' rows, rows `0 ..` of the store arena in order, every launch
     /// once over them all but the embedding, one a block at its own
-    /// positions: the embedding and the pack, `eh_proj`, the attention
+    /// positions with its media rows over theirs ([`splice_media`]): the
+    /// embedding and the pack, `eh_proj`, the attention
     /// site's mix, k and v, on the card's stream. The rows' tokens are
     /// `ids`, the blocks' in order, and their hidden rows the store arena's
     /// `h`; or, when `own`, one block of the draft's own last row. Each row's
@@ -2460,7 +2476,7 @@ impl Mtp38 {
         &mut self,
         c: &MtpCtx<'_>,
         ids: &[u32],
-        blocks: &[StoreBlock],
+        blocks: &[StoreBlock<'_>],
         own: bool,
     ) -> Result<(), GpuError> {
         let (embd, _) = self.borrowed(c.tw)?;
@@ -2510,6 +2526,9 @@ impl Mtp38 {
                     n_keys: &mut n_keys,
                 },
             )?;
+        }
+        for b in blocks {
+            splice_media(stream, &mut s.emb, b, h)?;
         }
         k.mtp.enqueue_mtp_input(
             stream,
@@ -2605,7 +2624,11 @@ impl Mtp38 {
     /// store then holds the sequence through the block's last row, and no
     /// walk is there to read (a store walk leaves no own row, no streams past
     /// its attention's input and no head).
-    pub(super) fn append_store(&mut self, c: &MtpCtx<'_>, b: StoreBlock) -> Result<(), GpuError> {
+    pub(super) fn append_store(
+        &mut self,
+        c: &MtpCtx<'_>,
+        b: StoreBlock<'_>,
+    ) -> Result<(), GpuError> {
         let Mtp38 {
             w,
             store,
@@ -2729,22 +2752,66 @@ fn refuse_store(mode: WalkMode, why: &'static str) -> Result<(), GpuError> {
     Ok(())
 }
 
-/// The rows `feed` walks, the one place a walk's rows are taken from it:
-/// `None` for the own row, which has no rows of a call's. Refused by name
-/// where the rows carry media rows: this draft has no media prompt call, and
-/// a draft that dropped them would walk another feed than the target's.
-/// Refused before the walk enqueues anything.
-fn media_free_rows(
+/// The rows `feed` walks in `mode`, the one place a walk's rows are taken
+/// from it: `None` for the own row, which has no rows of a call's. Media
+/// rows (a media prompt call's spans, [`Feed::media`]) are read by a store
+/// walk alone, the prompt's warmup, and only at the embedding's width: a
+/// walk elsewhere, or one that dropped them, would walk another feed than the
+/// target's, so either is refused by name before the walk enqueues anything.
+fn call_rows(
     feed: DraftFeed<'_, TargetRows>,
+    mode: WalkMode,
 ) -> Result<Option<Feed<'_, TargetRows>>, GpuError> {
-    match feed {
-        DraftFeed::Rows(f) if f.media.is_some() => Err(GpuError::shape(
+    let DraftFeed::Rows(f) = feed else {
+        return Ok(None);
+    };
+    match f.media {
+        Some(_) if mode != WalkMode::Store => Err(GpuError::shape(
             WHAT,
-            "a walk with media rows: this body's draft has no media prompt call",
+            "a walk with media rows outside a store walk: only a media prompt call's store walks \
+             read them",
         )),
-        DraftFeed::Rows(f) => Ok(Some(f)),
-        DraftFeed::Own { .. } => Ok(None),
+        Some(rows) if rows.n_embd() != geo::HIDDEN => Err(GpuError::shape(
+            WHAT,
+            format!(
+                "media rows of {} values a row; the draft's embedding rows are {}",
+                rows.n_embd(),
+                geo::HIDDEN
+            ),
+        )),
+        _ => Ok(Some(f)),
     }
+}
+
+/// `b`'s media rows copied over the embedding rows of their positions in
+/// `emb` (rows of `h` values, the block's from its row `b.at`), each run of
+/// consecutive span positions one copy, the bf16 rows widened exactly
+/// ([`widen_bf16`]); nothing for a block with none. On `stream` behind the
+/// block's embedding, which wrote the image token's rows there.
+fn splice_media(
+    stream: &CudaStream,
+    emb: &mut DeviceBuffer<f32>,
+    b: &StoreBlock<'_>,
+    h: usize,
+) -> Result<(), GpuError> {
+    let Some(media) = b.media else {
+        return Ok(());
+    };
+    let rows: Vec<Option<&[u16]>> = (b.pos0..).take(b.m).map(|p| media.row(p)).collect();
+    let mut at = b.at;
+    let mut run = Vec::new();
+    for part in rows.chunk_by(|x, y| x.is_some() == y.is_some()) {
+        if part[0].is_some() {
+            run.resize(part.len() * h, 0.0);
+            for (row, out) in part.iter().flatten().zip(run.chunks_exact_mut(h)) {
+                widen_bf16(row, out);
+            }
+            WindowMut::<f32>::of_mut(emb, at * h * size_of::<f32>(), run.len())?
+                .copy_from_host(stream, &run)?;
+        }
+        at += part.len();
+    }
+    Ok(())
 }
 
 /// The readback of a walk of `m` rows: the tokens, then the probabilities'
@@ -2772,17 +2839,22 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod tests {
-    use super::{TargetRows, media_free_rows};
-    use crate::draft::{DraftFeed, Feed, Hidden};
+    use super::{TargetRows, call_rows, geo};
+    use crate::draft::{DraftFeed, Feed, Hidden, WalkMode};
     use crate::media::CallRows;
 
-    /// A feed that holds media rows is refused by name, not walked without
-    /// them: this draft has no media prompt call. A feed with none gives its
-    /// rows, and the own row has none.
+    /// Media rows are a store walk's alone, at the embedding's width: a store
+    /// walk takes them, an eager or a captured walk refuses them by name
+    /// rather than walk without them, and rows of another width are refused
+    /// by name in any mode. A feed with none gives its rows, and the own row
+    /// has none. Mutant: the store walk refused as before (no media prompt
+    /// call), or the width left unchecked.
     #[test]
-    fn media_rows_are_refused_by_name() {
-        let (at, rows) = (0..1, [0u16; 2]);
-        let media = CallRows::new(5, 2, [(&at, &rows[..])]).expect("one whole row");
+    fn media_rows_are_a_store_walks_alone_at_the_embedding_width() {
+        let at = 0..1;
+        let (wide, narrow) = (vec![0u16; geo::HIDDEN], [0u16; 2]);
+        let media = CallRows::new(5, geo::HIDDEN, [(&at, &wide[..])]).expect("one whole row");
+        let other = CallRows::new(5, 2, [(&at, &narrow[..])]).expect("one whole row");
         let feed = |media| {
             DraftFeed::Rows(Feed {
                 tokens: &[1],
@@ -2794,18 +2866,28 @@ mod tests {
                 media,
             })
         };
-        let e = media_free_rows(feed(Some(&media))).expect_err("media rows");
         assert!(
-            e.to_string()
-                .contains("this body's draft has no media prompt call"),
+            matches!(call_rows(feed(Some(&media)), WalkMode::Store), Ok(Some(f)) if f.media.is_some()),
+            "a store walk reads the media rows"
+        );
+        for mode in [WalkMode::Eager, WalkMode::Graph] {
+            let e = call_rows(feed(Some(&media)), mode).expect_err("media outside a store walk");
+            assert!(e.to_string().contains("outside a store walk"), "{e}");
+        }
+        let e = call_rows(feed(Some(&other)), WalkMode::Store).expect_err("another width");
+        assert!(
+            e.to_string().contains("media rows of 2 values a row"),
             "{e}"
         );
         assert!(
-            matches!(media_free_rows(feed(None)), Ok(Some(f)) if f.tokens == [1]),
+            matches!(call_rows(feed(None), WalkMode::Eager), Ok(Some(f)) if f.tokens == [1]),
             "a feed with no media"
         );
         assert!(
-            matches!(media_free_rows(DraftFeed::Own { pos0: 3 }), Ok(None)),
+            matches!(
+                call_rows(DraftFeed::Own { pos0: 3 }, WalkMode::Graph),
+                Ok(None)
+            ),
             "the own row has no rows"
         );
     }
