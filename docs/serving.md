@@ -147,10 +147,12 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   Hermes treats a complete markup `<tool_call>` opener at EOF as an unterminated call, including immediately after a
   previous call closed. Only a proper prefix of that opener remains text at EOF; neither decision depends on
   stream chunk boundaries.
-  A think tag or a Qwen3-Coder or Hermes call tag (`<tool_call>`, `</tool_call>`) held as one special token is markup
+  A think tag or a Qwen3-Coder, Hermes, GLM or Solar call tag held as one special token is markup
   only where the model generated that token. The same characters written in ordinary tokens (a quoted
   `</think>`, a copied `<tool_call>` example) stay reasoning or content, streamed or not, and the
   `reasoning_budget` and `reasoning_loop` span below ends at the same place.
+  A call opened by a special token needs a special closing token too; an ordinary-token closing tag leaves
+  the call open and the request ends with a named markup error if generation ends there.
   `bash tools/ref/serve-control-markers.sh URL OUTPUT_DIR` saves the copied-call and quoted-think reproductions
   and a real tool-call request, whole and streamed, against a running model-backed server. The whole replies
   include token logprobs so a diagnosis can distinguish a special id from ordinary tokens spelling its text.

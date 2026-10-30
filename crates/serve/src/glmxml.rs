@@ -36,7 +36,7 @@
 //! arguments the call closes with, the text of a `"string"` argument as it
 //! arrives. The chat parser's scan reads only the text each push adds
 //! (`KvScan::push_stream`) and reports only the arguments it adds. Every
-//! decision depends on the text only, never on how it was cut into pieces.
+//! decision is independent of how the text and special-token offsets were cut into pieces.
 
 use std::collections::HashMap;
 
@@ -45,7 +45,8 @@ use serde_json::Value;
 use crate::callstream::{Args, Reading, find_from, held, read_value};
 use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, refuse, value};
 use crate::dsml::{Scanned, ToolCall};
-use crate::reasoning::partial_suffix;
+use crate::engine::Tokenizer;
+use crate::reasoning::{Marked, SpecialTags, partial_suffix};
 
 /// How a template spells the key/value markup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,7 +296,8 @@ pub struct KvScan {
     /// has not been settled.
     line_due: bool,
     /// Text not yet decided.
-    buf: String,
+    buf: Marked,
+    specials: SpecialTags,
     calls: usize,
     /// The call open at the start of `buf`, as far as it is read.
     read: CallRead,
@@ -310,7 +312,8 @@ impl KvScan {
             types,
             inside: false,
             line_due: false,
-            buf: String::new(),
+            buf: Marked::default(),
+            specials: SpecialTags::default(),
             calls: 0,
             read: CallRead::default(),
         }
@@ -319,24 +322,48 @@ impl KvScan {
     /// Feeds text; returns the content that may be sent and the calls that
     /// closed.
     pub fn push(&mut self, piece: &str) -> Result<Scanned, KvError> {
-        Ok(self.push_stream(piece)?.whole(&self.read.call, self.calls))
+        Ok(self
+            .push_stream(piece, &[])?
+            .whole(&self.read.call, self.calls))
+    }
+
+    /// Reads call tags only where their special tokens wrote them, for those
+    /// `tok` holds as one special token.
+    pub(crate) fn read_specials(&mut self, tok: &dyn Tokenizer) {
+        self.specials = SpecialTags::of(tok, &[self.markers.call_open, self.markers.call_close]);
     }
 
     /// [`KvScan::push`] that reads only the text `piece` adds and reports the
-    /// open call's new arguments as `advances` instead of its whole text.
-    pub(crate) fn push_stream(&mut self, piece: &str) -> Result<Scanned, KvError> {
+    /// open call's new arguments as `advances` instead of its whole text;
+    /// `specials` gives the byte offsets of special tokens in `piece`.
+    pub(crate) fn push_stream(
+        &mut self,
+        piece: &str,
+        specials: &[usize],
+    ) -> Result<Scanned, KvError> {
         let m = self.markers;
-        self.buf.push_str(piece);
+        self.buf.push(piece, specials);
         let mut out = Scanned::default();
         let advances = out.advances.insert(Vec::new());
         loop {
             if self.inside {
-                let Some(end) = find_from(&self.buf, &mut self.read.closing, m.call_close) else {
-                    self.read.advance(m, &self.buf, &self.types);
+                let end = loop {
+                    let Some(at) = find_from(&self.buf.text, &mut self.read.closing, m.call_close)
+                    else {
+                        break None;
+                    };
+                    if self.specials.at(&self.buf, at, m.call_close) {
+                        break Some(at);
+                    }
+                    self.read.closing = at + m.call_close.len();
+                };
+                let Some(end) = end else {
+                    self.read.advance(m, &self.buf.text, &self.types);
                     self.read.call.send(self.calls, advances);
                     return Ok(out);
                 };
-                let (name, arguments) = parse_call(m, &self.buf[..end], self.calls, &self.types)?;
+                let (name, arguments) =
+                    parse_call(m, &self.buf.text[..end], self.calls, &self.types)?;
                 let call = ToolCall {
                     index: self.calls,
                     name,
@@ -345,19 +372,18 @@ impl KvScan {
                 std::mem::take(&mut self.read).call.close(&call, advances);
                 out.calls.push(call);
                 self.calls += 1;
-                self.buf.drain(..end + m.call_close.len());
+                self.buf.take_front(end + m.call_close.len());
                 self.inside = false;
                 self.line_due = m.newline;
             } else if self.line_due && !self.settle_line() {
                 return Ok(out);
-            } else if let Some(at) = self.buf.find(m.call_open) {
-                out.content.push_str(&self.buf[..at]);
-                self.buf.drain(..at + m.call_open.len());
+            } else if let Some(at) = self.specials.find(&self.buf, m.call_open) {
+                self.buf.take_text_into(at, &mut out.content);
+                self.buf.take_front(m.call_open.len());
                 self.inside = true;
             } else {
-                let upto = self.buf.len() - partial_suffix(&self.buf, m.call_open);
-                out.content.push_str(&self.buf[..upto]);
-                self.buf.drain(..upto);
+                let upto = self.buf.text.len() - partial_suffix(&self.buf.text, m.call_open);
+                self.buf.take_text_into(upto, &mut out.content);
                 return Ok(out);
             }
         }
@@ -367,10 +393,10 @@ impl KvScan {
     /// it, content when it starts with anything else. `false` while nothing
     /// is buffered to tell.
     fn settle_line(&mut self) -> bool {
-        match self.buf.chars().next() {
+        match self.buf.text.chars().next() {
             None => return false,
             Some('\n') => {
-                self.buf.drain(..1);
+                self.buf.take_front(1);
             }
             Some(_) => {}
         }
@@ -381,7 +407,7 @@ impl KvScan {
     /// Releases what is held at the end of the stream; a call still open is
     /// an error.
     pub fn finish(&mut self) -> Result<Scanned, KvError> {
-        let rest = std::mem::take(&mut self.buf);
+        let rest = std::mem::take(&mut self.buf).text;
         if self.inside {
             // Complete arguments keep their errors when the call is cut.
             if let Err(e @ (KvError::NotJson { .. } | KvError::DuplicateKey { .. })) =
