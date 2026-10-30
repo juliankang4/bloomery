@@ -1064,8 +1064,8 @@ fn fixture_budget_error(
 /// every gate had them); the fixture tier's budget is the one the generator recorded in the header
 /// — the budget that puts half the experts on the card of every card-eligible layer — plus what
 /// the fixture tier's card sets aside past the card it was planned on ([`HeaderBudget`]) and
-/// `extra`, the card bytes a drafting load reserves out of the same budget (the draft's
-/// `card_bytes`; 0 for a target-only plan). A budget lever the caller set that is not the
+/// `extra`, the card bytes the load reserves out of the same budget past the header's plan (a
+/// draft's `card_bytes`, the stores' page rounding; 0 for neither). A budget lever the caller set that is not the
 /// recorded value — another value, or one per card — is refused by name, never planned under.
 ///
 /// # Errors
@@ -1083,7 +1083,7 @@ pub fn plan_levers(split: &Split, levers: &Levers, extra: u64) -> Result<PlanLev
 ///
 /// # Errors
 /// The fixture tier's missing header budget, a lever that names another budget (another value,
-/// or one per card), or a header budget plus its card's set-aside and the draft reservation that
+/// or one per card), or a header budget plus its card's set-aside and the load's reservation that
 /// overflows u64.
 pub fn budget_levers(
     tier: Tier,
@@ -1116,8 +1116,8 @@ pub fn budget_levers(
                 .and_then(|b| b.checked_add(extra))
                 .ok_or_else(|| {
                     format!(
-                        "fixture budget {} plus the card's set-aside {} and draft reservation \
-                         {extra} overflows u64",
+                        "fixture budget {} plus the card's set-aside {} and the load's \
+                         reservation {extra} overflows u64",
                         header.recorded, header.card_set_aside
                     )
                 })?;

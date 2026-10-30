@@ -614,7 +614,11 @@ mod gate {
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&file)?;
         let shape = crate::q38_arch::shape_of(&inputs.spec, &file)?;
-        let plan_levers = tier::plan_levers(&file, &levers, 0)?;
+        // The load reserves its stores' page rounding out of the card budget
+        // (`Open38::plan`); the header's budget was planned without it.
+        let page = bloomery_gpu_gates::generate::stage_page(card()?)?;
+        let rounding = inputs.room_padding(CTX as u64, 1, false, page)?;
+        let plan_levers = tier::plan_levers(&file, &levers, rounding)?;
         let n_expert = inputs.spec.routed().map_or(0, |m| m.experts as usize);
         let cfg = Cfg {
             path,
