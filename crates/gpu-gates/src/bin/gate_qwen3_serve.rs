@@ -312,7 +312,7 @@
 //!   `n_ctx` is at most the file's trained context, the load record names
 //!   the f16 planes, and the common rule's `place unset` record names `a`,
 //!   its why one card (or two the body serves no tier card of), and no
-//!   break-even, basis or tier count; and `ctx_default_is_the_highest_rung_held`,
+//!   break-even, basis or tier count; and `ctx_default_is_the_largest_step_held`,
 //!   the same server, on either card: the default is a context an unset
 //!   `--ctx` takes — the file's trained context (read by the seat's own
 //!   `trained_ctx`), or a `CTX_GRAN` step under it, the base a slot (4096)
@@ -1134,7 +1134,7 @@ mod gate {
     /// The seat's `--ctx` against the file and this gate's card, beyond the
     /// main server's own default arm ([`served`]: unset, the largest step
     /// under the target the load holds,
-    /// `ctx_default_is_the_highest_rung_held`): a load under `--place` takes
+    /// `ctx_default_is_the_largest_step_held`): a load under `--place` takes
     /// the context its plan holds, its two slots resident on either file
     /// (`placed_slots_are_resident`), and the q8_0 cache's load at the main
     /// server's context holds the planes' bytes — the whole-fit verdict's
@@ -1447,7 +1447,7 @@ mod gate {
         Ok(())
     }
 
-    /// `ctx_default_is_the_highest_rung_held`, on the default arm's server
+    /// `ctx_default_is_the_largest_step_held`, on the default arm's server
     /// (no `--ctx`, `--parallel 1`, its stderr `log`, its default `n`): the
     /// default is the largest step under the target the load holds. `n` is a
     /// context the default takes ([`default_fits`]); the seat's one whole-fit
@@ -1463,7 +1463,7 @@ mod gate {
     /// own. A line missing or without its terms is a named error.
     /// FAIL-first: a default that starts a step under the target defaults
     /// under the target where the whole load fits the target, red here.
-    fn ctx_default_is_the_highest_rung_held(
+    fn ctx_default_is_the_largest_step_held(
         model: &Path,
         split: &Split,
         log: &str,
@@ -1499,7 +1499,7 @@ mod gate {
         );
         let held =
             default_fits(trained, n) && (n == target || at_above.is_some_and(|b| b > budget));
-        check(ok, "ctx_default_is_the_highest_rung_held", held);
+        check(ok, "ctx_default_is_the_largest_step_held", held);
         Ok(())
     }
 
@@ -2327,7 +2327,7 @@ mod gate {
     // the card holds. An unset `--ctx` now asks the target and halves only
     // on a short card (`placement::ctx_ask`), which a card may hold only
     // placed, so the whole arm sets its total and (b) and (c) left with the
-    // search; the fit's relations are `ctx_default_is_the_highest_rung_held`'s
+    // search; the fit's relations are `ctx_default_is_the_largest_step_held`'s
     // and `default_ctx_line_names_its_rule`'s.
     fn slots_set_total_is_its_whole_fit(
         model: &Path,
@@ -3249,7 +3249,7 @@ mod gate {
 
         // The seat's default `--ctx` on this server (no `--ctx`, `--parallel
         // 1`): the largest step under the target the load holds, on either
-        // card ([`ctx_default_is_the_highest_rung_held`]).
+        // card ([`ctx_default_is_the_largest_step_held`]).
         // FAIL-first: a choice that keeps the target whatever the card
         // makes the load a plan the card cannot hold (the spawn never
         // listens), and one that starts a step low is red there.
@@ -3294,7 +3294,7 @@ mod gate {
                 && even.is_none()
                 && basis.is_none(),
         );
-        ctx_default_is_the_highest_rung_held(model, &split, &log, default_n, trained, ok)?;
+        ctx_default_is_the_largest_step_held(model, &split, &log, default_n, trained, ok)?;
         default_ctx_line_names_its_rule(&log, (1, default_n, trained), None, ok);
         default_load_counts_its_arena(&split, &log, default_n, &arch, ok)?;
         // Every choice the unset `--ctx` ran read the census once for all its

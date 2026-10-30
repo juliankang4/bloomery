@@ -45,7 +45,7 @@
 //!
 //! Without a load:
 //!
-//! - `host_room_halves_the_default`: the host room fits the default under
+//! - `host_room_fits_the_default`: the host room fits the default under
 //!   its target as a short card does. Every `--plan` child whose output a clause compares
 //!   with another child's runs under `BLOOMERY_HOST_ROOM` = `PLAN_ROOM`, this
 //!   workstation's host room with nothing loaded, so no reading of the box's
@@ -905,16 +905,16 @@ mod gate {
         Ok(HostNeed::of(&plan, 0).bytes())
     }
 
-    /// `host_room_halves_the_default` (the module header); `base` is the
+    /// `host_room_fits_the_default` (the module header); `base` is the
     /// default `plan_only_names_its_default` printed.
-    fn host_room_halves_the_default(
+    fn host_room_fits_the_default(
         dir: &Path,
         file: &Path,
         (levers, cards): (&bloomery_levers::Levers, usize),
         base: Option<&Defaulted>,
         ok: &mut bool,
     ) -> Result<(), GateError> {
-        const NAME: &str = "host_room_halves_the_default";
+        const NAME: &str = "host_room_fits_the_default";
         let Some(base) = base else {
             println!("{NAME}: no default to hold the rooms to");
             check(ok, NAME, false);
@@ -1798,14 +1798,14 @@ mod gate {
 
         if a.after_refusals {
             println!(
-                "plan_only_names_its_default, host_room_halves_the_default, \
+                "plan_only_names_its_default, host_room_fits_the_default, \
                  residency_default_is_the_machine, refusals_before_any_load, \
                  slots_total_is_planned, default_load_listens: run by the parent of this child"
             );
             after_refusals(&a.dir, &file, &levers, cards, &mut ok)?;
         } else {
             let base = plan_only_names_its_default(&a.dir, &file, cards, &mut ok)?;
-            host_room_halves_the_default(&a.dir, &file, (&levers, cards), base.as_ref(), &mut ok)?;
+            host_room_fits_the_default(&a.dir, &file, (&levers, cards), base.as_ref(), &mut ok)?;
             residency_default_is_the_machine(&a.dir, &file, &mut ok)?;
             refusals_before_any_load(&a.dir, &file, cards, &mut ok)?;
             slots_total_is_planned(&a.dir, &file, &mut ok)?;

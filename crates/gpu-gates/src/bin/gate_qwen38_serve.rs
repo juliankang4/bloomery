@@ -3641,11 +3641,10 @@ mod gate {
     /// starts a step low (the step above holds); a default of two slots (the
     /// `parallel` line names two); the refusal of a context past the card
     /// taken out (the load's own plan refuses it, not by the common words).
-    // PIN(2026-10-14): the default is the seats' ladder at one slot (ctx-first: the
-    // context comes first, the experts fill what is left; the user approved D1/D2), so
-    // the clause holds the line's word and the rung above, not the old margin rule's
-    // terms; the refusal names the seats' common words. Was the two-slot margin rule
-    // and the one-slot refusal of the two pins above it.
+    // PIN(2026-10-14): the default is fitted: one slot takes the largest step
+    // under the model's limit that the card holds (the context comes first, the experts
+    // fill what is left), so the clause holds the line's word and the step above it; the
+    // refusal names the seats' common words.
     fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let own = dir.join("ctx");
         std::fs::create_dir_all(&own)?;
@@ -3746,7 +3745,7 @@ mod gate {
         // holds the default, and not the step above it when it fitted.
         check(
             &mut ok,
-            "ctx_default_is_the_highest_rung_held",
+            "ctx_default_is_the_largest_step_held",
             default_line_held(&line, 1, limit) == Some(true)
                 && at_ctx.is_some()
                 && at_above.is_none_or(|a| a.is_none()),
