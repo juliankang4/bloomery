@@ -1979,11 +1979,13 @@ impl Body38 {
             .get(card)
             .ok_or_else(|| GpuError::shape(WHAT, format!("the plan has no card {card}")))?;
         let layers = spec.layers.clone();
-        // The card route's run and the arena bytes the plan counts with it.
+        // The card route's run and the arena bytes the plan counts with it,
+        // in the form this build holds the file's route in.
         let (route_run, counted) = model::arch::qwen35moe::place::card_route_run(
             spec,
             ubatch as u64,
             !plan.machine.tiers.is_empty(),
+            inputs.route_form(crate::NATIVE_FP4),
         )
         .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
         let route_run = usize::try_from(route_run)

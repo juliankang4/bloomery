@@ -393,9 +393,9 @@ fn leg_types(stacks: &Qwen38Stacks, l: usize) -> Result<(GgmlType, GgmlType), Gp
 /// ubatch route, from each card layer's `(layer, read by it)`: the route
 /// holds the run's rows in one input form, the q8_1 rows of the grouped GEMM
 /// or the 32-value rows, and the plan counts a run of the q8_1 form, the
-/// larger (`place::CARD_ROUTE_RUN_TOKEN_BYTES`). A load whose card layers
-/// read both is refused by name, naming a layer of each; one with no card
-/// layer reads the q8_1 form.
+/// larger, unless the native form holds them (`place::RouteForm`). A load
+/// whose card layers read both is refused by name, naming a layer of each;
+/// one with no card layer reads the q8_1 form.
 fn one_gate_up_form(forms: &[(usize, bool)]) -> Result<bool, GpuError> {
     let Some(&(first, blocks32)) = forms.first() else {
         return Ok(false);

@@ -540,6 +540,7 @@ mod gate {
     use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
         Experts, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs, machine_for_experts,
+        machine_for_route,
     };
     use model::placement::ctx::CtxLimit;
     use model::placement::workstation::{HostNeed, HostRead, RTX_3090};
@@ -919,8 +920,13 @@ mod gate {
             .on(&bloomery_gpu::census()?)?
             .card_specs()?[0];
         stage.free_bytes = Some(server_card_free(err_log)?);
-        let mut machine =
-            machine_for_experts(stage, inputs.spec.layers.len(), u64::try_from(ub)?, experts);
+        let mut machine = machine_for_route(
+            stage,
+            inputs.spec.layers.len(),
+            u64::try_from(ub)?,
+            experts,
+            inputs.route_form(bloomery_gpu::NATIVE_FP4),
+        );
         let page = bloomery_gpu_gates::generate::stage_page(stage)?;
         inputs.reserve_room(&mut machine, (u64::try_from(CTX)?, 1, mtp), page)?;
         // Under the draft the plan carries it (its granules, its store, its
