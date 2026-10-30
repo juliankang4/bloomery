@@ -5257,6 +5257,7 @@ mod tests {
             pci_bus: format!("0000:0{ordinal}:00.0"),
             held_by: None,
             compute_capability: None,
+            granule_bytes: None,
         };
         let the_box = [
             device(0, "NVIDIA GeForce RTX 3090", 25_351_356_416, false),

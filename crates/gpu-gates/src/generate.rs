@@ -2740,6 +2740,7 @@ mod tests {
                     held_by: None,
                     integrated: false,
                     compute_capability,
+                    granule_bytes: None,
                 }
             })
             .collect()

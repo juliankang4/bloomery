@@ -764,6 +764,7 @@ mod tests {
             pci_bus: format!("0000:{:02x}:00.0", 0x41 + ordinal),
             held_by: None,
             compute_capability: Some((8, 6)),
+            granule_bytes: None,
         }
     }
 

@@ -15,8 +15,8 @@ use gguf::GgmlType;
 use super::churn::ChurnPool;
 use super::ctx_ask::{Probe, card_experts_floor, short_of};
 use super::workstation::{
-    A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HOST_DRIFT, HostNeed,
-    HostRead, MARGIN, MIB, PLAN_ROOM, ROW_PAGE, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
+    A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, HOST_DRIFT, HostNeed, HostRead,
+    MARGIN, MIB, PLAN_ROOM, ROW_PAGE, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
     TIER_BATCH_RESERVE, census_usable, host, plan_room, resolve, tier_batch_host_bytes,
     tier_batch_staging_bytes,
 };
@@ -55,6 +55,7 @@ fn census_96(n: usize) -> Vec<DeviceInfo> {
             pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
             held_by: None,
             compute_capability: None,
+            granule_bytes: None,
             integrated: false,
         })
         .collect()
@@ -284,7 +285,7 @@ fn stage(spec: CardSpec) -> Card {
         // 20,480) = −77,987,840].
         scratch_bytes: 2_942_128_128,
         margin_bytes: spec.margin(),
-        granule_bytes: GRANULE,
+        granule_bytes: spec.granule_bytes,
         free_bytes: spec.free_bytes,
         held_by: spec.held_by,
         layers: 0..LAYERS,
@@ -330,7 +331,7 @@ fn machine_bp(stage_spec: CardSpec, tier: CardSpec) -> Machine {
             context_bytes: CONTEXT,
             scratch_bytes: SCRATCH,
             margin_bytes: tier.margin(),
-            granule_bytes: GRANULE,
+            granule_bytes: tier.granule_bytes,
             free_bytes: tier.free_bytes,
             held_by: tier.held_by,
             layers: 0..0,

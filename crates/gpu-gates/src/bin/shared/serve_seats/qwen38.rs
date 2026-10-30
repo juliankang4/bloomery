@@ -4052,6 +4052,7 @@ mod tests {
             pci_bus: "0000:01:00.0".to_string(),
             held_by: None,
             compute_capability: Some((12, 1)),
+            granule_bytes: None,
         };
         let place = Place38::of(
             Place::parse("0")

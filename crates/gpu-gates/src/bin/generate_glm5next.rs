@@ -1711,6 +1711,7 @@ mod cli {
                 held_by: None,
                 integrated: true,
                 margin_bytes: None,
+                granule_bytes: model::placement::workstation::GRANULE,
             };
             let tensors = [
                 TpTensor {

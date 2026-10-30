@@ -1053,6 +1053,7 @@ mod tests {
                 pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
                 held_by: None,
                 compute_capability: Some((8, 6)),
+                granule_bytes: None,
             })
             .collect()
     }
@@ -1891,6 +1892,7 @@ mod seat_words {
             pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
             held_by: None,
             compute_capability: Some((8, 6)),
+            granule_bytes: None,
         })
         .collect()
     }
