@@ -6203,15 +6203,64 @@ mod tests {
         (crate::weights::q8_0_planes(&blocks), twin)
     }
 
-    /// The gated launch through the pack-of-four entry or (`listed`) the
-    /// listed one, and the chain it replaces: `rope_neox`'s query norm into
-    /// stored rows, the plain entry over them, `q38`'s out gate. Each side's
-    /// fault is taken after it. Returns (the chain's output and fault, the
-    /// gated output and fault).
+    /// The decode pass over the case's lists (`flash_gqa`'s
+    /// `enqueue_pass_256_p12_sel`) on the stored queries `q`, its merge under
+    /// `gate`'s sigmoid gate when given.
+    fn decode_launch(
+        gpu: &Gpu,
+        c: &Gated<'_>,
+        (q, gate): (&DeviceBuffer<f32>, Option<&DeviceBuffer<f32>>),
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        use crate::flash_gqa::{listed_partials_ms_len, listed_partials_v_len_256};
+        let s = gpu.stream();
+        let m = c.n_keys.len();
+        let k = crate::flash_gqa::FlashGqaKernels::load(gpu.context())?;
+        let mut part_v = DeviceBuffer::zeroed(s, listed_partials_v_len_256(m, G_HEAD, c.ctx))?;
+        let mut part_ms = DeviceBuffer::zeroed(s, listed_partials_ms_len(m, G_HEAD, c.ctx))?;
+        k.enqueue_pass_256_p12_sel(
+            s,
+            crate::flash_gqa::GqaSelArgs {
+                attn: GqaListArgs {
+                    q,
+                    kv: c.kv,
+                    list: c.list,
+                    n_sel: c.n_keys,
+                    width: c.ctx,
+                    scale: 0.0625,
+                    n_kv: G_KV,
+                    ctx: c.ctx,
+                    m,
+                    fault,
+                    y,
+                },
+                part_v: &mut part_v,
+                part_ms: &mut part_ms,
+                gate,
+            },
+            G_HEAD,
+        )
+    }
+
+    /// The gated entries the pair test holds: the prompt's pack-of-four and
+    /// listed entries, and the decode pass's gated merge.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Entry {
+        P4,
+        Listed,
+        Decode,
+    }
+
+    /// The gated launch through `entry`, and the chain it replaces:
+    /// `rope_neox`'s query norm into stored rows, the plain entry over them,
+    /// `q38`'s out gate. The decode pass reads the stored rows on both sides.
+    /// Each side's fault is taken after it. Returns (the chain's output and
+    /// fault, the gated output and fault).
     fn gated_pair(
         gpu: &Gpu,
         k: &FlashGqaPrefill,
-        listed: bool,
+        entry: Entry,
         c: &Gated<'_>,
         sink: FaultSink,
     ) -> [(Vec<f32>, Option<crate::fault::Fault>); 2] {
@@ -6253,15 +6302,19 @@ mod tests {
         }
         .expect("the query norm");
         let mut plain = zeros(m * G_ROW);
-        gated_launch(
-            gpu,
-            k,
-            listed,
-            c,
-            (&q, None),
-            gpu.unlabelled_sink(),
-            &mut plain,
-        )
+        let unl = gpu.unlabelled_sink();
+        match entry {
+            Entry::Decode => decode_launch(gpu, c, (&q, None), unl, &mut plain),
+            _ => gated_launch(
+                gpu,
+                k,
+                entry == Entry::Listed,
+                c,
+                (&q, None),
+                unl,
+                &mut plain,
+            ),
+        }
         .expect("a flash launch");
         let mut want = zeros(m * G_ROW);
         q38.enqueue_out_gate(
@@ -6279,8 +6332,19 @@ mod tests {
         s.synchronize().expect("the chain's sync");
         let want_fault = gpu.take_fault().expect("the fault word");
         let mut got = zeros(m * G_ROW);
-        gated_launch(gpu, k, listed, c, (c.qg, Some(c.query)), sink, &mut got)
-            .expect("a flash launch");
+        match entry {
+            Entry::Decode => decode_launch(gpu, c, (&q, Some(c.qg)), sink, &mut got),
+            _ => gated_launch(
+                gpu,
+                k,
+                entry == Entry::Listed,
+                c,
+                (c.qg, Some(c.query)),
+                sink,
+                &mut got,
+            ),
+        }
+        .expect("a flash launch");
         s.synchronize().expect("the gated flash's sync");
         let got_fault = gpu.take_fault().expect("the fault word");
         [
@@ -6293,11 +6357,12 @@ mod tests {
     /// plain entry, `q38`'s out gate) over 40 rows (three blocks of 16
     /// positions, the last short) at counts across 300 keys, raw queries in
     /// [-2, 2) and gates in [-8, 8): the `_p4` and `_p12_sel` (each row's
-    /// list the keys below its count) gated outputs bit for bit the chain's;
+    /// list the keys below its count) gated outputs, and the decode pass's
+    /// gated merge over the chain's stored queries, bit for bit the chain's;
     /// a NaN gate raises `f32_product` at the launch's layer on both sides,
     /// every bit the same; a position at or past the cache's height leaves
     /// that row NaN and every other bit the same; a short `[q | gate]` buffer
-    /// refused by name.
+    /// refused by name, by the decode pass too.
     // PIN(2026-10-26): `hw_gated_entries_are_the_flash_under_the_out_gate`
     // became this test when the gated entries took the query norm: its
     // chain gained the query norm, and the gate half's read is held by the
@@ -6351,41 +6416,35 @@ mod tests {
             },
             ..base
         };
-        for listed in [false, true] {
-            let [(want, wf), (got, gf)] = gated_pair(&gpu, &k, listed, &base, sink);
+        for entry in [Entry::P4, Entry::Listed, Entry::Decode] {
+            let [(want, wf), (got, gf)] = gated_pair(&gpu, &k, entry, &base, sink);
             assert!(
                 wf.is_none() && gf.is_none(),
-                "listed={listed}: clean inputs raised {wf:?} {gf:?}"
+                "{entry:?}: clean inputs raised {wf:?} {gf:?}"
             );
             assert!(
                 want.iter().all(|v| v.is_finite()),
-                "listed={listed}: a non-finite output"
+                "{entry:?}: a non-finite output"
             );
-            assert!(same(&want, &got), "listed={listed}: not the chain's bits");
-            let [(want, wf), (got, gf)] = gated_pair(&gpu, &k, listed, &nan_case, sink);
+            assert!(same(&want, &got), "{entry:?}: not the chain's bits");
+            let [(want, wf), (got, gf)] = gated_pair(&gpu, &k, entry, &nan_case, sink);
             for f in [wf, gf] {
                 let f = f.expect("a NaN gate raises a fault");
                 assert!(
                     f.layer == LAYER as u32 && f.site() == Some(FaultSite::F32Product),
-                    "listed={listed}: a NaN gate raised {f:?}"
+                    "{entry:?}: a NaN gate raised {f:?}"
                 );
             }
-            assert!(
-                got[bad_at].is_nan(),
-                "listed={listed}: the NaN gate's value"
-            );
-            assert!(
-                same(&want, &got),
-                "listed={listed}: a NaN gate moved another bit"
-            );
-            let [(want, _), (got, _)] = gated_pair(&gpu, &k, listed, &pos_case, sink);
+            assert!(got[bad_at].is_nan(), "{entry:?}: the NaN gate's value");
+            assert!(same(&want, &got), "{entry:?}: a NaN gate moved another bit");
+            let [(want, _), (got, _)] = gated_pair(&gpu, &k, entry, &pos_case, sink);
             assert!(
                 got[9 * G_ROW..10 * G_ROW].iter().all(|v| v.is_nan()),
-                "listed={listed}: a position past the cache, not NaN"
+                "{entry:?}: a position past the cache, not NaN"
             );
             assert!(
                 same(&want, &got),
-                "listed={listed}: a bad position moved another bit"
+                "{entry:?}: a bad position moved another bit"
             );
         }
         // Each of the gated launch's inputs one value short, refused by name
@@ -6438,6 +6497,15 @@ mod tests {
                 );
             }
         }
+        // The decode pass's one gate input, short.
+        let q = DeviceBuffer::<f32>::zeroed(s, M * G_ROW).expect("rows");
+        let fault = gpu.unlabelled_sink();
+        let r = decode_launch(&gpu, &base, (&q, Some(&short_qg)), fault, &mut y);
+        let e = r.expect_err("a short gate").to_string();
+        assert!(
+            e.contains("flash_gqa::enqueue_256_p12_sel") && e.contains("gate.len()"),
+            "the decode pass, short gate: {e}"
+        );
     }
 
     /// The gated entries over a q8_0 cache (`enqueue_256_p4_gated_q8`, and

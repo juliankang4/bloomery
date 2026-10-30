@@ -87,9 +87,7 @@ use crate::linear::{self, LinearKernels};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::MtpKernels;
 use crate::ple::{PleConvArgs, PleGateArgs, PleKernels};
-use crate::q38::{
-    CardSharedAddArgs, EmbedIo, KeyAppendArgs, OutGateArgs, Q38Kernels, SharedAddArgs,
-};
+use crate::q38::{CardSharedAddArgs, EmbedIo, KeyAppendArgs, Q38Kernels, SharedAddArgs};
 use crate::qsa::{PoolArgs, QsaKernels, QsaScratch, SelectArgs};
 use crate::rope_neox::RopeNeoxKernels;
 use crate::site::{self, ByName, ByNameKernels, Out};
@@ -113,8 +111,8 @@ pub(super) const GDN_LAUNCHES: usize = 7;
 /// A selecting layer's mixer launches at one row: q, k and v; the indexer
 /// key's projection, its append and the pool; the indexer query's projection
 /// and the selection's two; the q/k norm, turn and append; the selected
-/// flash's two; the gate and the output projection.
-pub(super) const QSA_LAUNCHES: usize = 14;
+/// flash's two, its merge under the gate; the output projection.
+pub(super) const QSA_LAUNCHES: usize = 13;
 /// The PLE site's launches: the previous combine, the key and value
 /// projections, the gate and the conv.
 pub(super) const PLE_LAUNCHES: usize = 5;
@@ -1317,7 +1315,7 @@ struct KeysIo<'b> {
 /// The rows a selecting layer's attention over one sequence reads and
 /// writes: the selection's queries, each row's live key count and
 /// position, the query projection's `[q | gate]` rows, the normed queries,
-/// the keys and values, and the flash's output.
+/// the keys and values, and the flash's output under its gate.
 struct AttendIo<'b> {
     qsel: &'b DeviceBuffer<f32>,
     n_keys: &'b DeviceBuffer<u32>,
@@ -1335,8 +1333,9 @@ struct AttendIo<'b> {
 /// ([`qsa_qkv`]); each sequence's indexer keys ([`qsa_keys`]) and attention
 /// ([`qsa_attend`]) over its rows and its store, the indexer queries over
 /// every row between ([`qsa_query`]: after one sequence's keys, before
-/// several sequences' keys) and the join before the first attention; then
-/// the gate and the output projection over every row ([`qsa_out`]).
+/// several sequences' keys) and the join before the first attention, each
+/// attention under its gate into `s.attn`; then the output projection over
+/// every row.
 fn qsa(
     c: &Ctx38<'_>,
     qp: &QsaPlan,
@@ -1373,7 +1372,7 @@ fn qsa(
                 qsa: qa,
                 pos,
                 n_keys,
-                flash,
+                attn,
                 ..
             } = &mut *s;
             let io = AttendIo {
@@ -1384,7 +1383,7 @@ fn qsa(
                 k: &mut qa.k,
                 v: &qa.v,
                 pos,
-                y: flash,
+                y: attn,
             };
             let scratch = (&mut qa.sel, &mut qa.part_v, &mut qa.part_ms);
             // SAFETY: the front embedding generates consecutive positions within this
@@ -1400,7 +1399,7 @@ fn qsa(
                 qsa: qa,
                 pos,
                 n_keys,
-                flash,
+                attn,
                 by,
                 ..
             } = &mut *s;
@@ -1429,7 +1428,7 @@ fn qsa(
                     k: &mut *rows_mut(&mut qa.k, r, geo::KV)?,
                     v: &*rows_of(&qa.v, r, geo::KV)?,
                     pos: &pos,
-                    y: &mut *rows_mut(flash, r, geo::ATTN)?,
+                    y: &mut *rows_mut(attn, r, geo::ATTN)?,
                 };
                 let scratch = (&mut qa.sel, &mut qa.part_v, &mut qa.part_ms);
                 // SAFETY: the front embedding generates consecutive positions within this
@@ -1438,7 +1437,8 @@ fn qsa(
             }
         }
     }
-    qsa_out(c, qp, s, m, sink)
+    let Arena38 { attn, y, by, .. } = s;
+    c.project(by, &qp.out, &*attn, m, sink, Out::whole(y))
 }
 
 /// A selecting layer's q (with each head's gate), k and v over every row
@@ -1534,7 +1534,8 @@ fn qsa_query(
 /// K/V planes: the selection of each row's pooled keys (into `sel` from its
 /// first row), the q/k norm and turn with the K/V append at the rows'
 /// positions, then the selected flash over the selection's lists (its
-/// partials from their first row) into `io.y`.
+/// partials from their first row) into `io.y` under each head's sigmoid
+/// gate from `io.qg`.
 ///
 /// # Safety
 ///
@@ -1622,40 +1623,10 @@ unsafe fn qsa_attend(
             },
             part_v,
             part_ms,
+            gate: Some(qg),
         },
         geo::N_HEAD,
     )
-}
-
-/// A selecting layer's gate over every row's attention and its output
-/// projection, into `s.y`.
-fn qsa_out(
-    c: &Ctx38<'_>,
-    qp: &QsaPlan,
-    s: &mut Arena38,
-    m: usize,
-    sink: FaultSink,
-) -> Result<(), GpuError> {
-    let Arena38 {
-        qsa: qa,
-        flash,
-        attn,
-        y,
-        by,
-        ..
-    } = s;
-    c.k.q38.enqueue_out_gate(
-        c.gpu.stream(),
-        OutGateArgs {
-            attn: &*flash,
-            qg: &qa.qg,
-            n_head: geo::N_HEAD,
-            m,
-            fault: sink,
-            y: &mut *attn,
-        },
-    )?;
-    c.project(by, &qp.out, &*attn, m, sink, Out::whole(y))
 }
 
 /// The captured decode step's walk `(1, 1, Step)`, into `head`.

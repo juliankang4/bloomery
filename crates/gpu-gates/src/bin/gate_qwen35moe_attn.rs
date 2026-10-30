@@ -3874,6 +3874,7 @@ mod gate {
                         attn,
                         part_v: &mut pv,
                         part_ms: &mut pms,
+                        gate: None,
                     },
                     N_HEAD_Q38,
                 )?;
@@ -4237,6 +4238,7 @@ mod gate {
                             attn,
                             part_v: &mut pv,
                             part_ms: &mut pms,
+                            gate: None,
                         },
                         N_HEAD_Q38,
                     ),
@@ -4431,6 +4433,7 @@ mod gate {
                                 attn,
                                 part_v: &mut pv,
                                 part_ms: &mut pms,
+                                gate: None,
                             },
                             n_head,
                         ),
@@ -5921,6 +5924,7 @@ mod gate {
                                     attn,
                                     part_v: &mut pv,
                                     part_ms: &mut pms,
+                                    gate: None,
                                 },
                                 N_HEAD_Q38,
                             )?;
