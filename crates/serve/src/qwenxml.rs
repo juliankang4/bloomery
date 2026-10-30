@@ -385,13 +385,14 @@ impl QwenScan {
             .whole(&self.read.call, self.calls))
     }
 
-    /// [`QwenScan::push`] of text whose special tokens' texts start at
-    /// `specials`, reporting the call text as `advances`, each piece's new
-    /// arguments, instead of the open call's whole text.
+    /// [`QwenScan::push`] of text whose special tokens' texts are at
+    /// `specials` (byte offset and length), reporting the call text as
+    /// `advances`, each piece's new arguments, instead of the open call's
+    /// whole text.
     pub(crate) fn push_stream(
         &mut self,
         piece: &str,
-        specials: &[usize],
+        specials: &[(usize, usize)],
     ) -> Result<Scanned, QwenXmlError> {
         self.buf.push(piece, specials);
         let mut out = Scanned::default();

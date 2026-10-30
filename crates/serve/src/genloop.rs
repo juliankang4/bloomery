@@ -351,9 +351,9 @@ pub(crate) fn cause_word(stop: Option<StopKind>, failed: bool) -> &'static str {
 /// A finished generation.
 pub(crate) struct Outcome {
     pub content: String,
-    /// Where a special token's text starts in `content`: byte offsets,
-    /// ascending ([`Event::Text`]).
-    pub specials: Vec<usize>,
+    /// The special tokens' texts in `content`: byte offset and byte
+    /// length, ascending ([`Event::Text`]).
+    pub specials: Vec<(usize, usize)>,
     /// Every generated id, the end-of-generation one included.
     pub tokens: Vec<u32>,
     pub stop: StopKind,
@@ -374,13 +374,14 @@ impl Outcome {
 pub(crate) enum Event<'a> {
     /// The prompt is evaluated (llama-server's `prompt_progress`, sent once, complete).
     Prompt(&'a Timings),
-    /// Text safe to stream, and the byte offsets in it, ascending, where a
-    /// special token's text starts ([`Tokenizer::is_special`]): the output
-    /// parsers read a marker only there. Empty between the calls of a prompt
-    /// or of a run of fixed ids ([`Need::Fill`]) run a call a round
-    /// ([`Prompt`]): the event a client gone fails on, as a token's text
-    /// does, its timings the request's so far.
-    Text(&'a str, &'a [usize], &'a Timings),
+    /// Text safe to stream, and the special tokens' texts in it, ascending,
+    /// each as its byte offset and byte length ([`Tokenizer::is_special`]):
+    /// the output parsers read a marker only where one whole token wrote it.
+    /// Empty between the calls of a prompt or of a run of fixed ids
+    /// ([`Need::Fill`]) run a call a round ([`Prompt`]): the event a client
+    /// gone fails on, as a token's text does, its timings the request's so
+    /// far.
+    Text(&'a str, &'a [(usize, usize)], &'a Timings),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1981,8 +1982,9 @@ pub(crate) struct Gen {
     dec: Box<dyn Decoder>,
     /// The vocabulary, for which generated ids are special.
     vocab: Arc<dyn Tokenizer>,
-    /// Where a special id's text starts in the scan's text, ascending.
-    specials: Vec<usize>,
+    /// Where a special id's text is in the scan's text, ascending: byte
+    /// offset and byte length.
+    specials: Vec<(usize, usize)>,
     generated: Vec<u32>,
     /// The ids a draw sees, in order: the prompt's tail (its last
     /// `repeat_last_n` ids, as much of the prompt as there is), then the
@@ -2241,16 +2243,16 @@ impl Gen {
         self.think.as_ref().map_or(usize::MAX, |t| t.left)
     }
 
-    /// The special ids' starts in `text`, the scan's text it last sent, as
-    /// offsets into it.
-    fn sending(&self, text: &str) -> Vec<usize> {
+    /// The special ids' texts in `text`, the scan's text it last sent, as
+    /// offsets into it with their lengths.
+    fn sending(&self, text: &str) -> Vec<(usize, usize)> {
         let to = self.scan.sent();
         let from = to - text.len();
-        let range = &self.specials[self.specials.partition_point(|&at| at < from)..];
+        let range = &self.specials[self.specials.partition_point(|&(at, _)| at < from)..];
         range
             .iter()
-            .take_while(|&&at| at < to)
-            .map(|at| at - from)
+            .take_while(|&&(at, _)| at < to)
+            .map(|&(at, len)| (at - from, len))
             .collect()
     }
 
@@ -2260,7 +2262,7 @@ impl Gen {
     /// spending nothing either and starting the guard's span after it — then,
     /// only for a span already open, the count, which arms the forced close
     /// at zero, and the guard. Whether the guard found a loop.
-    fn spend(&mut self, piece: Option<&str>, special: Option<usize>) -> bool {
+    fn spend(&mut self, piece: Option<&str>, special: Option<(usize, usize)>) -> bool {
         let Some(t) = self.think.as_mut() else {
             return false;
         };
@@ -2587,18 +2589,21 @@ impl Gen {
                 break;
             }
             let piece = self.dec.push(tok);
-            // Where a special id's text starts in its piece: the piece ends
-            // with it, after any bytes the decoder held.
+            // Where a special id's text is in its piece: the piece ends with
+            // it, after any bytes the decoder held.
             let special = piece
                 .as_deref()
                 .filter(|_| self.vocab.is_special(tok))
                 .map(|p| {
-                    p.len()
-                        .checked_sub(self.vocab.decode(&[tok]).len())
-                        .expect("a special token's decoded text must fit its decoder piece")
+                    let len = self.vocab.decode(&[tok]).len();
+                    let at = p
+                        .len()
+                        .checked_sub(len)
+                        .expect("a special token's decoded text must fit its decoder piece");
+                    (at, len)
                 });
-            if let Some(at) = special {
-                self.specials.push(self.scan.text().len() + at);
+            if let Some((at, len)) = special {
+                self.specials.push((self.scan.text().len() + at, len));
             }
             // The token's text out. A request that asks for probabilities
             // sends an event a token, its value written first, the text
@@ -2952,7 +2957,7 @@ impl Gen {
         }
         self.tim.predicted_ms = ms_since(self.t1);
         let content = self.scan.text().to_owned();
-        self.specials.retain(|&at| at < content.len());
+        self.specials.retain(|&(at, _)| at < content.len());
         Ok(Outcome {
             content,
             specials: std::mem::take(&mut self.specials),

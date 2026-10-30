@@ -50,10 +50,11 @@ impl SpecialTags {
         self.0.contains(&tag)
     }
 
-    /// Whether the marker `tag` starts at byte `at` of `m`.
+    /// Whether the marker `tag` starts at byte `at` of `m`: for a special
+    /// tag, one whole special token wrote it there.
     pub(crate) fn at(&self, m: &Marked, at: usize, tag: &str) -> bool {
         m.text.get(at..).is_some_and(|t| t.starts_with(tag))
-            && (!self.special(tag) || m.specials.binary_search(&at).is_ok())
+            && (!self.special(tag) || m.specials.binary_search(&(at, tag.len())).is_ok())
     }
 
     /// Where the first marker `tag` starts in `m`.
@@ -62,35 +63,42 @@ impl SpecialTags {
             m.specials
                 .iter()
                 .copied()
-                .find(|&at| m.text[at..].starts_with(tag))
+                .find(|&(at, len)| len == tag.len() && m.text[at..].starts_with(tag))
+                .map(|(at, _)| at)
         } else {
             m.text.find(tag)
         }
     }
 }
 
-/// Generated text and the byte offsets in it, ascending, where a special
-/// token's text starts.
+/// Generated text and the special tokens' texts in it, ascending: each as
+/// its byte offset and byte length.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Marked {
     pub(crate) text: String,
-    pub(crate) specials: Vec<usize>,
+    pub(crate) specials: Vec<(usize, usize)>,
 }
 
 impl Marked {
-    /// Appends `text`, its special tokens starting at `specials`.
-    pub(crate) fn push(&mut self, text: &str, specials: &[usize]) {
+    /// Appends `text`, its special tokens' texts at `specials`.
+    pub(crate) fn push(&mut self, text: &str, specials: &[(usize, usize)]) {
         let base = self.text.len();
-        self.specials.extend(specials.iter().map(|at| base + at));
+        self.specials
+            .extend(specials.iter().map(|&(at, len)| (base + at, len)));
         self.text.push_str(text);
     }
 
     /// Takes out the first `n` bytes.
     pub(crate) fn take_front(&mut self, n: usize) -> Marked {
-        let k = self.specials.partition_point(|&at| at < n);
+        let k = self.specials.partition_point(|&(at, _)| at < n);
         let rest = Marked {
             text: self.text.split_off(n),
-            specials: self.specials.split_off(k).iter().map(|at| at - n).collect(),
+            specials: self
+                .specials
+                .split_off(k)
+                .iter()
+                .map(|&(at, len)| (at - n, len))
+                .collect(),
         };
         std::mem::replace(self, rest)
     }
@@ -225,8 +233,8 @@ pub struct Split {
     /// `</think>` was consumed by this push.
     pub closed: bool,
     pub content: String,
-    /// Where special tokens' texts start in `content`.
-    pub specials: Vec<usize>,
+    /// The special tokens' texts in `content`: byte offset and length.
+    pub specials: Vec<(usize, usize)>,
 }
 
 impl Split {
@@ -340,9 +348,9 @@ impl ThinkSplit {
         self.inside
     }
 
-    /// Feeds generated text, its special tokens' texts starting at
-    /// `specials`.
-    pub fn push(&mut self, piece: &str, specials: &[usize]) -> Split {
+    /// Feeds generated text, its special tokens' texts at `specials` (byte
+    /// offset and length).
+    pub fn push(&mut self, piece: &str, specials: &[(usize, usize)]) -> Split {
         if self.may_open {
             return self.may_open_step(piece, specials);
         }
@@ -371,7 +379,7 @@ impl ThinkSplit {
     /// whitespace and the tag (as llama-server's optional leading span takes
     /// them, into neither field), and any other text ends the chance: from
     /// there the text passes through.
-    fn may_open_step(&mut self, piece: &str, specials: &[usize]) -> Split {
+    fn may_open_step(&mut self, piece: &str, specials: &[(usize, usize)]) -> Split {
         self.held.push(piece, specials);
         let ws = self.held.text.len() - self.held.text.trim_start().len();
         if self.specials.at(&self.held, ws, self.tags.open) {
@@ -396,7 +404,7 @@ impl ThinkSplit {
     /// Inside the span: everything up to the first `</think>` (or the tag
     /// that ends it too) is reasoning, a tail that could still grow into
     /// either held back.
-    fn in_span_step(&mut self, piece: &str, specials: &[usize]) -> Split {
+    fn in_span_step(&mut self, piece: &str, specials: &[(usize, usize)]) -> Split {
         self.held.push(piece, specials);
         let close = self.specials.find(&self.held, self.tags.close);
         let call = self

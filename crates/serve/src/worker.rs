@@ -221,7 +221,7 @@ pub(crate) enum Msg {
     Started(usize),
     Prompt(Timings),
     /// Text and where its special tokens start ([`Event::Text`]).
-    Text(String, Vec<usize>, Timings),
+    Text(String, Vec<(usize, usize)>, Timings),
     /// The last message.
     Done(Result<Outcome, GenError>),
     /// The request took its slot but did not start: the state of the request
