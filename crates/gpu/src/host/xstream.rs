@@ -549,6 +549,12 @@ pub const XSTREAM_ROOM: &str = "XStream ring room";
 /// reader's twin): nothing streams where the card holds every expert.
 pub const XSTREAM_NO_HOST: &str = "XStream host experts";
 
+/// What the refusal of a ring whose stacks the family's ring pass does not
+/// read names ([`XSTREAM_ROOM`]'s reader's twin): the pass reads a matrix the
+/// ring holds whole as words, so a load whose card route reads NVFP4 planes
+/// streams nothing.
+pub const XSTREAM_FORM: &str = "XStream ring form";
+
 /// The ring's halves.
 const HALVES: usize = 2;
 
@@ -722,15 +728,16 @@ impl LaneShared {
             let end = at + self.slot_bytes;
             for (part, &want) in self.source.part_bytes(job.layer).iter().enumerate() {
                 let piece = self.source.source(job.layer, job.id, part)?;
-                if piece.bytes.len() != want || at + want > end {
+                if piece.target_len() != Some(want) || at + want > end {
                     return Err(GpuError::shape(
                         WHAT,
                         format!(
-                            "layer {} expert {} part {part}: {} source bytes for a part of \
-                             {want} in a staging slot of {}",
+                            "layer {} expert {} part {part}: {} source bytes ({:?}) for a part \
+                             of {want} in a staging slot of {}",
                             job.layer,
                             job.id,
                             piece.bytes.len(),
+                            piece.transform,
                             self.slot_bytes
                         ),
                     ));

@@ -272,6 +272,69 @@ pub(crate) fn fill_piece(
     split_pooled(format, row_recs, first_row, src, codes, heads)
 }
 
+/// One of a record's two planes ([`split_plane`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Side {
+    /// Each block's value bytes.
+    Codes,
+    /// Each block's scale bytes.
+    Scales,
+}
+
+/// The bytes `side`'s plane takes of `src_len` file bytes of `format`: `None` when they are
+/// not whole records.
+#[must_use]
+pub(crate) fn plane_len(format: Format, side: Side, src_len: usize) -> Option<usize> {
+    let rec = format.record_bytes();
+    src_len.is_multiple_of(rec).then(|| {
+        src_len / rec
+            * match side {
+                Side::Codes => format.code_bytes(),
+                Side::Scales => format.head_bytes(),
+            }
+    })
+}
+
+/// One plane of the records `src`, whole records of `format` checked as [`split_rows`] checks
+/// one row's: `side`'s bytes of every block, in record order, into `out`, exactly that plane's
+/// bytes ([`plane_len`]). The planes a card slot holds apart, each from the same file bytes:
+/// what a residency swap stages of an expert whose file keeps the two interleaved. A refused
+/// block is the error, naming it as a block of the run read as one row, with `out` unwritten.
+pub(crate) fn split_plane(
+    format: Format,
+    side: Side,
+    src: &[u8],
+    out: &mut [u8],
+) -> Result<(), String> {
+    if plane_len(format, side, src.len()) != Some(out.len()) {
+        return Err(format!(
+            "{} bytes into a {side:?} plane of {} are not whole {format:?} records",
+            src.len(),
+            out.len()
+        ));
+    }
+    check_row(format, 0, src).map_err(|e| format!("the run as {e}"))?;
+    let (sub, head, code) = format.dims();
+    let per = match side {
+        Side::Codes => code,
+        Side::Scales => head,
+    };
+    for (rec, o) in src
+        .chunks_exact(format.record_bytes())
+        .zip(out.chunks_exact_mut(sub * per))
+    {
+        for s in 0..sub {
+            let blk = &rec[s * (head + code)..][..head + code];
+            let from = match side {
+                Side::Codes => &blk[head..],
+                Side::Scales => &blk[..head],
+            };
+            o[s * per..][..per].copy_from_slice(from);
+        }
+    }
+    Ok(())
+}
+
 /// Rows a slot of `slot_bytes` holds as one piece: whole rows, at least one;
 /// `None` when one row's two planes do not fit the slot.
 pub(crate) fn piece_rows(format: Format, row_recs: usize, slot_bytes: usize) -> Option<usize> {

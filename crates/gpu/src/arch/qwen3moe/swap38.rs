@@ -14,13 +14,13 @@
 //! the card each part of slot `s` is the file's bytes of that expert at byte
 //! `s · part` of its layer's stack, which the placed load uploads as file
 //! bytes in slot order ([`place::routed_rule`] keeps these stacks in
-//! `CardFormat::KQuant`, and `super::card38` reads them exactly so). Nothing
-//! converts: a staged part is its slot's bytes as they are, so the r8
+//! `CardFormat::KQuant`, and `super::card38` reads them exactly so). Such a
+//! part converts nothing: it is its slot's bytes as they are, so the r8
 //! sidecar, which exists for Q3_K stacks alone (`qdot::repack_q3k_r8`), is
 //! undefined input here, refused by name. An NVFP4 stack loads in its planes,
-//! which no staged part writes; a load that runs the machine builds every
-//! layer's host view, and that build refuses an NVFP4 stack by name, so no
-//! machine starts over one.
+//! three parts a matrix, each staged from the expert's run of the file's
+//! blocks by its transform (`crate::host::swap::Transform`), and the host
+//! view reads the same blocks with qdot's NVFP4 dot.
 
 use super::swap::{self, CardLeg};
 use crate::GpuError;

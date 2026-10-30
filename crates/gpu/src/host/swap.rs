@@ -280,30 +280,66 @@ impl Residency {
 // ----------------------------------------------------------------- source
 
 /// How the lane turns an expert's source bytes into its slot's bytes, as it
-/// stages them: the same bytes, moved and checked, so a slot is its source's
-/// length ([`Transform::apply`]).
+/// stages them: the bytes moved and checked, never arithmetic. A slot part is
+/// [`Transform::target_len`] of its source's length: the same, but where the
+/// source holds both of NVFP4's planes interleaved and the slot one of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transform {
     /// The slot holds the source bytes as they are.
     Identity,
-    /// NVFP4 rows' code plane (a checkpoint folder's) into the card's NVFP4
-    /// code plane: each 16-value group's nibbles in the block's order
-    /// (`qdot::nvfp4_codes_to_blocks`, [`crate::mxfp4`]'s card layout).
-    Nvfp4Codes,
-    /// UE4M3 block scales as they are, the card's NVFP4 scale plane, each
-    /// byte checked: one that is no UE4M3 scale is refused by name, as the
-    /// card's NVFP4 load refuses it ([`crate::mxfp4::repack`]).
-    Ue4m3Scales,
+    /// NVFP4 codes, in the form `Nvfp4From` names, into the card's NVFP4
+    /// code plane: each 64-value block's 32 code bytes in GGUF's nibble
+    /// order ([`crate::mxfp4`]'s card layout).
+    Nvfp4Codes(Nvfp4From),
+    /// NVFP4's UE4M3 block scales, in the form `Nvfp4From` names, into the
+    /// card's NVFP4 scale plane, each byte checked: one that is no UE4M3
+    /// scale is refused by name, as the card's NVFP4 load refuses it
+    /// ([`crate::mxfp4::repack`]).
+    Ue4m3Scales(Nvfp4From),
+}
+
+/// The form an NVFP4 source holds an expert's codes and block scales in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nvfp4From {
+    /// One plane alone, a checkpoint folder's (`gguf::Place::Stack`): the
+    /// codes of 16-value groups in ModelOpt's nibble order
+    /// (`qdot::nvfp4_codes_to_blocks` moves them), or the scale bytes as they
+    /// are. The slot part is the source's length.
+    Plane,
+    /// GGUF's NVFP4 blocks (`GgmlType::NVFP4`: four UE4M3 scale bytes, then
+    /// 32 code bytes, a 64 values), both planes interleaved: the slot part is
+    /// the one plane of them ([`crate::planes::split_plane`]), 32 or 4 bytes
+    /// of each 36.
+    Blocks,
 }
 
 impl Transform {
+    /// The bytes of the slot part `src_len` source bytes become; `None` for a
+    /// source of no whole NVFP4 blocks under [`Nvfp4From::Blocks`].
+    #[must_use]
+    pub fn target_len(self, src_len: usize) -> Option<usize> {
+        use crate::planes::{Format, Side, plane_len};
+        match self {
+            Transform::Identity
+            | Transform::Nvfp4Codes(Nvfp4From::Plane)
+            | Transform::Ue4m3Scales(Nvfp4From::Plane) => Some(src_len),
+            Transform::Nvfp4Codes(Nvfp4From::Blocks) => {
+                plane_len(Format::Nvfp4, Side::Codes, src_len)
+            }
+            Transform::Ue4m3Scales(Nvfp4From::Blocks) => {
+                plane_len(Format::Nvfp4, Side::Scales, src_len)
+            }
+        }
+    }
+
     /// `src`, a part as its source holds it, into `dst`, its slot's bytes.
-    /// Refused by name, before `dst` is written: lengths that differ, codes
-    /// of no whole 16-value groups, a block-scale byte that is no UE4M3 scale
-    /// (bit 7 set, or E4M3's NaN 0x7F).
+    /// Refused by name, before `dst` is written: a `dst` that is not
+    /// [`Transform::target_len`] of the source, codes of no whole 16-value
+    /// groups, a block-scale byte that is no UE4M3 scale (bit 7 set, or
+    /// E4M3's NaN 0x7F).
     pub fn apply(self, src: &[u8], dst: &mut [u8]) -> Result<(), GpuError> {
         const WHAT: &str = "Transform::apply";
-        if src.len() != dst.len() {
+        if self.target_len(src.len()) != Some(dst.len()) {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
@@ -313,11 +349,20 @@ impl Transform {
                 ),
             ));
         }
+        use crate::planes::{Format, Side, split_plane};
+        let refuse = |e: String| GpuError::shape(WHAT, format!("{self:?}: {e}"));
         match self {
             Transform::Identity => dst.copy_from_slice(src),
-            Transform::Nvfp4Codes => qdot::nvfp4_codes_to_blocks(src, dst)
-                .map_err(|e| GpuError::shape(WHAT, format!("{self:?}: {e}")))?,
-            Transform::Ue4m3Scales => {
+            Transform::Nvfp4Codes(Nvfp4From::Blocks) => {
+                split_plane(Format::Nvfp4, Side::Codes, src, dst).map_err(refuse)?;
+            }
+            Transform::Ue4m3Scales(Nvfp4From::Blocks) => {
+                split_plane(Format::Nvfp4, Side::Scales, src, dst).map_err(refuse)?;
+            }
+            Transform::Nvfp4Codes(Nvfp4From::Plane) => {
+                qdot::nvfp4_codes_to_blocks(src, dst).map_err(|e| refuse(e.to_string()))?;
+            }
+            Transform::Ue4m3Scales(Nvfp4From::Plane) => {
                 // Every UE4M3 scale byte is below 0x7F: the max is one pass the
                 // compiler vectorizes, the position only for the refusal.
                 if src.iter().fold(0u8, |m, &b| m.max(b)) >= 0x7F {
@@ -344,6 +389,14 @@ impl Transform {
 pub struct Piece<'a> {
     pub bytes: &'a [u8],
     pub transform: Transform,
+}
+
+impl Piece<'_> {
+    /// The slot bytes the piece becomes ([`Transform::target_len`]).
+    #[must_use]
+    pub fn target_len(&self) -> Option<usize> {
+        self.transform.target_len(self.bytes.len())
+    }
 }
 
 /// A model's side of the machine: where an expert's bytes come from, where
@@ -4314,30 +4367,33 @@ mod tests {
     use super::super::lane::Stamp;
     use super::super::slots::{HOST, Slot, SlotMap};
     use super::{
-        CardTable, LATE_RING, LateAt, LateFlip, LateRing, Residency, SetDiff, SlotLedger,
-        SlotState, TableCheck, TableOff, Tally, Transform,
+        CardTable, LATE_RING, LateAt, LateFlip, LateRing, Nvfp4From, Residency, SetDiff,
+        SlotLedger, SlotState, TableCheck, TableOff, Tally, Transform,
     };
     use crate::GpuError;
 
-    /// A slot part is its source's bytes moved and checked: the codes in the
-    /// block's order (`qdot`'s rule), the block scales and the identity as
-    /// they are; a scale byte that is no UE4M3 scale (0x7F, and bit 7 set)
-    /// and lengths that differ are refused by name with the slot unwritten.
-    /// Mutant: `Ue4m3Scales` copying without its check — the 0x7F and 0x80
-    /// arms take the bytes.
+    /// A slot part is its source's bytes moved and checked: a folder plane's
+    /// codes in the block's order (`qdot`'s rule), its block scales and the
+    /// identity as they are; GGUF NVFP4 blocks give each of the two planes the
+    /// card's load splits them into (`planes::split_rows`), 32 and 4 bytes of
+    /// each 36, which is the part's target length. A scale byte that is no
+    /// UE4M3 scale (0x7F, and bit 7 set) and lengths that are not the
+    /// target's are refused by name with the slot unwritten. Mutants:
+    /// `Ue4m3Scales` copying without its check — the 0x7F and 0x80 arms take
+    /// the bytes; the blocks read as one plane — the lengths are refused.
     #[test]
     fn a_transform_moves_its_bytes_and_refuses_a_byte_that_is_no_scale() {
         let src: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37)).collect();
         let mut want = vec![0u8; src.len()];
         qdot::nvfp4_codes_to_blocks_scalar(&src, &mut want).expect("whole groups");
         let mut got = vec![0xA5u8; src.len()];
-        Transform::Nvfp4Codes
+        Transform::Nvfp4Codes(Nvfp4From::Plane)
             .apply(&src, &mut got)
             .expect("whole groups");
         assert_eq!(got, want, "the codes in the block's order");
         let scales: Vec<u8> = (0..0x7Fu8).collect();
         let mut slot = vec![0xA5u8; scales.len()];
-        Transform::Ue4m3Scales
+        Transform::Ue4m3Scales(Nvfp4From::Plane)
             .apply(&scales, &mut slot)
             .expect("every byte below 0x7F is a scale");
         assert_eq!(slot, scales);
@@ -4347,7 +4403,7 @@ mod tests {
             let mut part = vec![0x10u8; 32];
             part[19] = bad;
             let mut slot = vec![0xA5u8; 32];
-            match Transform::Ue4m3Scales.apply(&part, &mut slot) {
+            match Transform::Ue4m3Scales(Nvfp4From::Plane).apply(&part, &mut slot) {
                 Err(GpuError::Shape { detail, .. }) => assert!(
                     detail.contains("byte 19") && detail.contains("no UE4M3 scale"),
                     "{detail}"
@@ -4361,6 +4417,48 @@ mod tests {
                 assert!(detail.contains("64 source bytes"), "{detail}");
             }
             other => panic!("lengths that differ are refused, got {other:?}"),
+        }
+        // Six GGUF blocks, two rows of three: valid scales, any codes.
+        let mut blocks: Vec<u8> = (0..6 * 36u32).map(|i| (i * 89 % 251) as u8).collect();
+        for blk in blocks.as_chunks_mut::<36>().0 {
+            for b in &mut blk[..4] {
+                *b &= 0x7E;
+            }
+        }
+        let (mut codes, mut heads) = (vec![0u8; 6 * 32], vec![0u8; 6 * 4]);
+        crate::planes::split_rows(
+            crate::planes::Format::Nvfp4,
+            3,
+            0,
+            &blocks,
+            &mut codes,
+            &mut heads,
+        )
+        .expect("valid blocks");
+        for (t, want) in [
+            (Transform::Nvfp4Codes(Nvfp4From::Blocks), &codes),
+            (Transform::Ue4m3Scales(Nvfp4From::Blocks), &heads),
+        ] {
+            assert_eq!(t.target_len(blocks.len()), Some(want.len()), "{t:?}");
+            assert_eq!(t.target_len(35), None, "{t:?}");
+            let mut slot = vec![0xA5u8; want.len()];
+            t.apply(&blocks, &mut slot).expect("valid blocks");
+            assert_eq!(&slot, want, "{t:?}: the load's plane");
+            let mut whole = vec![0xA5u8; blocks.len()];
+            assert!(
+                t.apply(&blocks, &mut whole).is_err(),
+                "{t:?} into a slot of the blocks"
+            );
+            let mut bad = blocks.clone();
+            bad[36 * 4 + 2] = 0x7F;
+            let mut slot = vec![0xA5u8; want.len()];
+            match t.apply(&bad, &mut slot) {
+                Err(GpuError::Shape { detail, .. }) => {
+                    assert!(detail.contains("block 4 sub-block 2"), "{detail}");
+                }
+                other => panic!("{t:?}: 0x7F is no scale, got {other:?}"),
+            }
+            assert!(slot.iter().all(|&b| b == 0xA5), "a refusal wrote the slot");
         }
     }
 
