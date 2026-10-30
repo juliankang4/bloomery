@@ -12,7 +12,8 @@
 //! blocks, joined), `messages` with `text`, `image`, `thinking`, `tool_use` and
 //! `tool_result` blocks, `tools`, `tool_choice`, `stop_sequences`, `max_tokens`,
 //! `temperature`, `top_p`, `top_k`, `stream`, `chat_template_kwargs` — and
-//! `thinking.budget_tokens` to the chat path's `reasoning_budget`. `thinking`
+//! `thinking.budget_tokens` to the chat path's `reasoning_budget`; the chat
+//! path's `reasoning_loop` passes as it is. `thinking`
 //! does not turn the template's thinking on: that stays the template's default
 //! or the request's `chat_template_kwargs`, as in llama-server. A system text that is
 //! Claude Code's billing header has its per-request `cch` stamp written as
@@ -29,7 +30,8 @@
 //! The answer: a thinking block, a text block, then one `tool_use` block per
 //! call, each present only when it has something; `stop_reason` `max_tokens` at
 //! the request's or the context's end, `stop_sequence` on a stop sequence,
-//! `tool_use` when a call parsed, else `end_turn`; `usage` the prompt's ids the
+//! `reasoning_loop` when the loop guard ended it, `tool_use` when a call
+//! parsed, else `end_turn`; `usage` the prompt's ids the
 //! cache kept (`cache_read_input_tokens`), the rest (`input_tokens`) and the
 //! generated ids. A stream is `message_start` (sent with the first text, when
 //! the prompt's counts are known), then each block's `content_block_start`, its
@@ -149,6 +151,7 @@ fn to_chat(b: &Map<String, Value>, generate: bool) -> Result<Map<String, Value>,
         "top_k",
         "stream",
         "chat_template_kwargs",
+        "reasoning_loop",
     ] {
         if let Some(v) = b.get(key) {
             chat.insert(key.into(), v.clone());
@@ -644,13 +647,14 @@ fn stop_reason(o: &Outcome, m: &Message) -> &'static str {
         StopKind::Word => "stop_sequence",
         StopKind::Eos if m.calls.is_empty() => "end_turn",
         StopKind::Eos => "tool_use",
+        StopKind::Loop => "reasoning_loop",
     }
 }
 
 fn stop_sequence(o: &Outcome) -> Value {
     match o.stop {
         StopKind::Word => json!(o.stopping_word),
-        StopKind::Eos | StopKind::Limit => Value::Null,
+        StopKind::Eos | StopKind::Limit | StopKind::Loop => Value::Null,
     }
 }
 

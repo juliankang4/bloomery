@@ -1170,6 +1170,139 @@ fn hw_qwen_chat_tool_calls_stream_and_non_stream() {
     assert_eq!(folded["calls"], json!(calls), "streamed == non-streamed");
 }
 
+/// A call ends the span for the budget and loop guard without `</think>`,
+/// on the chat route and on both text-completion routes, whose prompt ends
+/// in `<think>`. The mock spells `<tool_call>` a byte an id: after `r` and
+/// the first ten opener ids the budget of 12 has one left. Four-row passes
+/// resume as soon as the opener ends, and a repeated argument stays whole.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_call_ends_the_span_for_the_budget_and_the_loop_guard() {
+    use std::sync::{Arc, Mutex};
+
+    use serve::{Drafted, Engine, EngineError, Tokenizer};
+
+    struct DraftScript {
+        inner: ScriptedEngine,
+        produced: usize,
+        passes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Engine for DraftScript {
+        fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+            self.inner.tokenizer()
+        }
+        fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+            self.inner.prefill(ids)
+        }
+        fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+            let id = self.inner.next(last, out)?;
+            self.produced += 1;
+            Ok(id)
+        }
+        fn advance(&mut self, mut last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+            self.passes.lock().expect("passes").push(self.produced);
+            out.clear();
+            for _ in 0..4 {
+                last = self.next(last, None)?;
+                out.push(last);
+                if last == self.tokenizer().eos() {
+                    break;
+                }
+            }
+            Ok(Drafted {
+                proposed: out.len() - 1,
+                accepted: out.len() - 1,
+            })
+        }
+        fn advance_rows(&self) -> usize {
+            4
+        }
+        fn reset(&mut self) -> Result<(), EngineError> {
+            self.produced = 0;
+            self.inner.reset()
+        }
+        fn ctx_max(&self) -> usize {
+            self.inner.ctx_max()
+        }
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+    }
+
+    let text = "a".repeat(300);
+    let script = format!(
+        "r<tool_call>\n<function=save_note>\n<parameter=text>\n{text}\n</parameter>\n</function>\n</tool_call>"
+    );
+    for drafting in [false, true] {
+        let passes = Arc::new(Mutex::new(Vec::new()));
+        let inner = ScriptedEngine::new(4096, &script);
+        let engine: Box<dyn Engine> = if drafting {
+            Box::new(DraftScript {
+                inner,
+                produced: 0,
+                passes: Arc::clone(&passes),
+            })
+        } else {
+            Box::new(inner)
+        };
+        let addr = start_templated(engine, TEMPLATE);
+        for extra in [
+            json!({"reasoning_budget": 12}),
+            json!({"reasoning_loop": true}),
+            json!({"reasoning_loop": true, "reasoning_budget": 12}),
+        ] {
+            let with = |mut body: Value| {
+                passes.lock().expect("passes").clear();
+                body.as_object_mut()
+                    .expect("body")
+                    .extend(extra.as_object().expect("extra").clone());
+                body
+            };
+            let resumed = || {
+                if drafting && extra.get("reasoning_budget").is_some() {
+                    let passes = passes.lock().expect("passes");
+                    assert!(
+                        passes.contains(&12),
+                        "a four-row pass must resume at the call opener: {extra}, {passes:?}"
+                    );
+                }
+            };
+            let mut chat = tool_body(false);
+            chat["max_tokens"] = json!(1024);
+            let r = post(addr, "/v1/chat/completions", &with(chat));
+            assert_eq!(r.status, 200, "{drafting}, {extra}: {}", r.body);
+            let v = r.json();
+            let c = &v["choices"][0];
+            assert_eq!(c["finish_reason"], "tool_calls", "{drafting}, {extra}: {v}");
+            assert_eq!(c["message"]["reasoning_content"], "r", "{extra}: {v}");
+            let args: Value = serde_json::from_str(
+                c["message"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .expect("arguments"),
+            )
+            .expect("JSON");
+            assert_eq!(args, json!({ "text": text }), "{extra}");
+            resumed();
+            let completion = json!({"prompt": "q<think>", "n_predict": 1024, "temperature": 0});
+            let r = post(addr, "/completion", &with(completion));
+            assert_eq!(r.status, 200, "{drafting}, {extra}: {}", r.body);
+            let v = r.json();
+            assert_eq!(v["stop_type"], "eos", "{drafting}, {extra}: {v}");
+            assert_eq!(v["content"], script, "{drafting}, {extra}");
+            resumed();
+            let completion = json!({"prompt": "q<think>", "max_tokens": 1024, "temperature": 0});
+            let r = post(addr, "/v1/completions", &with(completion));
+            assert_eq!(r.status, 200, "{drafting}, {extra}: {}", r.body);
+            let v = r.json();
+            let c = &v["choices"][0];
+            assert_eq!(c["finish_reason"], "stop", "{drafting}, {extra}: {v}");
+            assert_eq!(c["text"], script, "{drafting}, {extra}");
+            resumed();
+        }
+    }
+}
+
 /// MiMo's compact calls return the reference arguments,
 /// `get_weather {"city":"Seoul"}`, in streamed and non-streamed responses.
 #[test]

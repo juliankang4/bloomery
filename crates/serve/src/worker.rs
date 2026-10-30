@@ -1993,6 +1993,7 @@ mod tests {
         assert_eq!(cause_word(Some(StopKind::Eos), false), "eos");
         assert_eq!(cause_word(Some(StopKind::Word), false), "stop");
         assert_eq!(cause_word(Some(StopKind::Limit), false), "length");
+        assert_eq!(cause_word(Some(StopKind::Loop), false), "reasoning_loop");
         assert_eq!(cause_word(None, false), "cancel");
         assert_eq!(cause_word(None, true), "error");
     }

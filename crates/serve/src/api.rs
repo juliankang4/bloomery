@@ -2238,8 +2238,10 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             .unwrap_or(false),
         cache_prompt: get_b(o, "cache_prompt")?.unwrap_or(true),
         reasoning_budget,
+        reasoning_loop: get_b(o, "reasoning_loop")?.unwrap_or(false),
         think_entry: ThinkEntry::Closed,
         think: state.think,
+        think_split: None,
         logprobs: None,
         constraint,
         logit_bias,
@@ -2355,20 +2357,22 @@ fn reasoning_budget(o: &Map<String, Value>) -> Result<Option<usize>, ApiError> {
 /// A JSON value's type, for a field's refusal naming what it got.
 use ::embed::request::json_type;
 
-/// The think-span budget lives only where a span can open, `p.think`'s span
-/// (the server's tags): a prompt that ends with the start tag starts the model inside it, one that ends with
-/// the closed span (the template with thinking off) has no reasoning to cap,
-/// so the budget is silently ignored there — llama-server ignores
-/// `--reasoning-budget` when thinking is already off by other means — and one
-/// that ends with neither leaves the span to the model, where the budget
-/// starts counting at the start tag, as llama-server's sampler does. The
-/// entry lands in `p` for the generation's budget tracker whatever the
-/// budget: the ids before a model-opened span spend nothing, and its close
-/// ids are not forced until the span opens.
-fn gate_reasoning_budget(p: &mut GenParams, prompt: &str) {
+/// The think-span budget and the loop guard live only where a span can open,
+/// `p.think`'s span (the server's tags): a prompt that ends with the start tag
+/// starts the model inside it, one that ends with the closed span (the
+/// template with thinking off) has no reasoning to cap or guard, so both are
+/// silently ignored there — llama-server ignores `--reasoning-budget` when
+/// thinking is already off by other means — and one that ends with neither
+/// leaves the span to the model, where the budget starts counting and the
+/// guard starts reading at the start tag, as llama-server's sampler does. The
+/// entry lands in `p` for the generation's tracker whatever the budget: the
+/// ids before a model-opened span spend nothing, and its close ids are not
+/// forced until the span opens.
+fn gate_think_span(p: &mut GenParams, prompt: &str) {
     p.think_entry = ThinkEntry::of_prompt_with(prompt, p.think);
-    if p.reasoning_budget.is_some() && p.think_entry == ThinkEntry::Closed {
+    if p.think_entry == ThinkEntry::Closed {
         p.reasoning_budget = None;
+        p.reasoning_loop = false;
     }
 }
 
@@ -2446,8 +2450,10 @@ fn default_params(state: &State) -> GenParams {
         include_usage: false,
         cache_prompt: true,
         reasoning_budget: None,
+        reasoning_loop: false,
         think_entry: ThinkEntry::Closed,
         think: state.think,
+        think_split: None,
         logprobs: None,
         constraint: None,
         logit_bias: Vec::new(),
@@ -4497,19 +4503,29 @@ struct CompletionPlan {
 }
 
 /// The completion path's steps on a completion body: the sampling fields,
-/// the prompt's ids ([`completion_prompt`]) and the think-span budget, whose
-/// span check reads the prompt's text (a string prompt is its own, an id
-/// array's its decode). Every route that runs a completion builds its
-/// generation here.
+/// the prompt's ids ([`completion_prompt`]) and the think-span budget and
+/// loop guard, whose span check reads the prompt's text (a string prompt is
+/// its own, an id array's its decode) and whose span ends where the chat
+/// parser's does (a Qwen3-Coder call ends it too). Every route that runs a
+/// completion builds its generation here.
 fn completion_plan(state: &State, b: &Map<String, Value>) -> Result<CompletionPlan, ApiError> {
     let mut p = gen_params(state, b)?;
     let ids = completion_prompt(state, b.get("prompt"))?;
-    if p.reasoning_budget.is_some() {
+    if p.reasoning_budget.is_some() || p.reasoning_loop {
         let text = match b.get("prompt") {
             Some(Value::String(s)) => s.clone(),
             _ => state.tok.decode(&ids),
         };
-        gate_reasoning_budget(&mut p, &text);
+        gate_think_span(&mut p, &text);
+        if let ToolFormat::QwenXml(framing) = state.tool_format {
+            p.think_split = ChatParser::with_tags(
+                &text,
+                ReasoningFormat::None,
+                Some(Tools::QwenXml(framing, ParamKinds::default())),
+                state.think,
+            )
+            .think;
+        }
     }
     Ok(CompletionPlan {
         p,
@@ -4854,7 +4870,7 @@ fn chat_input(state: &State, b: &Map<String, Value>) -> Result<(String, Prompt),
 /// the same whichever API sent the request: the sampling fields, the
 /// reasoning format (`format`, the request's `reasoning_format` on the chat
 /// path; `None` takes the default), the prompt ([`chat_input`]), the
-/// tool-call scan and the think-span budget. The chat path and every API
+/// tool-call scan and the think-span budget and loop guard. The chat path and every API
 /// converted onto it build their generation here.
 fn chat_plan(
     state: &State,
@@ -4866,9 +4882,11 @@ fn chat_plan(
         ReasoningFormat::from_request(format).map_err(|e| invalid(e).at("reasoning_format"))?;
     let (text, input) = chat_input(state, b)?;
     let tools = tool_scan(state, b)?;
-    gate_reasoning_budget(&mut p, &text);
+    gate_think_span(&mut p, &text);
     let parser =
         ChatParser::with_tags(&text, format, tools, state.think).for_template(state.tool_format);
+    // Without a reasoning split or tool scan, the guard still tracks the server's think tags.
+    p.think_split.clone_from(&parser.think);
     Ok(ChatPlan {
         p,
         input,
@@ -10388,7 +10406,7 @@ mod tests {
         let m = chat_message(
             addr,
             r#"{"messages":[{"role":"user","content":"ok?"}],"max_tokens":64,
-                "response_format":{"type":"json_schema",
+                "reasoning_loop":true, "response_format":{"type":"json_schema",
                 "json_schema":{"name":"r","schema":{"type":"boolean"}}}}"#,
         );
         let content = m["content"].as_str().unwrap_or_default().trim();
@@ -10433,6 +10451,68 @@ mod tests {
         let natural = budgeted(&closed, 20);
         assert_eq!(natural["reasoning_content"], "ab", "{natural}");
         assert_eq!(natural["content"], SCRIPT[..24], "{natural}");
+    }
+
+    /// The loop guard (`reasoning_loop`) on every route that generates: a
+    /// script that repeats `abc` in the span ends at its 259th id, the run of
+    /// period 3 at 256, with the guard's reason; unguarded, or with thinking
+    /// off (the prompt closed the span, so the cycle is content), it runs to
+    /// its end. A guard that is not a boolean is a 400 naming it.
+    #[test]
+    fn the_loop_guard_ends_a_repeating_span_with_its_reason() {
+        let script = "abc".repeat(200);
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::ScriptedEngine::new(4096, &script)),
+            templated(include_str!("../tests/fixtures/qwen38-chat-template.jinja")),
+        );
+        let post = |path: &str, mut body: Value, guard: Value| {
+            body["reasoning_loop"] = guard;
+            let (status, text) = roundtrip(addr, "POST", path, &body.to_string());
+            (status, serde_json::from_str::<Value>(&text).expect("JSON"))
+        };
+        let chat = |guard: bool, effort: &str| {
+            let body = json!({"messages": [{"role": "user", "content": "q"}],
+                "max_tokens": 1024, "reasoning_effort": effort});
+            let (status, v) = post("/v1/chat/completions", body, json!(guard));
+            assert_eq!(status, 200, "{v}");
+            v["choices"][0].clone()
+        };
+        let looped = chat(true, "high");
+        assert_eq!(looped["finish_reason"], "reasoning_loop", "{looped}");
+        assert_eq!(looped["message"]["reasoning_content"], script[..259]);
+        let free = chat(false, "high");
+        assert_eq!(free["finish_reason"], "stop", "{free}");
+        assert_eq!(free["message"]["reasoning_content"], script);
+        let off = chat(true, "none");
+        assert_eq!(off["finish_reason"], "stop", "{off}");
+        assert_eq!(off["message"]["content"], script);
+        let (_, r) = post(
+            "/v1/responses",
+            json!({"input": "q", "max_output_tokens": 1024}),
+            json!(true),
+        );
+        assert_eq!(r["status"], "incomplete", "{r}");
+        assert_eq!(r["incomplete_details"]["reason"], "reasoning_loop", "{r}");
+        let (_, m) = post(
+            "/v1/messages",
+            json!({"messages": [{"role": "user", "content": "q"}], "max_tokens": 1024}),
+            json!(true),
+        );
+        assert_eq!(m["stop_reason"], "reasoning_loop", "{m}");
+        let (_, c) = post(
+            "/completion",
+            json!({"prompt": "q<think>", "n_predict": 1024}),
+            json!(true),
+        );
+        assert_eq!(c["stop_type"], "reasoning_loop", "{c}");
+        assert_eq!(c["tokens_predicted"], 259, "{c}");
+        let (status, e) = post(
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "q"}]}),
+            json!(1),
+        );
+        assert_eq!(status, 400, "{e}");
+        assert_eq!(e["error"]["param"], "reasoning_loop", "{e}");
     }
 
     /// The media part's refusals are the request's 400 with the error's own text, about the

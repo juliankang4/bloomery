@@ -110,7 +110,7 @@
 //! `output_tokens` the generated ids, `total_tokens` their sum. `status` is
 //! `completed`, or `incomplete` with `incomplete_details.reason`
 //! `max_output_tokens` when the generation stopped at the request's or the
-//! context's end. Ids: the response `resp_<32 hex>`; an item
+//! context's end, `reasoning_loop` when the loop guard ended it. Ids: the response `resp_<32 hex>`; an item
 //! `<rs|msg>_<output index>_<16 hex>`; a call `fc_<n>_<16 hex>`, its `call_id`
 //! `call_<n>_<16 hex>`, `n` the call's index and the hex the response's.
 //!
@@ -1236,10 +1236,11 @@ fn usage(t: &Timings) -> Value {
     })
 }
 
-/// `incomplete` when the generation stopped at its limit, else `completed`.
+/// `incomplete` when the generation stopped at its limit or the loop guard
+/// ended it, else `completed`.
 fn status(o: &Outcome) -> &'static str {
     match o.stop {
-        StopKind::Limit => "incomplete",
+        StopKind::Limit | StopKind::Loop => "incomplete",
         StopKind::Eos | StopKind::Word => "completed",
     }
 }
@@ -1268,8 +1269,10 @@ fn finished(ids: &Ids, o: &Outcome, output: Vec<Value>) -> Value {
     v["completed_at"] = json!(unix_now());
     v["output"] = Value::Array(output);
     v["usage"] = usage(&o.timings);
-    if o.stop == StopKind::Limit {
-        v["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+    match o.stop {
+        StopKind::Limit => v["incomplete_details"] = json!({ "reason": "max_output_tokens" }),
+        StopKind::Loop => v["incomplete_details"] = json!({ "reason": "reasoning_loop" }),
+        StopKind::Eos | StopKind::Word => {}
     }
     v
 }

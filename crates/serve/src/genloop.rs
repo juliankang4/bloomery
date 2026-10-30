@@ -130,6 +130,10 @@ pub(crate) struct GenParams {
     /// no reasoning to cap and the budget is silently ignored, as llama-server
     /// ignores the flag when thinking is off.
     pub reasoning_budget: Option<usize>,
+    /// The loop guard, the request's `reasoning_loop`: the generation ends
+    /// ([`StopKind::Loop`]) once the open think span repeats a cycle
+    /// ([`Repeats`]). `true` only where a span can open, as the budget.
+    pub reasoning_loop: bool,
     /// Where the prompt left the think span, for the budget's tracker: the
     /// ids before a model-opened span spends nothing, and its close ids are
     /// not forced until the span opens.
@@ -137,6 +141,11 @@ pub(crate) struct GenParams {
     /// The tags of the model's think span, the server's: the budget's tracker
     /// reads the span's close in them and forces `think.close` when it is spent.
     pub think: ThinkTags,
+    /// The chat parser's splitter of the span ([`crate::dsml::ChatParser`]),
+    /// which the budget and the loop guard read so the span ends for them
+    /// where it ends for the answer (a Qwen3-Coder call ends it without
+    /// `</think>`); `None` reads `think` from `think_entry`.
+    pub think_split: Option<ThinkSplit>,
     /// The probabilities the request asked for and the log its generation
     /// writes them to; `None` asks for none. Only the routes that render them
     /// set it.
@@ -298,6 +307,9 @@ pub(crate) enum StopKind {
     Eos,
     Word,
     Limit,
+    /// The loop guard found the open think span repeating a cycle
+    /// ([`GenParams::reasoning_loop`]).
+    Loop,
 }
 
 impl StopKind {
@@ -306,28 +318,31 @@ impl StopKind {
             StopKind::Eos => "eos",
             StopKind::Word => "word",
             StopKind::Limit => "limit",
+            StopKind::Loop => "reasoning_loop",
         }
     }
 
-    /// OpenAI `finish_reason`.
+    /// OpenAI `finish_reason`, and `reasoning_loop` for the loop guard's stop.
     pub(crate) fn finish_reason(self) -> &'static str {
         match self {
             StopKind::Eos | StopKind::Word => "stop",
             StopKind::Limit => "length",
+            StopKind::Loop => "reasoning_loop",
         }
     }
 }
 
 /// The server's stderr finish line's cause word: the generation's own stop
-/// (`eos`, `stop` for a stop string, `length`), `cancel` for a request its
-/// client or the server's stop cut short, `error` for one that failed. The
-/// one mapping, beside [`StopKind::finish_reason`]; the endpoints never
-/// derive their own.
+/// (`eos`, `stop` for a stop string, `length`, `reasoning_loop`), `cancel` for
+/// a request its client or the server's stop cut short, `error` for one that
+/// failed. The one mapping, beside [`StopKind::finish_reason`]; the endpoints
+/// never derive their own.
 pub(crate) fn cause_word(stop: Option<StopKind>, failed: bool) -> &'static str {
     match stop {
         Some(StopKind::Eos) => "eos",
         Some(StopKind::Word) => "stop",
         Some(StopKind::Limit) => "length",
+        Some(StopKind::Loop) => "reasoning_loop",
         None if failed => "error",
         None => "cancel",
     }
@@ -345,7 +360,8 @@ pub(crate) struct Outcome {
 }
 
 impl Outcome {
-    /// Whether the token limit ended the generation (`finish_reason` `length`).
+    /// Whether the token limit (`finish_reason` `length`) cut the generation
+    /// short: a call open there is read as far as it got.
     pub(crate) fn cut(&self) -> bool {
         self.stop == StopKind::Limit
     }
@@ -1736,32 +1752,85 @@ struct Span {
     close: bool,
 }
 
-/// The think-span budget's state in [`Gen`]: the budget left while the span is
-/// open, the span's close detection over the generated text (the output's own
-/// split is api-side; this instance only decides when the span closes), and the
-/// ids of the close, `at` naming the next of them the loop force-feeds —
-/// `close.len()` while the budget holds.
+/// The longest cycle the loop guard looks for, in ids.
+const LOOP_PERIOD_MAX: usize = 1024;
+
+/// The fewest ids in a row a loop repeats: each of the span's last ids equals
+/// the id one period before it, over this many ids and one whole period.
+const LOOP_RUN_MIN: usize = 256;
+
+/// The loop guard's state over the open think span: for each period `p` from
+/// 1 to [`LOOP_PERIOD_MAX`], how many of the span's last ids in a row equal
+/// the id `p` before them. A run that reaches [`LOOP_RUN_MIN`] and `p` is a
+/// loop: the span ends in two whole copies of a `p`-id cycle at least, and
+/// [`LOOP_RUN_MIN`] ids or more repeat. One taken id costs a compare a period.
+struct Repeats {
+    /// Where the span's ids start among the generated ids.
+    from: usize,
+    /// The run of period `p` at `p - 1`.
+    runs: Vec<usize>,
+}
+
+impl Repeats {
+    fn new() -> Repeats {
+        Repeats {
+            from: 0,
+            runs: vec![0; LOOP_PERIOD_MAX],
+        }
+    }
+
+    /// Whether the span's ids `span`, after its last id is taken, end in a
+    /// loop.
+    fn looped(&mut self, span: &[u32]) -> bool {
+        let Some((&last, before)) = span.split_last() else {
+            return false;
+        };
+        for (p, run) in (1..=before.len()).zip(self.runs.iter_mut()) {
+            if before[before.len() - p] != last {
+                *run = 0;
+                continue;
+            }
+            *run += 1;
+            if *run >= LOOP_RUN_MIN.max(p) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// The think span's state in [`Gen`], on a request with a budget or the loop
+/// guard: the budget left while the span is open, the span's close detection
+/// over the generated text (the output's own split is api-side; this instance
+/// only decides when the span closes), the ids of the close, `at` naming the
+/// next of them the loop force-feeds — `close.len()` while the budget holds —
+/// and the loop guard's [`Repeats`].
 struct Think {
-    /// Budget left; the id whose text opens a model-opened span and the id
-    /// whose text closes the span do not spend.
+    /// Budget left, `usize::MAX` without one; the id whose text opens a
+    /// model-opened span and the id whose text closes the span do not spend.
     left: usize,
     split: ThinkSplit,
     close: Vec<u32>,
     at: usize,
+    /// The loop guard, `None` on a request that did not ask for it.
+    repeats: Option<Repeats>,
 }
 
 impl Think {
-    /// A budget of `left` generated ids over a span of `tags` the prompt left
-    /// at `entry`, `close` the ids of `tags.close`; at 0 the close is forced
-    /// from the first taken id inside the span, which for a model-opened span
-    /// is the first after its start tag.
-    fn new(entry: ThinkEntry, tags: ThinkTags, left: usize, close: Vec<u32>) -> Think {
+    /// A budget of `left` generated ids (`None`: no budget) over the span
+    /// `split` reads, `close` the ids of its close tag, and the loop guard
+    /// when `guard`; at 0 the close is forced from the first taken id inside
+    /// the span, which for a model-opened span is the first after its start
+    /// tag.
+    fn new(split: ThinkSplit, left: Option<usize>, close: Vec<u32>, guard: bool) -> Think {
         let n = close.len();
+        let left = left.unwrap_or(usize::MAX);
         Think {
             left,
-            split: ThinkSplit::for_entry_with(entry, tags),
+            split,
             close,
             at: if left == 0 { 0 } else { n },
+            repeats: guard.then(Repeats::new),
         }
     }
 
@@ -1838,8 +1907,8 @@ pub(crate) struct Gen {
     lent: Vec<u32>,
     /// The token the loop takes next; `None` once there is none.
     tok: Option<u32>,
-    /// The think-span budget, `None` on a request without one (or whose prompt
-    /// closed the span) and once the span closed.
+    /// The think-span budget and loop guard, `None` on a request with neither
+    /// (or whose prompt closed the span) and once the span closed.
     think: Option<Think>,
     /// What reads each row and writes the request's probabilities, `None` on
     /// a request that asks for none.
@@ -1950,12 +2019,14 @@ impl Gen {
             taken: 0,
             lent: Vec::new(),
             tok: None,
-            think: p.reasoning_budget.map(|left| {
+            think: (p.reasoning_budget.is_some() || p.reasoning_loop).then(|| {
                 Think::new(
-                    p.think_entry,
-                    p.think,
-                    left,
+                    p.think_split
+                        .clone()
+                        .unwrap_or_else(|| ThinkSplit::for_entry_with(p.think_entry, p.think)),
+                    p.reasoning_budget,
                     slot.vocab.encode(p.think.close),
+                    p.reasoning_loop,
                 )
             }),
             probs,
@@ -2068,27 +2139,31 @@ impl Gen {
         self.think.as_ref().map_or(usize::MAX, |t| t.left)
     }
 
-    /// One taken id against the think budget: its text first — a piece that
-    /// closes the span retires the tracker, the closing id spending nothing,
-    /// and a piece that opens a model-opened span spending nothing either —
-    /// then the count, only for a span already open, which arms the forced
-    /// close at zero.
-    fn spend(&mut self, piece: Option<&str>) {
+    /// One taken id against the think budget and the loop guard: its text
+    /// first — a piece that closes the span retires the tracker, the closing
+    /// id spending nothing, and a piece that opens a model-opened span
+    /// spending nothing either and starting the guard's span after it — then,
+    /// only for a span already open, the count, which arms the forced close
+    /// at zero, and the guard. Whether the guard found a loop.
+    fn spend(&mut self, piece: Option<&str>) -> bool {
         let Some(t) = self.think.as_mut() else {
-            return;
+            return false;
         };
         if let Some(text) = piece {
             let s = t.split.push(text);
-            if s.closed {
+            if s.closed || !s.content.is_empty() {
                 self.think = None;
-                return;
+                return false;
             }
             if s.opened {
-                return;
+                if let Some(r) = t.repeats.as_mut() {
+                    r.from = self.generated.len();
+                }
+                return false;
             }
         }
         if !t.split.in_span() {
-            return;
+            return false;
         }
         if t.left > 0 {
             t.left -= 1;
@@ -2096,6 +2171,10 @@ impl Gen {
                 t.at = 0;
             }
         }
+        t.repeats.as_mut().is_some_and(|r| {
+            let from = r.from;
+            r.looped(&self.generated[from..])
+        })
     }
 
     /// The prompt on the selected slot: what the cache keeps of it (`held`),
@@ -2424,8 +2503,12 @@ impl Gen {
                     break;
                 }
             }
-            // The think budget: the text first, then the count.
-            self.spend(piece.as_deref());
+            // The think budget and the loop guard: the text first, then the
+            // count and the guard, whose loop ends the generation here.
+            if self.spend(piece.as_deref()) {
+                self.stop = StopKind::Loop;
+                break;
+            }
             if self.generated.len() >= self.budget {
                 break;
             }
@@ -3169,8 +3252,10 @@ mod cache_tests {
             include_usage: false,
             cache_prompt: true,
             reasoning_budget: None,
+            reasoning_loop: false,
             think_entry: ThinkEntry::Closed,
             think: ThinkTags::THINK,
+            think_split: None,
             logprobs: None,
             constraint: None,
             logit_bias: Vec::new(),
@@ -3336,8 +3421,10 @@ mod cache_tests {
             include_usage: false,
             cache_prompt: true,
             reasoning_budget: None,
+            reasoning_loop: false,
             think_entry: ThinkEntry::Closed,
             think: ThinkTags::THINK,
+            think_split: None,
             logprobs: None,
             constraint: None,
             logit_bias: Vec::new(),
@@ -3439,8 +3526,10 @@ mod cache_tests {
             include_usage: false,
             cache_prompt: true,
             reasoning_budget: None,
+            reasoning_loop: false,
             think_entry: ThinkEntry::Closed,
             think: ThinkTags::THINK,
+            think_split: None,
             logprobs: None,
             constraint: None,
             logit_bias: Vec::new(),
@@ -3480,8 +3569,10 @@ mod cache_tests {
             include_usage: false,
             cache_prompt: true,
             reasoning_budget: None,
+            reasoning_loop: false,
             think_entry: ThinkEntry::Closed,
             think: ThinkTags::THINK,
+            think_split: None,
             logprobs: Some(Ask::new(2, MockTokenizer.n_vocab())),
             constraint: None,
             logit_bias: Vec::new(),
@@ -4078,8 +4169,10 @@ mod media_tests {
             include_usage: false,
             cache_prompt: true,
             reasoning_budget: None,
+            reasoning_loop: false,
             think_entry: ThinkEntry::Closed,
             think: ThinkTags::THINK,
+            think_split: None,
             logprobs: None,
             constraint: None,
             logit_bias: Vec::new(),
@@ -4310,7 +4403,7 @@ mod slot_tests {
 mod think_tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{GenParams, Outcome, Slot, StopKind, Timings, generate};
+    use super::{GenParams, LOOP_RUN_MIN, Outcome, Repeats, Slot, StopKind, Timings, generate};
     use crate::engine::{Drafted, Engine, EngineError, SamplingParams, Tokenizer};
     use crate::mock::{DraftMock, MockEngine, MockTokenizer};
     use crate::reasoning::{ThinkEntry, ThinkTags};
@@ -4366,13 +4459,22 @@ mod think_tests {
         prompt: &str,
         budget: Option<usize>,
     ) -> (Vec<u32>, Outcome) {
+        run_with(inner, prompt, |p| p.reasoning_budget = budget)
+    }
+
+    /// [`run_on`] with the request's parameters as `set` leaves them.
+    fn run_with<E: Engine + 'static>(
+        inner: E,
+        prompt: &str,
+        set: impl FnOnce(&mut GenParams),
+    ) -> (Vec<u32>, Outcome) {
         let fed = Arc::new(Mutex::new(Vec::new()));
         let mut slot = Slot::new(Box::new(Fed {
             inner,
             fed: Arc::clone(&fed),
         }));
         let ids = MockTokenizer.encode(prompt);
-        let p = GenParams {
+        let mut p = GenParams {
             n_predict: 8,
             sampling: SamplingParams {
                 temperature: 0.0,
@@ -4385,13 +4487,16 @@ mod think_tests {
             return_progress: false,
             include_usage: false,
             cache_prompt: true,
-            reasoning_budget: budget,
+            reasoning_budget: None,
+            reasoning_loop: false,
             think_entry: ThinkEntry::of_prompt(prompt),
             think: ThinkTags::THINK,
+            think_split: None,
             logprobs: None,
             constraint: None,
             logit_bias: Vec::new(),
         };
+        set(&mut p);
         let mut tim = Timings::default();
         let o = generate(
             &mut slot,
@@ -4499,6 +4604,77 @@ mod think_tests {
         let (fed, o) = run("x<think>yx", Some(0));
         assert_eq!(o.tokens, vec![4, CLOSE, MockTokenizer.eos()]);
         assert_eq!(fed, vec![X, 4, Y, X, 4, CLOSE]);
+    }
+
+    /// The loop guard over a span of at most 1024 ids, on `inner`.
+    fn guarded<E: Engine + 'static>(inner: E, prompt: &str, on: bool) -> Outcome {
+        run_with(inner, prompt, |p| {
+            p.n_predict = 1024;
+            p.reasoning_loop = on;
+        })
+        .1
+    }
+
+    /// The guard ends a span that repeats `a`, `<think>`: the run of period 2
+    /// reaches [`LOOP_RUN_MIN`] at the 258th id, which ends the generation
+    /// with its text out, on a drafting engine too, whose pass's ids past it
+    /// are dropped. Unguarded, the span runs to the limit. A span the model
+    /// opens is read after its start tag: `y`, `x`, `<think>` repeat from the
+    /// second id, so its loop ends one id later than a read from the first.
+    #[test]
+    fn the_loop_guard_ends_a_span_that_repeats_a_cycle() {
+        let prompt = "q<think>aa<think>";
+        for o in [
+            guarded(MockEngine::new(4096), prompt, true),
+            guarded(DraftMock::new(4096), prompt, true),
+        ] {
+            assert_eq!((o.stop, o.tokens.len()), (StopKind::Loop, LOOP_RUN_MIN + 2));
+            assert_eq!(o.content, "a<think>".repeat(LOOP_RUN_MIN / 2 + 1));
+        }
+        let free = guarded(MockEngine::new(4096), prompt, false);
+        assert_eq!((free.stop, free.tokens.len()), (StopKind::Limit, 1024));
+        let opened = guarded(MockEngine::new(4096), "x<think>yx", true);
+        assert_eq!(&opened.tokens[..4], [4, Y, X, 4]);
+        assert_eq!(
+            (opened.stop, opened.tokens.len()),
+            (StopKind::Loop, 1 + LOOP_RUN_MIN + 3)
+        );
+    }
+
+    /// A cycle after the span closed is the answer's: the model closes the
+    /// span on its first id, then repeats `a`, `b`, `<think>`, `</think>` to
+    /// the limit.
+    #[test]
+    fn the_loop_guard_leaves_the_answer_alone() {
+        let o = guarded(MockEngine::new(4096), "z<think></think>abab<think>", true);
+        assert_eq!(o.tokens[0], CLOSE);
+        assert_eq!((o.stop, o.tokens.len()), (StopKind::Limit, 1024));
+    }
+
+    /// A cycle longer than [`LOOP_RUN_MIN`] is a loop once two whole copies
+    /// stand: 300 distinct ids twice end in a loop at the 600th id, not
+    /// before. One id repeated is a loop at [`LOOP_RUN_MIN`] + 1 ids; repeats
+    /// that are not in a row are none.
+    #[test]
+    fn a_loop_holds_two_copies_of_its_cycle() {
+        let first = |ids: &[u32]| {
+            let mut r = Repeats::new();
+            (1..=ids.len()).find(|&n| r.looped(&ids[..n]))
+        };
+        let long: Vec<u32> = (0..300).chain(0..300).chain(0..300).collect();
+        assert_eq!(first(&long), Some(600));
+        assert_eq!(first(&[7; 400]), Some(LOOP_RUN_MIN + 1));
+        assert_eq!(first(&long[..599]), None);
+        let at_limit: Vec<u32> = (0..1024).chain(0..1024).collect();
+        assert_eq!(first(&at_limit), Some(2048));
+        let past_limit: Vec<u32> = (0..1025).chain(0..1025).collect();
+        assert_eq!(first(&past_limit), None);
+        let sparse: Vec<u32> = (0..300).flat_map(|k| [3 * k, 3 * k, 3 * k + 1]).collect();
+        assert_eq!(
+            first(&sparse),
+            None,
+            "300 repeats of period 1, never 2 in a row"
+        );
     }
 }
 
@@ -4628,8 +4804,10 @@ mod sampled_tests {
                 include_usage: false,
                 cache_prompt: true,
                 reasoning_budget: None,
+                reasoning_loop: false,
                 think_entry: ThinkEntry::Closed,
                 think: ThinkTags::THINK,
+                think_split: None,
                 logprobs: None,
                 constraint: None,
                 logit_bias: Vec::new(),
