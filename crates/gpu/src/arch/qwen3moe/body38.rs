@@ -88,8 +88,10 @@
 //! media call is eager and runs every unit as a ubatch ([`Prompt38::Gemm`]):
 //! each unit's first layer copies the rows of the spans inside it over the
 //! embeddings of their positions (`image::MediaRows`), and the PLE hash takes
-//! the image placeholder inside a span only. A load that carries the MTP
-//! draft is refused by name.
+//! the image placeholder inside a span only. The MTP draft's walks read the
+//! table of the sequence they walk, as the target's do: its store walks over
+//! a media call's units take a span's rows in place of their positions'
+//! embeddings (`Mtp38::store_rows`), its keys turn by the image's positions.
 //!
 //! The PLE rows are the host's: each position's n-gram hash
 //! (`engram::Hash::ple_rows_into`) names 16 rows of the table, which stays in
@@ -2433,6 +2435,14 @@ impl Body38 {
         geo::STREAMS * geo::HIDDEN
     }
 
+    /// The values of one embedding row, [`geo::HIDDEN`]: the width of a media
+    /// span's rows, which stand in for a position's embedding in the target
+    /// and in the MTP draft's store walks.
+    #[must_use]
+    pub fn embed_width(&self) -> usize {
+        geo::HIDDEN
+    }
+
     fn draft_mut(&mut self) -> Result<&mut Mtp38, GpuError> {
         self.mtp.as_mut().ok_or(GpuError::state(
             WHAT,
@@ -2460,6 +2470,7 @@ impl Body38 {
             mtp,
             k,
             rope,
+            seq_rope,
             eps,
             plans,
             s,
@@ -2474,7 +2485,7 @@ impl Body38 {
         ))?;
         let target = mtp_target(plans, [s, a, wa], wrote, feed);
         d.run(
-            &mtp_ctx(gpu, w, k, *eps, &rope.table),
+            &mtp_ctx(gpu, w, k, *eps, rope_table(rope, seq_rope.as_ref())),
             target,
             feed,
             head,
@@ -2496,6 +2507,7 @@ impl Body38 {
             mtp,
             k,
             rope,
+            seq_rope,
             eps,
             plans,
             s,
@@ -2510,7 +2522,7 @@ impl Body38 {
         ))?;
         let target = mtp_target(plans, [s, a, wa], wrote, feed);
         d.run_walk(
-            &mtp_ctx(gpu, w, k, *eps, &rope.table),
+            &mtp_ctx(gpu, w, k, *eps, rope_table(rope, seq_rope.as_ref())),
             target,
             feed,
             head,
@@ -2528,13 +2540,21 @@ impl Body38 {
         f: impl FnOnce(&mut Mtp38, &MtpCtx<'_>) -> Result<T, GpuError>,
     ) -> Result<T, GpuError> {
         let Body38 {
-            mtp, k, rope, eps, ..
+            mtp,
+            k,
+            rope,
+            seq_rope,
+            eps,
+            ..
         } = self;
         let d = mtp.as_mut().ok_or(GpuError::state(
             WHAT,
             "an MTP draft (Body38::open_placed_mtp)",
         ))?;
-        f(d, &mtp_ctx(gpu, w, k, *eps, &rope.table))
+        f(
+            d,
+            &mtp_ctx(gpu, w, k, *eps, rope_table(rope, seq_rope.as_ref())),
+        )
     }
 
     /// One window's chain of the draft's program ([`Mtp38::run_chain`])
@@ -2552,6 +2572,7 @@ impl Body38 {
             mtp,
             k,
             rope,
+            seq_rope,
             eps,
             plans,
             s,
@@ -2566,7 +2587,7 @@ impl Body38 {
         ))?;
         let target = mtp_target(plans, [s, a, wa], wrote, refresh);
         d.run_chain(
-            &mtp_ctx(gpu, w, k, *eps, &rope.table),
+            &mtp_ctx(gpu, w, k, *eps, rope_table(rope, seq_rope.as_ref())),
             target,
             refresh,
             own,
@@ -4651,6 +4672,18 @@ impl GpuModel<Body38> {
         Ok(next)
     }
 
+    /// Prepare the media call's rotation table and span staging before `run`, and finish
+    /// both after it. The draft joins inside this frame, so its first key uses the image's
+    /// rotations even when a continuing call starts with an image.
+    pub fn media38_frame<T>(
+        &mut self,
+        ids: &[u32],
+        spans: &[ImageSpan<'_>],
+        run: impl FnOnce(&mut Self) -> Result<T, GpuError>,
+    ) -> Result<T, GpuError> {
+        media_call(self, "qwen4exp prompt_media", (ids, spans), |_| Ok(()), run)
+    }
+
     /// [`GpuModel::prompt38_with`] on [`Prompt38::Gemm`] inside the
     /// residency pass its caller opened and keeps (`prompt_pass`: a media
     /// call, which the session wraps as it wraps every body's prompt call):
@@ -5095,7 +5128,10 @@ fn mtp_target<'b>(
     }
 }
 
-/// The draft's context over the body's own pieces.
+/// The draft's context over the body's own pieces, `table` the rotation
+/// table the live sequence's rope launches read ([`rope_table`]): a media
+/// load's own, so the draft's keys turn by an image's positions as the
+/// target's do.
 fn mtp_ctx<'a>(
     gpu: &'a Gpu,
     w: &'a Weights,
@@ -5516,7 +5552,7 @@ impl MediaCarrier for Body38 {
     const VIA: &'static str = "GpuModel::enable_media";
 
     fn width(&self) -> usize {
-        geo::HIDDEN
+        self.embed_width()
     }
 
     fn seq_rope(&self) -> Option<&SeqRope> {
@@ -5536,17 +5572,29 @@ impl GpuModel<Body38> {
     /// of a media call's spans in place of their positions' embeddings
     /// ([`MediaBody::prefill_media`]). The tables start as the load's plain
     /// one; a captured chain bakes the table's address, so the table is
-    /// made before the first capture. Refused by name: a second call, a
-    /// file with no attention layer rotating by IMROPE sections, a load
-    /// that carries the MTP draft (its walks read the load's plain table),
-    /// more than one slot, a captured chain, and a model that has run a
-    /// call.
+    /// made before the first capture. The MTP draft's walks read the same
+    /// table as the target's (`mtp_ctx`), each sequence's walks
+    /// captured over its own. Refused by name: a second call, a draft that
+    /// has captured a walk (before or after a reset), a file with no
+    /// attention layer rotating by IMROPE sections, more than one slot, a
+    /// captured chain, and a model that has run a call.
     pub fn enable_media(&mut self) -> Result<(), GpuError> {
         const WHAT_E: &str = "qwen4exp enable_media";
         let (slots, captured, pos) = (self.slots(), self.has_capture(), self.pos());
         let (gpu, _, body) = self.body_parts(WHAT_E)?;
         if body.seq_rope.is_some() {
             return Err(GpuError::state(WHAT_E, "a load that takes no media yet"));
+        }
+        if body
+            .mtp
+            .as_ref()
+            .is_some_and(|d| !d.graph_nodes().is_empty())
+        {
+            return Err(GpuError::state(
+                WHAT_E,
+                "a load whose MTP draft has no captured walks: a captured walk bakes the \
+                 rotation table's address, and the captures stay with the load through a reset",
+            ));
         }
         let Some((sections, order)) = body.imrope else {
             return Err(GpuError::shape(
@@ -5555,13 +5603,6 @@ impl GpuModel<Body38> {
                  have no sections to follow",
             ));
         };
-        if body.mtp.is_some() {
-            return Err(GpuError::shape(
-                WHAT_E,
-                "a media load that carries the MTP draft: the draft's walks read the load's plain \
-                 rotation table, which an image's positions shift",
-            ));
-        }
         if slots != 1 {
             return Err(GpuError::shape(
                 WHAT_E,

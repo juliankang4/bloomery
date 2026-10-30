@@ -1198,8 +1198,7 @@ mod gate {
     }
 
     /// A server on the Qwen3.8 seat of `bloomery-serve` with `extra` flags, its stderr and stdout under
-    /// `dir`, its draft and residency off (an image load carries no draft); its address once it listens,
-    /// else the failure.
+    /// `dir`, its draft and residency off; its address once it listens, else the failure.
     fn start(dir: &Path, path: &Path, extra: &[&str]) -> Result<(Served, String), GateError> {
         std::fs::create_dir_all(dir)?;
         let model = path.to_str().ok_or("the model path is not UTF-8")?;

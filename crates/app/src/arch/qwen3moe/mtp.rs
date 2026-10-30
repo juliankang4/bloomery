@@ -6,6 +6,7 @@
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::{Body38, Mtp38, Prompt38, Qwen38Model, TargetRows};
 use bloomery_gpu::draft::{DraftFeed, WalkBounds};
+use bloomery_gpu::media::ImageSpan;
 use bloomery_gpu::model::Rows;
 
 use super::WHAT;
@@ -42,6 +43,12 @@ impl MtpBody for Body38 {
         Ok(m.body(WHAT)?.mtp_tap_width())
     }
 
+    /// One row of the model's width ([`Body38::embed_width`]): a hidden row
+    /// is four streams of it.
+    fn embed_width(m: &Qwen38Model) -> Result<usize, GpuError> {
+        Ok(m.body(WHAT)?.embed_width())
+    }
+
     /// [`Mtp38::held`]; 0 on a load without the layer.
     fn held(m: &Qwen38Model) -> Result<usize, GpuError> {
         Ok(m.body(WHAT)?.mtp().map_or(0, Mtp38::held))
@@ -63,6 +70,26 @@ impl MtpBody for Body38 {
         sink: Option<&mut UnitSink<'_, Body38>>,
     ) -> Result<(), GpuError> {
         m.prefill38_with(ids, path, sink)
+    }
+
+    fn media_frame(
+        m: &mut Qwen38Model,
+        ids: &[u32],
+        spans: &[ImageSpan<'_>],
+        run: impl FnOnce(&mut Qwen38Model) -> Result<u32, GpuError>,
+    ) -> Result<u32, GpuError> {
+        m.media38_frame(ids, spans, run)
+    }
+
+    /// The target's ubatch call inside `media_frame`: its rotations and span rows are
+    /// already installed before the draft's join and remain live through every unit.
+    fn prompt_media_with(
+        m: &mut Qwen38Model,
+        ids: &[u32],
+        _spans: &[ImageSpan<'_>],
+        sink: Option<&mut UnitSink<'_, Body38>>,
+    ) -> Result<u32, GpuError> {
+        m.prompt38_with(ids, Prompt38::Gemm, sink)
     }
 
     fn walk(

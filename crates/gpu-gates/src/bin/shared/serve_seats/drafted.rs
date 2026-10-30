@@ -636,10 +636,6 @@ where
     /// span's positions included), then its join record; without it, or while
     /// it is off, the session's ([`Session::prompt_media`]).
     #[cfg(feature = "vision")]
-    #[allow(
-        dead_code,
-        reason = "only the GLM seat's media call names it; the qwen38 serving binary compiles this file without that seat"
-    )]
     pub(crate) fn prefill_media(
         &mut self,
         s: &mut Session<B>,

@@ -2455,8 +2455,8 @@ pub enum Draft38Off {
     /// machine's drive scaling with the queue depth a verify's fills run
     /// at); a set [`DRAFT`] runs.
     Paged { arena: u64 },
-    /// Unset on the Qwen3.8 seat beside `--mmproj`: an image load gives every
-    /// sequence a rotation table the draft's walks do not read, so it carries
+    /// Unset on the Qwen3.5 seat beside `--mmproj`: an image load gives every
+    /// sequence a rotation table that draft's walks do not read, so it carries
     /// no draft; a set [`DRAFT`]`=mtp` is refused.
     Media,
     /// Unset on the Qwen3.8 seat serving a checkpoint folder without an MTP layer;

@@ -188,11 +188,6 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
         self.skip = None;
     }
 
-    /// Values of one hidden row a walk reads.
-    pub(super) fn hidden_width(&self) -> usize {
-        self.zeros.len()
-    }
-
     pub(super) fn skipping(&self) -> bool {
         self.skip.is_some()
     }
