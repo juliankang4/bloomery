@@ -10,6 +10,7 @@ use super::machine::{
 use super::refusal::{PlacementError, Violation};
 use super::table::{Row, Segment};
 use super::{CardFormat, Role};
+use crate::kernels;
 
 /// Which card runs each layer, which ends with the head, and which holds
 /// the token embedding when one does.
@@ -443,6 +444,7 @@ pub(super) fn routed_row_on_as(
         }
     }
     if !host.is_empty() {
+        host_runs(t, &host)?;
         // The host dots an nvfp4 stack's file blocks with its scales; a card
         // holds them as planes, and a residency swap copies file bytes into a
         // card slot, so one stack is not split between the two.
@@ -464,6 +466,20 @@ pub(super) fn routed_row_on_as(
         segments,
         read_bytes: file_per_expert * model.experts_used,
         stage,
+    })
+}
+
+/// Refused by name unless the host tier runs routed stack `t`, whose experts `host` the host
+/// would serve ([`kernels::host_stack`] at its row width).
+fn host_runs(t: &ModelTensor, host: &ExpertList) -> Result<(), PlacementError> {
+    // A width past usize is no whole number of any row unit: the rule refuses it.
+    let k = usize::try_from(t.dims.first().copied().unwrap_or(0)).unwrap_or(usize::MAX);
+    kernels::host_stack(t.ty, k).map_err(|why| PlacementError::NoHostKernel {
+        name: t.name.clone(),
+        ty: t.ty,
+        k,
+        experts: host.to_string(),
+        why,
     })
 }
 

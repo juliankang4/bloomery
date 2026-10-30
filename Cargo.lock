@@ -482,6 +482,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-levers",
  "bloomery-models",
+ "bloomery-qdot",
  "bloomery-runtime",
  "thiserror",
 ]

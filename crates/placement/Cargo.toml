@@ -18,5 +18,7 @@ workspace = true
 bloomery-gguf = { path = "../gguf" }
 bloomery-levers = { path = "../levers" }
 bloomery-models = { path = "../models" }
+# The host tier's kernels: whether the host runs a routed stack it would hold (`kernels::host_stack`).
+bloomery-qdot = { path = "../qdot" }
 bloomery-runtime = { path = "../runtime" }
 thiserror = { workspace = true }

@@ -56,7 +56,7 @@ mod tests {
 
     use super::super::hparams::tests::{keys, tensors};
     use super::{KvLayout, PlaceError, PlanInputs, VERIFY_LANES};
-    use crate::arch::synthetic::{V, header_shaped};
+    use crate::arch::synthetic::{V, header_shaped, host_run_experts};
     use crate::placement::{KvBytes, PlacementError, PlanLevers, workstation};
 
     /// The small header's file, opened; each test names its own file (the tests run in threads of
@@ -74,7 +74,10 @@ mod tests {
 
     /// The small header's file, described.
     fn described(name: &str) -> PlanInputs {
-        PlanInputs::describe(&opened(name)).expect("the synthetic header describes")
+        let mut inputs =
+            PlanInputs::describe(&opened(name)).expect("the synthetic header describes");
+        host_run_experts(&mut inputs.model);
+        inputs
     }
 
     /// A card's kv class is the layers' stores [derived from the header's widths, apart from the

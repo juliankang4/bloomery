@@ -2995,7 +2995,7 @@ mod tests {
                 } else if n.starts_with("blk.2.ffn_") && n.ends_with("_exps.weight") {
                     (n, vec![64, 1, 8], Ty::Nvfp4)
                 } else if n.contains(".ffn_") && n.ends_with("_exps.weight") {
-                    (n, vec![64, 1, 8], Ty::F32)
+                    (n, vec![64, 1, 8], Ty::Q8_0)
                 } else if n.ends_with(".attn_q.weight") {
                     // The query projection writes each of the 4 heads' 16
                     // values and its gate beside them.

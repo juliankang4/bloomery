@@ -98,6 +98,26 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
     ty.card().embed
 }
 
+/// Whether the host tier runs a routed stack of type `ty` whose rows contract `k` values: the
+/// host's side of the executor facts the card's entries above state. The host union's passes
+/// run fused rows only, so `ty` needs a fused kernel on this machine ([`qdot::supports`], its ISA
+/// included) and `k` whole units of its row ([`qdot::fuses`]); `Err` names which is missing.
+/// Holding a stack's bytes is no such fact. The plan's split
+/// ([`crate::placement::routed_row_on`]) and the host tier's load
+/// (`model::ops::host_stack_runs`) ask this one rule.
+pub fn host_stack(ty: GgmlType, k: usize) -> Result<(), qdot::QdotError> {
+    if !qdot::supports(ty) {
+        return Err(qdot::QdotError::UnsupportedType(ty));
+    }
+    if !qdot::fuses(ty, k) {
+        return Err(qdot::QdotError::UnalignedK {
+            k,
+            gran: qdot::k_granularity(ty),
+        });
+    }
+    Ok(())
+}
+
 /// The card bytes of the q8_1 activation of `cols` columns of `k` values
 /// ([`DownAct::Q8Act`], [`SiteAct::Q8x128`]): the five planes at `n_sb = k / 256`
 /// super-blocks a column — the codes at the q3 (`8 · 64 · ceil(n_sb / 2)`

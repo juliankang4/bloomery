@@ -1200,6 +1200,20 @@ pub(crate) mod synthetic {
         let _ = std::fs::remove_file(&path);
         got
     }
+
+    /// `model`'s routed stacks as rows a host kernel runs: Q8_0, each row widened to whole
+    /// 32-value blocks, its bytes that type's. A shaped header's routed stacks are F32 rows of a
+    /// few values, which no host kernel runs, so a plan that holds any expert on the host
+    /// refuses them by name.
+    pub(crate) fn host_run_experts(model: &mut crate::placement::ModelTensors) {
+        for t in &mut model.tensors {
+            if t.role == crate::placement::Role::RoutedExperts {
+                t.ty = gguf::GgmlType::Q8_0;
+                t.dims[0] = t.dims[0].next_multiple_of(32);
+                t.file_bytes = t.dims.iter().product::<u64>() / 32 * 34;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

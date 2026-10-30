@@ -5058,9 +5058,9 @@ impl<'p> UnionPlanView<'p> {
 }
 
 /// Whether the host tier runs a routed stack of type `ty` whose rows contract
-/// `k` values: the union's passes run fused rows only, so `ty` needs a fused
-/// kernel on this machine ([`qdot::supports`]) and `k` whole units of its row
-/// ([`qdot::fuses`]). Otherwise [`crate::ModelError::HostStack`], naming
+/// `k` values, by the rule the plan's split asks too
+/// ([`crate::placement::kernels::host_stack`]). Otherwise
+/// [`crate::ModelError::HostStack`], naming
 /// `what`, the stack `tensor`, its type and `k`, which every expert of the
 /// stack shares. The one check [`UnionStack::of`] makes of a stack, and the
 /// one a load that hands a layer to the host tier asks before it uploads. A
@@ -5075,23 +5075,13 @@ pub fn host_stack_runs(
     if ty == GgmlType::Q4_K {
         let _ = qdot::q4k_avx512();
     }
-    let refusal = |why: qdot::QdotError| crate::ModelError::HostStack {
+    crate::placement::kernels::host_stack(ty, k).map_err(|why| crate::ModelError::HostStack {
         what,
         tensor: tensor.to_owned(),
         ty,
         k,
         why,
-    };
-    if !qdot::supports(ty) {
-        return Err(refusal(qdot::QdotError::UnsupportedType(ty)));
-    }
-    if !qdot::fuses(ty, k) {
-        return Err(refusal(qdot::QdotError::UnalignedK {
-            k,
-            gran: qdot::k_granularity(ty),
-        }));
-    }
-    Ok(())
+    })
 }
 
 /// The form of a layer's routed experts — which stacks the layer holds and

@@ -354,7 +354,7 @@ mod tests {
 mod planning_tests {
     use super::super::tests::{check, keys, tensors};
     use super::*;
-    use crate::arch::synthetic::V;
+    use crate::arch::synthetic::{V, host_run_experts};
     use crate::placement::{PlanLevers, Role};
 
     #[test]
@@ -435,10 +435,11 @@ mod planning_tests {
         }
         let read = check("place-paging", &keys, &ts).unwrap();
         let mut inputs = PlanInputs::new("Flint", (), read.tensors, read.spec).unwrap();
+        host_run_experts(&mut inputs.model);
         for tensor in &mut inputs.model.tensors {
             if tensor.role == Role::RoutedExperts {
-                tensor.dims[1] *= 4096;
-                tensor.file_bytes *= 4096;
+                tensor.dims[1] *= 32_768;
+                tensor.file_bytes *= 32_768;
             }
         }
         inputs.prompt_reserve =

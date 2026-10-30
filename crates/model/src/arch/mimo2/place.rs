@@ -210,7 +210,7 @@ mod tests {
         PROMPT_ROWS, PlaceError, PlanInputs, TIER_CHUNK, prompt_reserve_bytes, prompt_shared_bytes,
         prompt_unit_bytes, tier_batch, tier_reserve_bytes,
     };
-    use crate::arch::synthetic::{V, header_shaped};
+    use crate::arch::synthetic::{V, header_shaped, host_run_experts};
     use crate::placement::{KvBytes, PlacementError, PlanLevers, workstation};
 
     /// A file whose next-token layers carry tensors is refused at
@@ -339,8 +339,9 @@ mod tests {
             ];
             let path = header_shaped(tag, "mimo2", kv, &global, &tensors());
             let split = Split::open(&path).expect("the synthetic header opens");
-            let inputs = PlanInputs::describe(&split).expect("the synthetic header describes");
+            let mut inputs = PlanInputs::describe(&split).expect("the synthetic header describes");
             let _ = std::fs::remove_file(&path);
+            host_run_experts(&mut inputs.model);
             inputs
         };
         let two = describe("mimo2-rope-two", &keys());
