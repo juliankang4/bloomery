@@ -312,7 +312,7 @@ and `--head-config` (the decide seat), the embedding side model (`--embd-*`, the
 llama-server's placement flags ([Placement](#placement); not on the decide seat), `--config`
 ([The settings file](#the-settings-file)), `--levers`, `--list-devices` and `--version`. The seat parses every other
 flag. Every generative seat takes this common set: `--host`, `--port`,
-`--ctx` (`--ctx-size`, `-c`), `--parallel` (`-np`), `--place`, `--plan`, `--queue-depth`, `--chat-template-file`,
+`--ctx` (`--ctx-size`, `-c`), `--parallel` (`-np`), `--slot-ctx`, `--place`, `--plan`, `--queue-depth`, `--chat-template-file`,
 `--api-key`, `--api-key-file`, `--alias` and `--slot-save-path`, and the qwen3 seat refuses the last two. The table
 gives what differs. A flag the seat named by `--model` does not take is refused by name with the seat's usage, before `--hf`
 downloads anything; `bloomery-serve --model <seat> --help` prints that usage.
@@ -321,7 +321,7 @@ downloads anything; `bloomery-serve --model <seat> --help` prints that usage.
 |---|---|---|---|---|---|
 | `ds41` | N | yes | no | yes | |
 | `glm` | N | yes | no | yes | `--prefill batch\|steps` |
-| `qwen38` | N | yes | 1 to 4096 | yes ² | `--cache-type-k f16\|q8_0` |
+| `qwen38` | N or `auto` | yes | 1 to 4096 | yes ² | `--cache-type-k f16\|q8_0` |
 | `qwen3` | N | no | a file with no routed expert ³ | yes | `--cache-type-k f16\|q8_0` |
 | `mimo2` | N | yes | no | no | `--prefill batch\|steps` |
 | `minimaxm3` | N | yes | no | no | |
@@ -330,7 +330,9 @@ downloads anything; `bloomery-serve --model <seat> --help` prints that usage.
 | `solar2`, `nemotron`, `raon1` | 1 | no | no | no | |
 | `decide` | no (one request at a time) | no | yes | Clef only | `--head`, `--head-config`; it takes only `--host`, `--port`, `--ctx`, `-ub`, the key flags and the image flags |
 
-`N` is any count, 1 by default; `1` is the seat's one slot, and `--parallel` above 1 is refused by name. `--mmproj`
+`N` is any count, 1 by default; `1` is the seat's one slot, and `--parallel` above 1 is refused by name. `auto`
+counts the slots from memory ("Concurrent requests" in [The seats](#the-seats)); every other seat refuses `--parallel auto`
+by name. `--mmproj`
 stands for the image flags together (`--no-mmproj`, `--image-min-tokens`, `--image-max-tokens`; Image input, below).
 `--park-ram` is refused by name on every seat that reads it (ds41, glm, qwen3, qwen38): their slots are resident
 sequences. The short spellings `-c`, `-np`, `-ub`, `-a`, `-mm` and `-cram` are the long flags
@@ -707,6 +709,20 @@ the placement follows every stream's passes (see [Limits](#limits)). Under more 
 llama-server splits it with `-np N` and no `-kvu`: a set `--ctx-size` is the total and each slot holds `total / N`
 rows, on V4.1 the same way; with no context named, each slot holds the default's choice (the largest context the plan of N slots holds, on Qwen3.8 one that also leaves the residency its experts, above) and the total is that times N.
 `--parallel 1` keeps one sequence with the whole context.
+
+`--slot-ctx S` sets one request's context apart from the count: `--parallel 4 --slot-ctx 32768` serves four slots of
+32,768 positions each, the same load as `--parallel 4 --ctx-size 131072`. Alone it serves one slot of `S`, and beside
+`--ctx-size` it is refused by name, since one would name the total and the other a slot's share. On the command
+line it replaces `LLAMA_ARG_CTX_SIZE` and a settings file's `ctx-size`, as `--ctx-size` does. Every seat that takes
+`--parallel` takes it.
+
+`--parallel auto` (the qwen38 seat) picks the count from memory: the most slots, up to 8, whose plan holds one
+request's context. That context is `--slot-ctx` when set. Unset, it is the context one slot's default takes, when
+that is the model's limit; where one slot already has to fit under the limit, auto serves one slot. The placement and
+the draft are chosen at one slot first, so auto counts the slots that load holds. A `--slot-ctx` that not even one
+slot holds is refused by name, as `--parallel 1 --slot-ctx S` would be. `--parallel auto` beside `--ctx-size` (or its
+variable or file entry) is refused by name, and under `BLOOMERY_ROUTE_TRACE` it serves one slot. The `parallel` line names the count it chose
+with `from=auto`. The default stays one slot; auto is never chosen for you.
 The plan counts every slot, so the slots' caches together never pass what it holds, and `--park-ram` is refused by
 name. A new request's prompt runs in one call between rounds, and the other streams wait for it.
 

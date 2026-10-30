@@ -165,6 +165,8 @@ pub enum SlotsFrom {
     RouteTrace,
     /// The DSpark draft's window is one sequence's, so one slot is served.
     Dspark,
+    /// `--parallel auto`: the most slots the plan holds at one request's context.
+    Auto,
 }
 
 impl SlotsFrom {
@@ -177,6 +179,7 @@ impl SlotsFrom {
             SlotsFrom::Default => "default",
             SlotsFrom::RouteTrace => "route-trace",
             SlotsFrom::Dspark => "dspark",
+            SlotsFrom::Auto => "auto",
         }
     }
 }
@@ -184,6 +187,109 @@ impl SlotsFrom {
 impl std::fmt::Display for SlotsFrom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.word())
+    }
+}
+
+/// `--parallel` (`-np`: a count, or `auto`) and `--slot-ctx` (one request's context) as a
+/// seat's parse takes them ([`SlotFlags::take`]), read beside `--ctx` once the parse ends
+/// ([`SlotFlags::ask`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SlotFlags {
+    parallel: Option<Parallel>,
+    slot_ctx: Option<usize>,
+}
+
+/// `--parallel`'s value.
+#[derive(Clone, Copy, Debug)]
+enum Parallel {
+    Count(usize),
+    Auto,
+}
+
+/// What the slot flags ask beside `--ctx`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotAsk {
+    /// The `--ctx` total the slots split and the `--parallel` count, each `None` where unset:
+    /// `--slot-ctx S` asks a total of `S × N` over `--parallel N`, one slot when it names none.
+    Given {
+        ctx: Option<usize>,
+        parallel: Option<usize>,
+    },
+    /// `--parallel auto`.
+    Auto(AutoSlots),
+}
+
+/// `--parallel auto`: the most slots, up to `ctx_ask::AUTO_MOST`, whose plan holds one
+/// request's context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoSlots {
+    /// `--slot-ctx`; unset, the context one slot's default takes.
+    pub slot_ctx: Option<usize>,
+}
+
+impl SlotFlags {
+    /// Takes `flag` with its value `v` when it is a slot flag (`Ok(true)`); `Ok(false)` leaves
+    /// it to the caller.
+    pub fn take(&mut self, flag: &str, v: &str) -> Result<bool, GateError> {
+        match flag {
+            "--parallel" | "-np" if v == "auto" => self.parallel = Some(Parallel::Auto),
+            "--parallel" | "-np" => {
+                self.parallel = Some(Parallel::Count(serve::flag::number(flag, v)?));
+            }
+            serve::flag::SLOT_CTX => self.slot_ctx = Some(serve::flag::number(flag, v)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// The ask beside `ctx` (`--ctx`, the slots' total). Refused by name: `--parallel 0`,
+    /// `--slot-ctx 0`, `--slot-ctx` beside `--ctx`, `--parallel auto` beside `--ctx`, and a
+    /// total past `usize`. Notes whether `--slot-ctx` was given for the start's refusals
+    /// ([`crate::start::note_slot_ctx`]); each call overwrites the note.
+    pub fn ask(self, ctx: Option<usize>) -> Result<SlotAsk, GateError> {
+        crate::start::note_slot_ctx(self.slot_ctx.is_some());
+        let parallel = match self.parallel {
+            Some(Parallel::Count(0)) => return Err(NoSlot.into()),
+            Some(Parallel::Count(n)) => Some(n),
+            Some(Parallel::Auto) | None => None,
+        };
+        let auto = matches!(self.parallel, Some(Parallel::Auto));
+        match (self.slot_ctx, ctx) {
+            (Some(0), _) => Err("--slot-ctx 0: a slot holds no position".into()),
+            (Some(s), Some(c)) => Err(format!(
+                "--slot-ctx {s} beside --ctx-size {c}: --slot-ctx is one request's context and \
+                 --ctx-size the total the slots split; give one of them"
+            )
+            .into()),
+            (None, Some(c)) if auto => Err(format!(
+                "--parallel auto beside --ctx-size {c}: auto counts the slots one request's \
+                 context leaves room for; give that context as --slot-ctx, not the slots' total"
+            )
+            .into()),
+            (slot_ctx, _) if auto => Ok(SlotAsk::Auto(AutoSlots { slot_ctx })),
+            (Some(s), None) => {
+                let n = parallel.unwrap_or(1);
+                let total = s.checked_mul(n).ok_or_else(|| {
+                    format!("--slot-ctx {s} over --parallel {n}: the total passes usize")
+                })?;
+                Ok(SlotAsk::Given {
+                    ctx: Some(total),
+                    parallel,
+                })
+            }
+            (None, ctx) => Ok(SlotAsk::Given { ctx, parallel }),
+        }
+    }
+
+    /// [`SlotFlags::ask`] for a seat that serves the count `--parallel` names: the `--ctx`
+    /// total and the count, `--parallel auto` refused by name.
+    pub fn given(self, ctx: Option<usize>) -> Result<(Option<usize>, Option<usize>), GateError> {
+        match self.ask(ctx)? {
+            SlotAsk::Given { ctx, parallel } => Ok((ctx, parallel)),
+            SlotAsk::Auto(_) => Err("--parallel auto: this seat serves the count --parallel \
+                 names; the qwen38 seat counts its slots from memory"
+                .into()),
+        }
     }
 }
 
@@ -228,7 +334,7 @@ pub fn slots_of(
 /// The slots a seat serves and what set the count (`from`, as [`slots_of`]
 /// returns it); a set `--ctx` with no
 /// `--parallel` prints the one line that says the flag is one request's
-/// context.
+/// context ([`one_request_line`]).
 pub fn slots_given(
     parallel: Option<usize>,
     ctx: Option<usize>,
@@ -237,12 +343,29 @@ pub fn slots_given(
     let (slots, from) = slots_of(parallel, ctx.is_some(), default)?;
     if from == SlotsFrom::Ctx {
         eprintln!(
-            "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
-             once (they split it)",
-            ctx.unwrap_or_default()
+            "{}",
+            one_request_line(ctx.unwrap_or_default(), crate::start::slot_ctx_noted())
         );
     }
     Ok((slots, from))
+}
+
+/// The line a count of one from a set context ([`SlotsFrom::Ctx`]) prints, naming the context
+/// flag the slot parser read (`per_slot`, as [`crate::start::slot_ctx_noted`] keeps it): N slots
+/// split a `--ctx-size` total, and each takes a whole `--slot-ctx`.
+#[must_use]
+pub fn one_request_line(ctx: usize, per_slot: bool) -> String {
+    if per_slot {
+        format!(
+            "--slot-ctx {ctx} is one request's context; add --parallel N to serve N requests at \
+             once (each takes it)"
+        )
+    } else {
+        format!(
+            "--ctx-size {ctx} is one request's context; add --parallel N to serve N requests at \
+             once (they split it)"
+        )
+    }
 }
 
 /// Checks that an explicit context leaves at least one position in each requested slot.
@@ -292,7 +415,7 @@ pub const DEFAULT_PORT: u16 = 8080;
 /// context (`--ctx`, under every spelling `serve::flag::CTX` lists), the
 /// placement word (`--place`, read by [`place_word`]), the alias, the chat
 /// template file, the slot actions' directory (`--slot-save-path`),
-/// `--parallel` (and `-np`) and `--plan`.
+/// `--parallel` (and `-np`) with `--slot-ctx` ([`SlotFlags`]), and `--plan`.
 pub struct SeatFlags {
     pub host: String,
     pub port: u16,
@@ -317,7 +440,8 @@ impl SeatFlags {
     /// The flags of `args`. A flag that is not one of the common set goes to
     /// `own` with its value: `Ok(true)` took it, `Ok(false)` is an unknown
     /// argument, refused by name with `usage`. `--help` returns `usage` as
-    /// the error; `--ctx 0` and `--parallel 0` are refused by name.
+    /// the error; `--ctx 0`, `--parallel 0` and `--parallel auto` are refused by name
+    /// ([`SlotFlags::given`]).
     pub fn parse(
         args: &[String],
         usage: &str,
@@ -336,6 +460,7 @@ impl SeatFlags {
             api_keys: serve::flag::ApiKeys::default(),
             slot_save_path: None,
         };
+        let mut slots = SlotFlags::default();
         let mut it = args.iter().map(String::as_str);
         while let Some(flag) = it.next() {
             if flag == "--help" || flag == "-h" {
@@ -355,10 +480,10 @@ impl SeatFlags {
                 "--place" => a.place = Some(place_word(v, None)?),
                 "--alias" => a.alias = Some(v.to_owned()),
                 TemplateFile::FLAG => a.template_file.set(v),
-                "--parallel" | "-np" => a.parallel = Some(serve::flag::number(flag, v)?),
                 "--queue-depth" => a.queue_depth = Some(serve::flag::number(flag, v)?),
                 "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
                 f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
+                f if slots.take(f, v)? => {}
                 other => {
                     if !own(other, v)? {
                         return Err(format!("unknown argument {other:?}: {usage}").into());
@@ -366,11 +491,9 @@ impl SeatFlags {
                 }
             }
         }
+        (a.ctx, a.parallel) = slots.given(a.ctx)?;
         if a.ctx == Some(0) {
             return Err("--ctx 0: the stores hold no position".into());
-        }
-        if a.parallel == Some(0) {
-            return Err("--parallel 0: the server serves no slot".into());
         }
         a.template_file.check()?;
         check_slot_ctx(a.ctx, a.parallel)?;
@@ -3798,6 +3921,153 @@ mod tests {
         }
     }
 
+    /// The slot flags beside `--ctx`: `--slot-ctx S` asks `S x N` over `--parallel N` (one
+    /// slot with no count), `--parallel auto` keeps its slot context for the seat, and each
+    /// conflict or zero is refused by name; a seat that serves a count refuses auto.
+    /// Mutants: `--slot-ctx` read as the total, auto beside `--ctx-size` taken as a total.
+    #[test]
+    fn slot_flags_ask_rows() {
+        use super::{AutoSlots, SlotAsk, SlotFlags};
+        let _note = crate::start::slot_note_tests();
+        let ask = |flags: &[(&str, &str)], ctx: Option<usize>| {
+            let mut slots = SlotFlags::default();
+            for (f, v) in flags {
+                assert!(slots.take(f, v).expect("a value"), "{f} is a slot flag");
+            }
+            slots.ask(ctx).map_err(|e| e.to_string())
+        };
+        let given = |ctx, parallel| Ok(SlotAsk::Given { ctx, parallel });
+        let auto = |slot_ctx| Ok(SlotAsk::Auto(AutoSlots { slot_ctx }));
+        assert_eq!(ask(&[], None), given(None, None));
+        assert_eq!(
+            ask(&[("-np", "4")], Some(32_768)),
+            given(Some(32_768), Some(4))
+        );
+        assert_eq!(
+            ask(&[("--parallel", "4"), ("--slot-ctx", "8192")], None),
+            given(Some(32_768), Some(4))
+        );
+        assert_eq!(
+            ask(&[("--slot-ctx", "8192")], None),
+            given(Some(8192), None)
+        );
+        assert_eq!(ask(&[("--parallel", "auto")], None), auto(None));
+        assert_eq!(
+            ask(&[("--slot-ctx", "8192"), ("-np", "auto")], None),
+            auto(Some(8192))
+        );
+        for (flags, ctx, named) in [
+            (&[("--parallel", "0")][..], None, "--parallel 0"),
+            (&[("--slot-ctx", "0")][..], None, "--slot-ctx 0"),
+            (
+                &[("--slot-ctx", "4096")][..],
+                Some(4096),
+                "--slot-ctx 4096 beside --ctx-size",
+            ),
+            (
+                &[("--parallel", "auto")][..],
+                Some(4096),
+                "--parallel auto beside --ctx-size",
+            ),
+            (
+                &[("--parallel", "2"), ("--slot-ctx", &usize::MAX.to_string())][..],
+                None,
+                "passes usize",
+            ),
+        ] {
+            let e = ask(flags, ctx).expect_err("refused");
+            assert!(e.contains(named), "{flags:?}: {e}");
+        }
+        let mut slots = SlotFlags::default();
+        assert!(!slots.take("--ctx-size", "8").expect("not a slot flag"));
+        assert!(slots.take("--parallel", "two").is_err());
+        slots.take("--parallel", "auto").expect("auto");
+        let e = slots.given(None).expect_err("auto refused").to_string();
+        assert!(
+            e.contains("--parallel auto: this seat serves the count"),
+            "{e}"
+        );
+    }
+
+    /// The context flag the parser reads, settings-file values included, is the one
+    /// [`SlotFlags::ask`] notes and the one-request line names; replaying the retry through the
+    /// parser asks the offered context.
+    #[test]
+    fn effective_context_flag_names_the_line_and_replays_the_retry() {
+        use super::{SlotAsk, SlotFlags, one_request_line};
+        let parse = |args: &[String]| {
+            let mut flags = SlotFlags::default();
+            let mut ctx = None;
+            for (flag, value) in crate::llama_launch::serve_args(args) {
+                let value = value.expect("a flag value");
+                if flag == "--ctx-size" {
+                    ctx = Some(value.parse::<usize>().expect("context"));
+                } else {
+                    assert!(flags.take(flag, value).expect("a valid flag"), "{flag}");
+                }
+            }
+            let asked = flags.ask(ctx).expect("compatible slot flags");
+            (crate::start::slot_ctx_noted(), asked)
+        };
+        let _note = crate::start::slot_note_tests();
+        let settings = |args: &[String], json: &str| {
+            crate::serve_config::joined(args, |_| Ok(json.to_owned()))
+                .expect("settings")
+                .0
+        };
+        for (raw, json, flag, offered, asked) in [
+            (
+                &["--config", "retry.json"][..],
+                r#"{"parallel":"auto","slot-ctx":16384}"#,
+                "--slot-ctx",
+                8192,
+                SlotAsk::Auto(super::AutoSlots {
+                    slot_ctx: Some(8192),
+                }),
+            ),
+            (
+                &["--parallel", "auto", "--slot-ctx", "16384"][..],
+                "{}",
+                "--slot-ctx",
+                8192,
+                SlotAsk::Auto(super::AutoSlots {
+                    slot_ctx: Some(8192),
+                }),
+            ),
+            (
+                &["--parallel", "4", "--ctx-size", "65536"][..],
+                "{}",
+                "--ctx-size",
+                32_768,
+                SlotAsk::Given {
+                    ctx: Some(32_768),
+                    parallel: Some(4),
+                },
+            ),
+            (
+                &["--parallel", "4", "--slot-ctx", "16384"][..],
+                "{}",
+                "--slot-ctx",
+                8192,
+                SlotAsk::Given {
+                    ctx: Some(32_768),
+                    parallel: Some(4),
+                },
+            ),
+        ] {
+            let raw: Vec<String> = raw.iter().map(|&a| a.to_owned()).collect();
+            let (per_slot, _) = parse(&settings(&raw, json));
+            assert_eq!(per_slot, flag == "--slot-ctx", "{raw:?}");
+            assert!(
+                one_request_line(offered, per_slot).starts_with(flag),
+                "{raw:?}"
+            );
+            let (_, mut retried) = crate::llama_launch::take_serve_args(&raw, &[flag]);
+            retried.extend([flag.to_owned(), offered.to_string()]);
+            assert_eq!(parse(&settings(&retried, json)).1, asked, "{raw:?}");
+        }
+    }
+
     /// The `from=` words are read as text by the gates: each variant prints
     /// its word, `Display` and [`SlotsFrom::word`] alike, and no two are one.
     #[test]
@@ -3809,6 +4079,7 @@ mod tests {
             (SlotsFrom::Default, "default"),
             (SlotsFrom::RouteTrace, "route-trace"),
             (SlotsFrom::Dspark, "dspark"),
+            (SlotsFrom::Auto, "auto"),
         ];
         for (from, word) in words {
             assert_eq!(from.word(), word);
@@ -3952,6 +4223,7 @@ mod tests {
     fn the_seats_read_the_place_word_as_one_grammar() {
         use super::{SeatFlags, place_word};
         use model::placement::workstation::{A6000, RTX_3090};
+        let _note = crate::start::slot_note_tests();
         let usage = "usage";
         let seat = |word: &str| {
             let args = ["--place".to_owned(), word.to_owned()];
@@ -3997,6 +4269,7 @@ mod tests {
     #[test]
     fn the_seats_take_the_slot_save_path_through_the_common_flags() {
         use super::SeatFlags;
+        let _note = crate::start::slot_note_tests();
         let parse = |args: &[&str]| {
             let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
             SeatFlags::parse(&args, "usage", |_, _| Ok(false))

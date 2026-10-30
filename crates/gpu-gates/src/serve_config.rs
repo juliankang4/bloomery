@@ -49,7 +49,7 @@ pub fn from_file(bin: &str, args: &[String]) -> Result<Vec<String>, GateError> {
 }
 
 /// [`from_file`]'s arguments and lines, the file's text read by `read`.
-fn joined(
+pub(crate) fn joined(
     args: &[String],
     read: impl FnOnce(&str) -> std::io::Result<String>,
 ) -> Result<(Vec<String>, Vec<String>), GateError> {

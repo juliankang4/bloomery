@@ -6,7 +6,7 @@
 //!
 //!     bloomery-serve-ds41 [--host 127.0.0.1] [--port 8080] [--place PLACE]
 //!                         [--ctx C] [--alias NAME] [--cache-ram MIB]
-//!                         [--parallel N] [--queue-depth Q] [--slot-save-path DIR]
+//!                         [--parallel N] [--slot-ctx S] [--queue-depth Q] [--slot-save-path DIR]
 //!                         [--chat-template-file PATH]
 //!                         [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
 //!                         [--image-max-tokens N] [--plan]
@@ -222,8 +222,8 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, TemplateFile,
-    Vocab, arm_screen, bind_server, model_props, parallel_line, placement_of,
+    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotFlags, SlotStep, SlotsFrom,
+    TemplateFile, Vocab, arm_screen, bind_server, model_props, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{DraftSeat, Lane, Place, lane_at, mode_name};
 use bloomery_gpu_gates::need;
@@ -266,7 +266,7 @@ use crate::{dspark, place};
 
 const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C] [--alias NAME] \
-                     [--cache-ram MIB] [--parallel N] [--queue-depth Q] [--plan] \
+                     [--cache-ram MIB] [--parallel N] [--slot-ctx S] [--queue-depth Q] [--plan] \
                      [--slot-save-path DIR] [--chat-template-file PATH] \
                      [--mmproj FILE | --no-mmproj] [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
                      [--api-key-file FNAME]";
@@ -345,6 +345,7 @@ fn parse_args(args: &[String]) -> Result<(Args, Option<Place>), GateError> {
     };
     let mut park_ram = false;
     let mut place_flag = None;
+    let mut slots = SlotFlags::default();
     let mut it = args.iter().map(|s| s.as_str());
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -367,7 +368,6 @@ fn parse_args(args: &[String]) -> Result<(Args, Option<Place>), GateError> {
             f if CTX.contains(&f) => a.ctx = Some(number(flag, v)?),
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(mib_bytes(flag, v)?),
-            "--parallel" | "-np" => a.parallel = Some(number(flag, v)?),
             "--queue-depth" => a.queue_depth = Some(number(flag, v)?),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
             TemplateFile::FLAG => a.template_file.set(v),
@@ -376,12 +376,11 @@ fn parse_args(args: &[String]) -> Result<(Args, Option<Place>), GateError> {
                 mib_bytes(flag, v)?;
                 park_ram = true;
             }
+            f if slots.take(f, v)? => {}
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
-    if a.parallel == Some(0) {
-        return Err("--parallel 0: the server serves no slot".into());
-    }
+    (a.ctx, a.parallel) = slots.given(a.ctx)?;
     if park_ram {
         return Err(
             "--park-ram holds the states of slots that take the model in turns; this seat's \

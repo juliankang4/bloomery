@@ -8,8 +8,8 @@
 //!     bloomery-serve-qwen38 [--host 127.0.0.1] [--port 8080]
 //!                           [--place a|gate|bp|<stage>[+<tier>…]] [--ctx-size C]
 //!                           [--alias NAME] [--cache-ram MIB]
-//!                           [--chat-template-file PATH] [--parallel N]
-//!                           [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR]
+//!                           [--chat-template-file PATH] [--parallel N|auto]
+//!                           [--slot-ctx S] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR]
 //!                           [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
 //!                           [--image-max-tokens N] [-ub N | --ubatch-size N]
 //!                           [--cache-type-k f16|q8_0]
@@ -177,12 +177,21 @@
 //! down, and the default's fit runs over a slot's context, the plan
 //! counting every sequence ([`PlanInputs::plan_with_slots`]). An explicit
 //! `--ctx` a slot of whose N-slot plan the machine cannot hold is refused by
-//! name before the load, naming the split. Nothing parks: no slot ever waits for another
+//! name before the load, naming the split. `--slot-ctx S` names one request's context
+//! apart from the count: beside `--parallel N` it asks a total of `S × N`, alone one slot
+//! of `S`, and beside `--ctx-size` it is refused by name (`bind::SlotFlags`).
+//! `--parallel auto` counts the slots from the plans ([`auto38`]): the most, up to
+//! `ctx_ask::AUTO_MOST`, whose plan holds `--slot-ctx` a slot, or with no `--slot-ctx` the
+//! context one slot's default takes when that is the model's limit (a default fitted
+//! under it serves one slot); the placement and the draft are chosen at one slot first,
+//! and a count one slot of `--slot-ctx` cannot hold is the one-slot ask, refused by name.
+//! Auto beside `--ctx-size` is refused by name, and under the route trace it serves one
+//! slot. Nothing parks: no slot ever waits for another
 //! (a slot's round runs whether the others stream), so `--park-ram` is
 //! refused by name — resident slots hold their state on the card, in the
 //! plan. A `parallel` line on stderr names the rule (`slots`), the slots,
 //! the split they serve, what set the count (`from`: the `--parallel`
-//! flag, a set `--ctx-size`, the default, or `route-trace`) and the shape of a
+//! flag, a set `--ctx-size`, the default, `auto`, or `route-trace`) and the shape of a
 //! round of several slots (`pass=one`, or
 //! `pass=turns` under `--place bp`, which runs the slots a slot at a time).
 //! `--queue-depth Q` bounds the requests that wait for a slot.
@@ -409,9 +418,10 @@ use bloomery_gpu::model::StepMode;
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
-    CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
-    SlotStep, SlotsFrom, TemplateFile, Vocab, arm_screen, begin, bind_server, eprint_noted,
-    model_props, note_line, parallel_line, place_word, placement_of, put_back, slots_of,
+    AutoSlots, CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine,
+    SlotAsk, SlotFlags, SlotPassRow, SlotStep, SlotsFrom, TemplateFile, Vocab, arm_screen, begin,
+    bind_server, eprint_noted, model_props, note_line, parallel_line, place_word, placement_of,
+    put_back, slots_of,
 };
 use bloomery_gpu_gates::generate::{BreakEven, FloorShort, Lane, Place, lane_of};
 use bloomery_gpu_gates::need;
@@ -436,7 +446,7 @@ use model::arch::qwen35moe::place::{
     widen_card_route,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule, card_experts_floor};
+use model::placement::ctx_ask::{AUTO_MOST, DEFAULT_SLOTS, Rule, card_experts_floor, most_slots};
 use model::placement::workstation::{
     CardSpec, HostNeed, HostRead, POINT_ROWS_RESERVE, host_available_read,
 };
@@ -474,8 +484,8 @@ use ubatch_rule::ubatch_rule;
 
 const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] [--ctx-size C] [--alias NAME] \
-                     [--cache-ram MIB] [--chat-template-file PATH] [--parallel N] \
-                     [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
+                     [--cache-ram MIB] [--chat-template-file PATH] [--parallel N|auto] \
+                     [--slot-ctx S] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
                      [--mmproj FILE | --no-mmproj] [--image-min-tokens N] \
                      [--image-max-tokens N] [-ub N | --ubatch-size N] \
                      [--cache-type-k f16|q8_0] [--plan] [--api-key KEY] [--api-key-file FNAME]";
@@ -1353,6 +1363,75 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
     })
 }
 
+/// `--parallel auto`'s count over `plans`, the one-slot plans the load chose its placement
+/// and draft by ([`most_slots`] up to [`AUTO_MOST`]), and the `--ctx-size` total it asks: at
+/// `--slot-ctx` (`slot_ctx`) the most slots whose plan holds it, the total that times the
+/// count; unset, the most whose plan holds the context one slot's default takes where that is
+/// the target (the model's limit), with no total, so the default asks the target again over
+/// every slot. A default fitted under the target at one slot serves one, as does one whose
+/// floor the plans cannot hold, or a drafted one the plans refuse (the default's draft
+/// yield answers both, and a draft that cannot yield keeps the refusal), and so does a
+/// `--slot-ctx` one slot cannot hold, whose ask is refused by name as a set context.
+fn auto38(plans: &Plans<'_>, slot_ctx: Option<usize>) -> Result<(usize, Option<usize>), GateError> {
+    let (ctx, least) = match slot_ctx {
+        Some(s) => (s, None),
+        None => match ctx38(plans, None) {
+            Ok(Ctx38 {
+                ctx,
+                rule: Rule::Target,
+                unmet,
+                ..
+            }) => (ctx, plans.floor.filter(|_| unmet.is_none())),
+            Ok(chosen) => {
+                eprintln!(
+                    "parallel auto slots=1: the default context is fitted below the model limit (ctx={ctx})",
+                    ctx = chosen.ctx
+                );
+                return Ok((1, None));
+            }
+            // A floor the machine cannot hold, or a drafted plan it refuses, is the one-slot
+            // default's to answer: its yield plans without the draft, and asks the refusal
+            // again where the draft cannot yield.
+            Err(e) if e.is::<FloorShort>() || plans.mtp.is_some() => {
+                eprintln!("parallel auto slots=1: the default does not hold at one slot ({e})");
+                return Ok((1, None));
+            }
+            Err(e) => return Err(e),
+        },
+    };
+    let n = most_slots(AUTO_MOST, |n| {
+        use model::placement::PlacementError;
+        use model::placement::ctx_ask::{PlanRefusal, Probe, Short, Side};
+        use model::placement::workstation::HostShort;
+
+        let e = match (Plans { slots: n, ..*plans }).holds_leaving(ctx, least) {
+            Ok(()) => return Ok(Probe::Holds(())),
+            Err(e) => e,
+        };
+        // A slot count also raises host and arena floors that shrinking the context cannot fix.
+        let placement = e
+            .downcast_ref::<PlaceError>()
+            .and_then(PlanRefusal::placement)
+            .or_else(|| e.downcast_ref::<PlacementError>());
+        let (need, room) = match placement {
+            Some(PlacementError::HostRoomFloor { floor, room, .. }) => (*floor, *room),
+            Some(PlacementError::NvTierArenaUnder { arena, least }) => (least.bytes, *arena),
+            Some(PlacementError::NvTierArena { arena, room, floor }) => (*arena, *room - *floor),
+            _ => match e.downcast_ref::<HostShort>() {
+                Some(short) => (short.need.bytes(), short.available),
+                None => return q38place::probe(Err(e)),
+            },
+        };
+        Ok(Probe::Short(Short {
+            on: Side::Host,
+            need,
+            room,
+        }))
+    })?
+    .unwrap_or(1);
+    Ok((n, slot_ctx.map(|s| s * n)))
+}
+
 pub(crate) struct Args {
     host: String,
     port: u16,
@@ -1375,6 +1454,9 @@ pub(crate) struct Args {
     /// one slot beside a set `--ctx-size`, else `ctx_ask::DEFAULT_SLOTS`
     /// (one).
     parallel: Option<usize>,
+    /// `--parallel auto`: the seat counts the slots from its plans
+    /// ([`auto38`]); `parallel` and `ctx` are unset beside it.
+    auto: Option<AutoSlots>,
     queue_depth: Option<usize>,
     /// `--park-ram` in bytes; set is refused by name (resident slots park
     /// nothing).
@@ -1406,6 +1488,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         template_file: TemplateFile::default(),
         slot_save_path: None,
         parallel: None,
+        auto: None,
         queue_depth: None,
         park_ram: None,
         vision: vision_seat::Flags::default(),
@@ -1414,6 +1497,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         cache_type_k: None,
         plan_only: false,
     };
+    let mut slots = SlotFlags::default();
     let mut it = args.iter().map(|s| s.as_str());
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -1439,7 +1523,6 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(flag, v)?),
             TemplateFile::FLAG => a.template_file.set(v),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
-            "--parallel" | "-np" => a.parallel = Some(serve::flag::number(flag, v)?),
             "--queue-depth" => a.queue_depth = Some(serve::flag::number(flag, v)?),
             "--park-ram" => a.park_ram = Some(CacheRam::parse_mib(flag, v)?),
             f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
@@ -1452,14 +1535,16 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                         .into(),
                 );
             }
+            f if slots.take(f, v)? => {}
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
+    match slots.ask(a.ctx)? {
+        SlotAsk::Given { ctx, parallel } => (a.ctx, a.parallel) = (ctx, parallel),
+        SlotAsk::Auto(auto) => a.auto = Some(auto),
+    }
     if a.ctx == Some(0) {
         return Err("--ctx-size 0: the stores hold no position".into());
-    }
-    if a.parallel == Some(0) {
-        return Err("--parallel 0: the server serves no slot".into());
     }
     if a.park_ram.is_some() {
         return Err(
@@ -1523,6 +1608,9 @@ pub(crate) fn check(
                 let (slots, _) = slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)?;
                 if let Some(ctx) = a.ctx {
                     check_mtp_ctx(ctx / slots, slots)?;
+                }
+                if let Some(ctx) = a.auto.and_then(|auto| auto.slot_ctx) {
+                    check_mtp_ctx(ctx, 1)?;
                 }
             }
             WidthMode::of(levers.mtp_width())?;
@@ -1660,8 +1748,15 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // every sequence (`Plans::slots`). A set `--ctx-size` with no
     // `--parallel` is one request's context — one slot at the whole of it
     // (`bind::slots_of`).
-    // The route trace records one sequence's steps, so its default is one.
+    // The route trace records one sequence's steps, so its default is one, and so is its
+    // `--parallel auto`. Until auto's count is chosen ([`auto38`], once the placement and the
+    // draft are), the seat runs its one-slot ask: one slot at `--slot-ctx`, or the default.
+    if let Some(ctx) = a.auto.and_then(|auto| auto.slot_ctx) {
+        a.ctx = Some(ctx);
+    }
     let (slots, from) = match slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)? {
+        _ if a.auto.is_some() && feed.traced => (1, SlotsFrom::RouteTrace),
+        _ if a.auto.is_some() => (1, SlotsFrom::Auto),
         (_, SlotsFrom::Default) if feed.traced => (1, SlotsFrom::RouteTrace),
         given => given,
     };
@@ -1766,9 +1861,11 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let folder = folder.map(|parts| parts(split));
     if from == SlotsFrom::Ctx {
         eprintln!(
-            "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
-             once (they split it)",
-            a.ctx.unwrap_or_default()
+            "{}",
+            bloomery_gpu_gates::bind::one_request_line(
+                a.ctx.unwrap_or_default(),
+                bloomery_gpu_gates::start::slot_ctx_noted()
+            )
         );
     }
     // The common rule's choice (the comment at the draft's rule above): the
@@ -1927,6 +2024,26 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                 mtp_inputs = None;
             }
             (drafts, if drafts { head } else { None }, draft_off)
+        }
+    };
+    let slots = match a.auto.filter(|_| from == SlotsFrom::Auto) {
+        None => slots,
+        Some(auto) => {
+            let one = Plans {
+                inputs: &inputs,
+                place: a.place,
+                experts,
+                levers: &plan_levers,
+                mtp: mtp_inputs.as_ref(),
+                slots,
+                feed,
+                ubatch,
+                folder: folder.as_ref(),
+                floor,
+            };
+            let (n, total) = auto38(&one, auto.slot_ctx)?;
+            a.ctx = total;
+            n
         }
     };
     let drafted = Plans {
@@ -3581,6 +3698,477 @@ mod tests {
             "{e}"
         );
     }
+    fn seat_plan_inputs() -> (super::PlanInputs, super::Folder38, super::Place38) {
+        use super::Place38;
+        use bloomery_gpu_gates::generate::Place;
+        use gguf::write::{Layout, TensorDecl};
+        use model::arch::models::{
+            Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, OutGate, Residual, Rope,
+            RopeMode,
+        };
+        use model::arch::qwen35moe::place::{KvLayout, PlanInputs};
+        use model::placement::{
+            ModelTensor, ModelTensors, Role, RowTableSource,
+            workstation::{DeviceInfo, HostRead},
+        };
+
+        let tensor = ModelTensor {
+            name: "blk.0.attn_norm.weight".to_string(),
+            shard: 0,
+            layer: Some(0),
+            role: Role::Attention,
+            ty: gguf::GgmlType::F32,
+            dims: vec![2560],
+            file_bytes: 2560 * 4,
+            gathered_rows: None,
+        };
+        let layout = Layout::new(
+            &[],
+            vec![TensorDecl {
+                name: tensor.name.clone(),
+                dims: tensor.dims.clone(),
+                type_id: tensor.ty.as_u32(),
+                nbytes: tensor.file_bytes,
+            }],
+        )
+        .expect("the header");
+        let header = || gguf::Split::header_only("seat-test".into(), &layout).expect("the header");
+        let folder = super::Folder38::with(header(), header(), None);
+        let spec = ModelSpec {
+            arch: Arch::Qwen4Exp,
+            hidden: 2560,
+            vocab: 8,
+            ctx_train: 262_144,
+            rms_eps: 1e-6,
+            layers: vec![LayerSpec {
+                mixer: Mixer::Gqa(Gqa {
+                    heads: 1,
+                    kv_heads: 1,
+                    head_dim: 8,
+                    value_dim: 8,
+                    rope: Rope {
+                        mode: RopeMode::NormTail,
+                        dims: 8,
+                        base: 1e4,
+                        yarn: None,
+                        factors: false,
+                    },
+                    qk_norm: false,
+                    o_norm: false,
+                    out_gate: OutGate::None,
+                    select: None,
+                    window: None,
+                    sinks: false,
+                    value_scale: None,
+                }),
+                ffn: Ffn::Dense {
+                    ff: 640,
+                    act: Act::SwiGlu { limit: None },
+                },
+                residual: Residual::Plain,
+                extras: Vec::new(),
+            }],
+            mtp: Vec::new(),
+            hc: None,
+            engram: None,
+            encoder: None,
+            logit_epilogue: None,
+            chat: ChatSpec {
+                pre: String::new(),
+                template: None,
+                tools: None,
+                reasoning: None,
+            },
+        };
+        let inputs = PlanInputs {
+            kv: KvLayout::of_spec(&spec).expect("the stores"),
+            spec,
+            model: ModelTensors {
+                tensors: vec![tensor],
+                layers: 1,
+                experts: 8,
+                experts_used: 2,
+                bf16_words: |_| false,
+            },
+            room: (u64::MAX, HostRead::Given),
+            row_source: RowTableSource::Parts,
+            arena: None,
+        };
+        let card = DeviceInfo {
+            ordinal: 0,
+            name: "GB10".to_string(),
+            total_bytes: 32 << 30,
+            free_bytes: 32 << 30,
+            integrated: true,
+            uuid: [1; 16],
+            pci_bus: "0000:01:00.0".to_string(),
+            held_by: None,
+            compute_capability: Some((12, 1)),
+        };
+        let place = Place38::of(
+            Place::parse("0")
+                .expect("a card")
+                .on(&[card])
+                .expect("census"),
+        );
+        (inputs, folder, place)
+    }
+
+    fn seat_plans<'a>(
+        inputs: &'a super::PlanInputs,
+        place: super::Place38,
+        levers: &'a model::placement::PlanLevers,
+        mtp: Option<&'a super::MtpInputs>,
+        folder: Option<&'a super::Folder38>,
+    ) -> super::Plans<'a> {
+        super::Plans {
+            inputs,
+            place,
+            levers,
+            mtp,
+            folder,
+            experts: super::Experts::Host,
+            slots: 1,
+            feed: super::Feed38 {
+                prompt: super::Prompt38::Auto,
+                traced: false,
+            },
+            ubatch: 1,
+            floor: None,
+        }
+    }
+
+    /// The slot search runs the real planner: one drafted slot holds a four-column arena,
+    /// while its larger candidates need eight columns. Host limits bound candidates too;
+    /// metadata errors still escape. Passing the per-slot context as the total loses the split.
+    #[test]
+    fn auto_slots_keep_the_fitting_drafted_plan() {
+        use super::{Plans, auto38};
+        use model::arch::models::{
+            Act, Ffn, HcKind, HcSpec, Mixer, Moe, MtpDraft, MtpHeadNorm, MtpInput, MtpSource,
+            Residual, Router, Score, Shared,
+        };
+        use model::arch::qwen35moe::place::{FileTensor, MtpInputs, mtp_tensors};
+        use model::placement::workstation::{HostNeed, HostRead};
+        use model::placement::{ArenaFloor, ModelTensor, PlacementError, Role};
+
+        let (mut inputs, _, _) = seat_plan_inputs();
+        let place = super::Place38::of(bloomery_gpu_gates::generate::Place::Gate);
+        inputs.spec.layers[0].ffn = Ffn::Moe(Moe {
+            experts: 512,
+            top_k: 10,
+            expert_ff: 640,
+            latent: None,
+            pre_exp_norm: false,
+            post_exp_norm: None,
+            act: Act::SwiGlu { limit: None },
+            router: Router {
+                score: Score::Softmax,
+                bias: false,
+                norm: model::arch::models::RouterNorm::SelectedSum,
+                scale: 1.0,
+                hash: false,
+            },
+            shared: Some(Shared {
+                ff: 640,
+                act: Act::SwiGlu { limit: None },
+                sigmoid_gate: true,
+            }),
+        });
+        inputs.spec.hc = Some(HcSpec {
+            streams: 4,
+            kind: HcKind::Gated { rank: 320 },
+        });
+        inputs.spec.layers[0].residual = Residual::Hc;
+        if let Mixer::Gqa(g) = &mut inputs.spec.layers[0].mixer {
+            g.head_dim = 32;
+            g.value_dim = 32;
+            g.rope.dims = 32;
+        }
+        inputs.model.experts = 512;
+        inputs.model.experts_used = 10;
+        inputs.model.tensors.push(ModelTensor {
+            name: "blk.0.ffn_gate_exps.weight".to_owned(),
+            shard: 0,
+            layer: Some(0),
+            role: Role::RoutedExperts,
+            ty: gguf::GgmlType::Q4_K,
+            dims: vec![2560, 24_576, 512],
+            file_bytes: 512 * 24_576 * 10 * 144,
+            gathered_rows: None,
+        });
+        let draft = MtpDraft {
+            source: MtpSource::InFile { layer: 1 },
+            layer: inputs.spec.layers[0].clone(),
+            index: 1,
+            hidden: inputs.spec.hidden,
+            vocab: inputs.spec.vocab,
+            rms_eps: inputs.spec.rms_eps,
+            hc: inputs.spec.hc,
+            input: MtpInput::Streams,
+            head_norm: MtpHeadNorm::HcHead,
+            head_rows: model::arch::models::headpick::HeadSet::Full,
+        };
+        inputs.spec.layers = vec![inputs.spec.layers[0].clone(); 4];
+        inputs.kv =
+            model::arch::qwen35moe::place::KvLayout::of_spec(&inputs.spec).expect("the stores");
+        inputs.model.layers = 4;
+        let routed = inputs
+            .model
+            .tensors
+            .last()
+            .expect("the routed stack")
+            .clone();
+        for layer in 1..4 {
+            inputs.model.tensors.push(ModelTensor {
+                name: format!("blk.{layer}.ffn_gate_exps.weight"),
+                layer: Some(layer),
+                ..routed.clone()
+            });
+        }
+        let file = mtp_tensors(&draft)
+            .expect("the draft's program")
+            .into_iter()
+            .filter_map(|t| {
+                t.form.clone().map(|(ty, dims)| {
+                    let nbytes = dims.iter().product::<u64>() / ty.blck_size().expect("block")
+                        * ty.type_size().expect("type");
+                    FileTensor {
+                        name: t.name(1),
+                        shard: 0,
+                        ty,
+                        dims,
+                        nbytes,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mtp = MtpInputs::from_parts(draft, &file).expect("the draft's inputs");
+        let levers = model::placement::PlanLevers::default();
+        let (room, arena) = seat_plans(&inputs, place, &levers, Some(&mtp), None)
+            .read(4096, |p| {
+                let floor = ArenaFloor::of(p).expect("the resident arena floor");
+                assert_eq!(floor.columns, 4);
+                (
+                    HostNeed::of(p, 0).bytes() - p.host.expert_bytes / 32,
+                    floor.bytes,
+                )
+            })
+            .expect("the resident plan")
+            .1;
+        inputs.room = (room, HostRead::Given);
+        inputs.arena = Some(arena);
+        seat_plans(&inputs, place, &levers, Some(&mtp), None)
+            .holds(4096)
+            .expect("one drafted slot fits");
+        let e = Plans {
+            slots: 5,
+            ..seat_plans(&inputs, place, &levers, Some(&mtp), None)
+        }
+        .holds(4096)
+        .expect_err("five slots need eight columns");
+        assert!(
+            matches!(
+                e.downcast_ref::<super::PlaceError>(),
+                Some(super::PlaceError::Placement(
+                    PlacementError::NvTierArenaUnder { .. }
+                ))
+            ),
+            "{e}"
+        );
+        assert_eq!(
+            auto38(
+                &seat_plans(&inputs, place, &levers, Some(&mtp), None),
+                Some(4096)
+            )
+            .expect("keep one"),
+            (1, Some(4096))
+        );
+        inputs.arena = Some(2 * arena);
+        assert_eq!(
+            auto38(
+                &seat_plans(&inputs, place, &levers, Some(&mtp), None),
+                Some(4096)
+            )
+            .expect("all fit"),
+            (8, Some(32_768))
+        );
+
+        // At the one-slot host floor the next candidate can exhaust either the room
+        // left for a set arena, or the host floor itself with the arena unset.
+        for given in [Some(2 * arena), None] {
+            inputs.arena = given;
+            inputs.room = (0, HostRead::Given);
+            let e = seat_plans(&inputs, place, &levers, Some(&mtp), None)
+                .holds(4096)
+                .expect_err("no host room");
+            let Some(super::PlaceError::Placement(PlacementError::HostRoomFloor { floor, .. })) =
+                e.downcast_ref::<super::PlaceError>()
+            else {
+                panic!("not the host floor: {e}");
+            };
+            inputs.room = (*floor + given.unwrap_or(0), HostRead::Given);
+            seat_plans(&inputs, place, &levers, Some(&mtp), None)
+                .holds(4096)
+                .expect("one slot fits at its host boundary");
+            let e = Plans {
+                slots: 5,
+                ..seat_plans(&inputs, place, &levers, Some(&mtp), None)
+            }
+            .holds(4096)
+            .expect_err("more slots pass the boundary");
+            match (given, e.downcast_ref::<super::PlaceError>()) {
+                (
+                    Some(_),
+                    Some(super::PlaceError::Placement(PlacementError::NvTierArena { .. })),
+                )
+                | (
+                    None,
+                    Some(super::PlaceError::Placement(PlacementError::HostRoomFloor { .. })),
+                ) => {}
+                _ => panic!("not the expected host refusal: {e}"),
+            }
+            assert_eq!(
+                auto38(
+                    &seat_plans(&inputs, place, &levers, Some(&mtp), None),
+                    Some(4096)
+                )
+                .expect("keep the fitting slot"),
+                (1, Some(4096))
+            );
+        }
+
+        // Unset, a drafted default the host floor refuses while the plain one holds is the
+        // one-slot default's: its draft yield serves the plain plan.
+        inputs.arena = None;
+        inputs.spec.ctx_train = 4096;
+        inputs.room = (0, HostRead::Given);
+        let e = seat_plans(&inputs, place, &levers, None, None)
+            .holds(4096)
+            .expect_err("no host room");
+        let Some(super::PlaceError::Placement(PlacementError::HostRoomFloor { floor, .. })) =
+            e.downcast_ref::<super::PlaceError>()
+        else {
+            panic!("not the host floor: {e}");
+        };
+        inputs.room = (*floor, HostRead::Given);
+        super::ctx38(&seat_plans(&inputs, place, &levers, None, None), None)
+            .expect("the plain default holds");
+        let drafted = seat_plans(&inputs, place, &levers, Some(&mtp), None);
+        let e = super::ctx38(&drafted, None)
+            .err()
+            .expect("the drafted default passes the host floor");
+        assert!(
+            matches!(
+                e.downcast_ref::<super::PlaceError>(),
+                Some(super::PlaceError::Placement(
+                    PlacementError::HostRoomFloor { .. }
+                ))
+            ),
+            "{e}"
+        );
+        assert_eq!(
+            auto38(&drafted, None).expect("the draft yield answers it"),
+            (1, None)
+        );
+
+        inputs.room = (u64::MAX, HostRead::Given);
+        let target = Plans {
+            experts: super::Experts::Card,
+            floor: Some(inputs.model.experts),
+            ..seat_plans(&inputs, place, &levers, Some(&mtp), None)
+        };
+        let chosen = super::ctx38(&target, None).expect("the plain target fits");
+        assert!(matches!(chosen.rule, super::Rule::Target));
+        assert!(
+            chosen.unmet.is_some(),
+            "the card cannot hold every expert in every layer"
+        );
+        let (slots, total) = auto38(&target, None).expect("the unmet floor does not bound slots");
+        assert!(slots > 1);
+        assert_eq!(total, None);
+
+        let e = auto38(
+            &Plans {
+                ubatch: 0,
+                ..seat_plans(&inputs, place, &levers, Some(&mtp), None)
+            },
+            Some(4096),
+        )
+        .expect_err("a configuration error is no capacity limit");
+        assert!(
+            matches!(
+                e.downcast_ref::<super::PlaceError>(),
+                Some(super::PlaceError::Ubatch { .. })
+            ),
+            "{e}"
+        );
+        inputs.model.tensors[0].ty = gguf::GgmlType::Unknown(999);
+        let e = auto38(
+            &seat_plans(&inputs, place, &levers, Some(&mtp), None),
+            Some(4096),
+        )
+        .expect_err("an unsupported model is no capacity limit");
+        assert!(
+            matches!(
+                e.downcast_ref::<super::PlaceError>(),
+                Some(super::PlaceError::Placement(
+                    PlacementError::NoCardFormat { .. }
+                ))
+            ),
+            "{e}"
+        );
+    }
+
+    /// A folder's part reads beside additional slots can exhaust a discrete host's room;
+    /// those candidates are short too, even though a shorter context is not their remedy.
+    #[test]
+    fn auto_slots_keep_the_fitting_host_plan() {
+        use super::{Plans, auto38};
+        use model::placement::workstation::{HostNeed, HostRead, HostShort};
+        let (mut inputs, folder, _) = seat_plan_inputs();
+        let place = super::Place38::of(bloomery_gpu_gates::generate::Place::Gate);
+        let levers = model::placement::PlanLevers::default();
+        let target = seat_plans(&inputs, place, &levers, None, None);
+        assert!(matches!(
+            super::ctx38(&target, None).expect("the target fits").rule,
+            super::Rule::Target
+        ));
+        assert_eq!(
+            auto38(&target, None).expect("count slots at the default target"),
+            (8, None)
+        );
+        let room = seat_plans(&inputs, place, &levers, None, Some(&folder))
+            .read(4096, |p| {
+                HostNeed::of(p, 0).bytes()
+                    + folder.least_reads(p, super::CARD38).expect("part reads")
+            })
+            .expect("the resident plan")
+            .1;
+        inputs.room = (room, HostRead::Given);
+        seat_plans(&inputs, place, &levers, None, Some(&folder))
+            .holds(4096)
+            .expect("one slot fits exactly");
+        let e = Plans {
+            slots: 5,
+            ..seat_plans(&inputs, place, &levers, None, Some(&folder))
+        }
+        .holds(4096)
+        .expect_err("more slots exhaust the host");
+        let short = e
+            .downcast_ref::<HostShort>()
+            .expect("a host capacity refusal");
+        assert!(short.pool_short().is_none(), "the host is discrete");
+        assert_eq!(
+            auto38(
+                &seat_plans(&inputs, place, &levers, None, Some(&folder)),
+                Some(4096)
+            )
+            .expect("keep one"),
+            (1, Some(4096))
+        );
+    }
+
     /// A default context leaves the residency its experts only where a word
     /// runs the machine with experts on the card: a set `mid` word asks its
     /// own least, and unset, the rule's least where it runs on the plan (the
@@ -3656,7 +4244,7 @@ mod tests {
     #[test]
     fn a_folder_plan_holds_its_reads_on_the_arena_floor() {
         const TRAINED: u64 = 262_144;
-        use bloomery_gpu_gates::generate::{Place, short_in};
+        use bloomery_gpu_gates::generate::short_in;
         use model::arch::qwen35moe::place::PlaceError;
         use model::placement::ctx_ask::Rule;
         use model::placement::workstation::{self, HostNeed, HostRead};
@@ -3664,7 +4252,7 @@ mod tests {
             ArenaFloor, KvBytes, ModelTensor, ModelTensors, PlanLevers, Role, plan_host_routed,
         };
 
-        use super::{Feed38, Place38, Plans, ctx38, folder_holds};
+        use super::{Feed38, Plans, ctx38, folder_holds};
 
         struct NoKv;
         impl KvBytes for NoKv {
@@ -3714,113 +4302,8 @@ mod tests {
         assert_eq!(short_in::<PlaceError>(&e), None);
 
         // The actual seat checks a folder's reads before choosing its context.
-        use gguf::write::{Layout, TensorDecl};
-        use model::arch::models::{
-            Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, OutGate, Residual, Rope,
-            RopeMode,
-        };
-        use model::arch::qwen35moe::place::{Experts, KvLayout, PlanInputs};
-        use model::placement::{RowTableSource, workstation::DeviceInfo};
-
-        let tensor = ModelTensor {
-            name: "blk.0.attn_norm.weight".to_string(),
-            shard: 0,
-            layer: Some(0),
-            role: Role::Attention,
-            ty: gguf::GgmlType::F32,
-            dims: vec![2560],
-            file_bytes: 2560 * 4,
-            gathered_rows: None,
-        };
-        let layout = Layout::new(
-            &[],
-            vec![TensorDecl {
-                name: tensor.name.clone(),
-                dims: tensor.dims.clone(),
-                type_id: tensor.ty.as_u32(),
-                nbytes: tensor.file_bytes,
-            }],
-        )
-        .expect("the header");
-        let header = || gguf::Split::header_only("seat-test".into(), &layout).expect("the header");
-        let folder = super::Folder38::with(header(), header(), None);
-        let spec = ModelSpec {
-            arch: Arch::Qwen4Exp,
-            hidden: 2560,
-            vocab: 8,
-            ctx_train: u32::try_from(TRAINED).expect("context"),
-            rms_eps: 1e-6,
-            layers: vec![LayerSpec {
-                mixer: Mixer::Gqa(Gqa {
-                    heads: 1,
-                    kv_heads: 1,
-                    head_dim: 8,
-                    value_dim: 8,
-                    rope: Rope {
-                        mode: RopeMode::NormTail,
-                        dims: 8,
-                        base: 1e4,
-                        yarn: None,
-                        factors: false,
-                    },
-                    qk_norm: false,
-                    o_norm: false,
-                    out_gate: OutGate::None,
-                    select: None,
-                    window: None,
-                    sinks: false,
-                    value_scale: None,
-                }),
-                ffn: Ffn::Dense {
-                    ff: 640,
-                    act: Act::SwiGlu { limit: None },
-                },
-                residual: Residual::Plain,
-                extras: Vec::new(),
-            }],
-            mtp: Vec::new(),
-            hc: None,
-            engram: None,
-            encoder: None,
-            logit_epilogue: None,
-            chat: ChatSpec {
-                pre: String::new(),
-                template: None,
-                tools: None,
-                reasoning: None,
-            },
-        };
-        let mut inputs = PlanInputs {
-            kv: KvLayout::of_spec(&spec).expect("the stores"),
-            spec,
-            model: ModelTensors {
-                tensors: vec![tensor],
-                layers: 1,
-                experts: 8,
-                experts_used: 2,
-                bf16_words: |_| false,
-            },
-            room: (u64::MAX, HostRead::Given),
-            row_source: RowTableSource::Parts,
-            arena: None,
-        };
-        let card = DeviceInfo {
-            ordinal: 0,
-            name: "GB10".to_string(),
-            total_bytes: 32 << 30,
-            free_bytes: 32 << 30,
-            integrated: true,
-            uuid: [1; 16],
-            pci_bus: "0000:01:00.0".to_string(),
-            held_by: None,
-            compute_capability: Some((12, 1)),
-        };
-        let place = Place38::of(
-            Place::parse("0")
-                .expect("a card")
-                .on(&[card])
-                .expect("census"),
-        );
+        let (mut inputs, folder, place) = seat_plan_inputs();
+        use model::arch::qwen35moe::place::Experts;
         let levers = PlanLevers::default();
         let half = usize::try_from(TRAINED / 2).expect("context");
         let machine = place
@@ -3874,5 +4357,9 @@ mod tests {
             unset.rule
         );
         assert!(ctx38(&plans, Some(target)).is_err());
+        assert_eq!(
+            super::auto38(&plans, None).expect("the fitted default stays at one slot"),
+            (1, None)
+        );
     }
 }

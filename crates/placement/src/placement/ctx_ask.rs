@@ -30,6 +30,30 @@ use super::{PlacementError, Plan, Role, Violation, per_expert};
 /// The slots a load serves when `--parallel` is unset.
 pub const DEFAULT_SLOTS: usize = 1;
 
+/// The most slots `--parallel auto` serves ([`most_slots`]).
+pub const AUTO_MOST: usize = 8;
+
+/// `--parallel auto`'s count: the most slots in `1..=most` whose plan at one
+/// request's context holds, each count planned at most once by `plan_of`, by
+/// bisection (a plan of more slots holds more bytes, so the counts that hold
+/// are those below a point). `None` when one slot is short, which the seat's
+/// one-slot ask refuses by name.
+///
+/// # Errors
+/// The first error `plan_of` returns: a refusal that is not a short memory.
+pub fn most_slots<P, E>(
+    most: usize,
+    mut plan_of: impl FnMut(usize) -> Result<Probe<P>, E>,
+) -> Result<Option<usize>, E> {
+    if most == 0 || matches!(plan_of(1)?, Probe::Short(_)) {
+        return Ok(None);
+    }
+    super::ctx::largest(1, most, |n| {
+        Ok((matches!(plan_of(n)?, Probe::Holds(_)), None))
+    })
+    .map(Some)
+}
+
 /// The user's context ask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ask {
@@ -1141,5 +1165,37 @@ mod tests {
             })
         );
         assert_eq!(host(HostNeed { cards: 0, ..need }).pool_short(), None);
+    }
+
+    /// `--parallel auto` counts the most slots whose plan holds a slot's
+    /// context, up to its most, each count planned once; one short slot is
+    /// `None`, and a seat's own refusal is the error. Mutants: a linear
+    /// search past the short count (a count planned twice or above the
+    /// fit), the most ignored (nine slots on a card that holds more).
+    #[test]
+    fn auto_counts_the_most_slots_that_hold() {
+        const SLOT: u64 = 4096;
+        for fits in 0..=10u64 {
+            let card = Card::holding(fits * SLOT);
+            let got = most_slots(AUTO_MOST, |n| card.plan(n as u64 * SLOT)).expect("no refusal");
+            let want = (fits > 0).then(|| fits.min(AUTO_MOST as u64) as usize);
+            assert_eq!(got, want, "a card that holds {fits} slots");
+            let mut calls = card.calls();
+            let asked = calls.len();
+            calls.sort_unstable();
+            calls.dedup();
+            assert_eq!(calls.len(), asked, "a count planned twice: {calls:?}");
+            assert!(asked <= 4, "{asked} plans for {fits} slots");
+            assert!(calls.iter().all(|&c| c <= AUTO_MOST as u64 * SLOT));
+        }
+        let refusing = Card {
+            fails_at: Some(5 * SLOT),
+            ..Card::holding(8 * SLOT)
+        };
+        assert_eq!(
+            most_slots(AUTO_MOST, |n| refusing.plan(n as u64 * SLOT)),
+            Err(format!("the seat's own refusal at {}", 5 * SLOT))
+        );
+        assert_eq!(most_slots(0, |n| refusing.plan(n as u64 * SLOT)), Ok(None));
     }
 }

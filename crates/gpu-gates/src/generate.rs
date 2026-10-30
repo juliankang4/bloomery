@@ -231,6 +231,7 @@ pub fn choose_ctx_of<P, E: Into<GateError> + std::fmt::Display>(
                     ..
                 } => Box::new(CtxDoesNotFit {
                     largest_total: largest.and_then(|share| share.checked_mul(slots as u64)),
+                    largest_slot: largest,
                     short,
                     text: e.to_string(),
                 }),
@@ -274,6 +275,8 @@ pub struct CtxDoesNotFit {
     /// The `--ctx` total the largest share a slot holds gives over the slots; `None` when not
     /// even the floor holds.
     pub largest_total: Option<u64>,
+    /// The largest share one slot holds, for a retry of `--slot-ctx`.
+    pub largest_slot: Option<u64>,
     /// The plan at the asked context and the memory it is short of.
     pub short: placement::ctx_ask::Short,
     text: String,
