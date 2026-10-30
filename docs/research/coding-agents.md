@@ -1,6 +1,6 @@
 # Coding agents on bloomery-serve: what each one sends first
 
-A survey (2026-10-30, the lead's Mac, no model run). The question: which coding agent fits a local `bloomery-serve`,
+A survey (2026-10-30, the lead's Mac and the box, no model run). The question: which coding agent fits a local `bloomery-serve`,
 judged by the first request each agent sends. A large first request is a long first prompt pass on a slow machine, and
 a field the server or the chat template refuses ends the session before it starts.
 
@@ -12,6 +12,7 @@ repo at 109e6075d.
 | Agent | Endpoint | System prompt (chars) | Tools | First request (bytes) | Prompt ids `[derived]` | Extra calls on the first prompt |
 |---|---|---|---|---|---|---|
 | pi 0.86.1 | `/v1/chat/completions` | 2,715 | 4 | 6,181 | ~1,700 | none |
+| DeepSeek Harness (dsh) 0.2.0-rc.2 | `/v1/chat/completions` | 2,592 (a `developer` message) | 24 | 22,776 | ~6,600 | one title call (796 B) |
 | Codex 0.153.4 | `/v1/responses` | 19,841 (`instructions` 16,979 + a `developer` item 2,862) | 9 | 39,614 | ~10,800 | none |
 | Crush 0.89.0 | `/v1/chat/completions` | 21,805 | 26 | 47,966 | ~13,700 | two title calls (~800 B each) |
 | OpenCode 1.19.3 | `/v1/responses` | 44,581 | 10 | 65,781 | ~18,600 | one title call (2,648 B), sent first |
@@ -44,6 +45,11 @@ Read from the code, not yet run against a live server:
   one model.
 - **Crush 0.89.0** speaks `/v1/chat/completions`: `system`, then two `user` messages (a to-do reminder is the second).
   Its title calls name `gpt-6-luna` unless a small model is configured; as above, the name is echoed.
+- **DeepSeek Harness (dsh) 0.2.0-rc.2** (npm `@deepseek-ai/dsh`, a web UI with `dsh web`, one task with `dsh headless`)
+  speaks `/v1/chat/completions` through a `pi-ai` provider: a `developer` message first, then two `user` messages,
+  `chat_template_kwargs` (`enable_thinking`, `reasoning_effort` from the profile), `max_completion_tokens`,
+  `stream_options`. The `developer` message reaches the template as `system` (`crates/serve/src/api.rs:2965`). It
+  served the DeepSeek-V4.1-Flash 1017 clip of 2026-10-19 on this server.
 - **pi** speaks plain `/v1/chat/completions`: `system`, `user`, four tools (`read`, `bash`, `edit`, `write`),
   `stream_options`. Nothing in it is new to the server.
 
@@ -53,6 +59,8 @@ Every agent streams. None puts a `system` item after another message in its firs
 
 - **A slow machine (a Mac):** pi. Its first request is about a tenth of the others', and a first turn on a slow
   prompt pass is the wait a user notices.
+- **DeepSeek-V4.1-Flash:** dsh. It is DeepSeek's own harness, its first request is the second smallest here, and
+  its web UI shows the work as it happens.
 - **A fast card set, a demo:** Claude Code (bloomery after 0.3.11) or OpenCode. Both carry many tools and long system
   prompts, which a fast prompt pass absorbs.
 - **Codex:** not until the server accepts its `namespace` tool.
@@ -70,6 +78,9 @@ Every agent streams. None puts a `system` item after another message in its firs
   - Codex: `config.toml` with `model_providers.<name>.base_url`; `codex exec --skip-git-repo-check '…'`.
   - Crush: `~/.config/crush/crush.json` (a legacy `config.json` is ignored without a warning); `crush run '…'`.
   - OpenCode: `~/.config/opencode/opencode.json`, provider `openai` with `options.baseURL`; `opencode run -m openai/local '…'`.
+  - dsh: a `headless` profile whose `profiles/headless/cordis.patch.yml` declares a `pi-ai` provider (`api:
+    openai-completions`, `baseURL`, the model) and makes it the default model; `DSH_HOME=<dir> dsh headless '…'`.
+    Captured on the box (Linux, node 26.8.2); the others on the Mac.
   - Claude Code: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL` (`docs/claude-code.md`), a fresh
     `CLAUDE_CONFIG_DIR`; `claude -p '…' --permission-mode default`.
 
