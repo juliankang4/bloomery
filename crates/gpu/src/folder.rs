@@ -89,7 +89,7 @@ impl<X> From<Folder<X>> for Model<X> {
 /// `gguf::Split::header_only` for a folder whose host reads nothing where the folder stores it),
 /// the header its plan is made from, whose in-place tensors the host reads where the folder
 /// stores them ([`InPlace`]), and its card tensors through its part source
-/// ([`crate::parts::load_placed_in_place`]). `X` is the architecture's own addition to the load, `()` for
+/// (`crate::parts::PlacedSource`). `X` is the architecture's own addition to the load, `()` for
 /// none.
 pub struct Folder<X = ()> {
     header: Split,
