@@ -2492,7 +2492,6 @@ impl Kernels {
 mod tests {
     use super::*;
     use crate::gemm::Gemm32Kernels;
-    use gguf::GgmlType;
 
     #[test]
     #[ignore = "needs a native FP4 card"]
@@ -2539,8 +2538,7 @@ mod tests {
             kernels.native.quantize(stream, &mut reference, None)?;
             for only_native in [false, true] {
                 let mut act = if only_native {
-                    GemmAct32::new_routed_for(stream, cols, k, [GgmlType::NVFP4])?
-                        .native_input_only()
+                    GemmAct32::new_native_input(stream, cols, k)?
                 } else {
                     GemmAct32::new_routed(stream, cols, k)?
                 };
@@ -2565,9 +2563,18 @@ mod tests {
                     bits(want.scale.to_host_vec(stream)?)
                 );
                 if only_native {
-                    assert!(act.q.to_host_vec(stream)?.iter().all(|&v| v == 0));
-                    assert!(act.d.to_host_vec(stream)?.iter().all(|&v| v == 0.0));
-                    assert!(act.s.to_host_vec(stream)?.iter().all(|&v| v == 0));
+                    assert_eq!(
+                        act.bytes(),
+                        got.bytes(),
+                        "a native input holds no Q8 planes"
+                    );
+                    let err = kernels
+                        .enqueue_swiglu_quant32(stream, &input, &input, cols, &mut act, sink)
+                        .expect_err("a SwiGLU into a native input");
+                    assert!(
+                        err.to_string().contains("a native input holds none"),
+                        "{err}"
+                    );
                 } else {
                     assert_eq!(act.q.to_host_vec(stream)?, reference.q.to_host_vec(stream)?);
                     assert_eq!(
@@ -2577,7 +2584,8 @@ mod tests {
                     assert_eq!(act.s.to_host_vec(stream)?, reference.s.to_host_vec(stream)?);
                 }
                 println!(
-                    "native_activation k={k} cols={cols} only_native={only_native} fp4_codes_scales_equal=true quantizer_nodes=1 PASS"
+                    "native_activation k={k} cols={cols} only_native={only_native} bytes={} fp4_codes_scales_equal=true quantizer_nodes=1 PASS",
+                    act.bytes()
                 );
             }
             // Remapped routes leave HOST holes between the listed prefix and refused suffix.
