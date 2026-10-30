@@ -3049,7 +3049,7 @@ gate-gpu-qwen38-nodes-remote:
 # the server surface it links (gpu-gates' bind, serve_client; the serve and sampler crates) sits behind
 # that feature today — `just affected` and the recipes.py pins scope it so.
 # Stays solo, reason: the host set (tools/gate-batch-resources.tsv) loads under the big-load lock, and the seat's unset residency pick reads MemAvailable against the churn pool, so a neighbour's load moves it.
-# Never solo-real: the generate call and the two main servers pass `--place gate` (the 3090's bytes on the smallest card with the room for them: the 3090 on the box), the unset-place servers plan on the one card in view, and the gate plans on RTX_3090 directly (no shared/gate_card.rs); its plain arm's gpu-gate.sh call is 3090-only, and solo-real balances on `any`.
+# Never solo-real: the generate call and the two main servers pass `--place gate` (the 3090's bytes on the smallest card with the room for them: the 3090 on the box), the unset-place servers plan on the one card in view, and the gate plans on RTX_3090 directly (no shared/gate_card.rs); its plain arm's gpu-gate.sh call is 3090-only in the real tier, and solo-real balances on `any`.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-serve:
