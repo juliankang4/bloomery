@@ -38,6 +38,10 @@ holds the same three binaries under `bin/` (the converter as `prepare`). The com
 `target/release/` paths; a Homebrew binary runs by its name, and an installer one as `~/.local/bin/<name>` unless
 `~/.local/bin` is on your `PATH`.
 
+If Homebrew stops with "Your Command Line Tools are too outdated", update the Command Line Tools in Software Update,
+or use the installer line, which needs no build tools. The formula has no bottle, so Homebrew checks the build tools
+before it installs it. This was seen on macOS 27.0.1 with Command Line Tools 26.5.
+
 ## Build from source
 
 ```sh
@@ -133,7 +137,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 ```
 
 The model thinks first: its reasoning comes back in `reasoning_content`, so leave `max_tokens` room for the answer.
-`/health`, `/v1/models`, `/v1/chat/completions` and `/completion` answer as llama-server's do.
+`/health`, `/v1/models`, `/v1/chat/completions` and `/completion` answer as llama-server's do, and `/v1/messages`
+as Anthropic's, so Claude Code runs on the model: [`claude-code.md`](claude-code.md).
 
 The flags it takes: `-m`/`--model` or `--hf` (one of the two), `--host`, `--port`, `--ctx` (also `--ctx-size` and `-c`;
 unset, the smaller of 32,768 and the file's `context_length`), `--chat-template-file`, `--alias` (unset, the file's

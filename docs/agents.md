@@ -1,7 +1,9 @@
 # Starting bloomery from an agent
 
 For a program or an agent that starts `bloomery-serve` and then calls its API. stdout is machine-readable: JSON,
-one object a line. stderr is text for people; do not parse it.
+one object a line. stderr is text for people; do not parse it. On a Mac the server is `bloomery-serve-metal`, which
+has none of this yet: read [On a Mac](#on-a-mac) instead. To run Claude Code itself on the local model, read
+[`claude-code.md`](claude-code.md).
 
 ## Rules
 
@@ -11,6 +13,28 @@ one object a line. stderr is text for people; do not parse it.
    large. `--dry-run` downloads nothing.
 3. A gated repo needs `HF_TOKEN` in the environment.
 4. The exit status is the class of refusal, and the `error` event says what to run instead (`next`).
+
+## On a Mac
+
+Apple Silicon runs `bloomery-serve-metal` ([`mac.md`](mac.md)). It has no `--recommend`, no start by name and no
+events, so the steps differ:
+
+1. Install with `brew install midagedev/tap/bloomery`, or with the installer line in the README. If Homebrew stops
+   with "Your Command Line Tools are too outdated", use the installer: it needs no build tools.
+2. Pick a folder from [mac.md's table](mac.md#which-files-run). On a 32 GB Mac, the coding pick is
+   `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` (17.2 GB to download). Ask the user before a download that
+   large.
+3. Start it in the background, with stdout and stderr to a file:
+
+       bloomery-serve-metal --hf mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit --port 8080 > serve.log 2>&1 &
+
+4. Poll `GET /health` until it answers 200. Requests sent before that fail. If the process exits first, `serve.log`
+   says why. The exit status is 64 for a flag or value it refuses, 70 when the engine ended the run, and 1 for any
+   other refusal.
+5. `--ctx` unset is the smaller of 32,768 and the model's own context. Raise it only when the user asks, or when the
+   client is Claude Code ([`claude-code.md`](claude-code.md)).
+
+Do not pass `--place`, `--parallel` or `-ngl`: the Mac server refuses them with 64.
 
 ## 1. What this machine serves
 
@@ -121,6 +145,6 @@ The `error` event's `next` is a list of argument lists, each runnable as it stan
 ## Use the server
 
 Take `url` from the `ready` event (`--port 0` gives a free port). OpenAI clients use `URL/v1` as the base URL. Claude
-Code runs with `ANTHROPIC_BASE_URL=URL`. The cache is `~/.cache/bloomery/hf`; `BLOOMERY_CACHE` moves it, and
+Code runs with `ANTHROPIC_BASE_URL=URL` ([`claude-code.md`](claude-code.md) has the full setup). The cache is `~/.cache/bloomery/hf`; `BLOOMERY_CACHE` moves it, and
 `HF_HUB_OFFLINE=1` starts from a cached variant. Every flag and the API: [`serving.md`](serving.md). What each model
 needs: [`models.md`](models.md).

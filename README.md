@@ -41,6 +41,9 @@ bloomery-serve --model qwen3.8-flash-next --dry-run --json  # the start it would
 bloomery-serve --model qwen3.8-flash-next --port 0          # start it: one JSON event a line, then "ready" with the url
 ```
 
+On a Mac the server is `bloomery-serve-metal`, and the agent follows the "On a Mac" steps in the same page. To run
+Claude Code itself on the model you just started, see [`docs/claude-code.md`](docs/claude-code.md).
+
 ## What it does
 
 - **Models larger than the cards, and larger than the host's RAM.** The routed experts live on the cards and in host
@@ -337,6 +340,8 @@ start screen), [@Burntgogi](https://github.com/Burntgogi) (the common owners eve
 |---|---|
 | [`docs/evaluating.md`](docs/evaluating.md) | A checklist to run it and compare it fairly; hardware reports |
 | [`docs/serving.md`](docs/serving.md) | llama-server compatibility, flags, seats, concurrent requests, limits |
+| [`docs/agents.md`](docs/agents.md) | Starting the server from an agent or a script: the picks, the events, the exit codes |
+| [`docs/claude-code.md`](docs/claude-code.md) | Claude Code on a local model, on an NVIDIA card or a Mac, with measured first-turn times |
 | [`docs/models.md`](docs/models.md) | Recommended files and what each model needs |
 | [`docs/numbers.md`](docs/numbers.md) | Every measured table beyond the Status tables: two cards, older releases, other cards and Macs |
 | [`docs/performance.md`](docs/performance.md) | Number conditions, why it is fast, verification, recorded sessions |
