@@ -1609,6 +1609,8 @@ impl Seat for V41 {
                 .u("first", first)
                 .u("end", end)
                 .csv("at", at),
+            // The seat shares no prefix between slots (`Seat::share_keep`).
+            CacheNote::Share { .. } => return bloomery_gpu_gates::bind::note_line(WHAT, note),
         };
         r.eprint();
     }

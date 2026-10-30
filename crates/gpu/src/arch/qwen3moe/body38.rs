@@ -171,7 +171,7 @@ use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{BY_NAME_COLS, ByName};
 use crate::tensor::{WindowMut, to_host};
 use crate::weights::{Weights, tensor_scales};
-use crate::{Branch, DeviceTensor, Gpu, GpuError, StagedRows, launch_u32, ple, qsa};
+use crate::{Branch, DeviceTensor, Gpu, GpuError, SharedPages, StagedRows, launch_u32, ple, qsa};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, sys};
 use engram::hash::{History, Window};
@@ -192,6 +192,8 @@ use std::time::Instant;
 use vision::mrope::MropeSeq;
 
 const WHAT: &str = "qwen4exp Body38";
+/// The label of a share's refusals ([`GpuModel::seq_share_prefix`]).
+pub(super) const WHAT_SHARE: &str = "qwen4exp share";
 
 /// The coverage items the program opens a file with: the tokenizer's
 /// pre-tokenizer and the template's tool-call parser are the chat surface's,
@@ -288,6 +290,39 @@ pub struct Slot38 {
     draft: Option<DraftSeq38>,
     /// The sequence's rotation table on a media load ([`Body38::seq_rope`]).
     rope: Option<SeqRope>,
+}
+
+impl Slot38 {
+    /// The most positions of the first `n` another sequence can take from
+    /// this one ([`Body38::share_state`]): the nearest checkpoint at or below
+    /// `n` (and the held position) whose PLE history stands and, on a load
+    /// with the draft, where the draft rejoins (the point carries the
+    /// target's hidden row before it, and the draft's store holds every
+    /// position below it); 0 when none stands, a verify waits for its
+    /// commit, or on a media load the sequence holds an image (a share does
+    /// not carry the rotation table its later rows' positions come from).
+    fn share_point(&self, n: u32) -> u32 {
+        let images = (self.rope.as_ref()).is_some_and(|r| !r.rows().seq().is_empty());
+        if self.pending.is_some() || images {
+            return 0;
+        }
+        let rejoins = |p: u32| {
+            self.draft
+                .as_ref()
+                .is_none_or(|d| d.held() >= p as usize && point_at(&self.point_rows, p).is_some())
+        };
+        (self.ckpt.positions().into_iter().rev())
+            .find(|&p| {
+                p <= n.min(self.held) && point_at(&self.ple_points, p).is_some() && rejoins(p)
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// The index of the entry at position `p` among a sequence's points' host
+/// sides (its PLE histories, its hidden rows).
+fn point_at<T>(points: &[(u32, T)], p: u32) -> Option<usize> {
+    points.iter().position(|&(q, _)| q == p)
 }
 
 /// The most host bytes a sequence state of `positions` positions holds on
@@ -2567,6 +2602,16 @@ impl Body38 {
         (mapped, layout)
     }
 
+    /// The bytes of the live sequence's stores by position (the selecting
+    /// stores' and the draft store's) whose pages another sequence's stores
+    /// map too ([`GpuModel::seq_share_prefix`]): counted in
+    /// [`Body38::store_room`]'s mapped bytes of both.
+    #[must_use]
+    pub fn store_shared(&self) -> usize {
+        let draft = self.mtp.as_ref().map_or(0, Mtp38::store_shared);
+        self.stores.iter().map(Store38::shared).sum::<usize>() + draft
+    }
+
     /// The device bytes the planned slots' stores by position may still
     /// back as their sequences grow: every slot's pages at the load's
     /// context, less the pages the live sequence already backs. A slot not
@@ -2885,6 +2930,7 @@ impl Body38 {
         let word = u32::from(bits) * 0x1_0001;
         for s in &mut self.stores {
             s.fill()?;
+            s.own_from(0)?;
             if let Store38::Qsa { kv, ring, pooled } = s {
                 match &mut **kv {
                     KvPlanes::F16 { k, v } => {
@@ -2915,6 +2961,7 @@ impl Body38 {
         for s in &mut self.stores {
             if let Store38::Qsa { pooled, .. } = s {
                 pooled.fill()?;
+                pooled.own_from(0)?;
                 let mut rows = pooled.to_host_vec(stream)?;
                 let at = (from * crate::qsa::DIM).min(rows.len());
                 rows[at..].fill(bits);
@@ -3753,7 +3800,8 @@ impl Body38 {
             None => {}
         }
         let lane = self.lane.lane();
-        // The put-back writes the rows of the prefix it keeps alone.
+        // The reset preceding a put-back gave shared pages back; fit backs
+        // the prefix on memory no other sequence maps.
         let kept = s.keep_point(ask) as usize;
         for st in &mut self.stores {
             st.fit(kept)?;
@@ -3808,6 +3856,68 @@ impl Body38 {
         Ok(at)
     }
 
+    /// The first positions of `src`, another slot's sequence, up to its
+    /// share point for `ask` ([`Slot38::share_point`], `at`) put on the empty
+    /// model: the state a resume of a save `src` took at `at` leaves, with
+    /// the selecting stores' rows below `at` held on `src`'s pages
+    /// ([`Store38::share`]: every page of whole rows below `at` mapped, the
+    /// page where they end copied) and the recurrent stores, the PLE ring and
+    /// the raw key rings put back from `src`'s point there
+    /// ([`Checkpoints::load_point`]). The stores stand at `at`, the committed
+    /// lane stamped there, the PLE history the point's; on a load with the
+    /// draft its store shares `src`'s rows the same way and the draft
+    /// rejoins at `at` from the point's hidden row
+    /// ([`Body38::rejoin_draft`]). The model's own point at `at` is taken
+    /// last ([`Body38::take_mark`]), so a cut back to `at` stands. Returns
+    /// `at` and the bytes the stores map onto `src`'s pages and copied.
+    /// Refused by name, nothing moved, onto a model that is not empty and
+    /// where `src` has no share point at or below `ask`.
+    fn share_state(
+        &mut self,
+        stream: &CudaStream,
+        src: &Slot38,
+        ask: u32,
+    ) -> Result<(u32, SharedPages), GpuError> {
+        if self.held != 0 || self.pending.is_some() || self.staged.is_some() {
+            return Err(GpuError::shape(
+                WHAT_SHARE,
+                format!("a share onto stores at {}: reset first", self.held),
+            ));
+        }
+        let at = src.share_point(ask);
+        let (Some(h), row) = (point_at(&src.ple_points, at), point_at(&src.point_rows, at)) else {
+            return Err(GpuError::shape(
+                WHAT_SHARE,
+                format!(
+                    "no point of the other sequence at or below {ask} to take (points {:?}, \
+                     {} held)",
+                    src.ckpt.positions(),
+                    src.held
+                ),
+            ));
+        };
+        let mut moved = SharedPages::default();
+        for (st, from) in self.stores.iter_mut().zip(&src.stores) {
+            moved = moved + st.share(from, at as usize)?;
+        }
+        if let (Some(d), Some(from)) = (self.mtp.as_mut(), src.draft.as_ref()) {
+            moved = moved + d.share_store(from, at as usize)?;
+        }
+        let lane = self.lane.lane();
+        let mut c = Copied::of(&mut self.stores, &mut self.ple_ring, lane, None, None)?;
+        src.ckpt.load_point(stream, at, &mut c.list())?;
+        drop(c);
+        self.restamp(stream, lane, at)?;
+        self.ple.hist = src.ple_points[h].1.clone();
+        self.held = at;
+        if self.mtp.is_some() {
+            let row = row.ok_or(GpuError::state(WHAT_SHARE, "the point's hidden row"))?;
+            self.rejoin_draft(stream, at, &src.point_rows[row].1)?;
+        }
+        self.take_mark(stream, at)?;
+        Ok((at, moved))
+    }
+
     /// Plant a failure for the next call once its plan and copies are made,
     /// before its launch: the call fails and moves nothing. Gate use.
     pub fn plant_before_launch(&mut self) {
@@ -3832,7 +3942,8 @@ impl Body38 {
     /// history past: [`Body38::launch`] takes it. The stores' rows through
     /// the call's last position are backed first ([`Store38::fit`]), so every
     /// call that writes a row, a long reply's steps and a verify's rows
-    /// among them, finds its pages mapped.
+    /// among them, finds its pages mapped, and the pages it writes from
+    /// `pos` on are this sequence's alone ([`Store38::own_from`]).
     fn stage(
         &mut self,
         pos: u32,
@@ -3842,6 +3953,7 @@ impl Body38 {
     ) -> Result<(), GpuError> {
         for s in &mut self.stores {
             s.fit(pos as usize + rows)?;
+            s.own_from(pos as usize)?;
         }
         self.staged = Some(Staged38 {
             pos,
@@ -5273,7 +5385,8 @@ impl GpuModel<Body38> {
     /// positions, its checkpoints the points `s` carried and no other, and
     /// the calls after it are bit for bit those after the state was taken.
     /// Refused by name, nothing copied, for another model's state (its
-    /// file, card or context).
+    /// file, card or context), and while a pass of several slots waits for
+    /// its commit.
     pub fn seq_resume(&mut self, s: &Seq38) -> Result<(), GpuError> {
         if s.positions() == 0 {
             return self.seq_reset_for("qwen4exp resume");
@@ -5281,9 +5394,12 @@ impl GpuModel<Body38> {
         self.seq_resume_prefix(s, s.positions()).map(drop)
     }
 
-    /// The model reset unless it is empty already: what every resume starts
-    /// from.
+    /// The model reset unless it is empty already: what every resume and
+    /// share starts from. Refused by name, nothing reset, while a pass of
+    /// several slots waits for its commit: the reset would drop the pass the
+    /// commit keeps rows of.
     fn seq_reset_for(&mut self, what: &'static str) -> Result<(), GpuError> {
+        self.refuse_if_slots_wait(what)?;
         let b = self.body(what)?;
         let empty = self.pos() == 0
             && b.held == 0
@@ -5330,6 +5446,54 @@ impl GpuModel<Body38> {
             Ok(false)
         })?;
         Ok(at)
+    }
+}
+
+impl GpuModel<Body38> {
+    /// The most positions of the first `n` the selected slot can take from
+    /// slot `from` ([`GpuModel::seq_share_prefix`]): the nearest point of
+    /// `from`'s sequence at or below `n` where the selected slot can stand
+    /// (`Slot38::share_point`); 0 when none stands, for the selected slot
+    /// itself and for a slot out of range.
+    #[must_use]
+    pub fn seq_share_point(&self, from: usize, n: u32) -> u32 {
+        self.parked_ref(from).map_or(0, |s| s.share_point(n))
+    }
+
+    /// The selected slot's sequence replaced by the first positions of slot
+    /// `from`'s, up to its share point for `n` ([`GpuModel::seq_share_point`]):
+    /// a reset unless the model is empty already, then the stores rebuilt
+    /// beside `from`'s (`Body38::share_state`): the selecting stores' rows,
+    /// and the draft's store rows on a load with the draft, held on `from`'s
+    /// pages wherever a page holds the prefix's whole rows alone, the
+    /// recurrent stores put back from `from`'s point. The selected slot
+    /// stands at that point, which it returns with the bytes its stores map
+    /// onto `from`'s pages and copied, as a resume of a save `from` took
+    /// there and a cut to it leave it; the calls after it are bit for bit
+    /// those. A later write of either sequence below the point first gives
+    /// the pages it reaches memory of their own ([`Store38::own_from`]), and
+    /// a reset gives the shared pages back. Refused by name, nothing moved,
+    /// where no point stands (a share point of 0), on a poisoned model, and
+    /// while a pass of several slots waits for its commit.
+    pub fn seq_share_prefix(
+        &mut self,
+        from: usize,
+        n: u32,
+    ) -> Result<(u32, SharedPages), GpuError> {
+        self.refuse_if_poisoned(WHAT_SHARE)?;
+        if self.seq_share_point(from, n) == 0 {
+            return Err(GpuError::shape(
+                WHAT_SHARE,
+                format!(
+                    "slot {from} holds no point at or below {n} that slot {} can take",
+                    self.selected()
+                ),
+            ));
+        }
+        self.seq_reset_for(WHAT_SHARE)?;
+        self.beside(from, WHAT_SHARE, |gpu, body, src| {
+            body.share_state(gpu.stream(), src, n)
+        })
     }
 }
 

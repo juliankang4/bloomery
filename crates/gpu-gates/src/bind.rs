@@ -70,7 +70,7 @@ use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
     CacheNote, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER, Flight,
     Landed, ModelProps, Pending, PlacementProps, ResidencyReset, Saved, SavedState, ServeError,
-    Server, ServerConfig, SlotConfig, StateError, Tokenizer, Waits,
+    Server, ServerConfig, SharedPrefix, SlotConfig, StateError, Tokenizer, Waits,
 };
 
 use crate::GateError;
@@ -1216,6 +1216,12 @@ enum Cmd {
     /// Replace the sequence state with the first positions of a saved one
     /// ([`Seat::resume_prefix`]).
     ResumePrefix(Arc<dyn Saved>, usize),
+    /// What the selected slot can take of this many positions of that slot
+    /// ([`Seat::share_keep`]).
+    ShareKeep(usize, usize),
+    /// Give the selected slot the first positions of that slot, at most this
+    /// many ([`Seat::share_prefix`]).
+    Share(usize, usize),
     /// The selected slot's state written into the pipe ([`save_into`]).
     SaveState(SyncSender<Vec<u8>>),
     /// The selected slot's state read from the pipe ([`restore_from`]).
@@ -1292,6 +1298,8 @@ enum Extra {
     /// A `ResumePrefix`' positions put back, or its failure with its kind
     /// ([`resume_prefix_of`]).
     Prefix(Result<usize, StateError>),
+    /// A `Share`'s outcome, or its failure with its kind ([`share_of`]).
+    Shared(Result<SharedPrefix, StateError>),
     /// A `SaveState`'s or `RestoreState`'s outcome, its kind as the seat
     /// gave it.
     State(Result<SavedState, StateError>),
@@ -1545,6 +1553,22 @@ pub trait Seat: 'static {
         let _ = n;
         self.resume(state)?;
         Ok(state.n_tokens())
+    }
+    /// The most of the first `n` positions slot `from` holds that the
+    /// selected slot can take from it (`serve::Engine::share_keepable`). The
+    /// default is 0: the seat shares nothing between its slots, and
+    /// [`Seat::share_prefix`] is never asked.
+    fn share_keep(&self, from: usize, n: usize) -> usize {
+        let _ = (from, n);
+        0
+    }
+    /// The selected slot given the first positions slot `from` holds, at
+    /// most `n`, as [`Seat::share_keep`] granted
+    /// (`serve::Engine::share_prefix`). A refusal by name
+    /// ([`Seat::snapshot`]'s kinds) is the request's: the server resets the
+    /// slot. The default refuses by name.
+    fn share_prefix(&mut self, from: usize, n: usize) -> Result<SharedPrefix, GateError> {
+        Err(format!("this seat shares no prefix between slots (slot {from}, {n} positions)").into())
     }
     /// The selected slot's sequence state written to `out` in a form
     /// [`Seat::restore_state`] reads back (`serve::Engine::save_state`), the
@@ -1800,6 +1824,15 @@ impl SeatEngine {
                             None,
                             Extra::Prefix(resume_prefix_of(&mut g, &*state, n)),
                         ),
+                        Cmd::ShareKeep(from, n) => (
+                            u32::try_from(g.share_keep(from, n))
+                                .map_err(|_| format!("a shared prefix of at most {n} passes u32")),
+                            None,
+                            Extra::None,
+                        ),
+                        Cmd::Share(from, n) => {
+                            (Ok(0), None, Extra::Shared(share_of(&mut g, from, n)))
+                        }
                         Cmd::SaveState(chunks) => {
                             (Ok(0), None, Extra::State(save_into(&mut g, chunks)))
                         }
@@ -2023,6 +2056,19 @@ impl Link {
             (Err(e), _) => Err(StateError::Engine(EngineError(e))),
             (Ok(_), _) => Err(StateError::Engine(EngineError(
                 "the engine thread answered a prefix resume with no outcome".to_owned(),
+            ))),
+        }
+    }
+
+    /// The first `n` positions of slot `from` onto the selected slot
+    /// ([`Seat::share_prefix`]), its failure's kind as [`share_of`] read it.
+    fn share_prefix(&self, from: usize, n: usize) -> Result<SharedPrefix, StateError> {
+        let reply = self.ask(Cmd::Share(from, n))?;
+        match (reply.result, reply.extra) {
+            (Ok(_), Extra::Shared(r)) => r,
+            (Err(e), _) => Err(StateError::Engine(EngineError(e))),
+            (Ok(_), _) => Err(StateError::Engine(EngineError(
+                "the engine thread answered a share with no outcome".to_owned(),
             ))),
         }
     }
@@ -2475,6 +2521,8 @@ fn serve_cmd<S: Seat>(
         | Cmd::SaveWait(_)
         | Cmd::Resume(_)
         | Cmd::ResumePrefix(..)
+        | Cmd::ShareKeep(..)
+        | Cmd::Share(..)
         | Cmd::SaveState(_)
         | Cmd::RestoreState(_)
         | Cmd::Pass { .. }
@@ -2743,6 +2791,22 @@ fn resume_prefix_of<S: Seat + ?Sized>(
                 "resume of the first {n} positions of a state of {} positions",
                 state.n_tokens()
             ),
+        )
+    })
+}
+
+/// The first `n` positions of slot `from` onto the selected slot
+/// ([`Seat::share_prefix`]), on the engine thread; a failure with its kind
+/// ([`seat_failure`]).
+fn share_of<S: Seat + ?Sized>(
+    g: &mut S,
+    from: usize,
+    n: usize,
+) -> Result<SharedPrefix, StateError> {
+    g.share_prefix(from, n).map_err(|e| {
+        seat_failure(
+            &*e,
+            format!("share of the first {n} positions of slot {from}"),
         )
     })
 }
@@ -3349,6 +3413,20 @@ impl Engine for SeatEngine {
     /// ([`Link::resume_prefix`]).
     fn resume_prefix(&mut self, state: &Arc<dyn Saved>, n: usize) -> Result<usize, StateError> {
         self.link.resume_prefix(state, n)
+    }
+
+    /// The seat's share rule ([`Seat::share_keep`]), asked on the engine
+    /// thread; a thread that does not answer grants nothing.
+    fn share_keepable(&self, from: usize, n: usize) -> usize {
+        match self.link.ask(Cmd::ShareKeep(from, n)).map(|r| r.result) {
+            Ok(Ok(k)) => (k as usize).min(n),
+            _ => 0,
+        }
+    }
+
+    /// Slot `from`'s prefix onto the selected slot ([`Link::share_prefix`]).
+    fn share_prefix(&mut self, from: usize, n: usize) -> Result<SharedPrefix, StateError> {
+        self.link.share_prefix(from, n)
     }
 
     /// The selected slot's state through the pipe ([`Seat::save_state`]),

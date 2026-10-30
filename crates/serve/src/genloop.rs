@@ -99,8 +99,8 @@ use crate::api::logprobs::{Ask, Collector, RowError};
 use crate::constrain::{Constraint, Draw, StepError, Walk};
 use crate::engine::{
     CacheNote, Decoder, Drafted, Engine, EngineError, Landed, Pending, Sampler, SamplerFactory,
-    SamplerRefused, SamplingParams, SaveInFlight, Saved, SlotDraw, SlotPass, SlotRow, StateError,
-    Tokenizer,
+    SamplerRefused, SamplingParams, SaveInFlight, Saved, SharedPrefix, SlotDraw, SlotPass, SlotRow,
+    StateError, Tokenizer,
 };
 use crate::media::{Held, MediaFeed, MediaSpan, common_prefix, keep_whole_spans};
 use crate::promptcache::{PromptCache, Taken};
@@ -548,6 +548,16 @@ pub(crate) struct Slot {
     jump: bool,
 }
 
+/// Another slot's cache a request takes its prefix from ([`Slot::share_pick`]):
+/// the slot, the ids the request shares with it and what the engine keeps
+/// of them.
+#[derive(Clone, Copy)]
+struct Lend {
+    from: usize,
+    common: usize,
+    kept: usize,
+}
+
 /// What a cache hit put back ([`Slot::load`]).
 struct Loaded {
     positions: usize,
@@ -769,6 +779,12 @@ impl Slot {
     /// prefix the engine keeps less of than the request shares is noted with
     /// the engine's reason.
     ///
+    /// Another slot whose cache the engine can put more of `req` from than the
+    /// slot keeps ([`Engine::share_keepable`]) replaces the slot's state the
+    /// same way, its prefix taken on the device ([`Engine::share_prefix`]);
+    /// a cached state wins only by keeping more. The slot's state is saved
+    /// first as for a cached state, and the share is noted.
+    ///
     /// A slot handed its parked state back ([`Slot::hand_back`]) holds it off
     /// the engine: the cache takes that state as it is where the rule saves
     /// it, and the engine takes it back only when the request keeps some of
@@ -783,11 +799,12 @@ impl Slot {
         self.settle(self.cur)?;
         self.refresh()?;
         let (mut common, mut ask, mut k) = self.keep_of(req, want, away.as_ref());
+        let lent = if want { self.share_pick(req, k) } else { None };
         // The pick is taken out before the slot's state is saved: making room
         // for that state may evict it, and the pick then lives on in `picked`.
         let picked = if want && self.cache.enabled() {
             self.cache
-                .best(req, k)
+                .best(req, lent.map_or(k, |l| l.kept))
                 .map(|p| (p.kept, self.cache.take(p)))
         } else {
             None
@@ -801,7 +818,7 @@ impl Slot {
         };
         if self.cache.enabled()
             && !self.held.is_empty()
-            && (picked.is_some() || (saves_cut && !continues))
+            && (picked.is_some() || lent.is_some() || (saves_cut && !continues))
             && !sealed
                 .as_ref()
                 .is_some_and(|s| self.cache.contains(s, &self.held))
@@ -821,6 +838,22 @@ impl Slot {
                     ms: l.ms,
                     resumed: l.resumed,
                     waited_ms: l.waited_ms,
+                });
+            } else {
+                (common, ask, k) = (0, 0, 0);
+            }
+        } else if let Some(l) = lent {
+            let slot_kept = k;
+            if let Some((shared, ms)) = self.share(l.from, l.kept)? {
+                (common, ask, k) = self.keep_of(req, want, None);
+                self.engine.note(&CacheNote::Share {
+                    from: l.from,
+                    common: l.common,
+                    kept: k,
+                    slot_kept,
+                    mapped_bytes: shared.mapped_bytes,
+                    copied_bytes: shared.copied_bytes,
+                    ms,
                 });
             } else {
                 (common, ask, k) = (0, 0, 0);
@@ -849,6 +882,63 @@ impl Slot {
         self.held = held;
         self.held.truncate(k);
         Ok(k)
+    }
+
+    /// The other slot whose cache holds the most of `req` the engine can
+    /// put on the selected slot ([`Engine::share_keepable`]), never ending
+    /// inside an image span, if that keeps more than `floor`; of equals, the
+    /// lowest slot.
+    fn share_pick(&self, req: &Held, floor: usize) -> Option<Lend> {
+        let last = req.len().checked_sub(1)?;
+        let mut best: Option<Lend> = None;
+        for (from, held) in self.parked.iter().enumerate() {
+            let bar = best.map_or(floor, |b| b.kept);
+            let common = common_prefix(held, req);
+            if from == self.cur || common.min(last) <= bar {
+                continue;
+            }
+            let kept = keep_whole_spans(req, common.min(last), |n| {
+                self.engine.share_keepable(from, n)
+            });
+            if kept > bar {
+                best = Some(Lend { from, common, kept });
+            }
+        }
+        best
+    }
+
+    /// The first `n` positions slot `from` holds onto the selected slot
+    /// ([`Engine::share_prefix`]), the slot then holding them as `from`
+    /// does; returns what the engine took and the call's wall time in ms. A
+    /// share the engine refuses resets the slot, which then holds nothing
+    /// (`None`), noted; an engine failure is the request's error.
+    fn share(&mut self, from: usize, n: usize) -> Result<Option<(SharedPrefix, f64)>, EngineError> {
+        self.held = Held::default();
+        let t = Instant::now();
+        match self.rows()?.share_prefix(from, n) {
+            Ok(shared) => {
+                if shared.positions == 0 || shared.positions > n {
+                    return Err(EngineError(format!(
+                        "the engine took {} positions of a share of {n} from slot {from}",
+                        shared.positions
+                    )));
+                }
+                let mut held = self.parked[from].clone();
+                held.truncate(shared.positions);
+                self.prompts[self.cur] = held.ids.len();
+                self.held = held;
+                Ok(Some((shared, ms_since(t))))
+            }
+            Err(StateError::Engine(e)) => Err(e),
+            Err(e) => {
+                self.rows()?.reset()?;
+                self.engine.note(&CacheNote::Skip {
+                    positions: n,
+                    why: format!("the engine refused to share slot {from}'s prefix: {e}"),
+                });
+                Ok(None)
+            }
+        }
     }
 
     /// The engine, for a call that cuts, resets or replaces the selected
@@ -2976,8 +3066,8 @@ mod cache_tests {
     use super::{GenParams, Outcome, Slot, Timings, generate};
     use crate::api::logprobs::Ask;
     use crate::engine::{
-        CacheNote, Decoder, Engine, EngineError, SamplingParams, SaveInFlight, Saved, StateError,
-        Tokenizer,
+        CacheNote, Decoder, Engine, EngineError, SamplingParams, SaveInFlight, Saved, SharedPrefix,
+        StateError, Tokenizer,
     };
     use crate::media::{Held, MediaFeed};
     use crate::mock::{MockEngine, MockTokenizer, SaveStats};
@@ -3755,6 +3845,12 @@ mod cache_tests {
         fn resume_prefix(&mut self, state: &Arc<dyn Saved>, n: usize) -> Result<usize, StateError> {
             self.inner.resume_prefix(state, n)
         }
+        fn share_keepable(&self, from: usize, n: usize) -> usize {
+            self.inner.share_keepable(from, n)
+        }
+        fn share_prefix(&mut self, from: usize, n: usize) -> Result<SharedPrefix, StateError> {
+            self.inner.share_prefix(from, n)
+        }
         fn note(&self, note: &CacheNote) {
             self.notes.lock().expect("the notes").push(note.clone());
         }
@@ -3848,6 +3944,105 @@ mod cache_tests {
         assert_eq!(stats.hazards.load(SeqCst), 0);
         slot.settle(0).expect("the wait");
         assert!(slot.rows().is_ok(), "once the copy has landed");
+    }
+
+    /// A request that shares a prefix with what another slot holds takes it
+    /// from that slot ([`Engine::share_prefix`]) instead of evaluating it:
+    /// its `cache_n` is the prefix, one share is noted, and its tokens are a
+    /// fresh slot's; the other slot keeps its conversation, whose next turn
+    /// keeps all it held; a cached state that keeps more wins over the share.
+    #[test]
+    fn a_request_takes_the_prefix_another_slot_holds() {
+        let notes = Arc::new(Mutex::new(Vec::new()));
+        let engine = Noted {
+            inner: MockEngine::new(4096)
+                .with_slots(2)
+                .with_cache_ram(1 << 20)
+                .with_shares(),
+            notes: Arc::clone(&notes),
+        };
+        let mut slot = Slot::with_slots(Box::new(engine), 2);
+        let system = "<｜User｜>the cat sat on the mat and the dog sat on the log ";
+        let a = enc(&format!("{system}and the "));
+        let b = enc(&format!("{system}so a "));
+        let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        slot.select(0).expect("a select");
+        let ra = outcome(&mut slot, &a);
+        slot.select(1).expect("a select");
+        let rb = outcome(&mut slot, &b);
+        assert_eq!(rb.timings.cache_n, common, "the shared prefix kept");
+        let shares: Vec<CacheNote> = (notes.lock().expect("notes").iter())
+            .filter(|n| matches!(n, CacheNote::Share { .. }))
+            .cloned()
+            .collect();
+        assert!(
+            matches!(
+                shares[..],
+                [CacheNote::Share { from: 0, kept, slot_kept: 0, .. }] if kept == common
+            ),
+            "{shares:?}"
+        );
+        let mut fresh = Slot::new(Box::new(MockEngine::new(4096)));
+        assert_eq!(
+            rb.tokens,
+            outcome(&mut fresh, &b).tokens,
+            "a fresh slot's reply"
+        );
+        let mut a2 = a.clone();
+        a2.extend(&ra.tokens);
+        a2.extend(enc("<｜User｜>then "));
+        slot.select(0).expect("a select");
+        let ra2 = outcome(&mut slot, &a2);
+        assert_eq!(
+            ra2.timings.cache_n,
+            a.len() + ra.tokens.len() - 1,
+            "slot 0 keeps its turn"
+        );
+        slot.select(1).expect("a select");
+        outcome(&mut slot, &enc("<｜User｜>xyz uvw xyz "));
+        let mut b2 = b.clone();
+        b2.extend(&rb.tokens);
+        b2.extend(enc("<｜User｜>so "));
+        let cached = outcome(&mut slot, &b2).timings.cache_n;
+        assert_eq!(
+            cached,
+            b.len() + rb.tokens.len() - 1,
+            "the cached state of slot 1's turn keeps more than slot 0's prefix"
+        );
+        let n = notes.lock().expect("notes");
+        assert_eq!(
+            n.iter()
+                .filter(|n| matches!(n, CacheNote::Share { .. }))
+                .count(),
+            1,
+            "{n:?}"
+        );
+        assert!(
+            n.iter().any(|n| matches!(n, CacheNote::Load { .. })),
+            "{n:?}"
+        );
+        drop(n);
+        // Slot 1 moves to another prompt, its turn cached: that state keeps
+        // the system prompt of slot 0's next turn, less than slot 0 holds.
+        outcome(&mut slot, &enc("<｜User｜>one two three "));
+        let mut a3 = a2.clone();
+        a3.extend(&ra2.tokens);
+        a3.extend(enc("<｜User｜>and "));
+        let took = outcome(&mut slot, &a3).timings.cache_n;
+        assert_eq!(
+            took,
+            a2.len() + ra2.tokens.len() - 1,
+            "the share keeps more than the cached state"
+        );
+        let n = notes.lock().expect("notes");
+        let last = n
+            .iter()
+            .rev()
+            .find(|n| matches!(n, CacheNote::Share { .. } | CacheNote::Load { .. }));
+        assert!(
+            matches!(last, Some(CacheNote::Share { from: 0, kept, .. }) if *kept == took),
+            "{n:?}"
+        );
     }
 
     /// A pooled mock's cell: a state of the short prompts below fills one,

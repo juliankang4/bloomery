@@ -118,6 +118,7 @@ pub use graph::{
     op_write,
 };
 pub use model::{GpuModel, Slots};
+pub use room::SharedPages;
 pub use watchdog::Busy as EngineBusy;
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
 /// before the skeleton became generic over its architecture.

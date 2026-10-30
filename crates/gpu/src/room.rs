@@ -17,12 +17,24 @@
 //! reserves every buffer's page rounding on every resident slot and the
 //! device's spare page before choosing experts or context.
 //!
-//! Every writer calls `fit` first, outside capture, for all positions it
-//! can write. An unbacked page aliases the spare: a missed fit can corrupt
-//! another room without a device fault.
+//! Two rooms of one layout (two sequences' stores of one load) share the
+//! pages of a common prefix ([`Room::share`]): a page that holds whole rows
+//! of the prefix alone maps the other room's memory, and the page where the
+//! prefix ends gets memory of its own with the other room's bytes copied in.
+//! A shared page is written by neither: a writer first gives every shared
+//! page its write reaches memory of its own holding the same bytes
+//! ([`Room::own_from`]), and a sequence's end gives its shared pages back
+//! ([`Room::settle`]). A page's memory is freed when the last room that maps
+//! it lets it go.
+//!
+//! Every writer calls `fit` and `own_from` first, outside capture, for all
+//! positions it can write. An unbacked page aliases the spare: a missed fit
+//! can corrupt another room without a device fault, and a missed `own_from`
+//! another sequence's rows.
 
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use cuda_core::sys::CUdevice;
@@ -36,7 +48,7 @@ const WHAT: &str = "room";
 /// Rows of one buffer in a room: `rows` rows of `row` bytes from byte `at`
 /// of the buffer, one row for every `per` positions (a pooled key's row
 /// covers `per` positions, every other row one).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Run {
     pub(crate) at: usize,
     pub(crate) row: usize,
@@ -50,14 +62,39 @@ impl Run {
         let rows = positions.div_ceil(self.per).min(self.rows);
         (self.at, self.at + rows * self.row)
     }
+
+    /// The byte of the first row a write from position `pos` on reaches:
+    /// the row that holds `pos` (a pooled row a later position completes is
+    /// written again).
+    fn written_from(&self, pos: usize) -> usize {
+        self.at + (pos / self.per).min(self.rows) * self.row
+    }
 }
 
-/// A page of a room's range: its mapping, and the memory of its own a fit
-/// gave it (none while it maps the spare). The mapping drops first
-/// (unmapped), then the memory is released.
+/// What a share moved ([`Room::share`]): the bytes of the pages that map
+/// the other room's memory, and the bytes copied into pages of their own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SharedPages {
+    pub mapped: usize,
+    pub copied: usize,
+}
+
+impl std::ops::Add for SharedPages {
+    type Output = SharedPages;
+    fn add(self, o: SharedPages) -> SharedPages {
+        SharedPages {
+            mapped: self.mapped + o.mapped,
+            copied: self.copied + o.copied,
+        }
+    }
+}
+
+/// A page of a room's range: its mapping, and the memory it maps other
+/// than the spare (its own, or another room's too after a share). The
+/// mapping drops first (unmapped), then this room's hold on the memory.
 struct Page {
     _map: Mapping,
-    own: Option<PhysicalAllocation>,
+    own: Option<Arc<PhysicalAllocation>>,
 }
 
 /// The page every page of `device`'s rooms with no memory of its own maps,
@@ -102,6 +139,10 @@ pub(crate) struct Room {
     reach: usize,
     /// The pages with memory of their own.
     mapped: usize,
+    /// Whether a page may map memory another room maps too: set by a share
+    /// on both rooms (the one it reads from through `&`), cleared once a
+    /// scan finds none, so a sequence that never shared scans no page.
+    lent: AtomicBool,
     page: usize,
     spare: Arc<PhysicalAllocation>,
     stream: Arc<CudaStream>,
@@ -123,12 +164,12 @@ impl Room {
 
     /// Page `i` mapped read-write for the room's device to `own`, or to the
     /// spare without it, whatever mapped it before unmapped first.
-    fn back(&mut self, i: usize, own: Option<PhysicalAllocation>) -> Result<(), GpuError> {
+    fn back(&mut self, i: usize, own: Option<Arc<PhysicalAllocation>>) -> Result<(), GpuError> {
         if self.pages[i].take().is_some_and(|p| p.own.is_some()) {
             self.mapped -= 1;
         }
-        let va = self.reserve.base() + (i * self.page) as u64;
-        let map = Mapping::new(va, self.page, own.as_ref().unwrap_or(&self.spare), 0)
+        let va = self.va(i);
+        let map = Mapping::new(va, self.page, own.as_deref().unwrap_or(&self.spare), 0)
             .map_err(driver("cuMemMap"))?;
         vmm::set_access(va, self.page, &[self.stream.context().cu_device()])
             .map_err(driver("cuMemSetAccess"))?;
@@ -137,10 +178,75 @@ impl Room {
         Ok(())
     }
 
+    /// Page `i`'s address.
+    fn va(&self, i: usize) -> u64 {
+        self.reserve.base() + (i * self.page) as u64
+    }
+
+    /// Memory of its own for one page, the context bound to the thread.
+    fn new_page(&self) -> Result<Arc<PhysicalAllocation>, GpuError> {
+        let ctx = self.stream.context();
+        ctx.bind_to_thread()?;
+        let own =
+            PhysicalAllocation::new(ctx.cu_device(), self.page).map_err(driver("cuMemCreate"))?;
+        Ok(Arc::new(own))
+    }
+
+    /// The memory page `i` maps, other than the spare.
+    fn own(&self, i: usize) -> Option<&Arc<PhysicalAllocation>> {
+        self.pages[i].as_ref().and_then(|p| p.own.as_ref())
+    }
+
+    /// Whether page `i` maps memory another room maps too.
+    fn is_shared(&self, i: usize) -> bool {
+        self.own(i).is_some_and(|o| Arc::strong_count(o) > 1)
+    }
+
+    /// Whether page `i` touches a run's rows and holds, in every run it
+    /// touches, whole rows of the first `positions` positions alone: a page
+    /// no write from `positions` on reaches.
+    fn below(&self, i: usize, positions: usize) -> bool {
+        let (start, end) = (i * self.page, (i + 1) * self.page);
+        let mut touched = false;
+        for r in &self.runs {
+            let (at, last) = r.span(usize::MAX);
+            if end <= at || start >= last {
+                continue;
+            }
+            touched = true;
+            if end.min(last) > r.written_from(positions) {
+                return false;
+            }
+        }
+        touched
+    }
+
+    /// Whether page `i` holds a row a write from position `pos` on reaches.
+    fn written_from(&self, i: usize, pos: usize) -> bool {
+        let (start, end) = (i * self.page, (i + 1) * self.page);
+        self.runs.iter().any(|r| {
+            let (_, last) = r.span(usize::MAX);
+            start < last && end > r.written_from(pos)
+        })
+    }
+
+    /// `bytes` bytes from `src` to `dst` on the room's stream, in order
+    /// before any launch enqueued after.
+    fn copy(&self, dst: u64, src: u64, bytes: usize) -> Result<(), GpuError> {
+        // SAFETY: both ranges are `bytes` bytes of device memory mapped
+        // read-write for this device (pages of rooms of this device, or a
+        // room's scratch mappings of new pages) that stay mapped until the
+        // stream has run the copy, and they do not overlap.
+        unsafe {
+            cuda_core::simt::memory::memcpy_dtod_async(dst, src, bytes, self.stream.cu_stream())
+        }
+        .map_err(driver("cuMemcpyDtoDAsync"))
+    }
+
     /// Page `i`'s bytes zeroed on the room's stream, in order before any
     /// launch enqueued after.
     fn zero(&self, i: usize) -> Result<(), GpuError> {
-        let va = self.reserve.base() + (i * self.page) as u64;
+        let va = self.va(i);
         // SAFETY: `va` is the start of a page of this room's reservation,
         // `page` bytes long, mapped read-write for this device; the room
         // keeps a mapping there until it drops, after the device finished.
@@ -179,7 +285,6 @@ impl Room {
         if positions <= self.fitted {
             return Ok(());
         }
-        let mut bound = false;
         for r in 0..self.runs.len() {
             let (_, from) = self.runs[r].span(self.fitted);
             let (_, end) = self.runs[r].span(positions);
@@ -187,16 +292,10 @@ impl Room {
                 continue;
             }
             for i in from / self.page..end.div_ceil(self.page) {
-                if self.pages[i].as_ref().is_some_and(|p| p.own.is_some()) {
+                if self.own(i).is_some() {
                     continue;
                 }
-                let ctx = self.stream.context();
-                if !bound {
-                    ctx.bind_to_thread()?;
-                    bound = true;
-                }
-                let own = PhysicalAllocation::new(ctx.cu_device(), self.page)
-                    .map_err(driver("cuMemCreate"))?;
+                let own = self.new_page()?;
                 self.back(i, Some(own))?;
                 self.zero(i)?;
             }
@@ -206,14 +305,15 @@ impl Room {
     }
 
     /// The end of a sequence: every page none of the rows of the positions
-    /// it reached lies on given back to the spare, after the device has
-    /// finished every call that could read one, and the next sequence's
-    /// reach counted from none.
+    /// it reached lies on, and every page another room maps too, given back
+    /// to the spare, after the device has finished every call that could
+    /// read one, and the next sequence's reach counted from none.
     pub(crate) fn settle(&mut self) -> Result<(), GpuError> {
-        let give: Vec<usize> = (self.wanted(self.reach).into_iter().enumerate())
-            .filter(|&(i, keep)| !keep && self.pages[i].as_ref().is_some_and(|p| p.own.is_some()))
-            .map(|(i, _)| i)
+        let keep = self.wanted(self.reach);
+        let give: Vec<usize> = (0..self.pages.len())
+            .filter(|&i| self.own(i).is_some() && (!keep[i] || self.is_shared(i)))
             .collect();
+        let reached = give.iter().any(|&i| keep[i]);
         if !give.is_empty() {
             crate::capsync::ctx_sync(self.stream.context(), "room settle")?;
             self.stream.context().bind_to_thread()?;
@@ -221,14 +321,154 @@ impl Room {
                 self.back(i, None)?;
             }
         }
-        self.fitted = self.fitted.min(self.covered(self.reach));
+        self.fitted = if reached {
+            0
+        } else {
+            self.fitted.min(self.covered(self.reach))
+        };
         self.reach = 0;
         Ok(())
     }
 
-    /// Device bytes the pages with memory of their own hold.
+    /// Refused by name unless `from` is a room of this one's layout on its
+    /// device and backs every page the rows of the first `positions`
+    /// positions lie on: what [`Room::share`] takes.
+    fn check_share(&self, from: &Room, positions: usize) -> Result<(), GpuError> {
+        if self.page != from.page
+            || self.runs != from.runs
+            || self.pages.len() != from.pages.len()
+            || self.stream.context().cu_device() != from.stream.context().cu_device()
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                "a share from a room of another layout or device",
+            ));
+        }
+        let want = from.wanted(positions);
+        if let Some(i) = (0..want.len()).find(|&i| want[i] && from.own(i).is_none()) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a share of {positions} positions whose rows lie on page {i} of a room that \
+                     backs no memory there"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The rows of the first `positions` positions taken from `from`, a room
+    /// of the same layout on the same device: each page that holds whole
+    /// rows of those positions alone ([`Room::below`]) maps `from`'s memory,
+    /// and each other page one of their rows lies on gets memory of its own
+    /// (unless it holds memory no other room maps) with `from`'s page copied
+    /// in on the room's stream. The pages past the rows stay as they are,
+    /// and the reach counts the positions. Synchronizes the context first:
+    /// no call reads a page while its mapping moves. Refused by name,
+    /// nothing moved, as [`Room::check_share`] refuses. Never inside a
+    /// capture.
+    pub(crate) fn share(&mut self, from: &Room, positions: usize) -> Result<SharedPages, GpuError> {
+        self.check_share(from, positions)?;
+        let want = self.wanted(positions);
+        crate::capsync::ctx_sync(self.stream.context(), "room share")?;
+        self.stream.context().bind_to_thread()?;
+        let mut moved = SharedPages::default();
+        self.lent.store(true, Ordering::Relaxed);
+        from.lent.store(true, Ordering::Relaxed);
+        for i in (0..want.len()).filter(|&i| want[i]) {
+            let theirs = from
+                .own(i)
+                .ok_or(GpuError::state(WHAT, "the shared page's memory"))?;
+            if self.below(i, positions) {
+                if !self.own(i).is_some_and(|o| Arc::ptr_eq(o, theirs)) {
+                    self.back(i, Some(Arc::clone(theirs)))?;
+                }
+                moved.mapped += self.page;
+            } else {
+                if self.own(i).is_none() || self.is_shared(i) {
+                    let own = self.new_page()?;
+                    self.back(i, Some(own))?;
+                }
+                self.copy(self.va(i), from.va(i), self.page)?;
+                moved.copied += self.page;
+            }
+        }
+        self.fitted = self.fitted.max(self.covered(positions));
+        self.reach = self.reach.max(positions);
+        Ok(moved)
+    }
+
+    /// Every page a write from position `pos` on reaches that maps memory
+    /// another room maps too given memory of its own holding the same bytes:
+    /// what a writer calls before it writes rows from `pos`, so no write
+    /// reaches a page another sequence reads. The new pages are made and
+    /// filled first through mappings of their own in a scratch range, so a
+    /// failure leaves every page as it was and the copy takes no memory
+    /// beyond the pages themselves. The context is synchronized before the
+    /// mappings move and the copies are waited for; nothing happens when no
+    /// such page stands. Never inside a capture.
+    pub(crate) fn own_from(&mut self, pos: usize) -> Result<(), GpuError> {
+        if !self.lends() {
+            return Ok(());
+        }
+        let moving: Vec<usize> = (0..self.pages.len())
+            .filter(|&i| self.is_shared(i) && self.written_from(i, pos))
+            .collect();
+        if moving.is_empty() {
+            return Ok(());
+        }
+        crate::capsync::ctx_sync(self.stream.context(), "room own")?;
+        self.stream.context().bind_to_thread()?;
+        let scratch = VirtualReservation::new(moving.len() * self.page, self.page)
+            .map_err(driver("cuMemAddressReserve"))?;
+        // Each entry's mapping drops before its memory, and all before the
+        // scratch range.
+        let mut fresh = Vec::with_capacity(moving.len());
+        for (k, &i) in moving.iter().enumerate() {
+            let own = self.new_page()?;
+            let va = scratch.base() + (k * self.page) as u64;
+            let map = Mapping::new(va, self.page, &own, 0).map_err(driver("cuMemMap"))?;
+            vmm::set_access(va, self.page, &[self.stream.context().cu_device()])
+                .map_err(driver("cuMemSetAccess"))?;
+            fresh.push((i, map, own, va));
+        }
+        let sent =
+            (fresh.iter()).try_for_each(|&(i, _, _, va)| self.copy(va, self.va(i), self.page));
+        let waited = self.stream.synchronize();
+        sent?;
+        waited?;
+        for (i, map, own, _) in fresh {
+            drop(map);
+            self.back(i, Some(own))?;
+        }
+        Ok(())
+    }
+
+    /// Device bytes the pages with memory of their own hold, those that
+    /// map another room's memory too among them.
     pub(crate) fn mapped(&self) -> usize {
         self.mapped * self.page
+    }
+
+    /// Device bytes of the pages that map memory another room maps too.
+    pub(crate) fn shared(&self) -> usize {
+        if !self.lends() {
+            return 0;
+        }
+        (0..self.pages.len()).filter(|&i| self.is_shared(i)).count() * self.page
+    }
+
+    /// Whether a page maps memory another room maps too, scanned only while
+    /// the room's `lent` flag stands; a scan that finds none clears it.
+    fn lends(&self) -> bool {
+        if !self.lent.load(Ordering::Relaxed) {
+            return false;
+        }
+        let any = (0..self.pages.len()).any(|i| self.is_shared(i));
+        if !any {
+            self.lent.store(false, Ordering::Relaxed);
+        }
+        any
     }
 
     /// Device bytes every page of the range holds once backed: what a fill
@@ -318,6 +558,7 @@ impl<V: Views> Roomed<V> {
             fitted: 0,
             reach: 0,
             mapped: 0,
+            lent: AtomicBool::new(false),
             page,
             spare,
             stream,
@@ -397,15 +638,53 @@ impl<V: Views> Roomed<V> {
         self.fit(usize::MAX)
     }
 
-    /// A sequence's end: the memory of the pages past the rows it reached
-    /// given back ([`Room::settle`]).
+    /// A sequence's end: the memory of the pages past the rows it reached,
+    /// and of the pages another room maps too, given back ([`Room::settle`]).
     pub(crate) fn settle(&mut self) -> Result<(), GpuError> {
         self.rooms.iter_mut().try_for_each(Room::settle)
+    }
+
+    /// The rows of the first `positions` positions taken from `from`'s
+    /// buffers, room by room ([`Room::share`]). Refused by name, nothing
+    /// moved, unless every room may take its share ([`Room::check_share`]).
+    /// Never inside a capture.
+    pub(crate) fn share(
+        &mut self,
+        from: &Roomed<V>,
+        positions: usize,
+    ) -> Result<SharedPages, GpuError> {
+        if self.rooms.len() != from.rooms.len() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a share from buffers over {} rooms into buffers over {}",
+                    from.rooms.len(),
+                    self.rooms.len()
+                ),
+            ));
+        }
+        let pairs = || self.rooms.iter().zip(&from.rooms);
+        pairs().try_for_each(|(r, f)| r.check_share(f, positions))?;
+        (self.rooms.iter_mut().zip(&from.rooms)).try_fold(SharedPages::default(), |m, (r, f)| {
+            Ok(m + r.share(f, positions)?)
+        })
+    }
+
+    /// Every page a write from position `pos` on reaches given memory no
+    /// other room maps ([`Room::own_from`]). Never inside a capture.
+    pub(crate) fn own_from(&mut self, pos: usize) -> Result<(), GpuError> {
+        self.rooms.iter_mut().try_for_each(|r| r.own_from(pos))
     }
 
     /// Device bytes the pages with memory of their own hold.
     pub(crate) fn mapped(&self) -> usize {
         self.rooms.iter().map(Room::mapped).sum()
+    }
+
+    /// Device bytes of the pages that map memory another room maps too
+    /// ([`Room::shared`]).
+    pub(crate) fn shared(&self) -> usize {
+        self.rooms.iter().map(Room::shared).sum()
     }
 
     /// Device bytes every page holds once backed ([`Room::whole`]).
@@ -565,5 +844,117 @@ mod tests {
             Err(drain_error),
             "a room's failed drain stays on its retained context"
         );
+    }
+
+    /// Two rooms of one layout share a prefix's pages: the layout of
+    /// [`hw_a_room_backs_the_rows_a_fit_reaches`] (four rows a page, the
+    /// second head half a page past a boundary), the source's first thirteen
+    /// rows of every head written, a share of nine positions maps the three
+    /// pages of each buffer that hold whole rows below nine alone and copies
+    /// the three others those rows lie on; the rows read back as the
+    /// source's; a write from nine on moves nothing, a write from five on
+    /// gives the two pages of each buffer it reaches memory of their own with
+    /// the same bytes, after which a write there leaves the source's row as
+    /// it was; a settle gives the shared pages back and the source keeps its
+    /// rows; a room of another layout, and a source that backs no page
+    /// under the rows, are refused by name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_rooms_share_the_rows_below_a_point() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let page = vmm::allocation_granularity(ctx.cu_device()).expect("the granularity");
+        let (row, ctx_rows) = (page / 4, 18);
+        let half = row / size_of::<u16>();
+        let layout = |rows: usize| -> Vec<Run> {
+            (0..2)
+                .map(|h| Run {
+                    at: h * rows * row,
+                    row,
+                    per: 1,
+                    rows,
+                })
+                .collect()
+        };
+        let room = |rows: usize| -> Roomed<[DeviceBuffer<u16>; 2]> {
+            Roomed::new(Arc::clone(&stream), 2 * rows * half, &layout(rows), |b| b).expect("a room")
+        };
+        let byte = |h: usize, j: usize| (h * ctx_rows + j) * row;
+        let value = |b: usize, h: usize, j: usize| (b * 100 + h * 40 + j + 1) as u16;
+        let write = |r: &mut Roomed<[DeviceBuffer<u16>; 2]>, b: usize, h: usize, j: usize, v| {
+            WindowMut::<u16>::of_mut(&mut r[b], byte(h, j), half)
+                .expect("a backed row")
+                .copy_from_host(&stream, &vec![v; half])
+                .expect("a write");
+        };
+        let read = |r: &Roomed<[DeviceBuffer<u16>; 2]>, b: usize, h: usize, j: usize| {
+            Window::<u16>::of(&r[b], byte(h, j), half)
+                .expect("a backed row")
+                .to_host_vec(&stream)
+                .expect("a read")[0]
+        };
+        let rows_of = |r: &Roomed<[DeviceBuffer<u16>; 2]>, n: usize| -> Vec<u16> {
+            (0..2)
+                .flat_map(|b| (0..2).flat_map(move |h| (0..n).map(move |j| (b, h, j))))
+                .map(|(b, h, j)| read(r, b, h, j))
+                .collect()
+        };
+        let mut a = room(ctx_rows);
+        a.fit(13).expect("a fit");
+        for b in 0..2 {
+            for h in 0..2 {
+                for j in 0..13 {
+                    write(&mut a, b, h, j, value(b, h, j));
+                }
+            }
+        }
+        let mut b = room(ctx_rows);
+        b.fit(2).expect("a fit");
+        let moved = b.share(&a, 9).expect("a share");
+        assert_eq!(
+            moved,
+            SharedPages {
+                mapped: 6 * page,
+                copied: 6 * page
+            },
+            "pages 0, 1, 5 of each buffer mapped, 2, 4, 6 copied"
+        );
+        assert_eq!((a.shared(), b.shared()), (6 * page, 6 * page));
+        assert_eq!(rows_of(&b, 9), rows_of(&a, 9), "the shared rows");
+        a.own_from(9).expect("a write from 9");
+        assert_eq!(
+            a.shared(),
+            6 * page,
+            "a write from 9 reaches no shared page"
+        );
+        b.own_from(5).expect("a write from 5");
+        assert_eq!(
+            (a.shared(), b.shared()),
+            (2 * page, 2 * page),
+            "pages 1 and 5 of each buffer given their own memory"
+        );
+        assert_eq!(rows_of(&b, 9), rows_of(&a, 9), "the bytes moved with them");
+        write(&mut b, 0, 0, 4, 999);
+        assert_eq!(read(&b, 0, 0, 4), 999);
+        assert_eq!(read(&a, 0, 0, 4), value(0, 0, 4), "the source's row stands");
+        b.settle().expect("a settle");
+        assert_eq!(
+            (a.shared(), b.shared()),
+            (0, 0),
+            "the shared pages given back"
+        );
+        let want: Vec<u16> = (0..2)
+            .flat_map(|b| (0..2).flat_map(move |h| (0..13).map(move |j| value(b, h, j))))
+            .collect();
+        assert_eq!(rows_of(&a, 13), want, "the source keeps its rows");
+        let other = room(ctx_rows + 4);
+        let e = b.share(&other, 4).expect_err("another layout").to_string();
+        assert!(e.contains("another layout"), "{e}");
+        let bare = room(ctx_rows);
+        let e = b
+            .share(&bare, 4)
+            .expect_err("an unbacked source")
+            .to_string();
+        assert!(e.contains("backs no memory"), "{e}");
+        stream.synchronize().expect("the rooms' work finished");
     }
 }

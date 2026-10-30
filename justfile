@@ -1775,6 +1775,12 @@ gate-gpu-qwen4exp-nvfp4:
 gate-gpu-qwen4exp-mtp:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_mtp'
 
+# Qwen3.8's shared draft store: each walk detaches its written pages, and a reset releases
+# shared mappings before whole-state and prefix put-backs. No reference set is needed.
+[group('v41-load')]
+gate-gpu-qwen4exp-mtp-share:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --gpu --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen4exp_mtp -- --ignored hw_mtp_shared_store --nocapture'
+
 # Qwen3.8's MTP input boundary on a checkpoint folder (BLOOMERY_QWEN38_FOLDER names a Qwen3.8-Flash-Next folder with its MTP layer,
 # such as FP4-Local): MTP reads only target hidden rows the last layer completed, in both prompt walks, and refuses the rows of a
 # tapped call that failed past its launch; the draft's own row runs only at the refreshed walk's next position and is refused after

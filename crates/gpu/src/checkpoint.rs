@@ -345,20 +345,7 @@ impl Checkpoints {
                     missing: "the restored checkpoint's slot",
                 })?;
                 seqstate::restorable(slot, src.holds, at).map_err(refused)?;
-                let mut sent = Ok(());
-                for (s, h) in stores.iter_mut().zip(&src.bufs) {
-                    // SAFETY: the stream is synchronized below before this
-                    // returns, whether or not every copy was enqueued, and
-                    // `h` is neither written nor freed before then: the
-                    // slots are only touched through `&mut self`.
-                    sent = unsafe { s.copy_from_pinned_host_async(stream, h) };
-                    if sent.is_err() {
-                        break;
-                    }
-                }
-                let synced = stream.synchronize();
-                sent?;
-                synced?;
+                put_slot(stream, src, stores)?;
             }
         }
         stream.synchronize()?;
@@ -566,6 +553,21 @@ impl Checkpoints {
             off += b.len();
         }
         Ok(())
+    }
+
+    /// The point at `at`'s stores put on `stores`, another sequence's stores
+    /// of the same body in the body's order: what a sequence that takes this
+    /// one's prefix starts its recurrent stores from. Waits for the copies.
+    /// Refused by name, nothing copied, as [`Checkpoints::read_point`]
+    /// refuses and for stores of other lengths.
+    pub fn load_point(
+        &self,
+        stream: &CudaStream,
+        at: u32,
+        stores: &mut [&mut DeviceBuffer<f32>],
+    ) -> Result<(), GpuError> {
+        self.check(stores)?;
+        put_slot(stream, self.slot_of(at)?, stores)
     }
 
     /// The points at `ats`' stores copied after the work `stream` holds, into
@@ -793,6 +795,30 @@ impl Drop for Checkpoints {
             let _ = crate::capsync::ctx_sync_in_drop(&self.ctx, "Checkpoints::drop");
         }
     }
+}
+
+/// `src`'s buffers onto `stores`, one to one, on `stream`; waits for the
+/// copies.
+fn put_slot(
+    stream: &CudaStream,
+    src: &Slot,
+    stores: &mut [&mut DeviceBuffer<f32>],
+) -> Result<(), GpuError> {
+    let mut sent = Ok(());
+    for (s, h) in stores.iter_mut().zip(&src.bufs) {
+        // SAFETY: the stream is synchronized below before this returns,
+        // whether or not every copy was enqueued, and `h` is neither written
+        // nor freed before then: the slots are only written through
+        // `&mut Checkpoints`, which the caller's borrow of `src` excludes.
+        sent = unsafe { s.copy_from_pinned_host_async(stream, h) };
+        if sent.is_err() {
+            break;
+        }
+    }
+    let synced = stream.synchronize();
+    sent?;
+    synced?;
+    Ok(())
 }
 
 /// The host copy [`Checkpoints::enqueue_points`] queues: `(from, to, bytes)`

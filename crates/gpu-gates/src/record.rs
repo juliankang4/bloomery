@@ -979,11 +979,12 @@ pub static TIER_CENSUS: Kind = Kind {
 pub static KV_ROOM: Kind = Kind {
     name: "kv_room",
     head: "kv room",
-    doc: "A slot's stores by position on the card when the bytes they hold moved since the slot's last line: the slot, its positions, the bytes its pages with memory of their own hold (the rows its sequence reached, by pages) and the bytes the plan counts the stores at.",
+    doc: "A slot's stores by position on the card when the bytes they hold moved since the slot's last line: the slot, its positions, the bytes its pages with memory of their own hold (the rows its sequence reached, by pages), the bytes of those pages another slot's stores map too (a prefix one took from the other), and the bytes the plan counts the stores at.",
     parts: &[
         key("slot", U64, ""),
         key("positions", U64, ""),
         key("mapped_bytes", U64, "B"),
+        key("shared_bytes", U64, "B"),
         key("layout_bytes", U64, "B"),
     ],
 };
