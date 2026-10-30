@@ -106,19 +106,10 @@ impl HermesScan {
         self.specials = SpecialTags::of(tok, &[CALL_OPEN, CALL_CLOSE]);
     }
 
-    /// Feeds text; returns the content that may be sent and the calls that
-    /// closed.
-    pub fn push(&mut self, piece: &str) -> Result<Scanned, HermesError> {
-        self.push_marked(piece, &[])
-    }
-
     /// Feeds text whose special tokens start at `specials` (byte offsets,
-    /// ascending).
-    pub(crate) fn push_marked(
-        &mut self,
-        piece: &str,
-        specials: &[usize],
-    ) -> Result<Scanned, HermesError> {
+    /// ascending); returns the content that may be sent and the calls that
+    /// closed.
+    pub(crate) fn push(&mut self, piece: &str, specials: &[usize]) -> Result<Scanned, HermesError> {
         self.buf.push(piece, specials);
         let mut out = Scanned::default();
         loop {

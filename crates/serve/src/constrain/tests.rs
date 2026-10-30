@@ -957,7 +957,7 @@ fn scanned(format: ToolFormat, tools: &Value, text: &str) -> Vec<(String, Value)
     let calls = match format {
         ToolFormat::Hermes => {
             let mut s = HermesScan::default();
-            let mut out = s.push(text).expect("parses");
+            let mut out = s.push(text, &[]).expect("parses");
             out.calls.extend(s.finish().expect("closes").calls);
             out
         }
