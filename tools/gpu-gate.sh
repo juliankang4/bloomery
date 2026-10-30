@@ -649,6 +649,7 @@ PY
   TL="$t/pin-refusal" GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate forced to the A6000: 64, named' 64 'gate_qwen38_serve runs on the 3090 only' a6000 "$t/lease"
   TL="$t/pin-refusal" GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate under any: 64, named' 64 'gate_qwen38_serve runs on the 3090 only' any "$t/lease"
   GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate on the 3090 runs' 0 'ran on ' 3090 "$t/lease"
+  GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate in the fixture tier runs on the A6000' 0 'ran on ' a6000 "$t/lease" BLOOMERY_TIER=fixture
   for arm in lookup drafted; do
     gate_args=(--arm "$arm")
     GATE_BIN=gate_qwen38_serve case_ "the $arm arm runs on another card" 0 'ran on ' a6000 "$t/lease"
@@ -1735,6 +1736,7 @@ PY
     GATE_BIN=gate_qwen38_serve case_ "  … the $arm arm runs on another local card" 0 '^ran on GPU-caller$' any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller
   done
   gate_args=()
+  GATE_BIN=gate_qwen38_serve case_ '  … a 3090-only gate in the fixture tier runs on another local card' 0 '^ran on GPU-caller$' any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller BLOOMERY_TIER=fixture
   case_ '  … a V4.1 load takes the V4.1 load lock with it' 0 "$ON_LOCAL \\(asked any\\), V4\\.1 load lock$" any "$t/lease" "${LOC[@]}" BLOOMERY_GATE_V41_LOAD=1
   exec 5> "$t/gate.lock" 6> "$t/gate-a6000.lock"
   { flock -x 5 && flock -x 6; } || { echo "FAIL: the test cannot hold the two card locks"; return 1; }
@@ -2253,7 +2255,7 @@ esac
 esac
 # Gates whose checks hold on the 3090 alone, a fact the gate placement's bytes (gate_card) do not carry: one row a gate,
 # `<binary>: <the fact>`. Asked of another card (a6000, any, both, or box.sh's A6000 view) one stops here by name, before
-# any lock, with 64.
+# any lock, with 64. The facts are the real file's, so the fixture tier pins nothing.
 PIN_3090=(
   "gate_qwen38_serve: its paged clause runs generate_qwen3moe at 27 GiB of host room on the card in view, and only the 3090's plan pages there (on the A6000 the experts fit and the draft stays on)"
 )
@@ -2268,6 +2270,8 @@ fi
 # In box.sh's local mode the run must see one RTX 3090 alone: CUDA_VISIBLE_DEVICES set to its full UUID, or, unset, a
 # machine whose one card is it (tools/ref/cards.sh, the card-name owner).
 for row in "${PIN_3090[@]}"; do
+  # PIN(2026-10-31): The fixture tier defers paged (Tag::Scale), so the real file's card pin does not apply.
+  [ "$TIER" = real ] || break
   [ "${row%%:*}" = "$NAME" ] || continue
   # PIN(2026-10-20): Only plain runs paged(); lookup and drafted have no card-specific paged clause.
   case "$qwen38_arm" in lookup|drafted) continue ;; esac
