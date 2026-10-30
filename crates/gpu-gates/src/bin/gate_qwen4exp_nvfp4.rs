@@ -7,7 +7,7 @@
 //! (`shared/q38_oracle.rs`). The oracle keeps indexer projections in BF16; the model loader
 //! refuses Q8_0 indexer projections.
 //! The plan is `--place a`'s on the one visible card, a DGX Spark's GB10,
-//! whose budget holds every routed expert: no CPU kernel reads an NVFP4 stack.
+//! whose budget holds every routed expert, so the plan leaves none on the host.
 //!
 //! What is asserted:
 //! - (l) the load: the plan puts every routed expert of every layer on the card and none on the
@@ -23,9 +23,15 @@
 //!   named tie (ours the oracle's runner-up, the oracle's margin at most twice our distance at the
 //!   two ids, the logits within `FREE_BAND`). The layer outputs are printed: a flip in any of the
 //!   3,000 positions before it may lie on their path.
+//! - (s) the split: the plan of (l) under a card budget `SPLIT_HOST` short of the bytes (l) puts
+//!   on the card, so each layer keeps an id prefix of its experts on the card and the rest on the
+//!   host, where qdot's NVFP4 dot reads the file's blocks. The load opens, and the batch set's eager
+//!   steps hold (c)'s band, flips and last argmax against the oracle; the last logits' distance to
+//!   the all-card run is printed. Mutant: the plan's refusal of an NVFP4 stack split between a card
+//!   and the host, which refuses the load by name.
 //! - (rt) the load made for a route trace (`HostCfg::route_trace`): it opens, every layer keeps its
-//!   host leg, which writes the trace, and the host run holds no view (no CPU kernel reads an NVFP4
-//!   stack); the batch set's ids by eager steps as one prompt call fill a complete trace, every
+//!   host leg, which writes the trace, and the host run holds no view (no layer holds a host
+//!   expert); the batch set's ids by eager steps as one prompt call fill a complete trace, every
 //!   slot on the card, and each step's logits are the plain load's bit for bit.
 //! - Recorded, not judged: the batch run and the D3K step against the other pair of sets, the Q8_0
 //!   rounding's share of the distance.
@@ -121,6 +127,10 @@ mod gate {
 
     /// Cache rows: D3K's step at position 3,000, with room.
     const CTX: usize = 3072;
+
+    /// The card bytes (s)'s budget falls short of (l)'s plan by: a few of each layer's routed
+    /// experts.
+    const SPLIT_HOST: u64 = 8 << 30;
 
     /// What the clauses read of the file's header: the trunk's layers, a layer output's values
     /// (every stream of the hidden width), the routed experts and the slots a token takes, and
@@ -595,6 +605,80 @@ mod gate {
         Ok(ok)
     }
 
+    /// (s): `toks`, the batch set `batch`'s ids, by eager steps on the split load, judged as (c)
+    /// judges the all-card run, whose logits are `card`. A load that fails is a named FAIL.
+    fn split(
+        path: &Path,
+        d: &Dims,
+        levers: &bloomery_levers::Levers,
+        (batch, toks, card): (&RefManifest, &[u32], &[Vec<f32>]),
+        vocab: usize,
+    ) -> Result<bool, GateError> {
+        let specs = Place::A.on_host()?.card_specs()?;
+        let [spec] = specs[..] else {
+            return Err(format!("--place a resolved to {} cards, not one", specs.len()).into());
+        };
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
+        let whole = PlanLevers::default();
+        let mut open = Open38 {
+            card: spec,
+            ctx: CTX,
+            ub,
+            experts: Experts::Card,
+            slots: 1,
+            plan_levers: &whole,
+            host: levers.host(),
+            room: None,
+            residency: Residency::Off,
+            kv: KvQ8::F16,
+        };
+        let card_bytes = open.plan(model_of(path)?)?.facts().card_bytes;
+        let budget_bytes = (card_bytes + spec.margin()).saturating_sub(SPLIT_HOST);
+        let budget = PlanLevers {
+            card_budget_bytes: Some(budget_bytes).into(),
+        };
+        open.plan_levers = &budget;
+        let planned = open.plan(model_of(path)?)?;
+        let p = planned.facts();
+        let split_layers = (0..d.n_layer)
+            .filter(|&l| {
+                p.n_l
+                    .get(l)
+                    .is_some_and(|&n| n > 0 && n < d.n_expert as u64)
+            })
+            .count();
+        println!(
+            "(s) plan card_budget={budget_bytes} host_experts={} card_experts={} layers split \
+             between the card and the host: {split_layers}",
+            p.host_experts, p.card_experts
+        );
+        let split_plan = p.host_experts > 0 && split_layers > 0;
+        let mut m = match planned.open() {
+            Ok(o) => o.model,
+            Err(e) => {
+                println!("(s) the split load FAILED: {e} {}", verdict(false));
+                return Ok(false);
+            }
+        };
+        m.reset()?;
+        let r = run_steps(&mut m, toks)?;
+        let held = free(batch, &r, d, vocab, true)?;
+        let (ours, all) = (
+            r.logits.last().ok_or("no split logits")?,
+            card.last().ok_or("no all-card logits")?,
+        );
+        let ok = split_plan && held;
+        println!(
+            "(s) the split load: the plan splits {split_plan}, the oracle's band held {held}; last \
+             argmax {} the all-card run's {}, logits_rel to it {:.3e} (printed) {}",
+            argmax(ours),
+            argmax(all),
+            rel(ours, all),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     fn mtp(mut m: Qwen38Model, prompt: &[u32]) -> Result<bool, GateError> {
         m.reset()?;
         m.prompt38(prompt, Prompt38::Pass)?;
@@ -822,6 +906,7 @@ mod gate {
         )?;
         ok &= d3k_step(&mut m, &d, vocab, (d3k_name, &d3k), (other_d3k, &d3k_other))?;
         drop(m);
+        ok &= split(&path, &d, &levers, (&batch, toks, &r.logits), vocab)?;
         ok &= traced(&path, &d, &levers, (toks, &r.logits))?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }

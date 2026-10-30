@@ -868,12 +868,13 @@ mod gate {
         let p = planned.facts();
         println!(
             "plan card={} experts={experts:?} slots={slots} ctx_max={} ubatch={ub} host_experts={} \
-             card_experts={} card_layers={} ple={} room={} read={} row_reserve={} \
+             card_experts={} card_bytes={} card_layers={} ple={} room={} read={} row_reserve={} \
              card_budget={}",
             card.name,
             p.ctx_max,
             p.host_experts,
             p.card_experts,
+            p.card_bytes,
             p.card_layers,
             tier_word(p.ple_tier),
             p.room.0,

@@ -168,8 +168,8 @@ pub fn transform_check(
                 let mut got = vec![0u32; want.len() / 4];
                 view.copy_to_host(stream, &mut got)?;
                 let got: Vec<u8> = got.iter().flat_map(|w| w.to_le_bytes()).collect();
-                if got != want {
-                    let first = got.iter().zip(want).position(|(a, b)| a != b);
+                if got[..] != want[..] {
+                    let first = got.iter().zip(want.iter()).position(|(a, b)| a != b);
                     bad.push(format!(
                         "layer {l} expert {e} slot {slot} part {part} at {first:?}"
                     ));

@@ -67,8 +67,8 @@ impl HostRun {
     /// keeps fewer than `n_expert` experts on the card (`n_card`), or every one under a
     /// residency machine (`machine`), which moves experts to the host after the load. A layer
     /// that keeps every expert on the card has no view, so its stacks may be of a type no host
-    /// kernel reads (NVFP4); a route trace's service of it lists no expert, whose sum the run
-    /// writes without one ([`HostRun::zero_sum`]).
+    /// kernel reads; a route trace's service of it lists no expert, whose sum the run writes
+    /// without one ([`HostRun::zero_sum`]).
     pub fn viewed(
         run: std::ops::Range<usize>,
         machine: bool,

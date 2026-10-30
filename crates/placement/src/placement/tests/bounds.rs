@@ -268,13 +268,14 @@ fn a_node_host_projection_keeps_non_routed_rows_on_node_zero() {
 
 /// An nvfp4 stack loads in its planes under the default expert rule, and
 /// its card segment counts one f32 scale an expert it holds after the
-/// planes, where a dense nvfp4 tensor's segment holds its one scale. A
-/// split that leaves some experts of it on the host and the rest on a card
-/// is refused by name (the card's planes are not the file's blocks a swap
-/// copies); the whole stack on the host is its file bytes there, which the
-/// host's nvfp4 dot reads.
+/// planes, where a dense nvfp4 tensor's segment holds its one scale. The
+/// host's experts of a stack are its file bytes there, which the host's
+/// nvfp4 dot reads, whether a card holds the rest as planes (a residency
+/// swap stages each plane from the file's blocks) or none. Mutant, the rule
+/// before: a split between a card and the host was refused by name.
+// PIN(2026-10-31): an NVFP4 stack splits between a card and the host; a swap stages its planes.
 #[test]
-fn an_nvfp4_stack_holds_a_scale_an_expert_and_is_not_split() {
+fn an_nvfp4_stack_holds_a_scale_an_expert_on_a_card_and_its_file_bytes_on_the_host() {
     use GgmlType::NVFP4;
     assert_eq!(CardFormat::of_routed(NVFP4), Some(CardFormat::Nvfp4Planes));
     assert_eq!(CardFormat::of_routed(GgmlType::Q5_K), None);
@@ -310,12 +311,21 @@ fn an_nvfp4_stack_holds_a_scale_an_expert_and_is_not_split() {
         card_buffers(&dense, CardFormat::Nvfp4Planes, 4).expect("buffers"),
         [4 * 128, 4 * 16, 4]
     );
-    let err = routed_row(i, t, 0, list(&[0, 1]), &model)
-        .expect_err("a split between a card and the host")
-        .to_string();
-    assert!(
-        err.contains("ffn_gate_exps.weight") && err.contains("every one on the host"),
-        "{err}"
+    let split = routed_row(i, t, 0, list(&[0, 1]), &model).expect("a card and the host");
+    let [card, host] = split.segments.as_slice() else {
+        panic!("a card and a host segment, got {:?}", split.segments);
+    };
+    assert_eq!(
+        card.buffer_bytes(t, model.experts).expect("buffers"),
+        [8 * 128, 8 * 16, 2 * 4]
+    );
+    assert_eq!(
+        (host.device, host.format, host.resident_bytes),
+        (Device::Host, Format::HostFile, t.file_bytes / 8 * 6)
+    );
+    assert_eq!(
+        host.experts.as_ref().map(ToString::to_string).as_deref(),
+        Some("2..8")
     );
     let host = routed_row_on(i, t, 0, Vec::new(), &model).expect("every expert on the host");
     let [seg] = host.segments.as_slice() else {

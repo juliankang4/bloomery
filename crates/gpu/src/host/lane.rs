@@ -328,12 +328,11 @@ impl Ring {
     }
 
     /// `piece`'s bytes into ring slot `k` at byte `at`, turned into the
-    /// slot's by its transform ([`super::swap::Transform::apply`]). The caller is slot
-    /// `k`'s one host writer, the lane thread that holds the slot's job, and
-    /// writes it only once the copy stream has read its previous use
-    /// (`drained`).
-    fn write(&self, k: usize, at: usize, piece: &Piece<'_>) -> Result<(), GpuError> {
-        let len = piece.bytes.len();
+    /// slot's `len` bytes by its transform ([`super::swap::Transform::apply`]).
+    /// The caller is slot `k`'s one host writer, the lane thread that holds the
+    /// slot's job, and writes it only once the copy stream has read its
+    /// previous use (`drained`).
+    fn write(&self, k: usize, at: usize, len: usize, piece: &Piece<'_>) -> Result<(), GpuError> {
         let off = self.span(k, at, len, "SwapMachine ring write")?;
         // SAFETY: [off, off + len) lies inside the page (checked above); no
         // copy reads ring slot k until the staging word publishes this use,
@@ -568,18 +567,20 @@ impl Shared {
             let mut at = 0usize;
             for (part, &want) in self.source.part_bytes(job.layer).iter().enumerate() {
                 let piece = self.source.source(job.layer, job.id, part)?;
-                if piece.bytes.len() != want {
+                if piece.target_len() != Some(want) {
                     return Err(GpuError::shape(
                         "SwapMachine staging",
                         format!(
-                            "layer {} expert {} part {part}: {} source bytes for a slot of {want}",
+                            "layer {} expert {} part {part}: {} source bytes ({:?}) for a slot \
+                             of {want}",
                             job.layer,
                             job.id,
-                            piece.bytes.len()
+                            piece.bytes.len(),
+                            piece.transform
                         ),
                     ));
                 }
-                self.ring.write(job.ring, at, &piece)?;
+                self.ring.write(job.ring, at, want, &piece)?;
                 at += want;
             }
             Ok(())

@@ -445,19 +445,6 @@ pub(super) fn routed_row_on_as(
     }
     if !host.is_empty() {
         host_runs(t, &host)?;
-        // The host dots an nvfp4 stack's file blocks with its scales; a card
-        // holds them as planes, and a residency swap copies file bytes into a
-        // card slot, so one stack is not split between the two.
-        if t.ty == GgmlType::NVFP4 && !segments.is_empty() {
-            return Err(PlacementError::tensor(
-                t,
-                format!(
-                    "an nvfp4 stack with experts {host} on the host and the rest on a card, \
-                     which holds them as planes where a residency swap copies the file's \
-                     blocks: every expert of it must be on a card, or every one on the host"
-                ),
-            ));
-        }
         let bytes = host.len() * file_per_expert;
         segments.push(in_place(Device::Host, Format::HostFile, Some(host), bytes));
     }

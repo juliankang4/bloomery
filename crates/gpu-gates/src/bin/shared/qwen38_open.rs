@@ -74,6 +74,8 @@ pub struct PlanFacts {
     /// Routed experts on the host and on the card.
     pub host_experts: u64,
     pub card_experts: u64,
+    /// The bytes the plan puts on the card ([`CardTotals::bytes`](model::placement::CardTotals::bytes)).
+    pub card_bytes: u64,
     /// The layers holding routed experts on the card, and each layer's count.
     pub card_layers: usize,
     pub n_l: Vec<u64>,
@@ -140,6 +142,7 @@ impl<'a> Open38<'a> {
             ctx_max: plan.ctx_max,
             host_experts: plan.host.experts,
             card_experts: plan.cards[0].experts,
+            card_bytes: plan.cards[0].bytes(),
             card_layers: plan.n_l.iter().filter(|&&n| n > 0).count(),
             n_l: plan.n_l.clone(),
             ple_tier: plan.row_tier()?,

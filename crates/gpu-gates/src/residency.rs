@@ -15,9 +15,10 @@ use crate::record::ClimbRead;
 use bloomery_levers::{
     ResidencyPick, UnhostedPool, residency_at_plan, residency_beside_paged_planes,
 };
+use gguf::GgmlType;
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::{HostNeed, HostRead, host_available_read};
-use model::placement::{CardFormat, PlacementError, Plan, Role};
+use model::placement::{PlacementError, Plan, Role};
 
 /// `plan`'s room for the churn pool of card `card`'s experts, with `beside`
 /// bytes the load hosts outside the plan (a draft layer's experts; 0 for a
@@ -93,16 +94,20 @@ impl<'p, 'm> PlanRoom<'p, 'm> {
 
     /// The plan pages routed experts to the NVMe tier
     /// ([`HostTotals::nvme_expert_bytes`](model::placement::HostTotals::nvme_expert_bytes),
-    /// the load's tier then built) while a routed stack of its model loads in
-    /// NVFP4 planes ([`CardFormat::Nvfp4Planes`]): the pair the machine's
-    /// source refuses beside the tier.
+    /// the load's tier then built) while a routed stack of its model is NVFP4
+    /// rows, which a checkpoint folder keeps as two plane runs a matrix and
+    /// the card loads in NVFP4 planes: the pair the machine's source refuses
+    /// beside the tier. GGUF's NVFP4 blocks stage from the expert's one run,
+    /// which the arena holds.
     #[must_use]
     pub fn pages_planes(&self) -> bool {
         self.plan.host.nvme_expert_bytes > 0
-            && self.plan.model.tensors.iter().any(|t| {
-                t.role == Role::RoutedExperts
-                    && CardFormat::of_routed(t.ty) == Some(CardFormat::Nvfp4Planes)
-            })
+            && self
+                .plan
+                .model
+                .tensors
+                .iter()
+                .any(|t| t.role == Role::RoutedExperts && t.ty == GgmlType::NVFP4_ROWS)
     }
 }
 
