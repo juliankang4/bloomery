@@ -86,7 +86,10 @@
 //!   the clause with the draft off; its drafted half runs on the drafted
 //!   arm's main server, after that server's drafted clauses;
 //! - under the draft (`--arm drafted`, that arm's main server): a greedy
-//!   `/completion` gives the plain run's ids with its draft counts carried
+//!   `/completion` gives the ids of the same server's steps (the request
+//!   once more with `n_probs`, which drafts nothing; a plain load places
+//!   more target experts on the card, so its ids are no reference) with its
+//!   draft counts carried
 //!   (a draft changes which passes run, never a token; the fixture tier
 //!   defers the counts by name: its draft proposes and its random-weight
 //!   target accepts none), and `/props`'
@@ -96,7 +99,7 @@
 //!   server holds (`continued`): each keeps the held prefix (`cache_n`), a
 //!   prompt call past it prints one `mtp prompt` record — the draft caught
 //!   up at the kept position, nothing skipped — and none prints a skip, and
-//!   each drafts, with the plain run's ids (the generated ones); the prompt
+//!   each drafts, with those steps' ids (the generated ones); the prompt
 //!   resent keeps its end by a cut that rejoins the draft, after which the
 //!   extension drafts from its join, with the same prompt's ids fed fresh;
 //!   and a sampled `/completion` (temperature 0.8, a fixed seed) drafts, its
@@ -261,13 +264,13 @@
 //!   server's 501; a draft run with no chooser prints no `mtp width` record.
 //! - the width chooser's clause ([`width_cost`], a server of its own under
 //!   `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off` and
-//!   `BLOOMERY_MTP_WIDTH=cost`): one greedy request then the server's
-//!   orderly stop, which prints the request's record; its ids the plain
-//!   run's, its draft counts carried, and the chooser's `mtp width` record
+//!   `BLOOMERY_MTP_WIDTH=cost`): the prompt's steps (`n_probs`, no draft),
+//!   one greedy request then the server's orderly stop, which prints the
+//!   request's record; its ids its steps', its draft counts carried, and the chooser's `mtp width` record
 //!   its own aggregate — windows the widths above 0,
 //!   E inside the window's rows, a width below the draft's own among the
 //!   passes. It is the one clause that runs the default chooser on a
-//!   loaded server and holds its tokens to the plain run: every other
+//!   loaded server and holds its tokens to its steps: every other
 //!   drafted server this gate starts pins `BLOOMERY_MTP_WIDTH=fixed` (the
 //!   clauses that compare draft counts across two runs of a server hold the
 //!   fixed window; a chooser its clock drives promises no count twice), and
@@ -521,8 +524,8 @@ mod gate {
     use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, step_above};
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
-        LookupCompletion, PrefixRestore, curl, ids_of, json_of, metric, parse_ids, prefix_restore,
-        server_log, shared_system_prompt, slot_erased,
+        LookupCompletion, PrefixRestore, curl, draft_counts, ids_of, json_of, metric, parse_ids,
+        prefix_restore, server_log, shared_system_prompt, slot_erased,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -1316,13 +1319,13 @@ mod gate {
     /// that extend the sequence the server holds keep its prefix
     /// (`cache_prompt`), and the draft joins them — the rows an earlier
     /// request left waiting walked, the token the new request puts at their
-    /// last position — so it drafts from the first window, with the plain
-    /// run's ids. Three joins: after a request fed fresh that ended on its
-    /// first step (`n_predict` 1), extended by the id it generated: its prompt call is
+    /// last position — so it drafts from the first window, with
+    /// `reference`'s ids (the server's steps). Three joins: after a request
+    /// fed fresh that ended on its first step (`n_predict` 1), extended by the id it generated: its prompt call is
     /// empty, the join is its first step's, and no `mtp prompt` record says
     /// it skipped; after drafted windows (the held sequence is at most 11
     /// ids past the prompt: 8 generated, the last window's 3 past them),
-    /// extended by the plain run's next ids, a prompt call of 1 to 4 ids and
+    /// extended by `reference`'s next ids, a prompt call of 1 to 4 ids and
     /// its record; and after a first step again, extended by ids the model
     /// did not generate, against the same prompt fed fresh. That first step
     /// is the prompt resent, which keeps the prompt's end (one short of it)
@@ -3342,12 +3345,32 @@ mod gate {
         Ok(ok)
     }
 
+    /// The greedy ids of `prompt` on this server's own steps, and that
+    /// request's draft count ([`draft_counts`]): the request with `n_probs`,
+    /// which runs one row at a time and drafts nothing, fed fresh. The
+    /// reference a drafted load's greedy ids are held to: a plain load's ids
+    /// are none, for the draft's card bytes leave fewer target experts on the
+    /// card, and an expert served on the host rounds its sums another way, so
+    /// a greedy id can differ at a near tie (as the sampled ids do,
+    /// [`sampled_served`]). The drafted request that follows is fed fresh
+    /// too, so this one leaves no prefix it keeps.
+    fn steps_of(url: &dyn Fn(&str) -> String, prompt: &str) -> Result<(Vec<u32>, u64), GateError> {
+        let steps = json!({
+            "prompt": prompt, "n_predict": N_PREDICT, "temperature": 0, "n_probs": 2,
+            "return_tokens": true, "cache_prompt": false,
+        });
+        let (st, body) = curl(&url("/completion"), Some(&steps), false)?;
+        let s = json_of("/completion steps", st, &body)?;
+        Ok((ids_of(&s["tokens"]), draft_counts(&s)?.0))
+    }
+
     /// The width chooser's own server (the module header): the draft on,
     /// the residency off and `BLOOMERY_MTP_WIDTH=cost`, one greedy request
     /// of the gate's prompt then the server's orderly stop — the chooser's
     /// `mtp width` record of the slot's last request prints there, with no
-    /// later request to close it out — holding: the request's
-    /// ids the plain run's (the chooser changes which rows a pass runs,
+    /// later request to close it out, after its steps ([`steps_of`], which
+    /// run no pass and so print no record) — holding: the request's
+    /// ids its steps' (the chooser changes which rows a pass runs,
     /// never a token), its draft counts carried, and the record the
     /// chooser's own: its windows the widths above 0 it names, E inside the
     /// window's rows, and at least one pass of a width below the draft's
@@ -3357,7 +3380,7 @@ mod gate {
     /// defers the four clauses by name: the draft is the real file's, which
     /// proposes nothing a random target accepts, and the fixture's card
     /// budget holds no slot of the gate's context beside it.
-    fn width_cost(dir: &Path, prompt: &str, reference: &[u32]) -> Result<bool, GateError> {
+    fn width_cost(dir: &Path, prompt: &str) -> Result<bool, GateError> {
         if !tier::run_clause("width_cost", Tag::FileBound)? {
             return Ok(true);
         }
@@ -3379,7 +3402,8 @@ mod gate {
                 );
                 let _ = served.stop();
                 for name in [
-                    "width_cost_ids_are_the_plain_runs",
+                    "width_cost_reference_steps_draft_nothing",
+                    "width_cost_ids_are_its_steps",
                     "width_cost_draft_counts_carried",
                     "width_cost_record_is_the_choosers",
                     "width_cost_cut_a_window",
@@ -3391,18 +3415,29 @@ mod gate {
         };
         let url = |p: &str| format!("http://{addr}{p}");
         let mut ok = true;
+        let (reference, steps_draft_n) = steps_of(&url, prompt)?;
+        println!("width-cost steps {reference:?} draft_n={steps_draft_n}");
+        check(
+            &mut ok,
+            "width_cost_reference_steps_draft_nothing",
+            steps_draft_n == 0,
+        );
         let completion = json!({
             "prompt": prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,
+            "cache_prompt": false,
         });
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c = json_of("/completion", st, &body)?;
         let ids = ids_of(&c["tokens"]);
         let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
         println!("width-cost tokens {ids:?} stop_type={stop}");
+        // PIN(2026-10-30): this load's steps replace the plain run's ids: the draft's card
+        // reserve moves target experts to the host, whose sums round another way; was
+        // `generate_qwen3moe`'s ids.
         check(
             &mut ok,
-            "width_cost_ids_are_the_plain_runs",
-            agree(&ids, &stop, reference),
+            "width_cost_ids_are_its_steps",
+            agree(&ids, &stop, &reference),
         );
         let d = &c["timings"];
         check(
@@ -5031,7 +5066,7 @@ mod gate {
         ok &= churn_unhosted(dir)?;
         // The width chooser's server (the module header): the draft on, the
         // residency off, `BLOOMERY_MTP_WIDTH=cost`.
-        ok &= width_cost(dir, prompt, reference)?;
+        ok &= width_cost(dir, prompt)?;
         // The plain rounds of a load that drafts nothing run as one pass
         // (the module header): its own server, sampled requests that step,
         // the round records on.
@@ -5099,16 +5134,18 @@ mod gate {
     /// and the fixed window, running the main arm's drafted clauses alone —
     /// `/props`' `engine` against the gate's own plan with the draft (its
     /// card bytes the draft's among them, its `draft` naming the file
-    /// [`draft_file`] picks), the greedy pass's ids and its draft counts,
-    /// `continued`, the sampled requests and, after them, the `cache`
-    /// clause's drafted half — none of the plain arm's other clauses: each
-    /// runs there on the plain main server.
+    /// [`draft_file`] picks), the greedy pass's ids against this server's
+    /// steps and its draft counts, `continued`, the sampled requests and,
+    /// after them, the `cache` clause's drafted half — none of the plain
+    /// arm's other clauses: each runs there on the plain main server.
+    /// `generated` (`generate_qwen3moe`'s ids) is printed, not compared: that
+    /// run places more target experts on the card.
     fn drafted_main(
         dir: &Path,
         levers: &bloomery_levers::Levers,
         prompt: &str,
         ids: &[u32],
-        reference: &[u32],
+        generated: &[u32],
     ) -> Result<bool, GateError> {
         let err_log = dir.join("server.err");
         let exe = Served38::exe()?;
@@ -5132,8 +5169,25 @@ mod gate {
             .chain(SERVER_ARGS.iter().map(|s| (*s).to_owned()))
             .collect();
         ok &= props_engine(&url, &argv, served.child.id(), levers, &err_log, true)?;
+        let (reference, steps_draft_n) = steps_of(&url, prompt)?;
+        println!("steps on the drafted server: tokens {reference:?} draft_n={steps_draft_n}");
+        println!("generate_qwen3moe {generated:?} (another placement, not compared)");
+        check(
+            &mut ok,
+            "drafted_reference_steps_draft_nothing",
+            steps_draft_n == 0,
+        );
+        if reference.len() != N_PREDICT {
+            return Err(format!(
+                "--prompt {prompt:?}: the drafted server's steps gave {} ids, not {N_PREDICT}: \
+                 `continued` extends the prompt by all of them",
+                reference.len()
+            )
+            .into());
+        }
         let completion = json!({
             "prompt": prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,
+            "cache_prompt": false,
         });
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c1 = json_of("/completion", st, &body)?;
@@ -5143,15 +5197,17 @@ mod gate {
             "completion tokens {first:?} stop_type={stop} content={}",
             c1["content"]
         );
-        println!("generate_qwen3moe {reference:?}");
-        // The drafted server's own clause: the greedy ids are the plain
-        // run's (a draft changes which passes run, never a token), and the
-        // pass carried its counts.
+        // The drafted server's own clause: the greedy ids are its steps'
+        // (a draft changes which passes run, never a token), and the pass
+        // carried its counts.
+        // PIN(2026-10-30): same-load steps replace the plain-load oracle: the draft's card
+        // reserve moves target experts to the host, whose sums round another way; was
+        // `generate_qwen3moe`'s ids.
         let d = &c1["timings"];
         check(
             &mut ok,
-            "drafted_ids_are_the_plain_runs",
-            agree(&first, &stop, reference),
+            "drafted_ids_are_its_steps",
+            agree(&first, &stop, &reference),
         );
         // The accepted count is the file's: the fixture's draft proposes,
         // and its random-weight target accepts none of it.
@@ -5163,7 +5219,7 @@ mod gate {
                     && d["draft_n_accepted"].as_u64().is_some_and(|n| n > 0),
             );
         }
-        ok &= continued(&url, &err_log, ids, reference)?;
+        ok &= continued(&url, &err_log, ids, &reference)?;
         let sampled = json!({
             "prompt": prompt, "n_predict": N_PREDICT, "temperature": SAMPLED_TEMPERATURE,
             "seed": SAMPLED_SEED, "return_tokens": true,
