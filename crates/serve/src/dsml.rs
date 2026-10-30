@@ -938,10 +938,14 @@ impl ChatParser {
             .unwrap_or_else(|e| panic!("ChatParser::finish on a scan that failed: {e}"))
     }
 
-    /// Feeds generated text, its special tokens' texts starting at
-    /// `specials` (byte offsets, ascending); returns what may be sent now, or
+    /// Feeds generated text, its special tokens' texts at `specials` (byte
+    /// offset and length, ascending); returns what may be sent now, or
     /// the tool-call markup that does not parse.
-    pub fn try_push(&mut self, text: &str, specials: &[usize]) -> Result<Message, MarkupError> {
+    pub fn try_push(
+        &mut self,
+        text: &str,
+        specials: &[(usize, usize)],
+    ) -> Result<Message, MarkupError> {
         let split = match &mut self.think {
             Some(t) => t.push(text, specials),
             None => Split {

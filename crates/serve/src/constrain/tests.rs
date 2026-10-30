@@ -38,6 +38,21 @@ const CALL_SPECIALS: [&str; 4] = [
     "<|tool_call:end|>",
 ];
 
+/// Special tokens that spell only the start of a tag.
+const PREFIX_SPECIALS: [&str; 4] = ["<tool", "<|too", "<th", "</th"];
+
+/// The call tags and their prefixes, each one special piece.
+const TAG_PIECES: [&str; 8] = [
+    CALL_SPECIALS[0],
+    CALL_SPECIALS[1],
+    CALL_SPECIALS[2],
+    CALL_SPECIALS[3],
+    PREFIX_SPECIALS[0],
+    PREFIX_SPECIALS[1],
+    PREFIX_SPECIALS[2],
+    PREFIX_SPECIALS[3],
+];
+
 /// The mock's ids: its specials, then a byte each, then these pieces.
 const BYTES: u32 = SPECIALS.len() as u32;
 const PIECES: u32 = BYTES + 256;
@@ -178,10 +193,11 @@ impl Tokenizer for Pieces {
     fn n_vocab(&self) -> usize {
         PIECES as usize + self.0.0.len()
     }
-    /// The mock's specials, and the pieces that are call tags.
+    /// The mock's specials, and the pieces that are call tags or their
+    /// prefixes.
     fn is_special(&self, id: u32) -> bool {
         id < BYTES
-            || CALL_SPECIALS
+            || TAG_PIECES
                 .map(str::as_bytes)
                 .contains(&&*self.0.bytes_of(id))
     }
@@ -2550,7 +2566,7 @@ fn a_span_and_its_step_are_one_call() {
 /// budget forces the special close.
 #[test]
 fn a_tag_spelled_in_ordinary_ids_is_text() {
-    let pieces = Arc::new(PieceTok(&CALL_SPECIALS));
+    let pieces = Arc::new(PieceTok(&TAG_PIECES));
     let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::clone(&pieces)));
     let plain = |text: &str| -> Vec<u32> { text.bytes().map(|b| BYTES + u32::from(b)).collect() };
     let tools = json!([{"type": "function", "function": {"name": "f",
@@ -2572,7 +2588,7 @@ fn a_tag_spelled_in_ordinary_ids_is_text() {
     };
     // The message of `want` generated after `prompt`, whole and streamed.
     let parsed = |prompt: &str, entry: ThinkEntry, want: &[u32], format| {
-        let mut events: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut events: Vec<(String, Vec<(usize, usize)>)> = Vec::new();
         let mut slot = Slot::new(Box::new(Rows {
             tok: Arc::clone(&tok),
             want: want.to_vec(),
@@ -2654,7 +2670,34 @@ fn a_tag_spelled_in_ordinary_ids_is_text() {
             format,
         );
         assert_eq!((m.reasoning.as_str(), m.content.as_str()), ("", "<think>"));
+        // A special token that spells only the opener's start, the rest in
+        // ordinary ids, opens no call: leading the content or after text.
+        let prefix = &open[..5];
+        for lead in ["", "x "] {
+            let mut want = plain(lead);
+            want.push(pieces.piece(prefix));
+            want.extend(plain(&open[prefix.len()..]));
+            want.extend(plain(call));
+            want.push(pieces.piece(close));
+            let (_, m) = parsed("assistant\n", ThinkEntry::MayOpen, &want, format);
+            assert_eq!(m.content, format!("{lead}{open}{call}{close}"));
+            assert!(m.calls.is_empty(), "{:?}", m.calls);
+        }
     }
+    // The same for the think tags: a special `<th` or `</th` spelled on to
+    // `<think>` or `</think>` neither opens nor closes the span.
+    let mut want = vec![pieces.piece("<th")];
+    want.extend(plain("ink>x"));
+    let (_, m) = parsed("assistant\n", ThinkEntry::MayOpen, &want, QWEN);
+    assert_eq!((m.reasoning.as_str(), m.content.as_str()), ("", "<think>x"));
+    let mut want = plain("a ");
+    want.push(pieces.piece("</th"));
+    want.extend(plain("ink> b"));
+    let (_, m) = parsed("<think>\n", ThinkEntry::Open, &want, QWEN);
+    assert_eq!(
+        (m.reasoning.as_str(), m.content.as_str()),
+        ("a </think> b", "")
+    );
 
     let mut p = params(None, ThinkEntry::Open);
     p.reasoning_budget = Some(20);
@@ -2800,7 +2843,8 @@ fn an_ordinary_call_close_cannot_close_a_special_call() {
     ] {
         let mut p = ChatParser::with_tools("assistant\n", ReasoningFormat::None, Some(tools))
             .reading_specials(&tok);
-        p.try_push(open, &[0]).expect("the special opens a call");
+        p.try_push(open, &[(0, open.len())])
+            .expect("the special opens a call");
         p.try_push(&format!("{body}{close}"), &[])
             .expect("a short error waits for end of generation");
         let error = p
@@ -2838,10 +2882,10 @@ fn a_held_special_is_reported_only_when_its_text_is_sent() {
             &mut |ev| {
                 if let Event::Text(text, specials, _) = ev {
                     assert!(
-                        specials.iter().all(|&at| at < text.len()),
+                        specials.iter().all(|&(at, len)| at + len <= text.len()),
                         "{text:?}: {specials:?}"
                     );
-                    offsets.extend(specials.iter().map(|at| sent.len() + at));
+                    offsets.extend(specials.iter().map(|&(at, len)| (sent.len() + at, len)));
                     sent.push_str(text);
                 }
                 Ok(())
@@ -2854,7 +2898,7 @@ fn a_held_special_is_reported_only_when_its_text_is_sent() {
         assert_eq!(o.content, text, "whole and streamed text agree");
         assert_eq!(
             offsets,
-            vec![0, CALL_OPEN.len()],
+            vec![(0, CALL_OPEN.len()), (CALL_OPEN.len(), CALL_OPEN.len())],
             "each special is sent once"
         );
         assert_eq!(o.specials, offsets, "whole and streamed offsets agree");
@@ -2871,7 +2915,7 @@ fn a_held_special_is_reported_only_when_its_text_is_sent() {
     assert_eq!(o.content, CALL_OPEN, "the stop word is excluded");
     assert_eq!(
         o.specials,
-        vec![0],
+        vec![(0, CALL_OPEN.len())],
         "the stopped special has no content offset"
     );
 }

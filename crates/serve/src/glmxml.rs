@@ -335,11 +335,12 @@ impl KvScan {
 
     /// [`KvScan::push`] that reads only the text `piece` adds and reports the
     /// open call's new arguments as `advances` instead of its whole text;
-    /// `specials` gives the byte offsets of special tokens in `piece`.
+    /// `specials` gives the byte offset and length of each special token's
+    /// text in `piece`.
     pub(crate) fn push_stream(
         &mut self,
         piece: &str,
-        specials: &[usize],
+        specials: &[(usize, usize)],
     ) -> Result<Scanned, KvError> {
         let m = self.markers;
         self.buf.push(piece, specials);
