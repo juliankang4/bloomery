@@ -113,7 +113,10 @@
 //! and the padding are exact zeros, and every product keeps its shape). A
 //! call that ends inside a chunk leaves the state the chunk starts from in
 //! the lane, stamped at the call's end, and the chunk's rows in the store's
-//! carry ([`LinearShape::carry_len`]): [`CARRY_HEAD`] words (the rows'
+//! carry ([`LinearShape::carry_len`]); a call that keeps its last chunk
+//! (`keep`) leaves it so when the call's last row completes it, so a point
+//! one row short of the call's end is the lane and the carry less that row
+//! (`Body38::set_close`). The carry is [`CARRY_HEAD`] words (the rows'
 //! count and the position after them), then up to [`CARRY_ROWS`] rows of
 //! the conv's key and value heads, then their β and decays. A call from
 //! that position takes the carried rows first. The prompt form runs them
@@ -1334,10 +1337,10 @@ mod delta_kernels {
             qkv.len() >= m * (2 * n_k + n_v) * 128,
             beta.len() >= m * n_v,
             decay.len() >= m * n_v,
-            carry.len() >= 4 + 15 * ((n_k + n_v) * 128 + 2 * n_v),
+            carry.len() >= 4 + 16 * ((n_k + n_v) * 128 + 2 * n_v),
             pos.len() >= 1,
             work.len() >= chunks * n_v * 560 + 1,
-            chunks * 16 >= m + 15
+            chunks * 16 >= m + 16
         )
     )]
     pub fn gdn_chunk_prepare(
@@ -1583,7 +1586,7 @@ mod delta_kernels {
     /// `16·w ..`, their state transposed in registers from the first chunk
     /// to the last (each product's accumulator is the next one's A operand,
     /// so past a chunk's staging barriers a warp reads only shared tiles),
-    /// a last chunk the call leaves incomplete left out of it. The next
+    /// a last chunk the call leaves incomplete, or keeps, left out of it. The next
     /// chunk's global reads are issued after the chunk's state projections.
     /// The lane and stamp rules are `gdn_delta_lanes`'s in place mode (block
     /// 0's thread 0 alone touches the stamps).
@@ -1602,9 +1605,9 @@ mod delta_kernels {
         block = (128, 1, 1),
         requires = (
             qkv.len() >= m * (2 * n_k + n_v) * 128,
-            carry.len() >= 4 + 15 * ((n_k + n_v) * 128 + 2 * n_v),
+            carry.len() >= 4 + 16 * ((n_k + n_v) * 128 + 2 * n_v),
             work.len() >= chunks * n_v * 560 + 1,
-            chunks * 16 >= m + 15,
+            chunks * 16 >= m + 16,
             lane.len() >= lane_at + 1,
             lanes >= 1,
             pos.len() >= 1,
@@ -1625,6 +1628,7 @@ mod delta_kernels {
         grouped: u32,
         m: u32,
         chunks: u32,
+        keep: u32,
         pos: &[u32],
         fault: FaultSink,
         mut o: DisjointSlice<f32>,
@@ -1847,8 +1851,9 @@ mod delta_kernels {
                 }
             }
             // A chunk the call leaves incomplete stays out of the state: the
-            // carry holds its rows for the call that completes it.
-            if count < CHUNK {
+            // carry holds its rows for the call that completes it. So does
+            // the last chunk of a call that keeps it.
+            if count < CHUNK || keep != 0 && start + CHUNK == all {
                 continue;
             }
             // The state after the chunk: D·Sᵀ + (u ⊙ D/Dₜ)ᵀ·K.
@@ -1898,7 +1903,7 @@ mod delta_kernels {
 
     /// The prompt form's last launch (module doc, "Carry"): the rows of the
     /// last chunk of the call's rows into `carry` when the call leaves it
-    /// incomplete. Slot `s` holds the chunk's row `s`; a slot below the
+    /// incomplete or keeps it (`keep`). Slot `s` holds the chunk's row `s`; a slot below the
     /// carried rows the chunk starts with keeps its row, a slot past the
     /// chunk's rows is zero. Block `b < n_k + n_v` writes head `b` of the
     /// rows (the key heads, then the value heads), block `n_k + n_v` their β
@@ -1919,9 +1924,9 @@ mod delta_kernels {
             beta.len() >= m * n_v,
             decay.len() >= m * n_v,
             work.len() >= chunks * n_v * 560 + 1,
-            chunks * 16 >= m + 15,
+            chunks * 16 >= m + 16,
             pos.len() >= 1,
-            carry.len() >= 4 + 15 * ((n_k + n_v) * 128 + 2 * n_v)
+            carry.len() >= 4 + 16 * ((n_k + n_v) * 128 + 2 * n_v)
         )
     )]
     pub fn gdn_carry_keep(
@@ -1934,6 +1939,7 @@ mod delta_kernels {
         n_v: u32,
         m: u32,
         chunks: u32,
+        keep: u32,
         mut carry: DisjointSlice<f32>,
     ) {
         let tid = thread::threadIdx_x() as usize;
@@ -1944,9 +1950,14 @@ mod delta_kernels {
         let lead = unsafe { *work.get_unchecked(chunks as usize * nv * CHUNK_WORDS) } as usize;
         let all = lead + m;
         // The last chunk starts at call row `last`; it holds `held` rows when
-        // incomplete, and slots below `from` the rows the call carried in.
+        // incomplete or kept, and slots below `from` the rows the call
+        // carried in.
         let last = (all - 1) / CHUNK * CHUNK;
-        let held = if all - last < CHUNK { all - last } else { 0 };
+        let held = if all - last < CHUNK || keep != 0 {
+            all - last
+        } else {
+            0
+        };
         let from = lead.saturating_sub(last);
         let carry = carry.as_mut_ptr();
         if b < nk + nv {
@@ -2872,12 +2883,12 @@ pub struct KdaLanesArgs<'a> {
 
 impl DeltaKernels {
     /// Enqueue the in-place call `args` in the prompt form (module doc):
-    /// `gdn_chunk_prepare` over `⌈(m + 15) / 16⌉·n_v` blocks writing their
+    /// `gdn_chunk_prepare` over `⌈(m + 16) / 16⌉·n_v` blocks writing their
     /// records and the lead word into `work`, `gdn_delta_prepared` over
     /// `2·n_v` blocks, which takes the rows `carry` holds for `pos[0]` first,
     /// then `gdn_carry_keep` over `n_k + n_v + 1` blocks, which leaves in
-    /// `carry` the rows of a chunk the call does not complete (module doc,
-    /// "Carry"). Refused by name: what `enqueue_delta_lanes` refuses, row
+    /// `carry` the rows of a chunk the call does not complete, or of its
+    /// last chunk when `keep` (module doc, "Carry"). Refused by name: what `enqueue_delta_lanes` refuses, row
     /// mode, a carry shorter than the shape's and a `work` shorter than
     /// [`prompt_work_len`]. Asynchronous, allocation-free.
     pub fn enqueue_delta_prompt(
@@ -2886,6 +2897,7 @@ impl DeltaKernels {
         args: DeltaLanesArgs<'_>,
         carry: &mut DeviceBuffer<f32>,
         work: &mut DeviceBuffer<u32>,
+        keep: bool,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "enqueue_delta_prompt";
         if args.each {
@@ -2952,6 +2964,7 @@ impl DeltaKernels {
             map,
             rows,
             count,
+            u32::from(keep),
             pos,
             fault,
             o,
@@ -2963,7 +2976,19 @@ impl DeltaKernels {
             .module
             .prepare_gdn_carry_keep(LaunchConfig1D::new(grid, BLOCK, 0))?;
         self.module.gdn_carry_keep(
-            stream, &prep, qkv, beta, decay, work, pos, nk, nv, rows, count, carry,
+            stream,
+            &prep,
+            qkv,
+            beta,
+            decay,
+            work,
+            pos,
+            nk,
+            nv,
+            rows,
+            count,
+            u32::from(keep),
+            carry,
         )?;
         Ok(())
     }

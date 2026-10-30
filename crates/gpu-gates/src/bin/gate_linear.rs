@@ -102,7 +102,10 @@
 //!     e₀, every value 0.1, β 0.5 and the decays 0.99 from zero lanes, and
 //!     100 tokens cut at 50 and at 1, 2, 17, 32, 40, 41 and 77; a step after
 //!     the last, on the four rows its carry holds, the one-lane rule's bits
-//!     over them and its token; lane 2's stamp one past the call's first
+//!     over them and its token; a call of 32 that keeps its last chunk, the
+//!     call's `o`, the lanes of a call of its first 16 and their 16 rows
+//!     carried, then a call on to 100 the one call's bits and a step on that
+//!     carry the one-lane rule's; lane 2's stamp one past the call's first
 //!     position raising `delta_stamp` and a NaN value raising `linear_delta`
 //!     with what it reaches non-finite (its column of `o` from its chunk's
 //!     first row on and of lane 2's state) and every other value the clean
@@ -360,6 +363,16 @@ mod gate {
         each: bool,
     }
 
+    /// How [`Ctx::delta_carried`] runs a call: `gdn_delta_lanes`, or the
+    /// prompt form when it has `work`; the recovery record or replay; or the
+    /// prompt form keeping its last chunk (`enqueue_delta_prompt`'s `keep`).
+    #[derive(Clone, Copy, PartialEq)]
+    enum Form {
+        Plain,
+        Recovery,
+        Keep,
+    }
+
     struct Ctx<'a> {
         gpu: &'a Gpu,
         k: &'a LinearKernels,
@@ -482,21 +495,25 @@ mod gate {
             (call, work): (LaneCall, Option<usize>),
             m: usize,
         ) -> Result<(DeltaOut, Vec<u32>), GateError> {
-            let (d, sp, _) =
-                self.delta_carried(fault, st, (state, stamp, None), (call, work, false), m)?;
+            let (d, sp, _) = self.delta_carried(
+                fault,
+                st,
+                (state, stamp, None),
+                (call, work, Form::Plain),
+                m,
+            )?;
             Ok((d, sp))
         }
 
         /// [`Ctx::delta_lanes`] with `carry` beside the state (none for
         /// `gdn_delta_lanes`, a zero one for the prompt form, when `None`);
-        /// the carry after it too (empty without one). `recovery` selects
-        /// the record/replay entry, with no prompt `work`.
+        /// the carry after it too (empty without one), run as `form` says.
         fn delta_carried(
             &self,
             fault: FaultSink,
             st: &Step,
             (state, stamp, carry): (&[f32], &[u32], Option<&[f32]>),
-            (call, work, recovery): (LaneCall, Option<usize>, bool),
+            (call, work, form): (LaneCall, Option<usize>, Form),
             m: usize,
         ) -> Result<(DeltaOut, Vec<u32>, Vec<f32>), GateError> {
             let s = self.stream();
@@ -532,18 +549,21 @@ mod gate {
                 (None, Some(_)) => Some(DeviceBuffer::from_host(s, &zero)?),
                 (None, None) => None,
             };
-            match (recovery, work, cd.as_mut()) {
-                (true, _, cd) => {
+            match (form, work, cd.as_mut()) {
+                (Form::Recovery, _, cd) => {
                     let mut record = DeviceBuffer::zeroed(s, recovery_record_len(K1_SHAPE, m))?;
                     self.k
                         .delta
                         .enqueue_delta_recovery(s, args, cd.map(|c| &*c), &mut record)?;
                 }
-                (false, Some(n), Some(cd)) => {
+                (form, Some(n), Some(cd)) => {
                     let mut w = DeviceBuffer::from_host(s, &vec![0u32; n])?;
-                    self.k.delta.enqueue_delta_prompt(s, args, cd, &mut w)?;
+                    let keep = form == Form::Keep;
+                    self.k
+                        .delta
+                        .enqueue_delta_prompt(s, args, cd, &mut w, keep)?;
                 }
-                (false, _, cd) => self.k.delta.enqueue_delta_lanes(s, args, cd.map(|c| &*c))?,
+                (_, _, cd) => self.k.delta.enqueue_delta_lanes(s, args, cd.map(|c| &*c))?,
             }
             s.synchronize()?;
             Ok((
@@ -2591,7 +2611,7 @@ mod gate {
                                 each: false,
                             },
                             Some(prompt_work_len(K1_SHAPE, 3)),
-                            false,
+                            Form::Plain,
                         ),
                         3,
                     )?;
@@ -2877,7 +2897,7 @@ mod gate {
                             each: false,
                         },
                         Some(prompt_work_len(K1_SHAPE, 3)),
-                        false,
+                        Form::Plain,
                     ),
                     3,
                 )?;
@@ -3620,12 +3640,12 @@ mod gate {
         invalid[0] = f32::from_bits((CARRY_ROWS + 1) as u32);
         invalid[1] = f32::from_bits(p0);
         for (layer, what, work, recovery) in [
-            (40usize, "prompt carry count 16", prompt(1).1, false),
-            (41, "lane carry count 16", None, false),
-            (42, "recovery carry count 16", None, true),
+            (40usize, "prompt carry count 17", prompt(1).1, Form::Plain),
+            (41, "lane carry count 17", None, Form::Plain),
+            (42, "recovery carry count 17", None, Form::Recovery),
         ] {
             let call = LaneCall {
-                each: recovery,
+                each: recovery == Form::Recovery,
                 ..call
             };
             let sink = cx.gpu.layer_sink(layer)?;
@@ -3686,7 +3706,7 @@ mod gate {
                 unl,
                 &st.slice(0, rows),
                 (&lanes, &stamps, carry),
-                (call, Some(work), false),
+                (call, Some(work), Form::Plain),
                 m,
             );
             let named = matches!(&got, Err(e) if e.to_string().contains(want));
@@ -3782,7 +3802,10 @@ mod gate {
                                 cx.k.delta
                                     .enqueue_delta_recovery(s, args, Some(&*c), &mut r)
                             }
-                            _ => cx.k.delta.enqueue_delta_prompt(s, args, &mut c, &mut work),
+                            _ => {
+                                cx.k.delta
+                                    .enqueue_delta_prompt(s, args, &mut c, &mut work, false)
+                            }
                         }
                     };
                     let named = matches!(&got, Err(e) if e.to_string().contains(&format!("{name} at "))
@@ -3854,7 +3877,7 @@ mod gate {
                     unl,
                     &t.slice(at, n),
                     (&left.1, &left.2, Some(&left.3)),
-                    (call, Some(prompt_work_len(K1_SHAPE, n)), false),
+                    (call, Some(prompt_work_len(K1_SHAPE, n)), Form::Plain),
                     n,
                 )?;
                 left.0.extend(d.o);
@@ -3917,7 +3940,7 @@ mod gate {
             unl,
             &st.slice(M, 1),
             (&state, &stamp, Some(&carry)),
-            (step, None, false),
+            (step, None, Form::Plain),
             1,
         )?;
         let held = M % CHUNK_ROWS;
@@ -3941,6 +3964,111 @@ mod gate {
             "a step after the prompt of {M} cut at {ragged:?}, on its carry of {held} rows: o {} \
              lane {c} {} (the one-lane rule over the carried rows and the token), stamps {sp:?} \
              (want {want:?}) {}",
+            cmp(&d.o, o_last),
+            cmp(&lane_c, &h.state),
+            verdict(pass)
+        );
+        out.push(pass);
+        out.extend(keep_clauses(cx, st, (lanes, stamps), call)?);
+        Ok(out)
+    }
+
+    /// Clause 16's kept chunk: a call of two chunks that keeps its last
+    /// (`enqueue_delta_prompt`'s `keep`) gives the one call's `o`, leaves the
+    /// lanes the call of its first chunk leaves and its last chunk's sixteen
+    /// rows carried; a call on from there gives the one call's bits (`o`,
+    /// every lane, the stamps and the carry), and a step on the carry the
+    /// one-lane rule's over the carried rows and its token.
+    fn keep_clauses(
+        cx: &Ctx<'_>,
+        st: &Step,
+        (lanes, stamps): (&[f32], [u32; ROW_LANES]),
+        call: LaneCall,
+    ) -> Result<Vec<bool>, GateError> {
+        const K: usize = 2 * CHUNK_ROWS;
+        const M: usize = 100;
+        let unl = cx.gpu.unlabelled_sink();
+        let (len, nv) = (K1_SHAPE.state_len(), K1_SHAPE.n_v);
+        let c = call.lane as usize;
+        let zero = vec![0.0f32; K1_SHAPE.carry_len()];
+        // `n` rows of `st` from row `at`, on `left`'s lanes, stamps and carry.
+        type Ran = Result<(DeltaOut, Vec<u32>, Vec<f32>), GateError>;
+        let on = |(at, n): (usize, usize), left: (&[f32], &[u32], &[f32]), form: Form| -> Ran {
+            let call = LaneCall {
+                p0: call.p0 + u32::try_from(at)?,
+                ..call
+            };
+            let work = (form != Form::Plain || n > 1).then(|| prompt_work_len(K1_SHAPE, n));
+            cx.delta_carried(
+                unl,
+                &st.slice(at, n),
+                (left.0, left.1, Some(left.2)),
+                (call, work, form),
+                n,
+            )
+        };
+        let start = (lanes, &stamps[..], &zero[..]);
+        let (kept, ksp, kc) = on((0, K), start, Form::Keep)?;
+        let (first, _, _) = on((0, CHUNK_ROWS), start, Form::Plain)?;
+        let (both, bsp, _) = on((0, K), start, Form::Plain)?;
+        let (one, osp, oc) = on((0, M), start, Form::Plain)?;
+        let (held, at) = (kc[0].to_bits() as usize, kc[1].to_bits());
+        let at_want = call.p0 + u32::try_from(K)?;
+        let pass = bits_equal(&kept.o, &both.o)
+            && bits_equal(&kept.state, &first.state)
+            && ksp == bsp
+            && (held, at) == (CHUNK_ROWS, at_want);
+        println!(
+            "a prompt of {K} keeping its last chunk: o {} (the call's), lanes {} (the call of its \
+             first chunk's), stamps {}, carry {held} rows at {at} (want {CHUNK_ROWS} at {at_want}) {}",
+            cmp(&kept.o, &both.o),
+            cmp(&kept.state, &first.state),
+            ksp == bsp,
+            verdict(pass)
+        );
+        let mut out = vec![pass];
+        let (rest, rsp, rc) = on(
+            (K, M - K),
+            (&kept.state[..], &ksp[..], &kc[..]),
+            Form::Plain,
+        )?;
+        let o = [kept.o, rest.o].concat();
+        let pass = bits_equal(&o, &one.o)
+            && bits_equal(&rest.state, &one.state)
+            && rsp == osp
+            && bits_equal(&rc, &oc);
+        println!(
+            "the prompt of {M} as that call then {} more vs one call: o {} lanes {} stamps {} \
+             carry {} {}",
+            M - K,
+            cmp(&o, &one.o),
+            cmp(&rest.state, &one.state),
+            rsp == osp,
+            cmp(&rc, &oc),
+            verdict(pass)
+        );
+        out.push(pass);
+        let (d, sp, _) = on((K, 1), (&kept.state[..], &ksp[..], &kc[..]), Form::Plain)?;
+        let t = st.slice(CHUNK_ROWS, CHUNK_ROWS + 1);
+        let lane_of = |v: &[f32]| v[c * len..(c + 1) * len].to_vec();
+        let h = delta_host(
+            &t.qkv,
+            &t.beta,
+            &t.decay,
+            &lane_of(&kept.state),
+            LANES,
+            0,
+            K1_SHAPE,
+            CHUNK_ROWS + 1,
+        );
+        let o_last = &h.o[CHUNK_ROWS * nv * HEAD..];
+        let lane_c = lane_of(&d.state);
+        let mut want = ksp;
+        want[c] = at_want + 1;
+        let pass = bits_equal(&d.o, o_last) && bits_equal(&lane_c, &h.state) && sp == want;
+        println!(
+            "a step on the kept carry of {CHUNK_ROWS} rows: o {} lane {c} {} (the one-lane rule \
+             over the carried rows and the token), stamps {sp:?} (want {want:?}) {}",
             cmp(&d.o, o_last),
             cmp(&lane_c, &h.state),
             verdict(pass)

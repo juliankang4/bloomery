@@ -204,7 +204,9 @@ const LIST_ROWS: u32 = 40_960;
 // PIN(2026-10-30): the delta layers' one state lane and record (qwen4exp_meta's KV_AT, 329,122,224
 // B) and the ubatch arena's BF16 stream buffer (83,886,080 B at 4,096) leave the room: the planner
 // on this tree holds 1,370,491 and 444,492; the pin is one fewer.
-const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_370_490), ("3090", 444_491)];
+// PIN(2026-10-30): the GDN layers' carries of 16 rows (qwen4exp_meta's KV_AT, 1,193,472 B more)
+// leave the room: the planner on this tree holds 1,370,448 and 444,448; the pin is one fewer.
+const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_370_447), ("3090", 444_447)];
 
 /// The plan with the shared draft (`place::PlanInputs::plan_mtp`): on each
 /// card at 4,096 and 32,768 positions the target's plan is `plan`'s field
@@ -553,8 +555,12 @@ fn hw_qwen4exp_mtp_plan() {
 // layers' one state lane and record and the BF16 stream buffer leave the room as in
 // qwen4exp_meta's BP_PLAIN; the tier keeps its 7,236 experts [derived: the planner on this tree over
 // the pinned headers printed this row].
+// PIN(2026-10-30): the A6000 246 on the first 32 layers (was 33), both cards 397 on the first 20
+// layers (was 21). The GDN layers' carries of 16 rows leave the card's kv 1,193,472 B
+// (qwen4exp_meta's KV_AT); the tier keeps its 7,236 experts, its bytes and rounding [derived: the
+// planner on this tree over the pinned headers printed this row].
 const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
-    (246, 33, 245, 397, 21, 7_236, 22_676_889_600, 146_415_616);
+    (246, 32, 245, 397, 20, 7_236, 22_676_889_600, 146_415_616);
 
 /// Plan (b′) of the Qwen3.8 file with the shared draft (`place::machine_bp`
 /// with `MtpInputs::card_bytes` as the A6000's reserve, `plan_mtp_with`

@@ -18,7 +18,9 @@
 //! it. The server runs each prompt call as [`Engine::prefill_marked`] (whose
 //! default is that `prefill`), handing it the call's message starts, where a
 //! later request may be cut back to, and cutting the call where
-//! [`Engine::prefill_splits`] asks. An engine that names a prompt quantum `q`
+//! [`Engine::prefill_splits`] asks; the prompt's last call and the step of
+//! `ids[n-1]` reach the engine as one [`Engine::prefill_next`], whose default
+//! is those two calls. An engine that names a prompt quantum `q`
 //! ([`Engine::prompt_quantum`]) may see that `prefill` arrive instead as calls
 //! ending at `k + j·q`, the grid
 //! starting again at each cut [`Engine::prefill_splits`] asks for, one a round
@@ -625,6 +627,28 @@ pub trait Engine: Send {
         } else {
             self.prefill_media(ids, media)
         }
+    }
+    /// A prompt's last call `ids` (at least one) from the current position
+    /// and the step of its last id: [`Engine::prefill_marked`] of all but the
+    /// last id with `media` and `marks` (the feeds and the marks of that
+    /// part), then [`Engine::next`] of the last, writing its logits to
+    /// `logits_out` as that call does. That is the default. An engine whose
+    /// prompt call can run the last id as its last row overrides it; it then
+    /// stands past every id with the checkpoints the two calls would leave,
+    /// so a later request keeps of it what it keeps of theirs, and its logits
+    /// are that row's.
+    fn prefill_next(
+        &mut self,
+        ids: &[u32],
+        media: &[MediaFeed],
+        marks: &[usize],
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<u32, EngineError> {
+        let Some((&last, run)) = ids.split_last() else {
+            return Err(EngineError("prefill_next of no ids".to_owned()));
+        };
+        self.prefill_marked(run, media, marks)?;
+        self.next(last, logits_out)
     }
     /// The call length `q` at which this engine's prompt work is bit-neutral
     /// to cut: the calls `ids[a..a + k·q]` then `ids[a + k·q..b]` leave the

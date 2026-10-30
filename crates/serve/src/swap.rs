@@ -202,6 +202,24 @@ impl Engine for SwapEngine {
             self.prefill_media(ids, media)
         }
     }
+    /// The inner engine's call; a call that carries images is this engine's
+    /// [`Engine::prefill_media`] and [`Engine::next`].
+    fn prefill_next(
+        &mut self,
+        ids: &[u32],
+        media: &[MediaFeed],
+        marks: &[usize],
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<u32, EngineError> {
+        let Some((&last, run)) = ids.split_last() else {
+            return Err(EngineError("prefill_next of no ids".to_owned()));
+        };
+        if media.is_empty() {
+            return self.inner.prefill_next(ids, media, marks, logits_out);
+        }
+        self.prefill_media(run, media)?;
+        self.next(last, logits_out)
+    }
     fn note(&self, note: &CacheNote) {
         self.inner.note(note);
     }

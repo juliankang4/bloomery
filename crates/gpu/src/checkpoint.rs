@@ -464,6 +464,20 @@ impl Checkpoints {
     /// been evicted there. Refused by name, the take given back, when a store
     /// was not copied.
     pub fn seal(&mut self, stream: &CudaStream, pending: Pending) -> Result<(), GpuError> {
+        self.seal_with(stream, pending, |_| Ok(()))
+    }
+
+    /// [`Checkpoints::seal`] with `edit` run over the slot's stores, in the
+    /// body's order, once its copies are waited for and before the slot
+    /// holds the mark: a body whose stores reached the mark's state a row
+    /// past it rewrites the words that row moved. An edit's refusal is the
+    /// seal's, the take forgotten.
+    pub fn seal_with(
+        &mut self,
+        stream: &CudaStream,
+        pending: Pending,
+        edit: impl FnOnce(&mut [&mut [f32]]) -> Result<(), GpuError>,
+    ) -> Result<(), GpuError> {
         let synced = stream.synchronize();
         self.open = self.open.saturating_sub(1);
         let Pending { at, slot, sent } = pending;
@@ -481,6 +495,13 @@ impl Checkpoints {
                 what: WHAT,
                 detail: format!("the take at {at} sealed with store {i} not copied"),
             });
+        }
+        let mut stores: Vec<&mut [f32]> = (self.slots[slot].bufs.iter_mut())
+            .map(PinnedHostBuffer::as_mut_slice)
+            .collect();
+        if let Err(e) = edit(&mut stores) {
+            self.forget(at)?;
+            return Err(e);
         }
         self.slots[slot].holds = Some(at);
         Ok(())

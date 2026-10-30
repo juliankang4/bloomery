@@ -1172,6 +1172,12 @@ enum Cmd {
         ids: Vec<u32>,
         logits: Option<Vec<f32>>,
     },
+    /// A prompt's last call and the step of its last id
+    /// ([`Seat::prefill_next`]), the logits buffer lent as a `Next`'s.
+    PrefillNext {
+        ids: Vec<u32>,
+        logits: Option<Vec<f32>>,
+    },
     /// A pass from `last`, its kept tokens into the caller's buffer.
     Pass {
         last: u32,
@@ -1391,6 +1397,16 @@ pub trait Seat: 'static {
     /// last; a seat whose prefill already ran the head on its last row
     /// overrides it to read that row.
     fn prefill_row(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
+        prefill_then_step(self, ids, row)
+    }
+    /// A prompt's last call `ids` (at least one) from the slot's position and
+    /// the step of its last id (`serve::Engine::prefill_next`): the argmax after the last
+    /// and, into `row`, that position's logits. The prompt call takes its
+    /// checkpoints as [`Seat::prefill_only`] of all but the last id does. The
+    /// default is that call and [`Seat::step`] (or [`Seat::step_row`]) of the
+    /// last; a seat whose prompt call runs the last id as its last row
+    /// overrides it.
+    fn prefill_next(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
         prefill_then_step(self, ids, row)
     }
     /// One pass from `last` (`serve::Engine::advance`): the kept tokens into
@@ -2101,21 +2117,7 @@ impl Link {
     /// A step; with `logits_out`, the engine's buffer is lent for it and
     /// copied out once it is back.
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
-        let lent = logits_out
-            .is_some()
-            .then(|| std::mem::take(&mut self.logits));
-        let arg = self.call(Cmd::Next { last, logits: lent })?;
-        if let Some(out) = logits_out {
-            if out.len() != self.logits.len() {
-                return Err(EngineError(format!(
-                    "the caller's logits buffer holds {}, the engine's {}",
-                    out.len(),
-                    self.logits.len()
-                )));
-            }
-            out.copy_from_slice(&self.logits);
-        }
-        Ok(arg)
+        self.call_lent(|logits| Cmd::Next { last, logits }, logits_out)
     }
 
     /// `ids` and the step of the last ([`Cmd::NextAfter`]); with
@@ -2125,13 +2127,33 @@ impl Link {
         ids: &[u32],
         logits_out: Option<&mut [f32]>,
     ) -> Result<u32, EngineError> {
+        let ids = ids.to_vec();
+        self.call_lent(|logits| Cmd::NextAfter { ids, logits }, logits_out)
+    }
+
+    /// A prompt's last call and the step of its last id
+    /// ([`Cmd::PrefillNext`]); with `logits_out`, the engine's buffer is lent
+    /// as a step's is.
+    fn prefill_next(
+        &mut self,
+        ids: &[u32],
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<u32, EngineError> {
+        let ids = ids.to_vec();
+        self.call_lent(|logits| Cmd::PrefillNext { ids, logits }, logits_out)
+    }
+
+    /// The command `cmd` makes of the engine's logits buffer, lent when the
+    /// caller wants the row (`logits_out`) and copied out once it is back.
+    fn call_lent(
+        &mut self,
+        cmd: impl FnOnce(Option<Vec<f32>>) -> Cmd,
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<u32, EngineError> {
         let lent = logits_out
             .is_some()
             .then(|| std::mem::take(&mut self.logits));
-        let arg = self.call(Cmd::NextAfter {
-            ids: ids.to_vec(),
-            logits: lent,
-        })?;
+        let arg = self.call(cmd(lent))?;
         if let Some(out) = logits_out {
             if out.len() != self.logits.len() {
                 return Err(EngineError(format!(
@@ -2496,7 +2518,11 @@ fn serve_cmd<S: Seat>(
             return (arg, logits);
         }
         Cmd::NextAfter { ids, mut logits } => {
-            let arg = prefill_row(g, &ids, logits.as_deref_mut(), n_vocab);
+            let arg = prefill_row(g, &ids, logits.as_deref_mut(), n_vocab, S::prefill_row);
+            return (arg, logits);
+        }
+        Cmd::PrefillNext { ids, mut logits } => {
+            let arg = prefill_row(g, &ids, logits.as_deref_mut(), n_vocab, S::prefill_next);
             return (arg, logits);
         }
         Cmd::Reset => g
@@ -2583,15 +2609,16 @@ pub fn prefill_then_step<S: Seat + ?Sized>(
     }
 }
 
-/// `ids` and the step of the last ([`Seat::prefill_row`]), checked as a
-/// prefill's feed and a step's row are: a row of the wrong length or a feed
-/// past the context is refused before the call runs, and a row holding a NaN
-/// is the call's error.
+/// `ids` and the step of the last by `call` ([`Seat::prefill_row`] or
+/// [`Seat::prefill_next`]), checked as a prefill's feed and a step's row are:
+/// a row of the wrong length or a feed past the context is refused before the
+/// call runs, and a row holding a NaN is the call's error.
 fn prefill_row<S: Seat>(
     g: &mut S,
     ids: &[u32],
     row: Option<&mut [f32]>,
     n_vocab: usize,
+    call: impl FnOnce(&mut S, &[u32], Option<&mut [f32]>) -> Result<u32, GateError>,
 ) -> Result<u32, String> {
     let at = g.pos();
     let refuse = |e: String| format!("{} ids and a step from position {at}: {e}", ids.len());
@@ -2605,11 +2632,9 @@ fn prefill_row<S: Seat>(
     }
     check_feed(g, ids.len()).map_err(refuse)?;
     let Some(row) = row else {
-        return g.prefill_row(ids, None).map_err(|e| refuse(e.to_string()));
+        return call(g, ids, None).map_err(|e| refuse(e.to_string()));
     };
-    let arg = g
-        .prefill_row(ids, Some(&mut *row))
-        .map_err(|e| refuse(e.to_string()))?;
+    let arg = call(g, ids, Some(&mut *row)).map_err(|e| refuse(e.to_string()))?;
     if let Some(i) = row.iter().position(|v| v.is_nan()) {
         return Err(refuse(format!("logit {i} is NaN")));
     }
@@ -2713,7 +2738,7 @@ pub fn pass_rows_in_turn<S: Seat + ?Sized>(
 /// command.
 fn one_slot_call(cmd: &Cmd) -> Option<&'static str> {
     match cmd {
-        Cmd::Next { .. } => Some("step"),
+        Cmd::Next { .. } | Cmd::PrefillNext { .. } => Some("step"),
         Cmd::Pass { .. } => Some("pass"),
         Cmd::PassSampled { .. } => Some("sampled"),
         _ => None,
@@ -3240,6 +3265,26 @@ impl Engine for SeatEngine {
 
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
         self.link.next(last, logits_out)
+    }
+
+    /// One command on the engine thread ([`Seat::prefill_next`]) for a call
+    /// that carries no image; one that does is [`Engine::prefill_media`] of
+    /// all but the last id and [`Engine::next`] of the last.
+    fn prefill_next(
+        &mut self,
+        ids: &[u32],
+        media: &[MediaFeed],
+        marks: &[usize],
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<u32, EngineError> {
+        let Some((&last, run)) = ids.split_last() else {
+            return Err(EngineError("prefill_next of no ids".to_owned()));
+        };
+        if media.is_empty() {
+            return self.link.prefill_next(ids, logits_out);
+        }
+        self.prefill_marked(run, media, marks)?;
+        self.next(last, logits_out)
     }
 
     /// One command on the engine thread ([`Seat::prefill_row`]).
@@ -5645,7 +5690,7 @@ mod tests {
         /// plan's need holds the machine's `checkpoints` row, so the room
         /// past the need is the reading less the plan's own terms less that
         /// row, the budget half of it, and `checkpoints` is the term the
-        /// `cache` line prints, not a second subtraction. One Qwen3.8 slot
+        /// `cache` line prints, not a second subtraction. One example slot
         /// at a context of 16,384 positions pins five points of 148,065,344
         /// B spaced 4,096 apart (740,326,720 B) inside the need of
         /// 27,721,043,264 B: the same plan with no reserve leaves that much
@@ -5653,12 +5698,12 @@ mod tests {
         /// (`available`, `need`, `pool`) reproduce the budget it prints.
         #[test]
         fn a_default_budget_counts_the_checkpoint_reserve_once() {
-            const Q38: Price = Price {
+            const EXAMPLE: Price = Price {
                 point_bytes: 148_065_344,
                 every: 4_096,
             };
             let mut m = machine(0);
-            reserve_checkpoints(&mut m, Seqs::priced(1, Q38), 16_384).expect("a reserve");
+            reserve_checkpoints(&mut m, Seqs::priced(1, EXAMPLE), 16_384).expect("a reserve");
             let reserved = checkpoints_reserved(&m);
             assert_eq!(reserved, 5 * 148_065_344);
             let (terms, pool, available) = (26_980_716_544u64, 0u64, 40_000_000_000u64);
@@ -5742,8 +5787,8 @@ mod tests {
         /// spacing (`checkpoint_price35`, `checkpoint_price38`, pinned where
         /// they are made: `gate-gpu-lib`) and the budget one sequence's
         /// `Checkpoints` is made with is the price's at the slot's context.
-        /// A point of 73,728,000 B (Qwen3.6-35B-A3B) or 148,065,344 B
-        /// (Qwen3.8-Flash-Next) spaced 4,096 apart takes two points in a slot
+        /// The example prices of 73,728,000 B and 148,065,344 B, spaced
+        /// 4,096 apart, take two points in a slot
         /// of 2,048 positions and four in 10,240 (a whole call's points and
         /// the previous call's end) — not the 4 GiB of the default a slot.
         #[test]
@@ -5777,15 +5822,15 @@ mod tests {
 
         /// A deeper probe never reserves less: the machine's checkpoint row
         /// at each context a search can probe holds at the row of every
-        /// shallower one, for Qwen3.8's price and GLM's, so a search's probes
+        /// shallower one, for an example recurrent price and GLM's, so a search's probes
         /// never reserve under the load they bound.
         #[test]
         fn a_deeper_probe_never_reserves_less() {
-            let qwen38 = Price {
+            let recurrent = Price {
                 point_bytes: 148_065_344,
                 every: 4_096,
             };
-            for price in [qwen38, GLM_PRICE] {
+            for price in [recurrent, GLM_PRICE] {
                 let mut last = 0;
                 for ctx in (1..=140_000u64).step_by(7) {
                     let mut m = machine(1_000);

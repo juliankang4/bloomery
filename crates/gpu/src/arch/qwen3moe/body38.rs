@@ -1588,6 +1588,13 @@ pub struct Body38 {
     /// to the point reads ([`Body38::draft_rejoins`]).
     point_rows: Vec<(u32, Vec<f32>)>,
     marks: bool,
+    /// Whether a prompt call closes its prompt ([`Body38::set_close`]).
+    close: bool,
+    /// Whether the ubatch walk being planned is a closing call's last, whose
+    /// delta layers keep their last chunk out of the state
+    /// (`DeltaKernels::enqueue_delta_prompt`'s `keep`): the end mark one row
+    /// short of the walk's end is then the lane and the carry less that row.
+    keep_last: bool,
     /// A prompt call's checkpoint at the end of a ubatch, opened before the
     /// ubatch walks ([`Body38::open_end_mark`]) and sealed at the mark
     /// ([`Body38::take_mark`]).
@@ -2330,6 +2337,8 @@ impl Body38 {
             ple_points: Vec::new(),
             point_rows: Vec::new(),
             marks: false,
+            close: false,
+            keep_last: false,
             end_mark: None,
             marker: None,
             who,
@@ -3074,6 +3083,19 @@ impl Body38 {
         self.marks
     }
 
+    /// Whether a prompt call closes its prompt: its last id is the one a
+    /// server would step after the call, run as the call's last row, whose
+    /// head gives the argmax after it, and the call's checkpoints are those of
+    /// the call less its last id: the end mark stands before the last id
+    /// ([`GpuModel::feed38`]). A call of passes or steps leaves the bits of
+    /// the call less its last id and that id's step; a call by ubatches
+    /// leaves the ubatch walk's last row, as one call of the whole prompt
+    /// does. Off at load; the serve seat turns it on around a prompt's last
+    /// call.
+    pub fn set_close(&mut self, on: bool) {
+        self.close = on;
+    }
+
     /// The PLE rows of `token` at `pos`, the input the next step is to take,
     /// read ahead on the NVMe tier's helper while the caller hands the step's
     /// answer on. The history and every device buffer stay as they are: the
@@ -3153,7 +3175,8 @@ impl Body38 {
             return Err(e);
         }
         if let Some(open) = self.end_mark.take() {
-            return self.seal_end_mark(stream, pos, open);
+            let hist = self.ple.hist.clone();
+            return self.seal_end_mark(stream, pos, open, hist, |_| Ok(()));
         }
         let lane = self.lane.lane();
         let mut c = Copied::of(&mut self.stores, &mut self.ple_ring, lane, None, None)?;
@@ -3165,7 +3188,8 @@ impl Body38 {
                     self.ple_points.retain(|&(p, _)| p != e);
                     self.point_rows.retain(|&(p, _)| p != e);
                 }
-                self.point_taken(stream, pos)
+                let hist = self.ple.hist.clone();
+                self.point_taken(stream, pos, hist)
             }
             Ok(Take::Held | Take::Empty) => Ok(()),
             Err(e) => {
@@ -3177,11 +3201,16 @@ impl Body38 {
     }
 
     /// A point's host side once its stores' copy holds `pos`: the PLE
-    /// history beside it and, on a load with the draft, the target's final
+    /// history `hist` beside it and, on a load with the draft, the target's final
     /// hidden row at `pos - 1` when an arena still holds it. Blocking.
-    fn point_taken(&mut self, stream: &CudaStream, pos: u32) -> Result<(), GpuError> {
+    fn point_taken(
+        &mut self,
+        stream: &CudaStream,
+        pos: u32,
+        hist: History,
+    ) -> Result<(), GpuError> {
         let i = self.ple_points.partition_point(|&(p, _)| p < pos);
-        self.ple_points.insert(i, (pos, self.ple.hist.clone()));
+        self.ple_points.insert(i, (pos, hist));
         let point_row = match (&self.mtp, pos.checked_sub(1)) {
             (Some(_), Some(before)) => self.hidden_row(stream, before)?,
             _ => None,
@@ -3271,13 +3300,16 @@ impl Body38 {
 
     /// The end mark `open` at `pos` sealed ([`Checkpoints::seal`]) once its
     /// walk is waited for and found sound, and its point's host side
-    /// ([`Body38::point_taken`]); points a later take evicted lose theirs.
+    /// ([`Body38::point_taken`]) with the PLE history `hist` and `edit` run
+    /// over its stores ([`Checkpoints::seal_with`]); points a later take evicted lose theirs.
     /// A mark of another position is given back and refused by name.
     fn seal_end_mark(
         &mut self,
         stream: &CudaStream,
         pos: u32,
         open: checkpoint::Pending,
+        hist: History,
+        edit: impl FnOnce(&mut [&mut [f32]]) -> Result<(), GpuError>,
     ) -> Result<(), GpuError> {
         let copy = self.marker.as_ref().map_or(stream, |m| &*m.copy);
         if open.at() != pos {
@@ -3288,7 +3320,7 @@ impl Body38 {
                 format!("the end mark opened at {at} sealed at {pos}"),
             ));
         }
-        if let Err(e) = self.ckpt.seal(copy, open) {
+        if let Err(e) = self.ckpt.seal_with(copy, open, edit) {
             self.ple_points.clear();
             self.point_rows.clear();
             return Err(e);
@@ -3297,9 +3329,58 @@ impl Body38 {
         self.ple_points.retain(|(p, _)| kept.contains(p));
         self.point_rows.retain(|(p, _)| kept.contains(p));
         if kept.contains(&pos) {
-            self.point_taken(stream, pos)?;
+            self.point_taken(stream, pos, hist)?;
         }
         Ok(())
+    }
+
+    /// The closing call's end mark at `at`, the position before its last id,
+    /// sealed once its fold has walked a row past it ([`fold_units`]): every
+    /// store but the delta lanes holds a position's state a row past it (the
+    /// rings keep a pass past their reach, the rest are rows by position),
+    /// and the walk kept its last chunk out of the lanes ([`Body38::keep_last`]),
+    /// in the point's copy each delta layer's carry gives that row back (its
+    /// count one less, standing at `at`), and the PLE history `hist` (at
+    /// `at`) goes beside it ([`Body38::seal_end_mark`]). Refused by
+    /// name, the take forgotten, when a carry does not stand a row past `at`
+    /// with a row in it.
+    fn seal_close_mark(
+        &mut self,
+        stream: &CudaStream,
+        at: u32,
+        hist: History,
+    ) -> Result<(), GpuError> {
+        let Some(open) = self.end_mark.take() else {
+            return Ok(());
+        };
+        let delta = (self.stores.iter())
+            .filter(|s| matches!(s, Store38::Rec { .. }))
+            .count();
+        self.seal_end_mark(stream, at, open, hist, |stores| {
+            for i in (0..delta).map(|j| 3 * j + 2) {
+                let carry = stores
+                    .get_mut(i)
+                    .filter(|c| c.len() >= 2)
+                    .ok_or(GpuError::state(
+                        WHAT,
+                        "each delta layer's carry in the point",
+                    ))?;
+                let (rows, past) = (carry[0].to_bits(), carry[1].to_bits());
+                if rows == 0 || past != at + 1 {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "the closing mark at {at}: store {i}'s carry holds {rows} rows \
+                             standing at {past}, not a row standing at {}",
+                            at + 1
+                        ),
+                    ));
+                }
+                carry[0] = f32::from_bits(rows - 1);
+                carry[1] = f32::from_bits(at);
+            }
+            Ok(())
+        })
     }
 
     /// An open end mark given back ([`Checkpoints::abandon`]): its ubatch
@@ -4317,6 +4398,7 @@ impl Body38 {
             plant,
             end_mark,
             marker,
+            keep_last,
             ..
         } = self;
         let done = marker
@@ -4353,6 +4435,7 @@ impl Body38 {
                 media: media.as_mut(),
                 ple_rows: late.then_some(&mut rows_in as &mut PleRowsIn<'_>),
                 done,
+                keep: std::mem::take(keep_last),
             },
         };
         let cap = prog.p.x.rows;
@@ -4548,6 +4631,20 @@ fn call_units(from: u32, n: usize, width: usize, marks: &[u32]) -> Vec<(usize, b
     units
 }
 
+/// The units of a closing call of `n` ids from `from` whose marks (as
+/// [`call_units`] takes them) end at its last id's position, that id folded
+/// into the call's last ubatch: [`call_units`] without that end mark, when
+/// the last ubatch then holds a row before the id. `None` otherwise: the
+/// mark cuts the call there as any mark does.
+fn fold_units(from: u32, n: usize, width: usize, marks: &[u32]) -> Option<Vec<(usize, bool)>> {
+    let (&end, inner) = marks.split_last()?;
+    if end as usize + 1 != from as usize + n {
+        return None;
+    }
+    let units = call_units(from, n, width, inner);
+    units.last().is_some_and(|&(m, _)| m >= 2).then_some(units)
+}
+
 impl GpuModel<Body38> {
     /// Arm (or disarm) the per-layer taps: after each layer the step copies
     /// its streams into the layer's tap, which [`Body38::taps`] reads back,
@@ -4583,6 +4680,28 @@ impl GpuModel<Body38> {
     pub fn take_prompt38_stats(&mut self) -> Result<Option<PromptStats>, GpuError> {
         let (_, _, body) = self.body_parts("qwen4exp take_prompt38_stats")?;
         Ok(body.wide_timing.as_mut().and_then(PromptTiming::take))
+    }
+
+    /// Whether a closing call ([`Body38::set_close`]) of `n` ids on `path`
+    /// from where the model stands runs its last id in the ubatch walk: the
+    /// call is ubatches, and its last ubatch holds a row before that id
+    /// ([`fold_units`]) or the call takes no checkpoint. Otherwise the end
+    /// mark before the last id would leave it a walk of its own, which a
+    /// step runs faster; a serve seat then feeds the call less that id and
+    /// steps it.
+    pub fn closes_by_ubatch(&self, n: usize, path: Prompt38) -> Result<bool, GpuError> {
+        const WHAT_C: &str = "qwen4exp closing call";
+        let pos = self.pos();
+        let body = self.body(WHAT_C)?;
+        if body.resolve_prompt(path, n) != Prompt38::Gemm {
+            return Ok(false);
+        }
+        if !body.marks {
+            return Ok(true);
+        }
+        let end = launch_u32(WHAT_C, "positions", pos as usize + n - 1)?;
+        let marks = body.ckpt.marks(pos, end);
+        Ok(fold_units(pos, n, body.wide.rows, &marks).is_some())
     }
 
     /// Feed `tokens` from where the model stands by `path` and return the
@@ -4836,8 +4955,10 @@ impl GpuModel<Body38> {
             .and_then(|n| from.checked_add(n))
             .ok_or_else(|| GpuError::shape(WHAT_M, format!("{} ids from {from}", tokens.len())))?;
         let body = self.body(WHAT_M)?;
+        // A closing call's marks are the call's less its last id.
+        let end = to - u32::from(body.close);
         let marks = match body.marks {
-            true => body.ckpt.marks(from, to),
+            true => body.ckpt.marks(from, end),
             false => Vec::new(),
         };
         if path != Prompt38::Step {
@@ -4855,7 +4976,13 @@ impl GpuModel<Body38> {
             }
             self.mark_here(WHAT_M)?;
         }
-        next.ok_or(GpuError::state(WHAT_M, "a mark at the call's end"))
+        if at < to {
+            next = Some(self.feed_steps(&tokens[(at - from) as usize..], sink)?);
+        }
+        next.ok_or(GpuError::state(
+            WHAT_M,
+            "a token after the call's last mark",
+        ))
     }
 
     /// The checkpoint at the model's position ([`Body38::take_mark`]).
@@ -4899,6 +5026,17 @@ impl GpuModel<Body38> {
     /// tap reads them, and the fault word read before the checkpoint copies a
     /// store. Each unit reads the rows those readers name and no other
     /// ([`Body38::walk_gemm`]'s `read`).
+    ///
+    /// A closing call ([`Body38::set_close`]) by ubatches whose marks end
+    /// before its last id runs that id as the last row of its last ubatch
+    /// (the fold) when the ubatch holds a row before it ([`fold_units`]): the
+    /// ubatch keeps its last delta chunk out of the lanes
+    /// ([`Body38::keep_last`]), and the end mark opens on it and is sealed a
+    /// row before where the walk stands ([`Body38::seal_close_mark`]), the
+    /// point's row read with the head's.
+    /// Otherwise the mark cuts the call there as any mark does, and the last
+    /// id is a ubatch of its own: the same bits, each row's a function of its
+    /// own inputs whatever ubatch holds it.
     fn feed38(
         &mut self,
         tokens: &[u32],
@@ -4922,7 +5060,18 @@ impl GpuModel<Body38> {
             }
         };
         let point_row = body.mtp.is_some();
-        let units = call_units(pos0, tokens.len(), width, marks);
+        let n = tokens.len();
+        let mut units = call_units(pos0, n, width, marks);
+        let mut fold = None;
+        let folded = fold_units(pos0, n, width, marks).filter(|_| body.close);
+        if let (Some(folded), Prompt38::Gemm) = (folded, path) {
+            units = folded;
+            let mut hist = body.ple.hist.clone();
+            for &t in &tokens[..n - 1] {
+                hist.push(t);
+            }
+            fold = Some((pos0 + launch_u32(WHAT_P, "positions", n - 1)?, hist));
+        }
         if path == Prompt38::Gemm {
             // The call's PLE rows are read ahead: the first ubatch's fill
             // reads its own, each later one's runs under the ubatch before
@@ -4942,9 +5091,13 @@ impl GpuModel<Body38> {
             let last = i + 1 == units.len();
             let point = marked && !last;
             let headed = last && head;
+            let folded = fold.as_ref().filter(|_| last).map(|(e, _)| *e);
             let read = match tapped {
                 true => m,
-                false => usize::from(headed || marked && point_row),
+                false => {
+                    usize::from(headed || marked && point_row)
+                        + usize::from(folded.is_some() && point_row)
+                }
             };
             let pos = self.pos();
             {
@@ -4952,9 +5105,13 @@ impl GpuModel<Body38> {
                 match path {
                     Prompt38::Gemm => {
                         body.plan_gemm(gpu.stream(), chunk, pos)?;
+                        body.keep_last = folded.is_some();
                         if marked {
                             let to = launch_u32(WHAT_P, "positions", pos as usize + m)?;
                             body.open_end_mark(gpu.stream(), pos, to)?;
+                        }
+                        if let Some(e) = folded {
+                            body.open_end_mark(gpu.stream(), pos, e)?;
                         }
                     }
                     _ => body.plan_pass(gpu.stream(), chunk, pos)?,
@@ -4995,6 +5152,10 @@ impl GpuModel<Body38> {
             if marked {
                 self.mark_here(WHAT_P)?;
             }
+        }
+        if let Some((e, hist)) = fold {
+            let (gpu, _, body) = self.body_parts(WHAT_P)?;
+            body.seal_close_mark(gpu.stream(), e, hist)?;
         }
         if !head {
             return Ok(0);
@@ -6939,12 +7100,12 @@ mod tests {
     /// A checkpoint of Qwen3.8-Flash-Next's 36 delta layers and 12
     /// selecting layers (48 layers at interval 4) copies each delta layer's
     /// committed lane (786,432 f32), conv ring (112,640 f32) and carry
-    /// (124,324 f32), the PLE ring (174,080 f32), and each selecting layer's
-    /// raw key ring (eleven rows of 128 f16, 704 f32 words): 148,099,136 B,
+    /// (132,612 f32), the PLE ring (174,080 f32), and each selecting layer's
+    /// raw key ring (eleven rows of 128 f16, 704 f32 words): 149,292,608 B,
     /// one derivation for the sequences' `Checkpoints` and the plan's price,
     /// spaced at the 4,096-token ubatch, so a slot of 2,048 positions pins two
     /// points (a whole call's one and the previous call's end), one of 10,240
-    /// four, and the host budget fits 29.
+    /// four, and the host budget fits 28.
     #[test]
     fn a_checkpoint_copies_the_delta_layers_lane_ring_the_ple_ring_and_the_key_rings() {
         let lens = checkpoint_lens(36, 12);
@@ -6952,17 +7113,17 @@ mod tests {
         assert!(
             lens[..108]
                 .chunks(3)
-                .all(|c| c == [786_432, 112_640, 124_324])
+                .all(|c| c == [786_432, 112_640, 132_612])
         );
         assert_eq!(lens[108], 174_080);
         assert!(lens[109..].iter().all(|&n| n == 704));
-        assert_eq!(checkpoint_bytes(36, 12), 148_099_136);
-        assert_eq!(checkpoint_price38(36, 12).point_bytes, 148_099_136);
+        assert_eq!(checkpoint_bytes(36, 12), 149_292_608);
+        assert_eq!(checkpoint_price38(36, 12).point_bytes, 149_292_608);
         assert_eq!(checkpoint_price38(36, 12).every, 4_096);
-        for (ctx, points) in [(2_048u64, 2u64), (10_240, 4), (1 << 20, 29)] {
+        for (ctx, points) in [(2_048u64, 2u64), (10_240, 4), (1 << 20, 28)] {
             assert_eq!(
                 checkpoint_budget38(36, 12, ctx).expect("a budget"),
-                points * 148_099_136,
+                points * 149_292_608,
                 "ctx {ctx}"
             );
         }

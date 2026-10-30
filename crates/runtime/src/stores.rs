@@ -233,8 +233,9 @@ pub const fn delta_lane_bytes(v_heads: usize, state: usize, lanes: usize) -> u64
 pub const DELTA_CHUNK_ROWS: usize = 16;
 
 /// Rows of a gated-delta-rule layer's carry: the tokens of the chunk a call
-/// left incomplete, at most one short of a chunk.
-pub const DELTA_CARRY_ROWS: usize = DELTA_CHUNK_ROWS - 1;
+/// left out of the state, a chunk at most (a call that ends inside a chunk,
+/// or a prompt's closing call that keeps the chunk its last id completes).
+pub const DELTA_CARRY_ROWS: usize = DELTA_CHUNK_ROWS;
 
 /// Words before a carry's rows: the rows' count, the position after them
 /// and two spare words.
@@ -393,7 +394,7 @@ mod tests {
 
     /// Qwen3.8's sizes: a GDN layer holds 48 heads of 128 × 128 f32,
     /// eleven conv rows of 10,240 f32 channels and a carry of four words and
-    /// fifteen rows of 64 heads of 128 f32 and 2 × 48 f32; the PLE ring 17
+    /// sixteen rows of 64 heads of 128 f32 and 2 × 48 f32; the PLE ring 17
     /// rows of four 2,560-value streams; an attention position 2 × 2 × 256 f16 of K and V
     /// (17/16 B a value in q8_0), a 128-value pooled key per four positions, the last pool
     /// whole, and eleven raw index key rows of 128 f16 whatever the context.
@@ -402,7 +403,7 @@ mod tests {
         assert_eq!(conv_ring_rows(4), 11);
         assert_eq!(ple_ring_rows(4, 3), 17);
         assert_eq!(recurrent_bytes(48, 16, 128, 4), 3_145_728 + 11 * 10_240 * 4);
-        assert_eq!(delta_carry_bytes(48, 16, 128), (4 + 15 * (8192 + 96)) * 4);
+        assert_eq!(delta_carry_bytes(48, 16, 128), (4 + 16 * (8192 + 96)) * 4);
         assert_eq!(ple_ring_bytes(4, 3, 4, 2560), 696_320);
         assert_eq!(kv_row_bytes(2, 256), 2048);
         assert_eq!(index_ring_rows(4), 11);

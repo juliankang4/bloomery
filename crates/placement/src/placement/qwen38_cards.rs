@@ -202,7 +202,7 @@ fn indexer_projection(t: &ModelTensor) -> bool {
 /// from `runtime::stores`]: a delta layer's state in one lane of 48 heads
 /// of 128 × 128 f32 with its u32 stamp, its verify record of
 /// `DELTA_VERIFY_ROWS` rows of 48 · 3 · 128 f32, its conv ring of 11 rows
-/// of 10,240 f32 and its carry of 124,324 f32, 4,388,500 B; the PLE layer's
+/// of 10,240 f32 and its carry of 132,612 f32, 4,421,652 B; the PLE layer's
 /// ring beside it, 17 rows of 4 · 2,560 f32; a selecting layer, every
 /// fourth, its K and V, 2,048 B a position, a pooled key, 256 B a pool of
 /// four, and its raw index key ring of 11 rows of 128 f16, 2,816 B; and
@@ -216,7 +216,7 @@ impl KvBytes for Kv38 {
         let own = if layer % 4 == 3 {
             ctx_max * 2048 + ctx_max.div_ceil(4) * 256 + 11 * 128 * 2
         } else {
-            4_388_500
+            4_421_652
         };
         own + ple
     }
@@ -239,7 +239,7 @@ const ROWS: u64 = 9 * 4 * 2560 * 4;
 /// the 12 selecting layers' positional bytes (2,048 B a position and a
 /// 256 B pooled key a pool of four), a context- and budget-bounded number
 /// of checkpoint copies of the 36 delta layers' committed state lane,
-/// conv ring and carry, 4,093,584 B each, the PLE ring, 17 · 4 · 2,560 f32,
+/// conv ring and carry, 4,126,736 B each, the PLE ring, 17 · 4 · 2,560 f32,
 /// and the 12 raw index key rings, 11 rows of 128 f16 each. Under the draft,
 /// its store (2,048 B a position), the arena rows ([`ROWS`]) and each saved
 /// inner point's hidden row (4 · 2,560 f32).
@@ -261,7 +261,7 @@ fn state38(ctx: u64, drafts: bool) -> u64 {
 /// One checkpoint's host bytes: the 36 delta layers' committed state lane,
 /// conv ring and carry, the PLE ring and the 12 selecting layers' raw index
 /// key rings ([`state38`]'s term).
-const CHECKPOINT_38: u64 = 36 * 4_093_584 + 17 * 4 * 2560 * 4 + 12 * 11 * 128 * 2;
+const CHECKPOINT_38: u64 = 36 * 4_126_736 + 17 * 4 * 2560 * 4 + 12 * 11 * 128 * 2;
 
 /// The stage card of `qwen35moe::place::machine_for_experts(spec, 48, 4096,
 /// Experts::Card)`: every layer, the head and the token embedding, its

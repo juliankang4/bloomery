@@ -605,6 +605,30 @@ where
         )
     }
 
+    /// [`SlotDrafts::prefill`] of a prompt's last call whose last id the
+    /// call runs as its last row (`serve::Engine::prefill_next` through a
+    /// seat whose body runs it so), under the draft the window anchored at
+    /// the prompt's end ([`Advance::begin`]) as the step after a call less
+    /// that id anchors it ([`Draft::stepped`]).
+    pub(crate) fn prompt_close(
+        &mut self,
+        s: &mut Session<B>,
+        slot: usize,
+        ids: &[u32],
+    ) -> Result<u32, GateError> {
+        self.prefill_by(
+            s,
+            slot,
+            ids,
+            |s| Ok(s.prompt(ids, Want::Argmax)?.argmax()),
+            |spec, s| {
+                let next = Advance::prompt(spec, s, ids)?;
+                Advance::begin(spec, s, ids, next)?;
+                Ok(next)
+            },
+        )
+    }
+
     /// The same prompt and draft-store walk without the target's head.
     pub(crate) fn prefill_only(
         &mut self,
