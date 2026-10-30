@@ -41,7 +41,7 @@ mod vocab;
 #[cfg(test)]
 pub(crate) use program::Kid;
 pub(crate) use program::{Constraint, Decision, Draw, Part, StepError, Style, Walk, Watch};
-pub(crate) use schema::{Ask, Fun, call, is_text, request, value};
+pub(crate) use schema::{Ask, Fun, call, is_text, refuse, request, value};
 pub(crate) use vocab::Vocab;
 
 /// A request the constrained path will not take, named. The route answers it
@@ -53,6 +53,9 @@ pub(crate) struct Refusal {
     pub message: String,
     /// The markup is unsupported, not the request invalid.
     pub unsupported: bool,
+    /// The path of the request field refused (`response_format.json_schema.schema.items`),
+    /// when the refusal is about one.
+    pub field: Option<String>,
 }
 
 impl Refusal {
@@ -60,6 +63,7 @@ impl Refusal {
         Refusal {
             message,
             unsupported: false,
+            field: None,
         }
     }
 }

@@ -162,7 +162,8 @@ pub struct ServerConfig {
 }
 
 /// A family's request preparation: it shapes a request before the template
-/// renders it, and refuses it by name when it cannot.
+/// renders it, and refuses it by name when it cannot, a 400 about the
+/// request's `messages`.
 ///
 /// The family supplies one with its chat template; `None` renders the request
 /// as the template reads it.
@@ -1498,19 +1499,47 @@ struct ApiError {
     message: String,
     /// Sent with `Retry-After`: the request may succeed later as it is.
     retry_after: bool,
+    /// The top-level request field the error is about, sent as `param`.
+    param: Option<String>,
+}
+
+impl ApiError {
+    /// This error as one about the request field `path` names (`top_k`,
+    /// `messages[0].content`, `text.format`): its `param` is the path's
+    /// top-level key.
+    fn at(mut self, path: &str) -> Self {
+        let end = path.find(['.', '[']).unwrap_or(path.len());
+        self.param = Some(path[..end].to_owned());
+        self
+    }
+
+    /// The error object: [`error_body`], with `param` when the error is about
+    /// a request field.
+    fn body(&self) -> Value {
+        let mut v = error_body(self.code, self.kind, &self.message);
+        if let Some(p) = &self.param {
+            v["error"]["param"] = json!(p);
+        }
+        v
+    }
 }
 
 impl From<::embed::request::Error> for ApiError {
     fn from(error: ::embed::request::Error) -> Self {
-        let kind = match &error {
-            ::embed::request::Error::Context { .. } => "exceed_context_size_error",
-            ::embed::request::Error::Invalid(_) => "invalid_request_error",
-        };
-        ApiError {
+        use ::embed::request::Error;
+        let e = ApiError {
             retry_after: false,
+            param: None,
             code: 400,
-            kind,
+            kind: match &error {
+                Error::Context { .. } => "exceed_context_size_error",
+                Error::Invalid(_) | Error::Field { .. } => "invalid_request_error",
+            },
             message: error.to_string(),
+        };
+        match &error {
+            Error::Field { field, .. } => e.at(field),
+            _ => e,
         }
     }
 }
@@ -1518,6 +1547,7 @@ impl From<::embed::request::Error> for ApiError {
 fn invalid(message: impl Into<String>) -> ApiError {
     ApiError {
         retry_after: false,
+        param: None,
         code: 400,
         kind: "invalid_request_error",
         message: message.into(),
@@ -1528,6 +1558,7 @@ fn invalid(message: impl Into<String>) -> ApiError {
 fn not_found(message: impl Into<String>) -> ApiError {
     ApiError {
         retry_after: false,
+        param: None,
         code: 404,
         kind: "not_found_error",
         message: message.into(),
@@ -1544,7 +1575,7 @@ fn send_json(w: &mut TcpStream, req: &Request, status: u16, v: &Value) -> io::Re
 }
 
 fn send_error(w: &mut TcpStream, req: &Request, e: &ApiError) -> io::Result<bool> {
-    let body = error_body(e.code, e.kind, &e.message).to_string();
+    let body = e.body().to_string();
     let retry = [("Retry-After", RETRY_AFTER_SECS.to_owned())];
     let headers: &[(&str, String)] = if e.retry_after { &retry } else { &[] };
     http::respond(w, req, e.code, JSON, headers, body.as_bytes())?;
@@ -1591,6 +1622,7 @@ fn key_denied(keys: &ApiKeys, req: &mut Request, w: &mut TcpStream) -> io::Resul
         req,
         &ApiError {
             retry_after: false,
+            param: None,
             code: 401,
             kind: "authentication_error",
             message: "Invalid API Key".to_owned(),
@@ -1749,7 +1781,7 @@ fn gen_body(req: &Request) -> Result<Map<String, Value>, ApiError> {
     if matches!(b.get("logit_bias"), Some(Value::Object(_))) {
         serde_json::Deserializer::from_slice(&req.body)
             .deserialize_map(Top)
-            .map_err(|e| invalid(format!("invalid JSON body: {e}")))?;
+            .map_err(|e| invalid(format!("invalid JSON body: {e}")).at("logit_bias"))?;
     }
     Ok(b)
 }
@@ -1777,7 +1809,7 @@ fn get_f32(o: &Map<String, Value>, k: &str) -> Result<Option<f32>, ApiError> {
         .map(|x| x as f32)
         .filter(|x| x.is_finite())
         .map(Some)
-        .ok_or_else(|| invalid(format!("{k} must be a finite number, not {v}")))
+        .ok_or_else(|| invalid(format!("{k} must be a finite number, not {v}")).at(k))
 }
 
 /// An integer field. Absent or `null` is `None`, any other type than a number
@@ -1803,7 +1835,8 @@ fn in_limits(k: &str, n: i64, lo: i64) -> Result<i64, ApiError> {
     Err(invalid(format!(
         "{k} must be an integer in {lo}..={}, as llama-server takes it, not {n}",
         i32::MAX
-    )))
+    ))
+    .at(k))
 }
 
 /// A boolean field. Absent or `null` is `None`, any other type than a boolean
@@ -1828,7 +1861,7 @@ fn stop_list(v: Option<&Value>) -> Result<Vec<String>, ApiError> {
             .map(|x| {
                 x.as_str()
                     .map(str::to_owned)
-                    .ok_or_else(|| invalid(format!("stop must hold strings, not {x}")))
+                    .ok_or_else(|| invalid(format!("stop must hold strings, not {x}")).at("stop"))
             })
             .collect(),
         Some(other) => Err(wrong_type("stop", "a string or an array of strings", other)),
@@ -1870,7 +1903,7 @@ fn unserved_samplers(o: &Map<String, Value>) -> Result<(), ApiError> {
         ),
     ];
     if let Some((field, _)) = on.iter().find(|(_, hit)| *hit) {
-        return Err(invalid(format!("{field} is not supported by this server")));
+        return Err(invalid(format!("{field} is not supported by this server")).at(field));
     }
     for k in [
         "mirostat_tau",
@@ -1890,7 +1923,8 @@ fn unserved_samplers(o: &Map<String, Value>) -> Result<(), ApiError> {
         Some(Value::Array(a)) if !a.is_empty() && a.iter().all(Value::is_string) => Ok(()),
         Some(Value::Array(_)) => Err(invalid(format!(
             "dry_sequence_breakers must be {takes}, as llama-server takes it"
-        ))),
+        ))
+        .at("dry_sequence_breakers")),
         Some(v) => Err(wrong_type("dry_sequence_breakers", takes, v)),
     }
 }
@@ -1984,7 +2018,8 @@ fn sampler_order(o: &Map<String, Value>, sp: &SamplingParams) -> Result<(), ApiE
     Err(invalid(format!(
         "samplers must be this server's order {SAMPLERS:?} (or \"ekpmt\"), not {}",
         o["samplers"]
-    )))
+    ))
+    .at("samplers"))
 }
 
 /// Knobs shared by both generation endpoints. The token limit is the first set
@@ -2045,7 +2080,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         ("n", get_i(o, "n")?.is_some_and(|n| n > 1)),
     ];
     if let Some((field, _)) = refused.iter().find(|(_, hit)| *hit) {
-        return Err(invalid(format!("{field} is not supported by this server")));
+        return Err(invalid(format!("{field} is not supported by this server")).at(field));
     }
     unserved_samplers(o)?;
     let constraint = constrain::request(
@@ -2061,12 +2096,17 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         if r.unsupported {
             ApiError {
                 retry_after: false,
+                param: None,
                 code: 501,
                 kind: "not_supported_error",
                 message: r.message,
             }
         } else {
-            invalid(r.message)
+            let e = invalid(r.message);
+            match &r.field {
+                Some(f) => e.at(f),
+                None => e,
+            }
         }
     })?;
     let d = SamplingParams::default();
@@ -2090,7 +2130,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             .as_f64()
             .map(|x| x as f32)
             .filter(|&x| ok(x))
-            .ok_or_else(|| invalid(format!("{k} must be {rule}, not {v}"))),
+            .ok_or_else(|| invalid(format!("{k} must be {rule}, not {v}")).at(k)),
     };
     let finite = "a finite number";
     let repeat_last_n = get_i_in(o, "repeat_last_n", 0)?.map_or(d.repeat_last_n, |n| {
@@ -2173,7 +2213,8 @@ fn logit_bias(o: &Map<String, Value>, n_vocab: usize) -> Result<Vec<(u32, f32)>,
         Some(v) => {
             return Err(invalid(format!(
                 "logit_bias must be an object of token ids to numbers in -100..=100, not {v}"
-            )));
+            ))
+            .at("logit_bias"));
         }
     };
     let mut bias = std::collections::BTreeMap::new();
@@ -2189,6 +2230,7 @@ fn logit_bias(o: &Map<String, Value>, n_vocab: usize) -> Result<Vec<(u32, f32)>,
                 invalid(format!(
                     "logit_bias key {k:?} is not a token id below the vocabulary's {n_vocab}"
                 ))
+                .at("logit_bias")
             })?;
         let b = v
             .as_f64()
@@ -2197,9 +2239,10 @@ fn logit_bias(o: &Map<String, Value>, n_vocab: usize) -> Result<Vec<(u32, f32)>,
                 invalid(format!(
                     "logit_bias[{k:?}] must be a number in -100..=100, not {v}"
                 ))
+                .at("logit_bias")
             })?;
         if bias.insert(id, b as f32).is_some() {
-            return Err(invalid(format!("logit_bias names token id {id} twice")));
+            return Err(invalid(format!("logit_bias names token id {id} twice")).at("logit_bias"));
         }
     }
     Ok(bias.into_iter().filter(|&(_, b)| b != 0.0).collect())
@@ -2209,16 +2252,22 @@ fn logit_bias(o: &Map<String, Value>, n_vocab: usize) -> Result<Vec<(u32, f32)>,
 /// its program ends on, and a think budget would force a close the program
 /// writes itself.
 fn program_ends_itself(ignore_eos: bool, budget: Option<usize>) -> Result<(), ApiError> {
-    let why = if ignore_eos {
-        "ignore_eos is not supported with structured output: its program ends on an \
-         end-of-generation id"
+    let (field, why) = if ignore_eos {
+        (
+            "ignore_eos",
+            "ignore_eos is not supported with structured output: its program ends on an \
+             end-of-generation id",
+        )
     } else if budget.is_some() {
-        "reasoning_budget is not supported with structured output: the program starts after \
-         the think span and closes an open one itself"
+        (
+            "reasoning_budget",
+            "reasoning_budget is not supported with structured output: the program starts \
+             after the think span and closes an open one itself",
+        )
     } else {
         return Ok(());
     };
-    Err(invalid(why.to_owned()))
+    Err(invalid(why).at(field))
 }
 
 /// `reasoning_budget`: absent or `null` unrestricted, `-1` unrestricted
@@ -2243,11 +2292,13 @@ fn reasoning_budget(o: &Map<String, Value>) -> Result<Option<usize>, ApiError> {
         Some(n) if n >= 0 => Ok(Some(usize::try_from(n).unwrap_or(usize::MAX))),
         Some(n) => Err(invalid(format!(
             "reasoning_budget {n} is not -1 (unrestricted) or an integer >= 0"
-        ))),
+        ))
+        .at("reasoning_budget")),
         None => Err(invalid(format!(
             "reasoning_budget must be an integer, not {}",
             json_type(v)
-        ))),
+        ))
+        .at("reasoning_budget")),
     }
 }
 
@@ -2844,7 +2895,7 @@ fn tokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
     let with_pieces = get_b(b, "with_pieces")?.unwrap_or(false);
     let t = &*state.tok;
     let ids = match b.get("content") {
-        None => return Err(invalid("'content' is required")),
+        None => return Err(invalid("'content' is required").at("content")),
         Some(v) => prompt_ids(t, "content", v, add_special)?,
     };
     let tokens: Vec<Value> = if with_pieces {
@@ -2861,8 +2912,8 @@ fn tokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
 /// naming it.
 fn detokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
     let ids = match b.get("tokens") {
-        None => return Err(invalid("'tokens' is required")),
-        Some(v) => token_ids(&*state.tok, v)?,
+        None => return Err(invalid("'tokens' is required").at("tokens")),
+        Some(v) => token_ids(&*state.tok, v).map_err(|e| e.at("tokens"))?,
     };
     Ok(json!({ "content": state.tok.decode(&ids) }))
 }
@@ -2924,7 +2975,7 @@ impl Rendered {
 /// ([`crate::guard`]) and is text in the prompt.
 fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiError> {
     let Some(Value::Array(msgs)) = b.get("messages") else {
-        return Err(invalid("'messages' is required and must be an array"));
+        return Err(invalid("'messages' is required and must be an array").at("messages"));
     };
     // The media part refuses a typed placeholder by name; the guard leaves such a string to it.
     let markers: Vec<&str> = state
@@ -2957,10 +3008,10 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
     );
     for (i, m) in msgs.iter().enumerate() {
         let Value::Object(m) = m else {
-            return Err(invalid("each message must be an object"));
+            return Err(invalid("each message must be an object").at("messages"));
         };
         let Some(role) = m.get("role").and_then(Value::as_str) else {
-            return Err(invalid("each message needs a string 'role'"));
+            return Err(invalid("each message needs a string 'role'").at("messages"));
         };
         // llama-server maps `developer` to `system` before the template: a
         // template without a branch for the role drops the message, and
@@ -2980,7 +3031,9 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         match m.get("content") {
             Some(Value::Array(parts)) => {
                 let text = match &state.media {
-                    None => guard.text_if(client, &content_text(parts)?).into_owned(),
+                    None => guard
+                        .text_if(client, &content_text(parts).map_err(|e| e.at("messages"))?)
+                        .into_owned(),
                     Some(model) => {
                         let first = media
                             .iter()
@@ -2990,7 +3043,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
                             media::flatten_with(role, parts, &**model, first, &mut video, &|t| {
                                 guard.text_if(client, t)
                             })
-                            .map_err(|e| media_error(&e))?;
+                            .map_err(|e| media_error(&e, "messages"))?;
                         media.extend(f.media);
                         f.text
                     }
@@ -3050,7 +3103,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
             vars: &mut vars,
             marker: &|value| guard.value(value),
         };
-        preparation(&mut request).map_err(invalid)?;
+        preparation(&mut request).map_err(|e| invalid(e).at("messages"))?;
     }
     // The messages go in last: a preparation may have rewritten them.
     vars.insert("messages".into(), Value::Array(messages));
@@ -3083,6 +3136,7 @@ fn template_error(e: TemplateError) -> ApiError {
         Some(refusal) => invalid(refusal.to_owned()),
         None => ApiError {
             retry_after: false,
+            param: None,
             code: 500,
             kind: "server_error",
             message: e.to_string(),
@@ -3273,6 +3327,7 @@ fn tool_call_arguments(at: usize, message: &mut Map<String, Value>) -> Result<()
             invalid(format!(
                 "messages[{at}].tool_calls[{j}].function.arguments is not valid JSON: {e}"
             ))
+            .at("messages")
         })?;
         call["function"]["arguments"] = parsed;
     }
@@ -3296,7 +3351,8 @@ fn check_effort(field: &str, effort: &str) -> Result<(), ApiError> {
     Err(invalid(format!(
         "invalid value for \"{field}\": {effort:?} (expected one of {})",
         REASONING_EFFORTS.join(", ")
-    )))
+    ))
+    .at(field))
 }
 
 /// The thinking vars a chat body carries, in llama-server's order: the kwargs
@@ -3339,7 +3395,8 @@ fn thinking_vars(
             Some(Value::String(_)) => {
                 return Err(invalid(
                     "invalid type for \"enable_thinking\" (expected boolean, got string)",
-                ));
+                )
+                .at("chat_template_kwargs"));
             }
             _ => {}
         }
@@ -3416,6 +3473,7 @@ fn content_text(parts: &[Value]) -> Result<String, ApiError> {
 fn dead_engine(reason: &str) -> ApiError {
     ApiError {
         retry_after: false,
+        param: None,
         code: 503,
         kind: "unavailable_error",
         message: stopping(reason),
@@ -3428,6 +3486,7 @@ fn dead_engine(reason: &str) -> ApiError {
 fn stopping_gate(cause: &str) -> ApiError {
     ApiError {
         retry_after: false,
+        param: None,
         code: 503,
         kind: "unavailable_error",
         message: stopping_message(cause),
@@ -3439,6 +3498,7 @@ fn refused(state: &State, r: Refusal, what: &str) -> ApiError {
     match r {
         Refusal::Full { depth } => ApiError {
             retry_after: true,
+            param: None,
             code: 503,
             kind: "unavailable_error",
             message: format!(
@@ -3448,6 +3508,7 @@ fn refused(state: &State, r: Refusal, what: &str) -> ApiError {
         },
         Refusal::Busy => ApiError {
             retry_after: false,
+            param: None,
             code: 503,
             kind: "unavailable_error",
             message: format!("{what} is processing a request"),
@@ -3484,11 +3545,11 @@ fn engine_gone(state: &State, started: bool) -> ApiError {
 /// prompt is tokenized; the clip's temp file that cannot be written is the
 /// server's 500. A numbered placeholder whose ids are not its image's
 /// position is the request's 400, with the placeholder-count and image-last faults.
-fn media_error(e: &MediaError) -> ApiError {
+fn media_error(e: &MediaError, field: &str) -> ApiError {
     match e {
         MediaError::Expand(ExpandError::EmptySpan(_))
         | MediaError::Clip(video::VideoError::Temp(_)) => engine_error(e),
-        _ => invalid(e.to_string()),
+        _ => invalid(e.to_string()).at(field),
     }
 }
 
@@ -3500,7 +3561,7 @@ fn chat_prompt(state: &State, rendered: &Rendered) -> Result<Prompt, ApiError> {
     let Some(model) = &state.media else {
         return Ok(Prompt::from(ids));
     };
-    media::expand_prompt(&ids, &rendered.media, &**model).map_err(|e| media_error(&e))
+    media::expand_prompt(&ids, &rendered.media, &**model).map_err(|e| media_error(&e, "messages"))
 }
 
 /// What the 400 for a prompt past the context adds to its two numbers: the
@@ -3586,6 +3647,7 @@ fn run_choices(
     if ids.len() >= state.info.ctx_max {
         return Err(ApiError {
             retry_after: false,
+            param: None,
             code: 400,
             kind: "exceed_context_size_error",
             message: format!(
@@ -3690,6 +3752,7 @@ fn run_choices(
                 leave();
                 return Err(ApiError {
                     retry_after: true,
+                    param: None,
                     code: 503,
                     kind: "unavailable_error",
                     message: why,
@@ -3889,6 +3952,7 @@ fn residency_reset(state: &State, req: &Request, w: &mut TcpStream) -> io::Resul
             Ok(None) => (
                 Err(ApiError {
                     retry_after: false,
+                    param: None,
                     code: 501,
                     kind: "not_supported_error",
                     message: "this engine runs no adaptive expert residency".to_owned(),
@@ -3933,6 +3997,7 @@ fn post_shutdown(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<
                 req,
                 &ApiError {
                     retry_after: false,
+                    param: None,
                     code: 500,
                     kind: "server_error",
                     message: format!("cannot read the connection's peer: {e}"),
@@ -3946,6 +4011,7 @@ fn post_shutdown(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<
             req,
             &ApiError {
                 retry_after: false,
+                param: None,
                 code: 403,
                 kind: "permission_error",
                 message: "shutdown is accepted only from this machine (a loopback peer)".to_owned(),
@@ -3971,6 +4037,7 @@ fn slot_action(state: &State, req: &Request, w: &mut TcpStream, id: &str) -> io:
             req,
             &ApiError {
                 retry_after: false,
+                param: None,
                 code: 501,
                 kind: "not_supported_error",
                 message: "This server does not support slots action. Start it with \
@@ -4005,11 +4072,11 @@ fn slot_request(req: &Request, id: &str, slots: usize) -> Result<(usize, SlotAct
         let b = body(req)?;
         let f = b
             .get("filename")
-            .ok_or_else(|| invalid("'filename' is required"))?
+            .ok_or_else(|| invalid("'filename' is required").at("filename"))?
             .as_str()
-            .ok_or_else(|| invalid("'filename' must be a string"))?;
+            .ok_or_else(|| invalid("'filename' must be a string").at("filename"))?;
         if !slotfile::valid_filename(f) {
-            return Err(invalid("Invalid filename"));
+            return Err(invalid("Invalid filename").at("filename"));
         }
         Ok(f.to_owned())
     };
@@ -4083,6 +4150,7 @@ fn state_error(
         StateError::Unsupported(_) => (
             Err(ApiError {
                 retry_after: false,
+                param: None,
                 code: 501,
                 kind: "not_supported_error",
                 message: e.to_string(),
@@ -4093,6 +4161,7 @@ fn state_error(
         StateError::Format(_) | StateError::Io(_) | StateError::NoRoom { .. } => (
             Err(ApiError {
                 retry_after: false,
+                param: None,
                 code,
                 kind,
                 message: format!("{what}: {e}"),
@@ -4109,19 +4178,22 @@ fn state_error(
 /// image part makes.
 fn completion_prompt(state: &State, v: Option<&Value>) -> Result<Vec<u32>, ApiError> {
     let ids = completion_ids(state, v)?;
+    if ids.is_empty() {
+        return Err(invalid("the prompt is empty").at("prompt"));
+    }
     if let Some(model) = &state.media {
-        media::expand_prompt(&ids, &[], &**model).map_err(|e| media_error(&e))?;
+        media::expand_prompt(&ids, &[], &**model).map_err(|e| media_error(&e, "prompt"))?;
     }
     Ok(ids)
 }
 
 fn completion_ids(state: &State, v: Option<&Value>) -> Result<Vec<u32>, ApiError> {
     match v {
-        Some(o) if carries_media(o) => Err(no_media()),
+        Some(o) if carries_media(o) => Err(no_media().at("prompt")),
         Some(v @ (Value::String(_) | Value::Array(_))) => {
             prompt_ids(&*state.tok, "prompt", v, true)
         }
-        _ => Err(invalid("'prompt' must be a string or an array of tokens")),
+        _ => Err(invalid("'prompt' must be a string or an array of tokens").at("prompt")),
     }
 }
 
@@ -4153,7 +4225,7 @@ fn prompt_ids(
         (special && tok.add_eos()).then(|| tok.eos()),
         tok.n_vocab(),
     )
-    .map_err(ApiError::from)
+    .map_err(|e| ApiError::from(e).at(k))
 }
 
 /// Whether a prompt object carries media: a `multimodal_data` that holds
@@ -4210,6 +4282,7 @@ fn sse(s: &mut EventStream<'_>, v: &Value) -> io::Result<()> {
 fn engine_error(e: &dyn fmt::Display) -> ApiError {
     ApiError {
         retry_after: false,
+        param: None,
         code: 500,
         kind: "server_error",
         message: e.to_string(),
@@ -4376,15 +4449,9 @@ fn finish_stream<T>(
         Ok(Err(GenError::Client(e))) => return Err(e),
         Ok(Err(e)) => {
             let err = engine_error(&e);
-            sse(
-                &mut stream,
-                &json!({ "error": error_body(err.code, err.kind, &err.message)["error"] }),
-            )?;
+            sse(&mut stream, &err.body())?;
         }
-        Err(e) => sse(
-            &mut stream,
-            &json!({ "error": error_body(e.code, e.kind, &e.message)["error"] }),
-        )?,
+        Err(e) => sse(&mut stream, &e.body())?,
     }
     let reusable = stream.reusable();
     stream.finish()?;
@@ -4487,6 +4554,7 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
         ToolFormat::Unparsed => {
             return Err(ApiError {
                 retry_after: false,
+                param: None,
                 code: 501,
                 kind: "not_supported_error",
                 message: "the chat template's tool-call markup has no parser in this server \
@@ -4504,6 +4572,7 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
 fn tool_markup_error(e: &MarkupError) -> ApiError {
     ApiError {
         retry_after: false,
+        param: None,
         code: 500,
         kind: "server_error",
         message: format!("tool-call markup: {e}"),
@@ -4543,6 +4612,7 @@ fn take_choices(state: &State, b: &mut Map<String, Value>) -> Result<usize, ApiE
                  beside them, not {n}",
                 state.parallel, state.depth
             ))
+            .at("n")
         })
 }
 
@@ -4595,7 +4665,8 @@ fn chat_plan(
     format: Option<&Value>,
 ) -> Result<ChatPlan, ApiError> {
     let mut p = gen_params(state, b)?;
-    let format = ReasoningFormat::from_request(format).map_err(invalid)?;
+    let format =
+        ReasoningFormat::from_request(format).map_err(|e| invalid(e).at("reasoning_format"))?;
     let (text, input) = chat_input(state, b)?;
     let tools = tool_scan(state, b)?;
     gate_reasoning_budget(&mut p, &text);
@@ -4764,10 +4835,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 Ok(d) => d,
                 Err(e) => {
                     let e = tool_markup_error(&e);
-                    return sse(
-                        s,
-                        &json!({ "error": error_body(e.code, e.kind, &e.message)["error"] }),
-                    );
+                    return sse(s, &e.body());
                 }
             };
             // The tokens no chunk carried yet go with the last delta, or with
@@ -9771,18 +9839,21 @@ mod tests {
         assert_eq!(natural["content"], SCRIPT[..24], "{natural}");
     }
 
-    /// The media part's refusals are the request's 400 with the error's own text. An empty span
-    /// is the model's 500. A numbered placeholder whose ids are not its image's position is
-    /// the request's 400, with the other pairing faults.
+    /// The media part's refusals are the request's 400 with the error's own text, about the
+    /// field that carried the media. An empty span is the model's 500, about no field. A
+    /// numbered placeholder whose ids are not its image's position is the request's 400, with
+    /// the other pairing faults.
     #[test]
     fn an_empty_span_is_500_and_a_wrong_image_number_is_400() {
-        let empty = media_error(&MediaError::Expand(ExpandError::EmptySpan(0)));
+        let empty = media_error(&MediaError::Expand(ExpandError::EmptySpan(0)), "messages");
         assert_eq!(
             (empty.code, empty.kind, empty.message.as_str()),
             (500, "server_error", "image 0 has an empty span")
         );
-        let number = media_error(&MediaError::ImageNumber { index: 2 });
+        assert_eq!(empty.param, None);
+        let number = media_error(&MediaError::ImageNumber { index: 2 }, "messages");
         assert_eq!((number.code, number.kind), (400, "invalid_request_error"));
+        assert_eq!(number.param.as_deref(), Some("messages"));
         assert_eq!(
             number.message,
             MediaError::ImageNumber { index: 2 }.to_string()
@@ -9794,7 +9865,7 @@ mod tests {
             }),
             MediaError::ImageLast,
         ] {
-            let got = media_error(&e);
+            let got = media_error(&e, "messages");
             assert_eq!((got.code, got.kind), (400, "invalid_request_error"));
             assert_eq!(got.message, e.to_string());
         }

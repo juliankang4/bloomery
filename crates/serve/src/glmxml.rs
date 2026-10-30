@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::callstream::{Args, Progress, released};
-use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
+use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, refuse, value};
 use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
 
@@ -532,11 +532,14 @@ pub(crate) fn call_parts(spelling: KvSpelling, funs: &[Fun<'_>]) -> Result<Vec<P
                 if is_text(&a.schema)
                     && a.schema.get("type").and_then(Value::as_str) != Some("string")
                 {
-                    return Err(Refusal::invalid(format!(
-                        "{}: {}'s tool markup reads a text value as text only under \"type\": \
-                         \"string\"; add it",
-                        a.path, m.family
-                    )));
+                    return Err(refuse(
+                        &a.path,
+                        format!(
+                            "{}'s tool markup reads a text value as text only under \"type\": \
+                             \"string\"; add it",
+                            m.family
+                        ),
+                    ));
                 }
                 parts.push(Part::Text(format!(
                     "{}{}{}{}",

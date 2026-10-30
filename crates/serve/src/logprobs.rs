@@ -495,6 +495,7 @@ pub(super) fn completion_ask(
             invalid(format!(
                 "n_probs {n} is past the {MAX_TOP} alternatives a token this server returns"
             ))
+            .at("n_probs")
         })?;
     if get_b(b, "post_sampling_probs")? == Some(true) {
         return Err(post_sampling());
@@ -520,7 +521,9 @@ pub(super) fn chat_ask(
     match lp {
         None | Some(Value::Bool(false)) => match top_set {
             None => Ok(None),
-            Some(_) => Err(invalid("top_logprobs requires logprobs to be set to true")),
+            Some(_) => {
+                Err(invalid("top_logprobs requires logprobs to be set to true").at("top_logprobs"))
+            }
         },
         Some(Value::Bool(true)) => {
             let tools = b
@@ -528,7 +531,7 @@ pub(super) fn chat_ask(
                 .and_then(Value::as_array)
                 .is_some_and(|a| !a.is_empty());
             if tools && get_b(b, "stream")? == Some(true) {
-                return Err(invalid("logprobs is not supported with tools + stream"));
+                return Err(invalid("logprobs is not supported with tools + stream").at("logprobs"));
             }
             let n = match (top_set, top) {
                 (None, _) => DEFAULT_TOP,
@@ -538,7 +541,8 @@ pub(super) fn chat_ask(
                 (Some(v), _) => {
                     return Err(invalid(format!(
                         "top_logprobs must be an integer in 0..={MAX_TOP}, not {v}"
-                    )));
+                    ))
+                    .at("top_logprobs"));
                 }
             };
             if get_b(b, "post_sampling_probs")? == Some(true) {
@@ -549,7 +553,8 @@ pub(super) fn chat_ask(
         Some(v) => Err(invalid(format!(
             "logprobs must be a boolean on the chat path, not {}",
             json_type(&v)
-        ))),
+        ))
+        .at("logprobs")),
     }
 }
 
@@ -558,6 +563,7 @@ fn post_sampling() -> ApiError {
         "post_sampling_probs is not supported by this server: its sampler hands back the drawn \
          id alone, not the candidates its chain kept",
     )
+    .at("post_sampling_probs")
 }
 
 #[cfg(test)]

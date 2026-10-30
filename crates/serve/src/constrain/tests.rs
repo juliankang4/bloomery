@@ -1312,6 +1312,12 @@ fn a_stop_text_in_the_program_is_refused_by_name() {
             "{what}: {e}"
         );
         assert!(!e.unsupported, "{what}: {e}");
+        let field = if what == "a tool argument" {
+            "tools"
+        } else {
+            "response_format.json_schema.schema"
+        };
+        assert_eq!(e.field.as_deref(), Some(field), "{what}: {e}");
     }
 }
 

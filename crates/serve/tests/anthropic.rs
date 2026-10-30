@@ -1175,7 +1175,13 @@ fn hw_anthropic_vision_format_accepted() {
         assert_eq!(a.status, o.status, "{} vs {}", a.body, o.body);
         let ae = a.json();
         assert_eq!(ae["type"], "error", "{ae}");
-        assert_eq!(ae["error"], o.json()["error"], "{anthropic}");
+        // Anthropic's error object carries no `param`.
+        let mut oe = o.json();
+        oe["error"]
+            .as_object_mut()
+            .expect("an error object")
+            .remove("param");
+        assert_eq!(ae["error"], oe["error"], "{anthropic}");
     }
 }
 

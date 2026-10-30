@@ -90,8 +90,12 @@ pub(crate) struct Ask<'a> {
     pub think: ThinkTags,
 }
 
-fn refuse(path: &str, message: impl std::fmt::Display) -> Refusal {
-    Refusal::invalid(format!("{path}: {message}"))
+/// The refusal of the request field at `path`, its message led by the path.
+pub(crate) fn refuse(path: &str, message: impl std::fmt::Display) -> Refusal {
+    Refusal {
+        field: Some(path.to_owned()),
+        ..Refusal::invalid(format!("{path}: {message}"))
+    }
 }
 
 fn type_of(v: &Value) -> &'static str {
@@ -885,11 +889,14 @@ pub(crate) fn request(
     ask: &Ask<'_>,
 ) -> Result<Option<Constraint>, Refusal> {
     if o.get("json_schema").is_some_and(|v| !v.is_null()) {
-        return Err(Refusal::invalid(
-            "json_schema is not supported by this server: send the schema as response_format \
-             {\"type\": \"json_schema\", \"json_schema\": {\"schema\": ...}}"
-                .to_owned(),
-        ));
+        return Err(Refusal {
+            field: Some("json_schema".to_owned()),
+            ..Refusal::invalid(
+                "json_schema is not supported by this server: send the schema as response_format \
+                 {\"type\": \"json_schema\", \"json_schema\": {\"schema\": ...}}"
+                    .to_owned(),
+            )
+        });
     }
     let reply = response_schema(o)?;
     let forces = tool_choice(o)?;
@@ -914,11 +921,21 @@ pub(crate) fn request(
             let path = "response_format.json_schema.schema";
             let mut bytes = MAX_BODY;
             let parts = value(&written_out(s, path, &mut bytes)?, style, path)?;
-            (program::compile(&parts, &env)?, Vec::new())
+            let prog = program::compile(&parts, &env).map_err(|r| Refusal {
+                field: Some(path.to_owned()),
+                ..r
+            })?;
+            (prog, Vec::new())
         }
-        (Reply::Object, None) => program::json_object(style, &env)?,
+        (Reply::Object, None) => program::json_object(style, &env).map_err(|r| Refusal {
+            field: Some("response_format".to_owned()),
+            ..r
+        })?,
         (Reply::Text, Some(f)) => (
-            program::compile(&tool_parts(o, f, ask.format)?, &env)?,
+            program::compile(&tool_parts(o, f, ask.format)?, &env).map_err(|r| Refusal {
+                field: Some("tools".to_owned()),
+                ..r
+            })?,
             Vec::new(),
         ),
     };

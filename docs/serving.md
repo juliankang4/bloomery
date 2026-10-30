@@ -388,6 +388,13 @@ A request field is read, refused or ignored:
   `generation_settings` reports the bias as llama-server does (`[{"bias": -100.0, "token": 15}]`).
 - **Ignored.** A field the server does not know is ignored, as llama-server ignores it. So a misspelled field is no
   error: `"temprature": 0` answers 200 and samples at the default temperature.
+- **Errors.** An error answers llama-server's object, `{"error": {"code": 400, "message": "...", "type":
+  "invalid_request_error"}}`. Routes that answer this object add OpenAI's `param` when the error is about one request
+  field: its top-level name, which a client can read instead of parsing the message. A fault inside a field names the
+  field that holds it: `messages` for `messages[2].content`, `response_format` for a keyword its schema refuses.
+  `/v1/responses` names its own fields (`input`, `text`, `reasoning`) where the chat request it runs as names others.
+  An error about no single field has no `param`: a body that is not JSON, a prompt past the context, a full queue.
+  The Anthropic Messages API keeps its own error object, which has no `param`.
 
 Unset, a generation samples at llama-server's defaults: `temperature` 0.8, `top_k` 40, `top_p` 0.95, `min_p` 0.05,
 `repeat_penalty` 1, `repeat_last_n` 64, no token limit but the context (`n_predict` -1) and `cache_prompt` true. A
