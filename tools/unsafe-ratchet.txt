@@ -724,7 +724,11 @@ gguf 7 2 0
 # without a memset (`DeviceTensor::unfilled`, 1 fn and its 2 blocks, the allocation and the buffer taking it over)
 # and its load-time callers that write the buffer whole (weights.rs's `upload_whole` 1 block, `upload_split` 2
 # blocks and the two plane joins 3 blocks, one block an allocation), each with its SAFETY line.
-gpu 2848 387 10
+# PIN(2026-10-31): gpu 2848 -> 2860 blocks, 387 -> 393 fns, new kernel entries, not old code relaxed: the BF16 stores of
+# the W8A8 MXFP8 and BF16 MMA products (nvfp4mma.rs `mxfp8_w8a8_gemm_bf16` and the shared `mxfp8_w8a8_body`, an unsafe
+# fn; kernels32.rs `bf16_mma_cols_gemm_bf16`) and conv.rs `gdn_conv_prep_bf16`: `ConvIn`'s `head` and `store_ring`
+# in their F32 and BF16 impls, and `conv_channel`, the tap read both heads share, each with its SAFETY line.
+gpu 2860 393 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

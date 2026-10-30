@@ -139,7 +139,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::linear::conv::{
-        ConvArgs, ConvOut, KdaBetaScale, KdaConvArgs, KdaGateRule, conv_prep_host,
+        ConvArgs, ConvOut, ConvRows, KdaBetaScale, KdaConvArgs, KdaGateRule, conv_prep_host,
         kda_conv_prep_host,
     };
     use bloomery_gpu::linear::delta::{
@@ -159,6 +159,7 @@ mod gate {
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
+    use gguf::quant::{bf16_bits_to_f32, fp32_to_bf16_bits};
     use model::arch::models::OutGate;
 
     /// Qwen3.6-35B-A3B's linear layers.
@@ -394,9 +395,33 @@ mod gate {
             pos: &[u32],
             m: usize,
         ) -> Result<ConvOut, GateError> {
+            self.conv_held(fault, l, tk, ring, pos, (m, false))
+        }
+
+        /// [`Ctx::conv`], with `bf16` the channels held as BF16 words, each
+        /// value rounded to nearest even.
+        fn conv_held(
+            &self,
+            fault: FaultSink,
+            l: &Layer,
+            tk: &Tokens,
+            ring: &[f32],
+            pos: &[u32],
+            (m, bf16): (usize, bool),
+        ) -> Result<ConvOut, GateError> {
             let s = self.stream();
             let (ch, nv) = (l.shape.channels(), l.shape.n_v);
             let x = DeviceBuffer::from_host(s, &tk.x)?;
+            let words: Vec<u32> = tk
+                .x
+                .chunks(2)
+                .map(|p| {
+                    let half =
+                        |i: usize| u32::from(fp32_to_bf16_bits(p.get(i).copied().unwrap_or(0.0)));
+                    half(0) | half(1) << 16
+                })
+                .collect();
+            let words = DeviceBuffer::from_host(s, &words)?;
             let b = DeviceBuffer::from_host(s, &tk.b)?;
             let a = DeviceBuffer::from_host(s, &tk.a)?;
             let w = DeviceBuffer::from_host(s, &l.w)?;
@@ -410,7 +435,11 @@ mod gate {
             self.k.conv.enqueue_conv_prep(
                 s,
                 ConvArgs {
-                    x: &x,
+                    x: if bf16 {
+                        ConvRows::Bf16(&words)
+                    } else {
+                        ConvRows::F32(&x)
+                    },
                     b_raw: &b,
                     a_raw: &a,
                     w: &w,
@@ -829,7 +858,7 @@ mod gate {
     /// The host rule's conv outputs for `tk` at `pos` over `ring`.
     fn conv_host(l: &Layer, tk: &Tokens, ring: &[f32], pos: &[u32], m: usize) -> ConvOut {
         conv_prep_host(
-            &tk.x, &tk.b, &tk.a, &l.w, &l.dt, &l.sa, pos, ring, l.shape, l.eps, m,
+            &tk.x, &tk.b, &tk.a, &l.w, &l.dt, &l.sa, pos, ring, l.shape, l.eps, m, false,
         )
     }
 
@@ -873,6 +902,33 @@ mod gate {
             let (pass, line) = conv_same(&d, &h);
             println!(
                 "conv m={m} at p0={P0} over a random ring: {line} {}",
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+
+        // Channels held as BF16 words: the conv rule over their widened
+        // values on the BF16 entry's lanes, the ring included.
+        let widened = Tokens {
+            shape: SHAPE,
+            x: tk
+                .x
+                .iter()
+                .map(|&v| bf16_bits_to_f32(fp32_to_bf16_bits(v)))
+                .collect(),
+            b: tk.b.clone(),
+            a: tk.a.clone(),
+        };
+        for m in [PROMPT, 2, 1] {
+            let pos = positions(P0, m);
+            let d = cx.conv_held(unl, &l, &tk.slice(0, m), &dirty, &pos, (m, true))?;
+            let w = widened.slice(0, m);
+            let h = conv_prep_host(
+                &w.x, &w.b, &w.a, &l.w, &l.dt, &l.sa, &pos, &dirty, l.shape, l.eps, m, true,
+            );
+            let (pass, line) = conv_same(&d, &h);
+            println!(
+                "conv m={m} at p0={P0} over a random ring, channels as BF16 words: {line} {}",
                 verdict(pass)
             );
             out.push(pass);
@@ -1171,7 +1227,7 @@ mod gate {
         k.conv.enqueue_conv_prep(
             st,
             ConvArgs {
-                x: &i.x,
+                x: ConvRows::F32(&i.x),
                 b_raw: &i.b,
                 a_raw: &i.a,
                 w: &i.w,

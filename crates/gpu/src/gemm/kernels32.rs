@@ -1344,6 +1344,50 @@ mod gemm32_kernels {
         unsafe { bf16_mma_body(Bf16Rows(w), cols, rows, k, n, &mut y, sh) };
     }
 
+    /// [`bf16_mma_cols_gemm`]'s products as BF16, each value its F32 one
+    /// rounded to nearest even (`f32tile.rs`'s `ProductCell`).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            rows >= 1,
+            n >= 1,
+            2 * w.len() >= rows * k,
+            x.len() >= n * k,
+            2 * xb.len() >= n * k,
+            refused.len() >= n,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn bf16_mma_cols_gemm_bf16(
+        w: &[u32],
+        x: &[f32],
+        xb: &[u32],
+        refused: &[u32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        mut y: DisjointSlice<u16>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        let cols = Bf16Cols {
+            words: xb,
+            refused,
+            exact: x,
+        };
+        // SAFETY: 256 converged threads, aligned weight/activation words,
+        // and the checked grid and spans required by bf16_mma_body.
+        unsafe { bf16_mma_body(Bf16Rows(w), cols, rows, k, n, &mut y, sh) };
+    }
+
     /// BF16 prompt gate projection with a shared sigmoid norm at its store.
     #[allow(clippy::too_many_arguments, reason = "flat kernel ABI")]
     #[kernel]

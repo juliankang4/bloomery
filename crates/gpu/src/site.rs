@@ -80,7 +80,7 @@
 
 use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
-    GemmRoute, GemmWeight, MmaForm,
+    GemmRoute, GemmWeight, MmaForm, ProductOut,
 };
 use crate::kquant::{Act, SelDown};
 use crate::model::fit::{act_col_bytes, act32_col_bytes};
@@ -312,7 +312,7 @@ pub fn gemv(
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    let src = (Some(ty), w, SiteWeight::Resident(name));
+    let src = (Some(ty), w, name);
     launch(gpu, gpu.stream(), Some(g32), src, x, m, y)
 }
 
@@ -342,15 +342,7 @@ pub fn resident_gemv_cols_on(
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    launch(
-        gpu,
-        stream,
-        g32,
-        (None, w, SiteWeight::Resident(name)),
-        x,
-        m,
-        y,
-    )
+    launch(gpu, stream, g32, (None, w, name), x, m, y)
 }
 
 /// [`resident_gemv_cols`] over rows `at .. at + n` of the resident weight
@@ -453,25 +445,24 @@ fn resident_ty(
     }
 }
 
-/// The gemv of site `src` over the first `m` (1..=8) columns of the f32 rows
-/// `x`, token-major, at the site type of its resident form, which must be
+/// The gemv of resident weight `name` over the first `m` (1..=8) columns
+/// of the f32 rows `x`, token-major, at the site type of its resident form, which must be
 /// `declared` when the caller names one ([`resident_ty`]). `g32` is read
 /// only by an F32 site past one column.
 fn launch(
     gpu: &Gpu,
     stream: &cuda_core::CudaStream,
     g32: Option<&Gemm32Kernels>,
-    (declared, w, src): (Option<SiteTy>, &Weights, SiteWeight<'_>),
+    (declared, w, name): (Option<SiteTy>, &Weights, &str),
     x: &DeviceBuffer<f32>,
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     const WHAT: &str = "site::gemv";
-    let (name, part) = src.rows(WHAT)?;
     let weight = w.resident(WHAT, name)?;
     let ty = resident_ty(WHAT, (declared, weight, name))?;
     match ty.reads() {
-        Form::F32 | Form::Q8x32 => with_planes(WHAT, (ty, weight, name), part, |p| {
+        Form::F32 | Form::Q8x32 => with_planes(WHAT, (ty, weight, name), None, |p| {
             gemv_planes(gpu, stream, g32, p, x, m, y)
         }),
         Form::Q8x128 => Err(GpuError::shape(
@@ -1049,37 +1040,13 @@ impl ByName {
         match ty.reads() {
             Form::F32 | Form::Q8x32 => {
                 if whole {
-                    return launch(
-                        gpu,
-                        stream,
-                        g32,
-                        (None, w, SiteWeight::Resident(name)),
-                        x,
-                        m,
-                        y,
-                    );
+                    return launch(gpu, stream, g32, (None, w, name), x, m, y);
                 }
                 if m == 1 {
                     let mut win = WindowMut::<f32>::of_mut(y, at * size_of::<f32>(), rows)?;
-                    return launch(
-                        gpu,
-                        stream,
-                        g32,
-                        (None, w, SiteWeight::Resident(name)),
-                        x,
-                        1,
-                        &mut win,
-                    );
+                    return launch(gpu, stream, g32, (None, w, name), x, 1, &mut win);
                 }
-                launch(
-                    gpu,
-                    stream,
-                    g32,
-                    (None, w, SiteWeight::Resident(name)),
-                    x,
-                    m,
-                    &mut self.stage,
-                )?;
+                launch(gpu, stream, g32, (None, w, name), x, m, &mut self.stage)?;
                 scatter(stream, &self.stage, (rows, m), y, (at, stride))
             }
             Form::Q8x128 => {
@@ -1482,14 +1449,46 @@ impl WideActsMut<'_> {
 pub fn gemm(
     gpu: &Gpu,
     k: &WideKernels<'_>,
+    site: (SiteTy, &Weights, SiteWeight<'_>),
+    rows: usize,
+    x: &WideIn<'_>,
+    table: (&GemmRoute, GemmInput),
+    m: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    gemm_into(gpu, k, site, rows, x, table, m, y.into()).map(drop)
+}
+
+/// [`gemm`] into `y`'s cells. A BF16 `y` is stored by the dense MMA tile's
+/// BF16 store alone (an MXFP8 site's W8A8 product and a BF16 site's product
+/// over its held BF16 form), each cell the F32 product's rounded to nearest
+/// even: false, with nothing launched, for a site whose product has no BF16
+/// store. Always true for an F32 `y`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one site's kernels, weight, rows, inputs, table, column rule, width and output (rust-quality R8)"
+)]
+fn gemm_into(
+    gpu: &Gpu,
+    k: &WideKernels<'_>,
     (ty, w, src): (SiteTy, &Weights, SiteWeight<'_>),
     rows: usize,
     x: &WideIn<'_>,
     (route, input): (&GemmRoute, GemmInput),
     m: usize,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
+    y: ProductOut<'_>,
+) -> Result<bool, GpuError> {
     const WHAT: &str = "site::gemm";
+    // `y`'s F32 cells; a product with no BF16 store returns false, launching
+    // nothing, for a BF16 `y`.
+    macro_rules! f32_cells {
+        ($y:expr) => {
+            match $y {
+                ProductOut::F32(y) => y,
+                ProductOut::Bf16(_) => return Ok(false),
+            }
+        };
+    }
     let stream = gpu.stream();
     let name = src.name();
     let missing = |form: &'static str| {
@@ -1513,8 +1512,9 @@ pub fn gemm(
         }
     };
     src.check(WHAT, ty)?;
-    match ty {
+    let launched = match ty {
         SiteTy::Nvfp4 => {
+            let y = f32_cells!(y);
             dense()?;
             let DevWeight::Nvfp4 { qs, e, scales, .. } = w.resident(WHAT, name)? else {
                 return Err(GpuError::tensor(WHAT, name, "an NVFP4 weight"));
@@ -1536,6 +1536,7 @@ pub fn gemm(
             )
         }
         SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K | SiteTy::Iq4Xs => {
+            let y = f32_cells!(y);
             k.gemm.enqueue_gemm(
                 stream,
                 GemmArgs {
@@ -1564,37 +1565,48 @@ pub fn gemm(
                 )
             };
             let f32_rows = || x.f32.ok_or_else(|| missing("f32 rows"));
-            with_planes(WHAT, (ty, weight, site), part, |p| match p {
-                Planes::Q8_0(qs, d) => g32()?.enqueue_gemm32(
-                    stream,
-                    Gemm32Args {
-                        w: Gemm32Weight::Q8_0Plane { qs, d },
-                        rows_per_expert: rows,
-                        act: x.q32.ok_or_else(|| missing("q8 blocks of 32"))?,
-                        route,
-                        input,
-                        y,
+            return with_planes(WHAT, (ty, weight, site), part, |p| {
+                match p {
+                    Planes::Q8_0(qs, d) => g32()?.enqueue_gemm32(
+                        stream,
+                        Gemm32Args {
+                            w: Gemm32Weight::Q8_0Plane { qs, d },
+                            rows_per_expert: rows,
+                            act: x.q32.ok_or_else(|| missing("q8 blocks of 32"))?,
+                            route,
+                            input,
+                            y: f32_cells!(y),
+                        },
+                    ),
+                    Planes::F32(t) => {
+                        g32()?.enqueue_f32_tile(stream, t, f32_rows()?, m, f32_cells!(y))
+                    }
+                    Planes::E4m3(t) if gpu.q8f32().dense_mma => match (x.q32, f32_rows()?) {
+                        (Some(act), rows) if crate::gemm::mxfp8_w8a8_reads(&t, act, rows, m) => {
+                            g32()?.enqueue_mxfp8_w8a8(stream, t, rows, act, m, y)
+                        }
+                        (_, rows) => g32()?.enqueue_e4m3_mma(stream, t, rows, m, f32_cells!(y)),
                     },
-                ),
-                Planes::F32(t) => g32()?.enqueue_f32_tile(stream, t, f32_rows()?, m, y),
-                Planes::E4m3(t) if gpu.q8f32().dense_mma => match (x.q32, f32_rows()?) {
-                    (Some(act), rows) if crate::gemm::mxfp8_w8a8_reads(&t, act, rows, m) => {
-                        g32()?.enqueue_mxfp8_w8a8(stream, t, rows, act, m, y)
+                    Planes::E4m3(t) => {
+                        g32()?.enqueue_e4m3_tile(stream, t, f32_rows()?, m, f32_cells!(y))
                     }
-                    (_, rows) => g32()?.enqueue_e4m3_mma(stream, t, rows, m, y),
-                },
-                Planes::E4m3(t) => g32()?.enqueue_e4m3_tile(stream, t, f32_rows()?, m, y),
-                Planes::Bf16(t) => match (x.q32, f32_rows()?) {
-                    (Some(act), rows)
-                        if gpu.q8f32().dense_mma && act.holds(MmaForm::Bf16, rows, m) =>
-                    {
-                        g32()?.enqueue_bf16_mma_cols(stream, t, rows, act, m, y)
-                    }
-                    (_, rows) => gpu.q8f32().enqueue_bf16_prompt(stream, t, rows, m, y),
-                },
-            })
+                    Planes::Bf16(t) => match (x.q32, f32_rows()?) {
+                        (Some(act), rows)
+                            if gpu.q8f32().dense_mma && act.holds(MmaForm::Bf16, rows, m) =>
+                        {
+                            g32()?.enqueue_bf16_mma_cols(stream, t, rows, act, m, y)
+                        }
+                        (_, rows) => {
+                            gpu.q8f32()
+                                .enqueue_bf16_prompt(stream, t, rows, m, f32_cells!(y))
+                        }
+                    },
+                }
+                .map(|()| true)
+            });
         }
         SiteTy::Q5_0 => {
+            let y = f32_cells!(y);
             dense()?;
             let Some(DevWeight::Q5_0 { w: packed, .. }) = w.get(name) else {
                 return Err(GpuError::tensor(WHAT, name, "a packed Q5_0 weight"));
@@ -1621,7 +1633,8 @@ pub fn gemm(
             WHAT,
             format!("{name} is {ty}: no card launch reads it"),
         )),
-    }
+    };
+    launched.map(|()| true)
 }
 
 /// [`gemm`] for the resident weight `name` at the site type of its resident
@@ -1640,7 +1653,24 @@ pub fn resident_gemm(
 ) -> Result<(), GpuError> {
     let rows = w.resident("site::resident_gemm", name)?.rows();
     let src = SiteWeight::Resident(name);
-    wide_by_name(gpu, k, (w, src, rows), x, route, m, y)
+    wide_by_name(gpu, k, (w, src, rows), x, route, m, y.into()).map(drop)
+}
+
+/// [`resident_gemm`] storing each output as BF16 bits, the F32 output rounded
+/// to nearest even, where the site's product has a BF16 store
+/// ([`gemm_into`]): false, with nothing launched, where it has none.
+pub(crate) fn resident_gemm_bf16(
+    gpu: &Gpu,
+    k: &WideKernels<'_>,
+    (w, name): (&Weights, &str),
+    x: &WideIn<'_>,
+    route: &GemmRoute,
+    m: usize,
+    y: &mut DeviceBuffer<u16>,
+) -> Result<bool, GpuError> {
+    let rows = w.resident("site::resident_gemm_bf16", name)?.rows();
+    let src = SiteWeight::Resident(name);
+    wide_by_name(gpu, k, (w, src, rows), x, route, m, y.into())
 }
 
 /// A resident gate projection followed by the shared sigmoid norm, its
@@ -1750,11 +1780,11 @@ pub fn resident_gemm_rows(
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     let src = SiteWeight::Part { name, at, n };
-    wide_by_name(gpu, k, (w, src, n), x, route, m, y)
+    wide_by_name(gpu, k, (w, src, n), x, route, m, y.into()).map(drop)
 }
 
-/// [`gemm`] of site `src`, `rows` rows, at the site type of its resident
-/// form, on the one-expert table `route` filled for `m` slots.
+/// [`gemm_into`] of site `src`, `rows` rows, at the site type of its
+/// resident form, on the one-expert table `route` filled for `m` slots.
 fn wide_by_name(
     gpu: &Gpu,
     k: &WideKernels<'_>,
@@ -1762,11 +1792,11 @@ fn wide_by_name(
     x: &WideIn<'_>,
     route: &GemmRoute,
     m: usize,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
+    y: ProductOut<'_>,
+) -> Result<bool, GpuError> {
     let ty = resident_type(w, "site::resident_gemm", src.name())?;
     let table = (route, GemmInput::PerSlot);
-    gemm(gpu, k, (ty, w, src), rows, x, table, m, y)
+    gemm_into(gpu, k, (ty, w, src), rows, x, table, m, y)
 }
 
 /// Whether a site of type `ty` copies its input's `form` on the dense MMA

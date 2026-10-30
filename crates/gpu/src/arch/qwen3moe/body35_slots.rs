@@ -48,7 +48,8 @@ use crate::gated_quant::GateLayout;
 use crate::head::Head;
 use crate::host::StepLeg;
 use crate::hybrid::Chain;
-use crate::linear::{self, conv::ConvArgs, delta::DeltaArgs, norm_gate::NormGateArgs};
+use crate::linear::conv::{ConvArgs, ConvRows};
+use crate::linear::{self, delta::DeltaArgs, norm_gate::NormGateArgs};
 use crate::media::rope_table;
 use crate::model::lookup::f32_gain;
 use crate::model::slots::slot_twice;
@@ -641,7 +642,7 @@ impl ChainOps for Slots35<'_, '_> {
             lin.conv.enqueue_conv_prep(
                 stream,
                 ConvArgs {
-                    x: &*rows(&g.x, r, ch)?,
+                    x: ConvRows::F32(&*rows(&g.x, r, ch)?),
                     b_raw: &*rows(&g.b, r, nv)?,
                     a_raw: &*rows(&g.a, r, nv)?,
                     w: wc,

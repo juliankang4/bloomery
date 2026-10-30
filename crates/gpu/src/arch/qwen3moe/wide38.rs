@@ -209,7 +209,7 @@ use crate::host::prompt_stream::PromptStream;
 use crate::host::run::HostRun;
 use crate::host::xstream::{GROUP_WALK_ORDER, LandBatch, RingLayer};
 use crate::kquant::Act;
-use crate::linear::conv::ConvArgs;
+use crate::linear::conv::{ConvArgs, ConvRows};
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::ple::{PleConvArgs, PleGateArgs};
@@ -2591,7 +2591,23 @@ fn gdn(
     quantize_unheld(c, &gp.input_sites(), (mixed, m), &mut x.act_hid, sink)?;
     let dense = &x.dense[u.route];
     let act = (&*mixed, &x.act_hid, m);
-    dense_gemm(c, by, &gp.qkv, act, (dense, sink), &mut g.x)?;
+    let bf16 = if reads_q8_1(c, &gp.qkv)? {
+        false
+    } else {
+        let mut half = WindowMut::<u16>::of_mut(&mut g.x, 0, m * GDN.channels())?;
+        site::resident_gemm_bf16(
+            c.gpu,
+            &dense_kernels(c),
+            (w, &gp.qkv),
+            &wide_in(mixed, &x.act_hid),
+            dense,
+            m,
+            &mut half,
+        )?
+    };
+    if !bf16 {
+        dense_gemm(c, by, &gp.qkv, act, (dense, sink), &mut g.x)?;
+    }
     // The joined stack is `2·nv` rows (`plan38::plans` refuses another shape
     // at load), β's rows first and α's next.
     let (k, x_in) = (dense_kernels(c), wide_in(mixed, &x.act_hid));
@@ -2602,10 +2618,15 @@ fn gdn(
     }
     let (b, a) = beta_alpha_rows(&g.ba, m)?;
     let lin = &c.k.linear;
+    let words = Window::<u32>::of(&g.x, 0, m * GDN.channels() / 2)?;
     lin.conv.enqueue_conv_prep(
         stream,
         ConvArgs {
-            x: &g.x,
+            x: if bf16 {
+                ConvRows::Bf16(&words)
+            } else {
+                ConvRows::F32(&g.x)
+            },
             b_raw: &b,
             a_raw: &a,
             w: f32_gain(w, &gp.conv)?,
@@ -2622,6 +2643,7 @@ fn gdn(
             ring: &mut r.ring,
         },
     )?;
+    drop(words);
     // The conv has read the q·k·v rows: the prompt form's chunk records take
     // their room.
     let len = g.x.len();

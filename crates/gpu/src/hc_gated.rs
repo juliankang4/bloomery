@@ -2831,7 +2831,7 @@ impl HcWideKernels {
         let words = match a.w.down {
             HcMatrix::Bf16(down) if a.q8f32.dense_mma => {
                 let rows = r + geo.s() * inject as usize;
-                let t = mma_launch_words(what, rows, wide, &a.scratch.xn, m, &mut a.scratch.down)?;
+                let t = mma_launch_words(what, rows, wide, &a.scratch.xn, m, &a.scratch.down)?;
                 check_alignment::<U32x4, _>(what, "down", down.buf())?;
                 if let Some(inj) = a.w.inject {
                     check_alignment::<F32x4, _>(what, "inject", inj.buf())?;
@@ -2855,10 +2855,7 @@ impl HcWideKernels {
             && words.is_some()
             && m > MAX_COLS
         {
-            Some((
-                w,
-                bf16_mma_launch(what, w, &a.scratch.lo, m, &mut a.scratch.g)?,
-            ))
+            Some((w, bf16_mma_launch(what, w, &a.scratch.lo, m, &a.scratch.g)?))
         } else {
             None
         };
