@@ -1,0 +1,50 @@
+# cflow M1 (step T2): what share of V4.1's prose prompt card time is the shadow's expert kernels, the term a grouped-IMMA
+# card-expert GEMM would shrink (cflow audit step.md T2, row 2).
+#
+# Decomposition [derived], A6000 300 W, plan (a), CED on, G 2, r8 on, the prose prompt P 4096 (8 batches x 40 layers; one
+# layer-batch is one layer over one batch of up to 512 positions). The flow model (tools/flow/ds41_prefill.py --levers,
+# the `prose P 4096` table, today's flow row) gives per served layer-batch, in ms:
+#   host 29.6 (union 25.7)  card 44.1  wall 47.0  route 21.8  shadow 21.6  (wait 7.1, enq 12.7 are the host's, under the card)
+#   card duty = card / wall = 44.1 / 47.0 = 0.94 (the audit's 0.87 is the same model before the clock term); the bound column
+#   reads `card 89 serial 27` layers of 116 served: the card binds, the host union (25.7) sits under it.
+#   shadow = the card's routed experts by the (slot tile, row tile) dp4a tiles: ds41_expert_gate_up_tiles (gate+up) and
+#   q4k_gemv_tiles (down), crates/gpu-deepseek41/src/chain/ffn/batch.rs:274 and :944; the rest of the shadow is buckets,
+#   gather and the shared expert, taken as 5..15 % of it [assumed].
+#   share of the card's layer-batch = 21.6 x (0.85..0.95) / 44.1 = 41.6..46.5 %; widened to 38..52 for the model's own
+#   residual (its prose shadow term carries the clk_tile_prose factor, a fit, and was backtested to a few percent).
+# Resource timeline of one layer-batch [derived, same table]: host CPU 29.6 ms busy (union 25.7 on 32 threads), host DRAM
+# 25.7 ms busy at the union (the card holds only the shadow then), card SMs 44.1 ms, PCIe the route's D2H of x and the sums
+# upload (a few ms inside the card FIFO), NVMe 0 (host set resident). The wall is the card's chain (route, then the shadow
+# under the union): the card is the max here, the host under it, so a card-side lever counts and a host-side one predicts 0
+# until the card term drops to the host's 29.6 + issue.
+# Runner. nsys-ds41.sh's prefill form feeds lcg ids only (`--depth P`); lcg is host-bound (flow model: 68.6 of 73.8 ms on the
+# host), so its share is not this card's term. The decode form takes the prose corpus (`prose:4096`, `--tokens` over the first
+# 4096 ids of $BLOOMERY_DATA/engram/corpus-prose.ids) and runs the same eager prompt batch before its replays, so its trace holds
+# the prompt window of the prose prompt; the prefill analysis then re-reads that sqlite with `--analyze` (no card, no lease).
+# Wall [derived]: V4.1 plan (a) load ~10 s warm, ~47 s cold (rig-log, load.md) + prompt 4096 at ~370-400 tok/s ~ 11 s under
+# nsys + 7 replays ~0.3 s + nsys export ~30-90 s + two analyses ~1 min: 3..5 min.
+kind: profile
+question: on V4.1 plan (a) with the prose prompt at P 4096, what share of the card's layer-batch kernel time do
+  ds41_expert_gate_up_tiles and q4k_gemv_tiles take, and does the card bind (duty)?
+term: share of the layer-batch's kernel time (nsys, kernel table of layer 2 and the layers 2-39 mean of
+  nsys-ds41.sh's prefill analysis) in ds41_expert_gate_up_tiles + q4k_gemv_tiles, V4.1 public Q3_K_M, prose P 4096,
+  plan (a), A6000
+unit: %
+predict: 38..52
+condition: one lease through nsys-ds41.sh with this card, BLOOMERY_MODEL=deepseek41 BLOOMERY_GEN_PLACE=a on the A6000 as the
+  timing card, BLOOMERY_NSYS_FORM unset (decode form) with the argument prose:4096 and BLOOMERY_NSYS_N=8; the run log's
+  `time prompt` row says kind=batch and the boundary count is N - 1 replays (else the runner refuses and the run is void); the
+  witness pre and post show no compute process on either card and no [cpu-busy]; then the prefill analysis over the saved
+  sqlite, BLOOMERY_NSYS_FORM=prefill nsys-ds41.sh --analyze <sqlite> 4096 8 <run log>, prints the layer-batch tables (no
+  table on a wrong count of the run log's `stat prefill split` / `ced=` records = void). Card duty is read as the layer-batch
+  kernel sum over its wall in that table and from the union-gap and idle lines; a window whose union gap is longer than the
+  shadow (the host binds) is the host-bound case below
+decide-in: the shadow's expert kernels are 38 percent or more of the card's time and the card duty is 0.8 or more: T2 stands
+  as priced (+0 .. +7.8 percent pp4096 prose); price it with the measured per-kernel us (bytes per launch, rate) and open the
+  design round for the grouped IMMA card experts, with the lead's call on the batched-prompt bit gate (float sum order moves)
+decide-below: the share is under 38 percent: scale T2's priced gain by share / 45 and re-run tools/flow/ds41_prefill.py
+  with the measured shadow term; a share under 15 percent, or a window whose union gap shows the host binding (duty under 0.8),
+  moves T2 to 0 and closes row 2
+decide-above: the share is over 52 percent: the shadow is more of the card than modeled, so T2's ceiling is the host union (25.7
+  ms against a card that shrinks): recompute the gain with the measured shadow, capped where the card term meets the host's
+  29.6 ms, and read the tile kernels' own bound before pricing the IMMA rate

@@ -1,0 +1,49 @@
+# cflow M2 (step T3): is q4k_gemv_sel, Qwen3.6's card-side Q4_K expert-down gemv at decode, at the DRAM ceiling or held by its
+# 32-bit load path? (cflow audit step.md T3, row 3.)
+#
+# Decomposition [derived], A6000 (GDDR6, 768 GB/s theoretical), one-row pass (m = 1), 8 routed slots a launch:
+#   rate   = 579 GB/s, the kernel's recorded large-launch rate (rig-log plan.md, BW row: `q4k_gemv_sel` 579, A6000, nsys bytes
+#            over duration), against the Q8_0 family's 615-680
+#   dram % = 579 / 768 = 75.4 % of peak: the band 72..78 is that value +-3 points for ncu's own duration (it times a launch
+#            with caches flushed, `--cache-control all`) [derived]
+#   T3's lever (128-bit loads) pays only if the kernel is held by LSU/issue; at 75 % of peak a kernel held by DRAM latency
+#   shows long_scoreboard on top with issue-active well under half (q3gemma, rig-log 09-26#q3gemma-ab: L1TEX wavefronts -39 %,
+#   cycles unmoved, lever predicted 0), and one held by the load path shows lg_throttle or mio_throttle on top with issue-active
+#   over 60 %. Expected here: long_scoreboard on top, issue-active 25..45 % [assumed: no record of this kernel's issue-active].
+# Resource timeline of one decode step (Qwen3.6, whole card, 3090 numbers in the audit, A6000 here): the card chain is the only
+# busy resource: Q4_K bytes 2.4-2.9 ms of the 5.31 ms step [derived, step.md T3], the rest other gemvs, attention, gaps; host,
+# PCIe, DRAM-host, NVMe ~ 0. The wall is the sum on one stream, so a cut in this kernel's time is a cut in the step, if the
+# kernel is movable: share of the step 45..55 %, the lever's range -6..-15 % of that term = +0..+8 % step.
+# Conditions the runner fixes and this card reads around: tools/ref/ncu-gpu.sh's depth form profiles at --clock-control base
+# (SM ~1.4 GHz against the ~1.9-2.0 GHz the step runs at [derived, flow constants f_sm]); a kernel at the DRAM ceiling reads
+# the same dram % at base, a kernel held by issue reads a LOWER dram % and a HIGHER issue-active at base than it has at the
+# running clock. So 72..78 % at base with issue-active under 50 % is a ceiling reading at any clock; a lower dram % with issue
+# over 60 % is an issue-bound reading at base only and is re-read at the running clock (the q3pp form's --clock-control none)
+# before the 128-bit round opens.
+# Runner. The depth form's launch skip is for the dense `generate`; here the prompt is ONE id (lcg_prompt 1), so the process
+# runs only one-row passes (the prompt pass and two feedback steps, eager), every pass holds the same q4k_gemv_sel launches, and
+# skip 0 with count 8 takes the first eight launches (eight layers of the first pass), median taken by the runner. BIN is
+# generate_qwen3moe (BLOOMERY_GEN_BIN), BLOOMERY_MODEL=qwen35moe picks the Q4_K_M file (21.2 GB, whole on the A6000).
+# Wall [derived]: load ~20 s cold (page cache warm: seconds) + ncu replays: the card holds ~22 GB, saved and restored around each
+# pass (ncu-gpu.sh ds41pp note: minutes) ~10 passes x 0.9 s x 8 launches ~ 1.5 min = 3..6 min.
+kind: profile
+question: is q4k_gemv_sel at the DRAM ceiling on the A6000, and what is its top warp stall and issue-active at the decode shape?
+term: DRAM Throughput in percent of peak (ncu, median of 8 launches) of q4k_gemv_sel in generate_qwen3moe's one-row passes,
+  Qwen3.6-35B-A3B Q4_K_M, A6000 300 W, --clock-control base, eager mode, caches flushed by ncu
+unit: %
+predict: 72..78
+condition: one lease through ncu-gpu.sh's depth form with this card: BLOOMERY_MODEL=qwen35moe
+  BLOOMERY_GEN_BIN=target/release/generate_qwen3moe BLOOMERY_NCU_DEPTHS=1 BLOOMERY_NCU_MODE=eager
+  BLOOMERY_NCU_KERNELS='^q4k_gemv_sel$' BLOOMERY_NCU_SKIP=0 BLOOMERY_NCU_COUNT=8, the A6000 the timing card, root, the
+  binary fresh (assert_fresh_binary). The CSV holds 8 launches of the name with one grid and one block (else the filter caught
+  another kernel and the run is void); the summary's stall block prints long_scoreboard, lg_throttle and mio_throttle, and the
+  CSV carries smsp__issue_active.avg.pct_of_peak_sustained_active through BLOOMERY_NCU_METRICS (the runner's stall list plus
+  that metric, dram__throughput and gpu__time_duration) read off the raw CSV; no process of ours on the 3090 (witness gpu-apps)
+decide-in: DRAM 72 to 78 percent: split on the top stall. lg_throttle or mio_throttle on top, or issue-active over 60 percent,
+  opens the 128-bit load round (the v4 round, size S, +0 .. +8 percent step, re-read at the running clock first); long_scoreboard
+  on top with issue-active under 50 percent drops T3 (latency, not loads: the lever predicts 0)
+decide-below: DRAM under 72 percent: the kernel sits further from the ceiling than its recorded 579 GB/s. Read the stalls the
+  same way; with the load path on top the headroom is larger than priced (up to the Q8_0 family's 615-680 GB/s = 80-88 percent),
+  with long_scoreboard on top the extra gap is latency or a small grid (read the occupancy and the wave count before any lever)
+decide-above: DRAM over 78 percent: the kernel is at the GDDR6 ceiling; no load-width change moves it, drop T3 and record the
+  rate against the Q8_0 family's

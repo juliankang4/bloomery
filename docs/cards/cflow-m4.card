@@ -1,0 +1,52 @@
+# cflow M4 (load R9): after a `place=a` start, how much of the model file is still in the page cache (the box has no fincore), and which of the two records
+# about CARD_DONTNEED holds? (cflow audit load.md R9 and its Box line.)
+#
+# What the code says [read, not measured]. BLOOMERY_CARD_DONTNEED defaults to "1" (crates/levers/src/registry.rs:766-777): "each
+# uploaded card segment's file pages are dropped right after its upload (token_embd and the engram table excepted)". The host
+# config's card_dontneed reaches Weights::load_placed (crates/gpu/src/model.rs:2378, host/node.rs:455), which builds a PageDrop
+# (crates/model/src/placement/host_lock.rs:745) over the split: after a segment is staged, MADV_DONTNEED on this process's
+# mapping and posix_fadvise(DONTNEED) over the whole pages inside the segment's bytes, so a page shared with a host segment or a
+# neighbouring tensor stays and a page another process maps stays. The drop is unconditional on the plan: a load with no host
+# set (host_experts = 0, qwen3moe place=a, one card) drops the same way, the audit's R9. So the code predicts: after a default
+# start of a no-host-set model the file is almost all out of the cache.
+# What the records say [read]. ab-q3moe-4.log (mac-port/prfix2, one lease, A6000, qwen3moe Q4_K_M 18.66 GB, place=a one card,
+# every process a fresh load of the same file): its first two loads read `in 22.0 s` (line 135) and `in 18.6 s` (line 202), the
+# next twenty-two `in 1.6 .. 1.7 s` (lines 214 .. 1037). The two cold loads fit the drop (the second start re-read the drive at
+# 0.85..1.0 GB/s); the twenty-two warm ones do not, unless something re-warmed the file between the starts. The audit's quote
+# ("four consecutive 1.6 s loads at 135, 202, 214") is wrong about the first two. Both records are about the same lever; a run
+# decides it, and the log cannot (the arms of that A/B were set by a runner this card has not read).
+# Resource timeline of a restart [derived, load.md T2]: NVMe 18.66 GB at 0.85..1.3 GB/s = 13..22 s if the pages are gone (22.0
+# and 18.6 s measured), PCIe 0.7 s, host CPU ~1 s; if the pages stayed, the pool memcpy at 11.7 GB/s = 1.6 s. The wall is the
+# NVMe term, a sum with the rest, one resource.
+# The prediction (the code's): the resident share of the file after one default start has exited is the unreleased bytes:
+# token_embd (Q4_K 151,936 x 2,048 = 175 MB = 0.9 %), the output tensor if the head reads it from the file, the pages at each
+# segment's edges, small tensors: 0..8 % [derived; the byte list is the loader's, not read from this file's tensor table].
+# A second default start then reads the file again: load >= 12 s (the two cold loads measured 18.6 and 22.0 s). With the lever
+# at 0 the share stays ~100 % and the load ~1.6 s.
+# Wall [derived]: 3 starts of generate_qwen3moe (default, default, lever 0) each ~22 s cold or 1.6 s warm + 1 token + exit,
+# the residency read each ~2 s (4.5 M pages): 1..2 min. V4.1: the same read of its shards after M1's profile exits, no run of its own: seconds.
+kind: profile
+question: after a `place=a` start of qwen3moe (one card, no host set), what share of its file stays in the page cache, and does
+  the next start read the drive?
+term: page-cache resident share (mincore) in percent of the file's bytes (qwen3moe Q4_K_M, /models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-
+  Q4_K_M.gguf, 18.66 GB) right after a default start of generate_qwen3moe --tokens <1 id> -n 1 exited, A6000, BLOOMERY_CARD_DONTNEED
+  unset
+unit: %
+predict: 0..8
+condition: one lease through lease-hold.sh with this card, the A6000 the one visible card (BLOOMERY_BOX_ENV carries TIMING_GPU and
+  CUDA_VISIBLE_DEVICES = its UUID: lease-hold.sh does not source timing-card.sh), nothing else
+  reading /models (the lease holds the machine; the page cache state is part of the record, so residency is read before the
+  first start too); the box has no fincore or vmtouch [measured 2026-10-29], so the reader is the page cache's own answer,
+  mincore(2) over a read-only mapping of the file through python3 (checked once on a 64 MiB scratch file: 100 percent after a
+  write, 0 percent after posix_fadvise(DONTNEED), before it reads the model); sequence: residency, start 1, residency, start 2,
+  residency, then BLOOMERY_CARD_DONTNEED=0 start 3, residency, and start 4 the same (the warm control: a file the lever kept loads in
+  ~1.6 s, which separates the drop from a page cache under pressure); each start prints its own `load ... in X s` and `place unset
+  place=a why=one card` (else the run is void). V4.1: the same reader over every shard of the V4.1 file right after the M1
+  profile exits (shard list from the run's `load` line), read beside the qwen3moe rows
+decide-in: under 8 percent resident and the next start's load 12 s or more: the drop holds on a no-host-set place=a start and
+  R9's premise stands: the 22 warm loads of ab-q3moe-4.log were warmed by something else (read that runner's preheat or warm-up
+  step before claiming R9), then open R9 (resolve the default from the plan, restart -11 .. -18 s for the no-host-set models)
+decide-below: nothing below 0 percent exists; a reading of 0 is the band's lower edge and decides as in-band
+decide-above: over 8 percent resident, or the second start loads in 2 s or less: the drop does not evict this file on this
+  path (a mapping held, or the pages re-read): drop R9, the 1.6 s loads are the default, and file the doc line of
+  BLOOMERY_CARD_DONTNEED as wrong for no-host-set loads
