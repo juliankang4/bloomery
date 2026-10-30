@@ -1124,7 +1124,7 @@ mod tests {
     ) -> Result<folder::Planning<Step>, folder::Error> {
         let checkpoint = Checkpoint::parse(config)?;
         let quant = Config::parse(config, Some(&json(HF_QUANT))).unwrap();
-        folder::plan_tensors(&checkpoint, &quant, entries, q8)
+        folder::plan_tensors(&checkpoint, &quant, entries, q8, folder::Keep::InPlace)
     }
 
     /// The refusal of `entries` read under `config`.

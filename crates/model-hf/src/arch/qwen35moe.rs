@@ -12,8 +12,9 @@
 //! to tiled (`_LinearAttentionVReorderBase`; an MLX file keeps HF's grouped order), the indexer's
 //! joint q and k projection split by rows, `+1` on the zero-centred gammas of an HF-native
 //! checkpoint (an MLX file's carry it already), and `A_log` as `-exp`. The routed experts of a
-//! projection stack by expert id (Qwen3.6's arrive stacked, one `switch_mlp` tensor), and the PLE
-//! table's parts concatenate in part order. Qwen3.8's target and next-token layers share the
+//! projection stack by expert id (Qwen3.6's arrive stacked, one `switch_mlp` tensor), a load
+//! reading a stack of plain NVFP4 experts where the folder stores it, as NVFP4 rows planes
+//! ([`Origin::Stack`]), and the PLE table's parts concatenate in part order. Qwen3.8's target and next-token layers share the
 //! layer map; Qwen3.6's next-token layers (`mtp.*`) and every family's vision tower are left out.
 //! The dense families' next-token layer is left out by the name of each of its tensors
 //! ([`dense_next_token`]) and refused by name as a draft when a folder holds one; any other name
@@ -22,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use gguf::Value;
+use gguf::{GgmlType, StackLayout, Value};
 use hf::modelopt::{Normal, Plain, Use};
 use hf::schema::{self, Fields, Rule, Rule::*, Type};
 use serde_json::Value as Json;
@@ -1466,7 +1467,10 @@ fn map<'a>(
                 role: Use::Matrix(Plain::Q8_0),
                 steps: vec![],
                 dims: dims.into_iter().map(|d| d as u64).collect(),
-                origin: Origin::Made,
+                origin: Origin::Stack {
+                    ty: GgmlType::NVFP4_ROWS,
+                    layout: StackLayout::Planes,
+                },
             },
         )?;
     }
@@ -2142,6 +2146,99 @@ mod tests {
             "model.language_model.layers.3.mlp.experts.7.down_proj.weight"
         );
         assert_eq!(mapped["per_layer_token_embd.weight"].sources.len(), 128);
+    }
+
+    /// nvidia/Qwen3.8-Flash-Next-NVFP4's routed stacks (layers 0, 1 and 3) are kept for a load
+    /// where the folder stores them, as NVFP4 rows planes with a tensor scale an expert; the
+    /// split `prepare` writes makes them NVFP4, and so does a load of the stacks stored with
+    /// `csf` block scales (FP4-Local's encoding), a form the host does not read in place.
+    /// FAIL-first: the map makes every stack, so a load keeps none.
+    #[test]
+    fn a_load_keeps_plain_nvfp4_stacks_where_the_folder_stores_them() {
+        use crate::folder::Make;
+        let plain = entries(&json(
+            "checkpoint-headers/qwen3.8-flash-next-nvfp4-layers-0-1-3.tensors.json.gz",
+        ));
+        let hq = json("quant-configs/nvidia__Qwen3.8-Flash-Next-NVFP4__hf_quant_config.json.gz");
+        let mut csf_hq = hq.clone();
+        for (module, entry) in csf_hq["quantization"]["quantized_layers"]
+            .as_object_mut()
+            .unwrap()
+        {
+            if module.starts_with("model.language_model.layers.") && module.ends_with(".experts") {
+                entry["weight_scale_encoding"] = "csf".into();
+            }
+        }
+        let csf: Entries = plain
+            .iter()
+            .flat_map(|(n, d, s)| match n.strip_suffix(".weight_scale") {
+                Some(stem) if n.contains(".mlp.experts.") => {
+                    let fixed = vec![s[0] / 16, 16 * (1 + s[1] / 2)];
+                    vec![
+                        (
+                            format!("{stem}.weight_scale.nvfp4_csf_fixed"),
+                            Dtype::U8,
+                            fixed,
+                        ),
+                        (
+                            format!("{stem}.weight_scale.nvfp4_csf_exceptions"),
+                            Dtype::U32,
+                            vec![1],
+                        ),
+                    ]
+                }
+                _ => vec![(n.clone(), *d, s.clone())],
+            })
+            .collect();
+        let checkpoint = Checkpoint::parse(&config()).unwrap();
+        let stacks = |hq: &Json, entries: &Entries, keep| {
+            let quant = Config::parse(&config(), Some(hq)).unwrap();
+            let (_, planned) = folder::plan_tensors(&checkpoint, &quant, entries, false, keep)
+                .unwrap_or_else(|e| panic!("{e}"));
+            planned
+                .into_iter()
+                .filter(|p| p.decl.name.ends_with("_exps.weight"))
+                .map(|p| {
+                    let Make::Tensor(m) = p.make else {
+                        panic!("{}: a stack is a tensor", p.decl.name)
+                    };
+                    (p.decl.name, GgmlType::from_u32(p.decl.type_id), m.origin)
+                })
+                .collect::<Vec<_>>()
+        };
+        let kept = Origin::Stack {
+            ty: GgmlType::NVFP4_ROWS,
+            layout: StackLayout::Planes,
+        };
+        for (what, hq, entries, keep, want) in [
+            (
+                "load",
+                &hq,
+                &plain,
+                folder::Keep::InPlace,
+                (GgmlType::NVFP4_ROWS, kept),
+            ),
+            (
+                "split",
+                &hq,
+                &plain,
+                folder::Keep::Made,
+                (GgmlType::NVFP4, Origin::Made),
+            ),
+            (
+                "csf load",
+                &csf_hq,
+                &csf,
+                folder::Keep::InPlace,
+                (GgmlType::NVFP4, Origin::Made),
+            ),
+        ] {
+            let got = stacks(hq, entries, keep);
+            assert_eq!(got.len(), 9, "{what}: three layers' gate, up and down");
+            for (name, ty, origin) in got {
+                assert_eq!((ty, origin), want, "{what}: {name}");
+            }
+        }
     }
 
     fn constant(part: &str) -> Result<Vec<i64>, Error> {
@@ -2913,6 +3010,7 @@ mod tests {
             &Config::parse(&config, None).unwrap(),
             &entries,
             false,
+            folder::Keep::InPlace,
         )
         .unwrap();
         assert!(plan.refused.is_empty(), "{:?}", plan.refused);
@@ -2999,6 +3097,7 @@ mod tests {
             &Config::parse(&real, None).unwrap(),
             &entries,
             false,
+            folder::Keep::InPlace,
         )
         .unwrap();
         assert!(plan.refused.is_empty(), "{:?}", plan.refused);
@@ -3098,7 +3197,7 @@ mod tests {
         let refuse = |edit: &dyn Fn(&mut Entries)| {
             let mut e = base.clone();
             edit(&mut e);
-            folder::plan_tensors(&checkpoint, &quant, &e, false)
+            folder::plan_tensors(&checkpoint, &quant, &e, false, folder::Keep::InPlace)
                 .err()
                 .expect("refused")
                 .to_string()

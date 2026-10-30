@@ -49,6 +49,7 @@ fn planning(
         &Config::parse(config, None).unwrap(),
         entries,
         false,
+        folder::Keep::InPlace,
     )
 }
 

@@ -208,20 +208,32 @@ mod tests {
     /// IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M or NVFP4 gate and up of one type with a Q5_1, Q8_0, IQ4_NL or NVFP4 down is
     /// a card layer, and the refusal's text lists those types; a Q4_K
     /// down (a down type its gate·up reads) and a Q6_K one (a type no part
-    /// reads) are refused. Mutant: Qwen3.6's down arm for Qwen3.8's — the
-    /// Q5_1 and IQ4_NL arms are refused, the Q4_K one passes.
+    /// reads) are refused. A checkpoint folder's NVFP4 rows layer is a card
+    /// layer whose leg runs NVFP4's planes (`card38::leg_types`), every other
+    /// its listed types. Mutants: Qwen3.6's down arm for Qwen3.8's — the
+    /// Q5_1 and IQ4_NL arms are refused, the Q4_K one passes; the listed
+    /// types passed to the leg as they are — the rows layer runs NVFP4_ROWS.
     #[test]
     fn qwen38s_leg_keeps_its_table() {
-        use GgmlType::{IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, NVFP4, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0};
-        for ok in [
-            [Q4_K, Q4_K, Q5_1],
-            [Q5_K, Q5_K, Q8_0],
-            [IQ3_XXS, IQ3_XXS, IQ4_NL],
-            [IQ3_S, IQ3_S, Q5_1],
-            [IQ4_XS, IQ4_XS, Q8_0],
-            [NVFP4, NVFP4, NVFP4],
+        use GgmlType::{
+            IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, NVFP4, NVFP4_ROWS, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0,
+        };
+        for (ok, card) in [
+            ([Q4_K, Q4_K, Q5_1], (Q4_K, Q5_1)),
+            ([Q5_K, Q5_K, Q8_0], (Q5_K, Q8_0)),
+            ([IQ3_XXS, IQ3_XXS, IQ4_NL], (IQ3_XXS, IQ4_NL)),
+            ([IQ3_S, IQ3_S, Q5_1], (IQ3_S, Q5_1)),
+            ([IQ4_XS, IQ4_XS, Q8_0], (IQ4_XS, Q8_0)),
+            ([NVFP4, NVFP4, NVFP4], (NVFP4, NVFP4)),
+            ([NVFP4_ROWS, NVFP4_ROWS, NVFP4_ROWS], (NVFP4, NVFP4)),
         ] {
             assert_eq!(layer::<Leg38>(ok), Ok(()), "{ok:?}");
+            let table = stacks::<Leg38>(&model(1, |_| ok), |_| Ok(true)).unwrap();
+            assert_eq!(
+                super::super::card38::leg_types(&table, 0).unwrap(),
+                card,
+                "{ok:?}"
+            );
         }
         for bad in [
             [Q4_K, Q4_K, Q4_K],

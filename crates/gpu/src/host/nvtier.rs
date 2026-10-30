@@ -1871,7 +1871,9 @@ impl NvTier {
     /// a build without a placed load passes [`ArenaGrant::whole`] of the
     /// plan's), the same count a paged layer. Refused by name: a layer whose host segment's ids are
     /// not one run, whose routed stacks are not three rows the split holds,
-    /// a stack whose experts do not cut its bytes evenly, a stack in a shard
+    /// a stack no one run of its file holds ([`gguf::Split::run`]: a stack
+    /// a checkpoint folder locates matrix by matrix), a stack whose experts
+    /// do not cut its bytes evenly, a stack in a shard
     /// that is not its file's mapping ([`gguf::Gguf::file_backed`]: a drop
     /// would zero a copy), and a budget whose carve falls under the
     /// arena's floor ([`ArenaFloor::of`] at the served column: a plan whose
@@ -1983,6 +1985,9 @@ impl NvTier {
                 let (shard, info) = split
                     .find(name)
                     .ok_or(GpuError::shape(WHAT, format!("{name}: not in the split")))?;
+                let (_, run) = split
+                    .run(name)
+                    .map_err(|e| GpuError::shape(WHAT, format!("{e}: the NVMe arena reads one")))?;
                 let gguf = split.shard(shard).ok_or(GpuError::shape(
                     WHAT,
                     format!("{name}: shard {shard} is not there"),
@@ -2025,9 +2030,8 @@ impl NvTier {
                     ));
                 }
                 lens[p] = per;
-                let base = gguf.data_base() + info.offset;
                 for id in 0..n as u32 {
-                    let at = base + u64::from(id) * per as u64;
+                    let at = run.start + u64::from(id) * per as u64;
                     let (_, _, need) = aligned_span(at, per as u64);
                     parts[id as usize].push(PartRange {
                         at,

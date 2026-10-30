@@ -369,15 +369,20 @@ pub(super) fn leg_layers(
     Ok(per)
 }
 
-/// Layer `l`'s gate·up and down types as `stacks` lists them, refused by
-/// name unless the card leg runs them ([`accepts::leg_runs`] of Qwen3.8's
-/// program: the table checked every layer the plan cards when it was built).
-fn leg_types(stacks: &Qwen38Stacks, l: usize) -> Result<(GgmlType, GgmlType), GpuError> {
+/// Layer `l`'s gate·up and down types as the card holds the stacks `stacks`
+/// lists, refused by name unless the card leg runs them ([`accepts::leg_runs`]
+/// of Qwen3.8's program: the table checked every layer the plan cards when it
+/// was built). A checkpoint folder's NVFP4 rows load as NVFP4's planes.
+pub(super) fn leg_types(stacks: &Qwen38Stacks, l: usize) -> Result<(GgmlType, GgmlType), GpuError> {
+    let held = |ty| match ty {
+        GgmlType::NVFP4_ROWS => GgmlType::NVFP4,
+        ty => ty,
+    };
     match stacks.pair(l) {
-        Some(p @ (gate_up, down))
+        Some((gate_up, down))
             if accepts::leg_runs(Program::Qwen38Body, [gate_up, gate_up, down]) == Some(true) =>
         {
-            Ok(p)
+            Ok((held(gate_up), held(down)))
         }
         other => Err(GpuError::shape(
             WHAT,

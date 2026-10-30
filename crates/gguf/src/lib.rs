@@ -1072,6 +1072,22 @@ impl Split {
         self.shards[shard].data(info)
     }
 
+    /// The run of file bytes tensor `name` keeps: its shard and file offsets ([`Place::File`]). A
+    /// stack or a made tensor of a located split is refused by name, as [`Split::data`] refuses
+    /// it.
+    pub fn run(&self, name: &str) -> Result<(usize, Range<u64>), LoadError> {
+        let unread = |what| LoadError::Unread {
+            name: name.to_string(),
+            what,
+        };
+        match self.places.get(name) {
+            Some(Place::File { shard, range }) => Ok((*shard, range.clone())),
+            Some(Place::Stack { .. }) => Err(unread(UNREAD_STACK)),
+            Some(Place::Made) => Err(unread(UNREAD_MADE)),
+            None => Err(unread("is not a tensor of the split")),
+        }
+    }
+
     /// Matrix `e` of the stack `name` of a located split ([`Place::Stack`]): its runs where the
     /// file keeps them.
     pub fn matrix(&self, name: &str, e: usize) -> Result<StackMatrix<'_>, LoadError> {
@@ -2685,9 +2701,10 @@ mod located_tests {
     /// A two-file folder's split holds each file tensor's bytes where the file keeps them, reads
     /// a stack's matrices out of order with their block scales next to their codes, and a
     /// stack's runs each in its own file, and refuses a made tensor and a stack as one run by
-    /// name. A header alone, for the same header, ends every read in `OutOfBounds`. FAIL-first:
-    /// runs read from the stack's first file, or checked for overlap across files, read or
-    /// refuse `t.weight`, whose two files hold a run at the same offset.
+    /// name, as bytes and as a file run. A header alone, for the same header, ends every read in
+    /// `OutOfBounds`. FAIL-first: runs read from the stack's first file, or checked for overlap
+    /// across files, read or refuse `t.weight`, whose two files hold a run at the same offset; a
+    /// file run taken from the header's offset (`u64::MAX` for a stack) is not refused.
     #[test]
     fn a_located_split_reads_the_files_bytes_in_place() {
         let d = dir("reads");
@@ -2705,6 +2722,7 @@ mod located_tests {
         assert_eq!((shard, info.offset), (1, 56));
         assert_eq!(s.shard(shard).unwrap().data_base() + info.offset, 56);
         assert_eq!(s.shard(shard).unwrap().data(info).unwrap(), &b[56..64]);
+        assert_eq!(s.run("g.weight").unwrap(), (1, 56..64));
         // Adjacent: each matrix's scales begin where its codes end.
         for (e, at) in [64usize, 0, 16].into_iter().enumerate() {
             let m = s.matrix("s.weight", e).unwrap();
@@ -2723,6 +2741,10 @@ mod located_tests {
         named(s.data("s.weight"), &["s.weight", "stack"]);
         named(s.data("t.weight"), &["t.weight", "stack"]);
         named(s.data("absent"), &["absent", "not a tensor"]);
+        named(s.run("m.weight"), &["m.weight", "made"]);
+        named(s.run("s.weight"), &["s.weight", "stack"]);
+        named(s.run("t.weight"), &["t.weight", "stack"]);
+        named(s.run("absent"), &["absent", "not a tensor"]);
         let (shard, info) = s.find("m.weight").unwrap();
         named(s.shard(shard).unwrap().data(info), &["m.weight", "made"]);
         named(s.matrix("s.weight", 3), &["s.weight", "no matrix"]);

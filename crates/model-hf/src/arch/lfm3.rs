@@ -652,6 +652,7 @@ mod tests {
             &Config::parse(config, None).unwrap(),
             entries,
             false,
+            folder::Keep::InPlace,
         )
     }
 

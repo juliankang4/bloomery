@@ -10,7 +10,7 @@ use gguf::{Split, Value};
 use hf::quant_config::{Config, Plan};
 use safetensors::{Dtype, Folder};
 
-pub use crate::folder::{Error, served_as_hf};
+pub use crate::folder::{Error, Keep, served_as_hf};
 
 use super::{Checkpoint, Step};
 
@@ -27,8 +27,9 @@ pub fn plan_tensors(
     config: &Config,
     entries: &[(String, Dtype, Vec<usize>)],
     q8: bool,
+    keep: Keep,
 ) -> Result<(Plan, Vec<Planned>), Error> {
-    let planning = crate::folder::plan_tensors(checkpoint, config, entries, q8)?;
+    let planning = crate::folder::plan_tensors(checkpoint, config, entries, q8, keep)?;
     Ok((planning.plan, planning.planned))
 }
 
@@ -71,6 +72,7 @@ pub(super) fn mtp(
         )?,
         false,
         &HashMap::new(),
+        Keep::Made,
     )?;
     let header = draft_header(
         dir,
