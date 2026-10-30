@@ -50,7 +50,10 @@
 //!    and leaves the others clean;
 //!    38 columns on a 37-column scratch refused by name, and — before any
 //!    launch, the streams as they went in — planes of another shape and a
-//!    one-expert table filled for fewer slots than the mix's columns.
+//!    one-expert table filled for fewer slots than the mix's columns; on a
+//!    scratch made for BF16 normed streams, over all 37 columns, a site that
+//!    norms into BF16 words the full scratch's bits and one that norms into
+//!    F32 values refused by name before any launch.
 //! 9. form: on a dense MMA card the BF16 site's wide mix over 37 columns,
 //!    asked for the BF16 form of `mixed` and, on a native block-scaled
 //!    build, its MXFP8 form, into a scratch whose every column an earlier
@@ -1146,7 +1149,7 @@ mod gate {
                 g32: Gemm32Kernels::load(c.gpu.context())?,
                 gemm: GemmKernels::load(c.gpu.context())?,
                 route: GemmRoute::new(c.gpu.stream(), WIDE_COLS, 1)?,
-                scratch: HcWideScratch::new(c.gpu.stream(), c.geo, WIDE_COLS)?,
+                scratch: HcWideScratch::new(c.gpu.stream(), c.geo, WIDE_COLS, false)?,
             })
         }
     }
@@ -2142,6 +2145,47 @@ mod gate {
             println!(
                 "wide[refuse:{name}] m={m}, the table filled for {fill} -> {}; the streams \
                  as they went in: {kept} (want an error naming {want:?}) {}",
+                match &got {
+                    Ok(()) => "accepted".to_owned(),
+                    Err(e) => e.to_string(),
+                },
+                verdict(p)
+            );
+        }
+        // A scratch made for BF16 normed streams, over every column: a site
+        // that norms into BF16 words mixes on it bit for bit as on the full
+        // scratch; one that norms into F32 values, past the half the scratch
+        // holds in F32, is refused before any launch, the streams as they
+        // went in.
+        let mut half = HcWideScratch::new(c.gpu.stream(), c.geo, WIDE_COLS, true)?;
+        let cols = WIDE_COLS;
+        if xn_bf16(c, site)? {
+            let res = activations(WIDE, cols, 0x3a07);
+            let full = wide_mix(c, &mut w, site, true, &res, Pre::Plain, cols)?;
+            std::mem::swap(&mut w.scratch, &mut half);
+            let got = wide_mix(c, &mut w, site, true, &res, Pre::Plain, cols);
+            std::mem::swap(&mut w.scratch, &mut half);
+            let got = got?;
+            let p = bits_equal(&got.mixed, &full.mixed)
+                && bits_equal(&got.res, &full.res)
+                && bits_equal(&got.xn, &full.xn)
+                && got.fault == full.fault;
+            ok &= p;
+            println!(
+                "wide[bf16_scratch] m={cols} the half scratch's mix the full one's bits {}",
+                verdict(p)
+            );
+        } else {
+            std::mem::swap(&mut w.scratch, &mut half);
+            let got = wide_try(c, &mut w, site.weights(true), (cols, cols), None);
+            std::mem::swap(&mut w.scratch, &mut half);
+            let (got, kept) = got?;
+            let want = "made for BF16 words";
+            let p = kept && matches!(&got, Err(e) if e.to_string().contains(want));
+            ok &= p;
+            println!(
+                "wide[refuse:bf16_scratch] m={cols} an F32 norm on a BF16 scratch -> {}; the \
+                 streams as they went in: {kept} (want an error naming {want:?}) {}",
                 match &got {
                     Ok(()) => "accepted".to_owned(),
                     Err(e) => e.to_string(),

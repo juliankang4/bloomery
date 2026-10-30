@@ -199,9 +199,10 @@ fn indexer_projection(t: &ModelTensor) -> bool {
 }
 
 /// The file's cache bytes a layer (`qwen35moe::place::KvLayout`) [derived
-/// from `runtime::stores`]: a delta layer's state in four lanes of 48 heads
-/// of 128 × 128 f32 with a u32 stamp each, its conv ring of 11 rows of
-/// 10,240 f32 and its carry of 124,324 f32, 13,530,784 B; the PLE layer's
+/// from `runtime::stores`]: a delta layer's state in one lane of 48 heads
+/// of 128 × 128 f32 with its u32 stamp, its verify record of
+/// `DELTA_VERIFY_ROWS` rows of 48 · 3 · 128 f32, its conv ring of 11 rows
+/// of 10,240 f32 and its carry of 124,324 f32, 4,388,500 B; the PLE layer's
 /// ring beside it, 17 rows of 4 · 2,560 f32; a selecting layer, every
 /// fourth, its K and V, 2,048 B a position, a pooled key, 256 B a pool of
 /// four, and its raw index key ring of 11 rows of 128 f16, 2,816 B; and
@@ -215,7 +216,7 @@ impl KvBytes for Kv38 {
         let own = if layer % 4 == 3 {
             ctx_max * 2048 + ctx_max.div_ceil(4) * 256 + 11 * 128 * 2
         } else {
-            13_530_784
+            4_388_500
         };
         own + ple
     }
@@ -278,7 +279,10 @@ fn stage(spec: CardSpec) -> Card {
         // ubatch arena's flash rows leave 24,576 [derived: 4,096 · (644 − 24,576) = −98,025,472].
         // PIN(2026-10-28): 3,020,115,968 B: the ubatch arena's query, β·α and one-row indexer rows
         // leave 27,008 B per ubatch position [derived: 4,096 · 27,008 = 110,624,768].
-        scratch_bytes: 3_020_115_968,
+        // PIN(2026-10-30): 2,942,128,128 B: the PLE site's NVFP4 planes add 1,440 B and the ubatch
+        // arena's BF16 stream buffer takes 20,480 B per ubatch position [derived: 4,096 · (1,440 −
+        // 20,480) = −77,987,840].
+        scratch_bytes: 2_942_128_128,
         margin_bytes: spec.margin(),
         granule_bytes: GRANULE,
         free_bytes: spec.free_bytes,
@@ -512,8 +516,8 @@ const ROW_ROOM: u64 = 536_870_912;
 /// residency rule is `off`, no churn pool beside it: no
 /// host expert is left to move to the card. The restated terms first give
 /// an A6000 plan at the box gate's context and ubatch, its `CARD_PLANS` row:
-/// 263 experts on the first 30 layers, 262 on the rest, 39,505,100,800 B of
-/// experts and 593,981,952 B of rounding.
+/// 267 experts on the first 28 layers, 266 on the rest, 40,100,659,200 B of
+/// experts and 524,808,704 B of rounding.
 #[test]
 fn q4_on_one_96gb_card_holds_every_routed_expert() {
     let q4 = model(false);
@@ -551,8 +555,14 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
     // was 264 on the first 17 and 39,615,590,400 B. A selecting layer's raw index keys leave its
     // positional bytes for a ring of 11 rows (`Kv38`), 12 · (256 · 4,096 − 2,816) = 12,549,120 B at
     // 4,096, which the spread fills with 3 experts of 3,072,000 B [derived: this plan].
+    // PIN(2026-10-30): 267 on the first 28 layers and 266 on the rest, 40,100,659,200 B and
+    // 524,808,704 B of rounding, the box gate's CARD_PLANS row; was 264 on the first 20 and
+    // 39,624,806,400 B. Each of the 36 delta layers keeps one state lane and a verify record
+    // (`Kv38`, 4,388,500 B, was 13,530,784 B of four lanes), and the stage's scratch is the box
+    // gate's CARD_ROUTE_SCRATCH row (`stage`), 407,110,064 B more room in all, which the spread
+    // fills with experts and their granules [derived: this plan].
     let want: Vec<u64> = (0..LAYERS)
-        .map(|l| if l < 20 { 264 } else { 263 })
+        .map(|l| if l < 28 { 267 } else { 266 })
         .collect();
     assert_eq!(
         (
@@ -560,7 +570,7 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
             a6000.cards[0].expert_bytes,
             a6000.cards[0].rounding_bytes
         ),
-        (&want, 39_624_806_400, 595_911_168)
+        (&want, 40_100_659_200, 524_808_704)
     );
 
     let one = picked("a", &census_96(1))[0];
@@ -710,9 +720,14 @@ fn q3_routes_onto_cards_like_the_q4_file() {
     // needs; was 41,688,243,200, 70,488,381,440 and 42,225,114,112 B. A selecting layer's raw index
     // keys leave its positional bytes for a ring of 11 rows (`Kv38`), 12,549,120 B of the card at
     // 4,096, which the spread fills with experts and their granules [derived: the same spread].
+    // PIN(2026-10-30): 378,726,400 B more experts on the card, off the host and both needs; was
+    // 41,662,131,200, 70,462,269,440 and 42,199,002,112 B. The delta layers' one state lane and
+    // verify record (`Kv38`) and the box gate's stage scratch (`stage`) leave 407,110,064 B of the
+    // card at 8,192, which the spread fills with experts and their granules [derived: the same
+    // spread].
     assert_eq!(
         (host.host.expert_bytes, host_need, nvme_need),
-        (41_662_131_200, 70_462_269_440, 42_199_002_112)
+        (41_283_404_800, 70_083_543_040, 41_820_275_712)
     );
     assert_eq!(nvme_need + PLE_TABLE, host_need + ROW_ROOM);
     assert!(nvme_need <= SCOPE_61G && SCOPE_61G < host_need);
@@ -809,12 +824,12 @@ fn two_slots_at_4096_hold_every_routed_expert() {
     assert_eq!((bytes, n_l, host), (Q4_ROUTED, vec![EXPERTS; LAYERS], 0));
 }
 
-/// 285,696 positions a slot on one such card, two sequences and no draft,
+/// 300,032 positions a slot on one such card, two sequences and no draft,
 /// is the last step of 256 whose plan holds at most the plan's margin fewer
 /// card expert bytes than the plan at 4,096
 /// ([`two_slots_at_4096_hold_every_routed_expert`]: every routed byte); the
-/// next step passes it. There 504 or 505 experts a layer stay on the card
-/// and 337 go to the host.
+/// next step passes it. There 505 experts a layer stay on the card and 336
+/// go to the host.
 // PIN(2026-10-21): 252,928 positions (was 252,416), 505 or 506 experts a layer with one at 506 and
 // 335 on the host (was 504 or 505 with 47 at 505 and 337). The card keeps the 24 indexer
 // projections in their words (`indexer_projection`): 37,748,736 B of room, 664 positions of the two
@@ -846,11 +861,17 @@ fn two_slots_at_4096_hold_every_routed_expert() {
 // of 11 rows (`Kv38`): 3,072 B a position a slot, the two slots' cache and the stage's rope rows
 // 50,944 B a position (was 57,088), and the boundary moved 120 steps of 256 [derived: the plan's
 // own boundary, 285,696 − 254,976 = 30,720].
+// PIN(2026-10-30): 300,032 positions (was 285,696), 505 experts on every layer and 336 on the host
+// (was 504 or 505 with 47 at 505 and 337). Each sequence's 36 delta layers keep one state lane and
+// a verify record (`Kv38`, 9,142,284 B less a layer) and the stage's scratch is the box gate's
+// CARD_ROUTE_SCRATCH row (`stage`, 77,987,840 B less): 736,232,288 B of room, 14,451 positions of
+// 50,944 B, and the boundary moved 56 steps of 256 [derived: the plan's own boundary, 300,032 −
+// 285,696 = 14,336].
 #[test]
-fn two_slots_at_285696_stay_within_the_margin() {
-    let (at, n_l, host) = two_slots(285_696);
+fn two_slots_at_300032_stay_within_the_margin() {
+    let (at, n_l, host) = two_slots(300_032);
     assert!(Q4_ROUTED - at <= MARGIN);
-    let (next, _, _) = two_slots(285_696 + 256);
+    let (next, _, _) = two_slots(300_032 + 256);
     assert!(Q4_ROUTED - next > MARGIN);
     let (lo, hi) = (
         *n_l.iter().min().expect("layers"),
@@ -858,7 +879,7 @@ fn two_slots_at_285696_stay_within_the_margin() {
     );
     assert_eq!(
         (lo, hi, n_l.iter().filter(|&&n| n == hi).count(), host),
-        (504, 505, 47, 337)
+        (505, 505, 48, 336)
     );
 }
 
@@ -1395,11 +1416,13 @@ fn a_paged_stack_adds_nothing_to_the_churn_pool() {
             // PIN(2026-10-25): 93 (was 92): the ubatch arena's flash rows
             // leave the stage's scratch, 100,663,296 B at 4,096 [derived:
             // this plan].
+            // PIN(2026-10-30): 95 (was 93): the delta layers' one state lane and verify record
+            // (`Kv38`) and the box gate's stage scratch (`stage`) [derived: this plan].
             assert_eq!(
                 pick,
                 Residency38Pick {
                     pinned: Some(0),
-                    why: Residency38Why::PlanA { fewest: 93 },
+                    why: Residency38Why::PlanA { fewest: 95 },
                 },
                 "room {room}: the unset rule on the plan that pages through an arena"
             );

@@ -1629,21 +1629,26 @@ pub(super) struct Wide38 {
 /// site that reads the rows copies on the dense MMA tile
 /// ([`site::reads_form`]). The BF16 form is the model-width rows' alone,
 /// whose rounding the ubatch's BF16 sites share; an MXFP8 site's W8A8
-/// product reads its rows' MXFP8 form wherever they are.
+/// product reads its rows' MXFP8 form wherever they are. `hc_bf16`: every HC
+/// mix (each layer's two and the head's) has a BF16 down on a dense MMA card,
+/// so the wide mixes norm their streams into BF16 words alone
+/// ([`HcWideScratch::new`]).
 pub(super) struct WideForms {
     hid: Vec<MmaForm>,
     attn: Vec<MmaForm>,
     ff: Vec<MmaForm>,
+    hc_bf16: bool,
 }
 
 impl WideForms {
-    /// The forms the sites of `plans` read in `w`, none unless `reserved`.
+    /// The forms the sites of `plans` read in `w`, none unless `reserved`,
+    /// and whether the HC mixes norm into BF16 words alone on `gpu`'s card.
     pub(super) fn of(
         gpu: &crate::Gpu,
         w: &crate::weights::Weights,
         plans: &[Layer38],
         reserved: bool,
-    ) -> WideForms {
+    ) -> Result<WideForms, GpuError> {
         let read = |sites: &[&str], forms: &[MmaForm]| -> Vec<MmaForm> {
             let read = |f: &MmaForm| reserved && site::reads_form(gpu, w, sites, *f);
             forms.iter().copied().filter(read).collect()
@@ -1651,11 +1656,20 @@ impl WideForms {
         let hid: Vec<&str> = plans.iter().flat_map(Layer38::hidden_sites).collect();
         let attn: Vec<&str> = plans.iter().map(Layer38::attn_site).collect();
         let ff: Vec<&str> = plans.iter().map(|p| &*p.ffn.down_sh).collect();
-        WideForms {
+        let head = head_site();
+        let bf16_down =
+            |s: &HcSite| matches!(HcMatrix::of(w, WHAT, &s.down), Ok(HcMatrix::Bf16(_)));
+        let hc_bf16 = crate::dense_mma(gpu.context())?
+            && bf16_down(&head)
+            && plans
+                .iter()
+                .all(|p| bf16_down(&p.attn_hc) && bf16_down(&p.ffn_hc));
+        Ok(WideForms {
             hid: read(&hid, &[MmaForm::Bf16, MmaForm::Mxfp8]),
             attn: read(&attn, &[MmaForm::Mxfp8]),
             ff: read(&ff, &[MmaForm::Mxfp8]),
-        }
+            hc_bf16,
+        })
     }
 }
 
@@ -1710,7 +1724,7 @@ impl Wide38 {
             act_hid: act_with(stream, (rows, geo::HIDDEN), &forms.hid)?,
             act_attn: act_with(stream, (rows, geo::ATTN), &forms.attn)?,
             act_ff: act_with(stream, (rows, geo::FF), &forms.ff)?,
-            hc: HcWideScratch::new(stream, geometry, rows)?,
+            hc: HcWideScratch::new(stream, geometry, rows, forms.hc_bf16)?,
             ids: DeviceBuffer::zeroed(stream, rows * slots)?,
             weights: DeviceBuffer::zeroed(stream, rows * slots)?,
             taps: None,

@@ -310,10 +310,10 @@ pub(super) struct Arena38 {
     /// The residual streams, `[rows][STREAMS][HIDDEN]`, in two buffers: the
     /// PLE site writes the streams into the other one, and the walk goes on
     /// from there; a walk leaves its last streams in buffer [`final_res`].
-    /// A ubatch walk carries its streams as BF16 values in the first
-    /// `rows·STREAMS·HIDDEN` halfwords of the other buffer, and writes F32
-    /// values into buffer [`final_res`] only where a PLE site reads them and
-    /// where its last combine leaves its last streams.
+    /// A ubatch walk carries its streams as BF16 values in the other buffer,
+    /// which its arena allocates at `rows·STREAMS·HIDDEN` halfwords, and
+    /// writes F32 values into buffer [`final_res`] only where a PLE site
+    /// reads them and where its last combine leaves its last streams.
     pub(super) res: [DeviceBuffer<f32>; 2],
     /// A mix's output (the mixer's input) and a sub-layer's output (the next
     /// combine's input).
@@ -373,11 +373,12 @@ impl Arena38 {
             ));
         }
         let route = RouterOut::with_tokens(stream, router, rows)?;
-        Arena38::alloc(stream, rows, (rows, rows), route, ctx, by)
+        Arena38::alloc(stream, (rows, None), (rows, rows), route, ctx, by)
     }
 
     /// A ubatch walk's arena for up to `rows` (1..=`most`) tokens over caches
-    /// of `ctx` positions: every token-major buffer for `rows` tokens, the
+    /// of `ctx` positions, `fin` the walk's [`final_res`]: every token-major
+    /// buffer for `rows` tokens (the stream buffer other than `fin` in BF16), the
     /// selection's scratch for a run of [`select_run`] rows (its selecting
     /// rows run in runs of that many) and no selected-flash queries, partials
     /// or output, the router's buffers for [`ROUTE_ROWS`] (it routes in runs of that many).
@@ -385,19 +386,27 @@ impl Arena38 {
     pub(super) fn wide(
         stream: &CudaStream,
         router: RouterDims,
-        rows: usize,
-        most: usize,
+        (rows, most, fin): (usize, usize, usize),
         ctx: usize,
         by: (ByName, ByName),
     ) -> Result<Arena38, GpuError> {
-        if !(1..=most).contains(&rows) {
+        if !(1..=most).contains(&rows) || fin > 1 {
             return Err(GpuError::shape(
                 "qwen4exp::Arena38::wide",
-                format!("{rows} rows; a ubatch arena holds 1..={most}"),
+                format!(
+                    "{rows} rows, final streams {fin}; a ubatch arena holds 1..={most} rows and two stream buffers"
+                ),
             ));
         }
         let route = RouterOut::for_ubatch(stream, router, rows.min(ROUTE_ROWS))?;
-        let mut a = Arena38::alloc(stream, rows, (select_run(rows, ctx), 0), route, ctx, by)?;
+        let mut a = Arena38::alloc(
+            stream,
+            (rows, Some(1 - fin)),
+            (select_run(rows, ctx), 0),
+            route,
+            ctx,
+            by,
+        )?;
         // The prompt form's records take the q·k·v rows' room once the conv
         // has read them (`wide38::gdn`); a short walk needs a little more
         // than the rows.
@@ -408,12 +417,12 @@ impl Arena38 {
         Ok(a)
     }
 
-    /// The buffers for `rows` tokens, the selection's for `sel` rows and the
-    /// selected flash's queries, partials and output for `parts`, the
-    /// router's `route`.
+    /// The buffers for `rows` tokens (stream buffer `bf16`, when named, at a
+    /// halfword a value), the selection's for `sel` rows and the selected
+    /// flash's queries, partials and output for `parts`, the router's `route`.
     fn alloc(
         stream: &CudaStream,
-        rows: usize,
+        (rows, bf16): (usize, Option<usize>),
         (sel, parts): (usize, usize),
         route: RouterOut,
         ctx: usize,
@@ -426,12 +435,14 @@ impl Arena38 {
         let width = qsa::list_width(geo::KEPT);
         let geometry = Geometry::new(geo::STREAMS as u32, geo::RANK as u32, h as u32)
             .map_err(|e| GpuError::shape("qwen4exp::Arena38::new", e.to_string()))?;
+        let streams = |b: usize| f(if bf16 == Some(b) { wide / 2 } else { wide });
+        const _: () = assert!((geo::STREAMS * geo::HIDDEN).is_multiple_of(2));
         Ok(Arena38 {
             rows,
             emb: f(h)?,
             pos: u(1)?,
             n_keys: u(1)?,
-            res: [f(wide)?, f(wide)?],
+            res: [streams(0)?, streams(1)?],
             mixed: f(h)?,
             y: f(h)?,
             hc: HcScratch::new(stream, geometry)?,
@@ -837,7 +848,7 @@ mod tests {
         let w = Weights::default();
         let by = || ByName::for_sites(&gpu, &w, std::iter::empty::<&str>(), 1).expect("no site");
         let bytes = |rows: usize| {
-            let a = Arena38::wide(gpu.stream(), router, rows, rows, 8192, (by(), by()))
+            let a = Arena38::wide(gpu.stream(), router, (rows, rows, 1), 8192, (by(), by()))
                 .expect("a ubatch arena");
             a.bytes() as u64
         };

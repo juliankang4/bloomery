@@ -201,7 +201,10 @@ const LIST_ROWS: u32 = 40_960;
 // fewer.
 // PIN(2026-10-29): the PLE site's NVFP4 planes add 5,898,240 B to the target scratch at 4,096
 // positions: the planner on this tree holds 1,355,553 and 429,553; the pin is one fewer.
-const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_355_552), ("3090", 429_552)];
+// PIN(2026-10-30): the delta layers' one state lane and record (qwen4exp_meta's KV_AT, 329,122,224
+// B) and the ubatch arena's BF16 stream buffer (83,886,080 B at 4,096) leave the room: the planner
+// on this tree holds 1,370,491 and 444,492; the pin is one fewer.
+const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_370_490), ("3090", 444_491)];
 
 /// The plan with the shared draft (`place::PlanInputs::plan_mtp`): on each
 /// card at 4,096 and 32,768 positions the target's plan is `plan`'s field
@@ -301,7 +304,7 @@ fn hw_qwen4exp_mtp_plan() {
                 );
                 let headroom = plain.cards[0].headroom_bytes
                     - i128::from(with.draft_card_bytes() + with.arena_bytes);
-                // PIN(2026-10-25): the drafted plan counts its verify lanes in the
+                // PIN(2026-10-25): the drafted plan counts its verify rows in the
                 // paged arena's floor (`DELTA_VERIFY_ROWS` columns a slot, capped at the
                 // step port), plan() one column; before that the whole host terms
                 // were equal. The rest of the target's plan is still plan()'s.
@@ -544,8 +547,14 @@ fn hw_qwen4exp_mtp_plan() {
 // layers (was 14). The PLE site's NVFP4 planes add 5,898,240 B to the stage's scratch at 4,096
 // positions; the tier keeps its 7,236 experts, its bytes and rounding [derived: the planner on this
 // tree over the pinned headers printed this row].
+// PIN(2026-10-30): the A6000 246 on the first 33 layers and 245 on the rest (was 244 on the first
+// 24 and 243), both cards 397 on the first 21 layers and 396 on the rest (was 395 on the first 12),
+// the tier's 22,676,889,600 B of experts and 146,415,616 B of rounding, as BP_PLAIN. The delta
+// layers' one state lane and record and the BF16 stream buffer leave the room as in
+// qwen4exp_meta's BP_PLAIN; the tier keeps its 7,236 experts [derived: the planner on this tree over
+// the pinned headers printed this row].
 const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
-    (244, 24, 243, 395, 12, 7_236, 22_677_401_600, 145_903_616);
+    (246, 33, 245, 397, 21, 7_236, 22_676_889_600, 146_415_616);
 
 /// Plan (b′) of the Qwen3.8 file with the shared draft (`place::machine_bp`
 /// with `MtpInputs::card_bytes` as the A6000's reserve, `plan_mtp_with`

@@ -1105,7 +1105,7 @@ impl StoreArena {
             pack: f(r * 2 * WIDE)?,
             pack_q: GemmAct32::new(stream, cols, 2 * h)?,
             res: f(r * WIDE)?,
-            hc: HcWideScratch::new(stream, geometry, r)?,
+            hc: HcWideScratch::new(stream, geometry, r, false)?,
             mixed: f(r * h)?,
             mixed_q: GemmAct32::new(stream, r, h)?,
             k: f(r * geo::KV)?,
