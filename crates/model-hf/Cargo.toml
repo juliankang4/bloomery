@@ -19,6 +19,7 @@ bloomery-hf = { path = "../hf" }
 bloomery-levers = { path = "../levers" }
 bloomery-model = { path = "../model" }
 bloomery-safetensors = { path = "../safetensors" }
+bloomery-threads = { path = "../threads" }
 # A whole stored tensor is read past the page cache through the one direct reader.
 bloomery-engram = { path = "../engram" }
 # The `prepare` bin builds serving's tokenizer from the GGUF header it wrote and checks its split.

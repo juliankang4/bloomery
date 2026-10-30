@@ -46,6 +46,9 @@ pub enum Error {
     Tensors(#[from] safetensors::Error),
     #[error(transparent)]
     Direct(#[from] engram::EngramError),
+    /// A direct-read helper could not be placed.
+    #[error(transparent)]
+    Helper(#[from] threads::helper::HelperError),
 }
 
 impl From<TpError> for Error {
@@ -574,10 +577,13 @@ impl<'n> Wholes<'n> {
     /// reader) into one new buffer advised onto huge pages, so the reads take the drive's rate,
     /// fault once each 2 MiB and leave the page cache as it was. A routed stack is thousands of
     /// stored tensors, so each shard is opened, and its direct reads proved, once, and tensors
-    /// whose aligned spans touch in a shard are read as one extent. The extents run shard by
-    /// shard, so a read holds one shard open at a time, however many shards the part spans. `None` only when a shard's
-    /// filesystem refuses direct reads as invalid or unsupported ([`DirectFile::open`]); other
-    /// I/O errors propagate.
+    /// whose aligned spans touch in a shard are read as one extent. A stack's experts are small
+    /// extents apart in their shards, and one synchronous read of each in turn keeps too little
+    /// of the drive busy, so a shard's extents are read over [`READ_LANES`] threads at once
+    /// ([`read_extents`]). The extents run shard by shard, so a read holds one shard open at a
+    /// time, however many shards the part spans. `None` only when a shard's filesystem refuses
+    /// direct reads as invalid or unsupported ([`DirectFile::open`]); other I/O errors propagate,
+    /// the first extent's first.
     fn read(folder: &Folder, names: impl Iterator<Item = &'n str>) -> Result<Option<Self>, Error> {
         let mut spans = names
             .map(|name| Ok((folder.file_range(name)?, name)))
@@ -608,42 +614,49 @@ impl<'n> Wholes<'n> {
         }
         let mut buf = vec![0u8; size + DIRECT_ALIGN];
         os::advise_huge_within(&mut buf);
-        let mut slot = buf.as_ptr().align_offset(DIRECT_ALIGN);
-        let mut open: Option<DirectFile> = None;
-        let mut at = HashMap::new();
-        for Extent {
-            path,
-            start,
-            len: span,
-            held,
-        } in extents
-        {
-            let file = match open.take() {
-                Some(file) if file.path() == path => open.insert(file),
-                held => {
-                    drop(held);
-                    match DirectFile::open(&path) {
-                        Ok(file) => open.insert(file),
-                        Err(
-                            EngramError::OpenDirect { source, .. }
-                            | EngramError::DirectProbe { source, .. },
-                        ) if matches!(
-                            source.kind(),
-                            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
-                        ) =>
-                        {
-                            return Ok(None);
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
+        let first = buf.as_ptr().align_offset(DIRECT_ALIGN);
+        let mut got = Vec::with_capacity(extents.len());
+        let mut rest = &mut buf[first..];
+        for shard in extents.chunk_by(|a, b| a.path == b.path) {
+            let file = match DirectFile::open(&shard[0].path) {
+                Ok(file) => file,
+                Err(
+                    EngramError::OpenDirect { source, .. }
+                    | EngramError::DirectProbe { source, .. },
+                ) if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+                ) =>
+                {
+                    return Ok(None);
                 }
+                Err(e) => return Err(e.into()),
             };
-            let got = file.read_span(&mut buf[slot..slot + span], start)? as u64;
+            let mut windows = Vec::with_capacity(shard.len());
+            for e in shard {
+                let (window, after) = std::mem::take(&mut rest).split_at_mut(e.len);
+                windows.push((e.start, window));
+                rest = after;
+            }
+            got.extend(read_extents(&file, windows)?);
+        }
+        let mut slot = first;
+        let mut at = HashMap::new();
+        for (
+            Extent {
+                path,
+                start,
+                len,
+                held,
+            },
+            got,
+        ) in extents.into_iter().zip(got)
+        {
             for (name, range) in held {
-                if got < range.end - start {
+                if (got as u64) < range.end - start {
                     return Err(refuse(
                         name,
-                        format!("{} ends inside its bytes", file.path().display()),
+                        format!("{} ends inside its bytes", path.display()),
                     ));
                 }
                 let raw = folder.raw(name)?;
@@ -653,7 +666,7 @@ impl<'n> Wholes<'n> {
                     (raw.dtype, raw.shape.to_vec(), from..from + raw.bytes.len()),
                 );
             }
-            slot += span;
+            slot += len;
         }
         Ok(Some(Wholes { buf, at }))
     }
@@ -666,6 +679,55 @@ impl<'n> Wholes<'n> {
             bytes: &self.buf[at.clone()],
         })
     }
+}
+
+/// The direct reads [`Wholes::read`] keeps in flight in a shard at once, its own thread among
+/// them.
+const READ_LANES: usize = 8;
+
+/// Each window filled from `file` at its offset, the bytes placed per window in order; the
+/// windows are dealt over up to [`READ_LANES`] threads, each reading its own in turn. The first
+/// window's error in order is returned.
+fn read_extents(file: &DirectFile, windows: Vec<(u64, &mut [u8])>) -> Result<Vec<usize>, Error> {
+    let lanes = READ_LANES.min(windows.len()).max(1);
+    let mut dealt: Vec<Vec<(usize, u64, &mut [u8])>> = (0..lanes).map(|_| Vec::new()).collect();
+    for (i, (at, window)) in windows.into_iter().enumerate() {
+        dealt[i % lanes].push((i, at, window));
+    }
+    let read = |lane: Vec<(usize, u64, &mut [u8])>| {
+        lane.into_iter()
+            .map(|(i, at, window)| (i, file.read_span(window, at)))
+            .collect::<Vec<_>>()
+    };
+    let mut done: Vec<Vec<_>> = (0..lanes).map(|_| Vec::new()).collect();
+    std::thread::scope(|scope| {
+        let mut dealt = dealt.into_iter();
+        let own = dealt.next().unwrap_or_default();
+        let (own_done, others_done) = done.split_first_mut().expect("at least one read lane");
+        let mut others = Vec::new();
+        for (lane, result) in dealt.zip(others_done) {
+            let handle = std::thread::Builder::new()
+                .name("part-read".to_owned())
+                .spawn_scoped(scope, move || {
+                    threads::helper::float_caller()?;
+                    *result = read(lane);
+                    Ok::<_, threads::helper::HelperError>(())
+                })
+                .map_err(threads::helper::HelperError::Spawn)?;
+            others.push(handle);
+        }
+        *own_done = read(own);
+        for lane in others {
+            lane.join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))?;
+        }
+        Ok::<_, Error>(())
+    })?;
+    let mut done: Vec<_> = done.into_iter().flatten().collect();
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter()
+        .map(|(_, got)| got.map_err(Error::from))
+        .collect()
 }
 
 /// The stored tensors a tensor placed as `placed` is made of: each source, then the companions
@@ -1404,6 +1466,50 @@ pub(crate) mod tests {
         if Wholes::read(&c.folder, stored(&placed)).unwrap().is_none() {
             eprintln!("direct reads unsupported; descriptor-limit check skipped");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Windows dealt over the read lanes come back in their own order, each holding its offset's
+    /// bytes, with more windows than lanes and one past the file's end placing only what is there.
+    #[test]
+    fn extents_read_over_lanes_land_in_their_windows() {
+        let dir = temp_dir("lanes");
+        let path = dir.join("f.bin");
+        let bytes: Vec<u8> = (0..64 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = DirectFile::open_buffered(&path).unwrap();
+        let n = 3 * READ_LANES + 1;
+        let mut buf = vec![0u8; n * 1024];
+        let mut windows = Vec::new();
+        let mut rest = &mut buf[..];
+        for i in 0..n {
+            let (w, after) = std::mem::take(&mut rest).split_at_mut(1024);
+            windows.push(((i * 2048) as u64, w));
+            rest = after;
+        }
+        let last = 64 * 1024 - 100;
+        windows[n - 1].0 = last as u64;
+        let got = read_extents(&file, windows).unwrap();
+        assert!(
+            threads::helper::helpers()
+                .iter()
+                .all(|h| h.name != "part-read"),
+            "short-lived part readers must not enter the permanent helper registry"
+        );
+        assert_eq!(got[..n - 1], vec![1024; n - 1][..]);
+        assert_eq!(
+            got[n - 1],
+            100,
+            "the window past the end places what is there"
+        );
+        for i in 0..n - 1 {
+            assert_eq!(
+                buf[i * 1024..][..1024],
+                bytes[i * 2048..][..1024],
+                "window {i}"
+            );
+        }
+        assert_eq!(buf[(n - 1) * 1024..][..100], bytes[last..]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
