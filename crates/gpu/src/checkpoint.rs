@@ -34,7 +34,10 @@
 //!
 //! A body whose every store is a plane of positions takes no checkpoint: its
 //! state is the rows alone ([`planes`]).
+//!
+//! A state's byte form, what a slot file carries, is [`bytes`]'.
 
+pub mod bytes;
 pub mod planes;
 pub mod saved;
 pub mod staging;

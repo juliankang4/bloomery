@@ -78,6 +78,7 @@
 
 use std::fmt;
 
+use bloomery_gpu::checkpoint::bytes;
 use bloomery_gpu::media::{CallRows, MediaBody};
 use bloomery_gpu::model::{Rollback, Rows, SlotRows, Slots, StepMode};
 use bloomery_gpu::{GpuError, GpuModel};
@@ -421,6 +422,131 @@ pub struct Parked<A> {
     next: Option<Refresh<A>>,
     last_unit: Option<(A, usize)>,
     skip: Option<&'static str>,
+}
+
+impl<A: Copy> Parked<A> {
+    /// Its byte form ([`bytes`]), `code` naming each arena it holds rows of:
+    /// the refresh waiting (u8: 0 none, 1 then its tokens as an array, its
+    /// first position, u32, its arena's code, u8, and its first row, a
+    /// count); the last prompt unit (u8: 0 none, 1 then its arena's code and
+    /// its rows, a count); the skip, by its place in the window's reasons
+    /// ([`bytes::Put::named`]).
+    pub fn put(&self, w: &mut bytes::Put<'_>, code: impl Fn(A) -> u8) -> Result<(), bytes::Fail> {
+        match &self.next {
+            None => w.one(0u8)?,
+            Some(r) => {
+                w.one(1u8)?;
+                w.array(&r.tokens)?;
+                w.one(r.pos0)?;
+                w.one(code(r.walk))?;
+                w.count(r.first)?;
+            }
+        }
+        match self.last_unit {
+            None => w.one(0u8)?,
+            Some((walk, rows)) => {
+                w.one(1u8)?;
+                w.one(code(walk))?;
+                w.count(rows)?;
+            }
+        }
+        w.named(self.skip, &policy::SKIPS, "a parked draft's skip")
+    }
+
+    /// What [`Parked::put`] wrote, `arena` the kind and row capacity of each
+    /// code; refused by name for an unknown code or reason, an empty refresh,
+    /// rows outside their arena, or a last unit of no rows.
+    pub fn take(
+        r: &mut bytes::Take<'_>,
+        arena: impl Fn(u8) -> Option<(A, usize)>,
+    ) -> Result<Parked<A>, bytes::Fail> {
+        let arena_of = |r: &mut bytes::Take<'_>| {
+            let c = r.one::<u8>("a parked draft's arena")?;
+            arena(c).ok_or_else(|| bytes::refused(format!("a parked draft's arena of code {c}")))
+        };
+        let next = match r.one::<u8>("a parked draft's refresh")? {
+            0 => None,
+            1 => {
+                let tokens: Vec<u32> = r.array("a parked draft's refresh")?;
+                let pos0 = r.one("a parked draft's refresh")?;
+                let (walk, capacity) = arena_of(r)?;
+                let first = r.count("a parked draft's refresh")?;
+                if tokens.is_empty()
+                    || first
+                        .checked_add(tokens.len())
+                        .is_none_or(|end| end > capacity)
+                {
+                    return Err(bytes::refused("a parked draft's refresh outside its arena"));
+                }
+                Some(Refresh {
+                    tokens,
+                    pos0,
+                    walk,
+                    first,
+                })
+            }
+            c => {
+                return Err(bytes::refused(format!(
+                    "a parked draft's refresh of code {c}"
+                )));
+            }
+        };
+        let last_unit = match r.one::<u8>("a parked draft's last unit")? {
+            0 => None,
+            1 => {
+                let (walk, capacity) = arena_of(r)?;
+                let rows = r.count("a parked draft's last unit")?;
+                if rows == 0 {
+                    return Err(bytes::refused("a parked draft's last unit of no rows"));
+                }
+                if rows > capacity {
+                    return Err(bytes::refused("a parked draft's last unit past its arena"));
+                }
+                Some((walk, rows))
+            }
+            c => {
+                return Err(bytes::refused(format!(
+                    "a parked draft's last unit of code {c}"
+                )));
+            }
+        };
+        Ok(Parked {
+            next,
+            last_unit,
+            skip: r.named(&policy::SKIPS, "a parked draft's skip")?,
+        })
+    }
+
+    /// Refused by name unless the rows waiting can be walked on a state of
+    /// `pos` positions, before the state is put back: the refresh's ids by
+    /// `ids`, its last row the one at `pos`, and each walk's target rows (its
+    /// arena, its first row and rows, its first position) by `rows`; the last
+    /// unit read as the join's walk at `pos` reads it.
+    pub fn check(
+        &self,
+        pos: u32,
+        ids: impl Fn(&[u32]) -> Result<(), bytes::Fail>,
+        rows: impl Fn(A, (usize, usize), u32) -> Result<(), bytes::Fail>,
+    ) -> Result<(), bytes::Fail> {
+        if let Some(r) = &self.next {
+            ids(&r.tokens)?;
+            if u64::from(r.pos0) + r.tokens.len() as u64 != u64::from(pos) + 1 {
+                return Err(bytes::refused(format!(
+                    "a parked draft's refresh of {} rows from position {} on a state of {pos}",
+                    r.tokens.len(),
+                    r.pos0
+                )));
+            }
+            rows(r.walk, (r.first, r.tokens.len()), r.pos0)?;
+        }
+        if let Some((walk, n)) = self.last_unit {
+            let last = n
+                .checked_sub(1)
+                .ok_or_else(|| bytes::refused("a parked draft's last unit of no rows"))?;
+            rows(walk, (last, 1), pos)?;
+        }
+        Ok(())
+    }
 }
 
 /// How a prompt call that continues a held sequence joined the draft to it

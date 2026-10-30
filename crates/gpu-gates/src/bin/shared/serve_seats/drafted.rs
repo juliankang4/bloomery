@@ -38,6 +38,7 @@
 use app::mtp::{MtpBody, MtpDraft, Parked, SlotWalks};
 use app::{Keep, Prompt, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::checkpoint::bytes;
 use bloomery_gpu::model::{Rollback, Rows, Slots};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
@@ -390,6 +391,75 @@ enum Side<A> {
     Lookup(Vec<u32>),
 }
 
+impl<A: Copy> ParkedDraft<A> {
+    /// A saved state's draft side in a slot file ([`bytes`]): `side` none,
+    /// or the MTP draft's ([`Parked::put`], `code` its arenas) or the
+    /// lookup's context (an array of ids) after its kind (u8: 0 none, 1 the
+    /// MTP draft's, 2 the lookup's), then why the seat turned it off, by its
+    /// place in `whys`, the reasons the seat turns a draft off for
+    /// ([`bytes::Put::named`]).
+    pub(crate) fn put(
+        side: Option<&ParkedDraft<A>>,
+        w: &mut bytes::Put<'_>,
+        code: impl Fn(A) -> u8,
+        whys: &[&'static str],
+    ) -> Result<(), bytes::Fail> {
+        let Some(p) = side else {
+            return w.one(0u8);
+        };
+        match &p.draft {
+            Side::Mtp(d) => {
+                w.one(1u8)?;
+                d.put(w, code)?;
+            }
+            Side::Lookup(ctx) => {
+                w.one(2u8)?;
+                w.array(ctx)?;
+            }
+        }
+        w.named(p.off, whys, "the draft's off reason")
+    }
+
+    /// What [`ParkedDraft::put`] wrote, `arena` each code's kind and row
+    /// capacity, and `whys` the reasons it coded.
+    pub(crate) fn take(
+        r: &mut bytes::Take<'_>,
+        arena: impl Fn(u8) -> Option<(A, usize)>,
+        whys: &[&'static str],
+    ) -> Result<Option<ParkedDraft<A>>, bytes::Fail> {
+        let draft = match r.one::<u8>("the draft's side")? {
+            0 => return Ok(None),
+            1 => Side::Mtp(Parked::take(r, arena)?),
+            2 => Side::Lookup(r.array("the lookup's context")?),
+            c => return Err(bytes::refused(format!("a draft's side of code {c}"))),
+        };
+        let off = r.named(whys, "the draft's off reason")?;
+        Ok(Some(ParkedDraft { draft, off }))
+    }
+
+    /// Refused by name unless the side can be put back on a state of `pos`
+    /// positions of a model of `vocab` ids: every id it holds below `vocab`,
+    /// and the MTP draft's waiting rows as [`Parked::check`] checks them,
+    /// `rows` checking each walk's target rows against the state.
+    pub(crate) fn check(
+        &self,
+        vocab: usize,
+        pos: u32,
+        rows: impl Fn(A, (usize, usize), u32) -> Result<(), bytes::Fail>,
+    ) -> Result<(), bytes::Fail> {
+        let ids = |ts: &[u32]| match ts.iter().find(|&&t| t as usize >= vocab) {
+            Some(t) => Err(bytes::refused(format!(
+                "a saved draft id {t} past the vocabulary of {vocab}"
+            ))),
+            None => Ok(()),
+        };
+        match &self.draft {
+            Side::Mtp(d) => d.check(pos, ids, rows),
+            Side::Lookup(ctx) => ids(ctx),
+        }
+    }
+}
+
 /// One slot's drafted window over its own [`MtpDraft`] behind the shared
 /// width chooser (`runtime::width`), which `fixed` passes through untouched:
 /// every family's seat drives the one type.
@@ -546,12 +616,15 @@ where
     /// session's position moved where the draft holds no rows to rejoin at.
     /// The chooser's passes over the request before are closed out first
     /// (an `mtp width` record under the cost mode): a call the draft sits
-    /// out prints none. Nothing without a draft; refused as
+    /// out prints none. The draft's own state starts over, so an off draft
+    /// holds no rows waiting for a walk ([`MtpDraft::restart`]); its reset or
+    /// rejoin sets them anew. Nothing without a draft; refused as
     /// [`SlotDrafts::has`].
     pub(crate) fn turn_off(&mut self, slot: usize, why: &'static str) -> Result<(), GateError> {
         if self.has(slot)? {
             if let Some(spec) = self.specs[slot].as_mut() {
                 print_widths(spec);
+                spec.draft_mut().draft_mut().restart();
             }
             self.off[slot] = Some((why, false));
         }
@@ -961,17 +1034,21 @@ where
     }
 
     /// Refused by name unless a state whose draft's side is `p` fits this
-    /// seat: a side where a draft runs, none where none does.
+    /// seat: a side of the draft that runs where one does, none where none
+    /// does.
     pub(crate) fn takes(&self, p: Option<&ParkedDraft<B::Arena>>) -> Result<(), GateError> {
-        if p.is_some() == self.drafts() {
-            return Ok(());
+        if p.is_some() != self.drafts() {
+            return Err(format!(
+                "a state saved with the MTP draft {} put back with it {}",
+                if p.is_some() { "on" } else { "off" },
+                if self.drafts() { "on" } else { "off" }
+            )
+            .into());
         }
-        Err(format!(
-            "a state saved with the MTP draft {} put back with it {}",
-            if p.is_some() { "on" } else { "off" },
-            if self.drafts() { "on" } else { "off" }
-        )
-        .into())
+        if p.is_some_and(|p| matches!(p.draft, Side::Lookup(_)) != self.lookups.is_some()) {
+            return Err("a state saved under one draft put back under the other".into());
+        }
+        Ok(())
     }
 
     /// `p`, which [`SlotDrafts::park`] took with a state, back in `slot`'s
@@ -997,7 +1074,7 @@ where
                 }
                 Ok(())
             }
-            _ => Err("a state saved under one draft put back under the other".into()),
+            _ => unreachable!("takes refused a side of the other draft"),
         }
     }
 
@@ -1085,6 +1162,104 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::time::Duration;
+
+    /// Each side keeps its kind and bytes, and is taken only under that draft.
+    #[test]
+    fn parked_sides_keep_their_kind_and_refuse_a_different_draft() {
+        use bloomery_gpu::arch::qwen3moe::{Body38, TargetRows};
+
+        let arena = |c| (c == 0).then_some((TargetRows::Step, 1));
+        let mut input = &[0u8; 3][..];
+        let mtp = ParkedDraft {
+            draft: Side::Mtp(Parked::take(&mut bytes::Take::new(&mut input), arena).unwrap()),
+            off: None,
+        };
+        let lookup = ParkedDraft {
+            draft: Side::Lookup(vec![2, 5, 7]),
+            off: None,
+        };
+        for (side, tag) in [(None, 0u8), (Some(&mtp), 1), (Some(&lookup), 2)] {
+            let mut out = Vec::new();
+            let mut w = bytes::Put::new(&mut out);
+            ParkedDraft::put(side, &mut w, |_| 0, &[]).unwrap();
+            w.flush().unwrap();
+            assert_eq!(out[0], tag, "saved files keep each draft kind's tag");
+            let mut input = out.as_slice();
+            let mut r = bytes::Take::new(&mut input);
+            let back = ParkedDraft::take(&mut r, arena, &[]).unwrap();
+            r.end().unwrap();
+            assert_eq!(
+                format!("{back:?}"),
+                format!("{side:?}"),
+                "the side keeps its kind and context"
+            );
+        }
+        let none = SlotDrafts::<Body38, 2>::none();
+        let mut mtp_table = SlotDrafts::<Body38, 2>::none();
+        mtp_table.specs.push(None);
+        let mut lookup_table = SlotDrafts::<Body38, 2>::none();
+        lookup_table.lookups = Some(Lookups {
+            windows: Vec::new(),
+            history: None,
+        });
+        none.takes(None).expect("no draft takes no side");
+        mtp_table.takes(Some(&mtp)).expect("MTP takes its own side");
+        lookup_table
+            .takes(Some(&lookup))
+            .expect("lookup takes its own side");
+        for (table, side) in [(&mtp_table, &lookup), (&lookup_table, &mtp)] {
+            let e = table.takes(Some(side)).expect_err("a different draft");
+            assert!(
+                e.to_string()
+                    .contains("under one draft put back under the other"),
+                "{e}"
+            );
+        }
+        for (table, side) in [
+            (&none, Some(&lookup)),
+            (&mtp_table, None),
+            (&lookup_table, None),
+        ] {
+            table.takes(side).expect_err("a different draft presence");
+        }
+    }
+
+    /// Every id a saved side holds is checked against the vocabulary, the
+    /// MTP draft's refresh as the lookup's context.
+    #[test]
+    fn parked_sides_refuse_ids_past_the_vocabulary() {
+        use bloomery_gpu::arch::qwen3moe::TargetRows;
+
+        let mut b = Vec::new();
+        let mut w = bytes::Put::new(&mut b);
+        w.one(1u8).unwrap();
+        w.array(&[4u32, 9]).unwrap();
+        w.one(5u32).unwrap();
+        w.one(1u8).unwrap();
+        w.count(0).unwrap();
+        w.vals(&[0u8; 2]).unwrap(); // No last unit or skip.
+        w.flush().unwrap();
+        let arena = |c| (c == 1).then_some((TargetRows::Pass, 8));
+        let mtp = ParkedDraft {
+            draft: Side::Mtp(
+                Parked::take(&mut bytes::Take::new(&mut b.as_slice()), arena).unwrap(),
+            ),
+            off: None,
+        };
+        let lookup = ParkedDraft {
+            draft: Side::Lookup(vec![2, 9]),
+            off: None,
+        };
+        let rows = |_, _, _| Ok(());
+        for side in [&mtp, &lookup] {
+            side.check(10, 6, rows).expect("ids below the vocabulary");
+            let why = side.check(9, 6, rows).unwrap_err().to_string();
+            assert!(
+                why.contains("a saved draft id 9 past the vocabulary of 9"),
+                "{why}"
+            );
+        }
+    }
 
     /// The walls the target's calls take: a verify of the lookup's two rows
     /// costs 1.35 of the plain step.

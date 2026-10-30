@@ -32,6 +32,11 @@ const PROMPT_ARENA: &str = "the rows waiting for the draft sat in a prompt call'
                             sequence was parked, and a parked sequence keeps only the step's and \
                             the verify's";
 
+/// Every reason the window skips for, in the order a parked draft's byte form
+/// codes them ([`Parked::put`](super::Parked::put)). Append only: a saved
+/// file names each by its place here.
+pub(super) const SKIPS: [&str; 4] = [NOTHING_WAITS, ENDS_ELSEWHERE, STORE_BEHIND, PROMPT_ARENA];
+
 /// A call the window refuses, by name: the text the session reports.
 #[derive(Debug)]
 pub(super) struct Refused(pub(super) String);
@@ -626,6 +631,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bloomery_gpu::checkpoint::bytes;
 
     /// The arena kinds of a body whose prompt runs through ubatches or
     /// passes, its verify through the pass arena and its plain step through
@@ -1492,6 +1498,141 @@ mod tests {
         let mut skipping = Rig::new(64);
         skipping.p.skip = Some(NOTHING_WAITS);
         assert_eq!(skipping.p.park().skip, Some(NOTHING_WAITS));
+    }
+
+    /// A parked draft goes to bytes and back whole, each arena by its code
+    /// and each reason the window skips for by its place: a refresh waiting
+    /// in the verify's arena, a last unit in the step's with a skip, and
+    /// nothing; unknown codes, empty refreshes and rows outside their
+    /// arena are refused by name, while rows ending at capacity pass.
+    #[test]
+    fn a_parked_draft_goes_to_bytes_and_back() {
+        let arena = |c| {
+            [Ar::Step, Ar::Pass, Ar::Ubatch]
+                .get(usize::from(c))
+                .copied()
+                .map(|a| (a, 8))
+        };
+        let put = |p: &Parked<Ar>| {
+            let mut out = Vec::new();
+            let mut w = bytes::Put::new(&mut out);
+            p.put(&mut w, |a| a as u8).unwrap();
+            w.flush().unwrap();
+            out
+        };
+        let take = |mut b: &[u8]| Parked::take(&mut bytes::Take::new(&mut b), arena);
+        let parks = [
+            Parked {
+                next: Some(Refresh {
+                    tokens: vec![4, 5, 0],
+                    pos0: 9,
+                    walk: Ar::Pass,
+                    first: 1,
+                }),
+                last_unit: None,
+                skip: None,
+            },
+            Parked {
+                next: None,
+                last_unit: Some((Ar::Step, 1)),
+                skip: Some(PROMPT_ARENA),
+            },
+            Parked {
+                next: None,
+                last_unit: None,
+                skip: None,
+            },
+        ];
+        for p in &parks {
+            let back = take(&put(p)).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{p:?}"));
+        }
+        let mut p = parks[0].clone();
+        p.next.as_mut().unwrap().first = 5;
+        take(&put(&p)).expect("a refresh ending at capacity");
+        for first in [6, usize::MAX] {
+            p.next.as_mut().unwrap().first = first;
+            let why = take(&put(&p)).unwrap_err().to_string();
+            assert!(why.contains("refresh outside its arena"), "{why}");
+        }
+        p.next.as_mut().unwrap().tokens.clear();
+        p.next.as_mut().unwrap().first = 0;
+        let why = take(&put(&p)).unwrap_err().to_string();
+        assert!(why.contains("refresh outside its arena"), "{why}");
+        let mut p = parks[1].clone();
+        p.last_unit = Some((Ar::Step, 8));
+        take(&put(&p)).expect("a last unit filling its arena");
+        p.last_unit = Some((Ar::Step, 9));
+        let why = take(&put(&p)).unwrap_err().to_string();
+        assert!(why.contains("last unit past its arena"), "{why}");
+        let mut b = put(&parks[1]);
+        assert_eq!(
+            b.last(),
+            Some(&4),
+            "the code saved files hold for PROMPT_ARENA"
+        );
+        *b.last_mut().unwrap() = SKIPS.len() as u8 + 1;
+        let why = take(&b).unwrap_err().to_string();
+        assert!(why.contains("a parked draft's skip of code 5"), "{why}");
+        b = put(&parks[0]);
+        b[1 + 8 + 3 * 4 + 4] = 3;
+        let why = take(&b).unwrap_err().to_string();
+        assert!(why.contains("a parked draft's arena of code 3"), "{why}");
+        b = put(&parks[1]);
+        b[3..11].fill(0);
+        let why = take(&b).unwrap_err().to_string();
+        assert!(
+            why.contains("a parked draft's last unit of no rows"),
+            "{why}"
+        );
+    }
+
+    /// A parked draft is checked against the state it goes back on before
+    /// the put back: the refresh's ids and rows as its walk reads them, its
+    /// last row the state's next position, and a last unit's last row as the
+    /// join's walk at that position reads it; either check's refusal is the
+    /// check's.
+    #[test]
+    fn a_parked_draft_is_checked_against_its_state() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let ids = |ts: &[u32]| -> Result<(), bytes::Fail> {
+            seen.borrow_mut().push(format!("ids {ts:?}"));
+            Ok(())
+        };
+        let rows = |walk: Ar, (first, m): (usize, usize), pos0: u32| -> Result<(), bytes::Fail> {
+            seen.borrow_mut()
+                .push(format!("{walk:?} {first} {m} {pos0}"));
+            Ok(())
+        };
+        let mut p = Parked {
+            next: Some(Refresh {
+                tokens: vec![4, 5, 0],
+                pos0: 9,
+                walk: Ar::Pass,
+                first: 1,
+            }),
+            last_unit: None,
+            skip: None,
+        };
+        p.check(11, ids, rows).unwrap();
+        assert_eq!(*seen.borrow(), ["ids [4, 5, 0]", "Pass 1 3 9"]);
+        for pos in [10, 12] {
+            let why = p.check(pos, ids, rows).unwrap_err().to_string();
+            assert!(why.contains("refresh of 3 rows from position 9"), "{why}");
+        }
+        let why = p
+            .check(11, |_| Err(bytes::refused("an id")), rows)
+            .unwrap_err();
+        assert!(why.to_string().contains("an id"), "{why}");
+        let why = p
+            .check(11, ids, |_, _, _| Err(bytes::refused("a row")))
+            .unwrap_err();
+        assert!(why.to_string().contains("a row"), "{why}");
+        p.next = None;
+        p.last_unit = Some((Ar::Pass, 4));
+        seen.borrow_mut().clear();
+        p.check(7, ids, rows).unwrap();
+        assert_eq!(*seen.borrow(), ["Pass 3 1 7"]);
     }
 
     /// A walk that fails ends the call with the error, the target unmoved

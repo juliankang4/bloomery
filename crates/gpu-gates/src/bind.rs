@@ -1593,8 +1593,8 @@ pub trait Seat: 'static {
     /// that leaves the model in no defined state is `Engine`, which ends the
     /// server. The default writes nothing and refuses with `Unsupported`: the
     /// server answers 501. The seats that override it: V4.1
-    /// (`serve_seats::ds41`); GLM and Qwen3.8 once their sequence state
-    /// (`SeqState`) has a byte form.
+    /// (`serve_seats::ds41`) and Qwen3.8 (`serve_seats::qwen38`, its state
+    /// through `SeqState`'s byte form); GLM once its sequence state has one.
     fn save_state(&mut self, out: &mut dyn Write) -> Result<u64, StateError> {
         let _ = out;
         Err(StateError::Unsupported("slot save/restore"))
@@ -2846,7 +2846,7 @@ fn share_of<S: Seat + ?Sized>(
 /// by keeping no state or by resetting the slot; any other failure — the
 /// card's, the driver's, a fault, an error of no known kind — is `Engine`,
 /// which ends it.
-fn seat_failure(e: &(dyn std::error::Error + 'static), what: String) -> StateError {
+pub fn seat_failure(e: &(dyn std::error::Error + 'static), what: String) -> StateError {
     let chain = || std::iter::successors(Some(e), |e| e.source());
     if let Some(short) = chain().find_map(|e| e.downcast_ref::<NoRoom>()) {
         return StateError::NoRoom {

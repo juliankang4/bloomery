@@ -312,7 +312,7 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        self, Served, curl, ids_of, json_of, metric, parse_ids, plan_run, server_log,
+        self, Served, curl, ids_of, json_of, metric, parse_ids, plan_run, server_log, slot_action,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path, verdict};
     use gguf::{Gguf, Split};
@@ -1456,23 +1456,6 @@ mod gate {
         saved: u64,
         /// Whether this half held.
         held: bool,
-    }
-
-    /// A slot action's answer, printed: its status and its JSON (`Null`
-    /// when the body is not JSON).
-    fn slot_action(
-        url: &dyn Fn(&str) -> String,
-        slot: u64,
-        action: &str,
-        body: &Value,
-    ) -> Result<(u16, Value), GateError> {
-        let (st, text) = curl(
-            &url(&format!("/slots/{slot}?action={action}")),
-            Some(body),
-            false,
-        )?;
-        println!("slots {action} of slot {slot}: HTTP {st}: {text}");
-        Ok((st, serde_json::from_str(&text).unwrap_or(Value::Null)))
     }
 
     // PIN(2026-10-05): slots_save_refused_by_name (a save answered 501) is replaced by the

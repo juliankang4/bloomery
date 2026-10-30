@@ -116,6 +116,7 @@ use super::scratch::{
 };
 use super::scratch38::{PASS_ROWS, VERIFY_ROWS};
 use crate::card_slots::CardAcc;
+use crate::checkpoint::bytes::{Fail, Put, Take};
 use crate::checkpoint::saved::Spans;
 use crate::draft::{DraftFeed, DraftHead, Feed, Held, Hidden, WalkBounds, WalkMode, refuse_rows};
 use crate::fault::Fault;
@@ -926,6 +927,88 @@ impl DraftRows38 {
         (self.step.1.len() + self.pass.1.len()) * size_of::<f32>()
             + self.point_rows.iter().map(|(_, r)| r.len()).sum::<usize>() * size_of::<f32>()
     }
+
+    /// Its byte form ([`crate::checkpoint::bytes`]): the store's positions
+    /// (u32); the step's and then the pass's arena, each its record (the
+    /// first position and the rows, u32) and its values (a count, then the
+    /// f32s); the two final-row records; the point rows (a count, then each
+    /// point, u32, and its row as an array). The put back checks every
+    /// length against the load ([`super::body38`]'s `draft_fits`).
+    pub(super) fn put(&self, w: &mut Put<'_>) -> Result<(), Fail> {
+        w.one(self.held)?;
+        for (held, v) in [&self.step, &self.pass] {
+            put_held(w, *held)?;
+            w.array(v)?;
+        }
+        for &h in &self.final_rows {
+            put_held(w, h)?;
+        }
+        w.count(self.point_rows.len())?;
+        for (p, row) in &self.point_rows {
+            w.one(*p)?;
+            w.array(row)?;
+        }
+        Ok(())
+    }
+
+    /// What [`DraftRows38::put`] wrote.
+    pub(super) fn take(r: &mut Take<'_>) -> Result<DraftRows38, Fail> {
+        let held = r.one("the draft store's positions")?;
+        let step = (take_held(r)?, r.array("the step arena's rows")?);
+        let pass = (take_held(r)?, r.array("the pass arena's rows")?);
+        let final_rows = [take_held(r)?, take_held(r)?];
+        let n = r.count("the point rows")?;
+        let mut point_rows = Vec::new();
+        for _ in 0..n {
+            let p = r.one("a point row")?;
+            point_rows.push((p, r.array("a point row")?));
+        }
+        Ok(DraftRows38 {
+            held,
+            step,
+            pass,
+            final_rows,
+            point_rows,
+        })
+    }
+}
+
+/// Refused by name unless rows `first .. first + m` of the `walk` arena, of
+/// `rows` rows whose records are `held` and `final_rows`, hold the target's
+/// final hidden rows of the positions `pos0 - 1 ..` ([`Held::check_read`]).
+pub(super) fn check_target_rows(
+    what: &'static str,
+    walk: TargetRows,
+    (held, final_rows, rows): (Held, Held, usize),
+    (first, m): (usize, usize),
+    pos0: u32,
+) -> Result<(), GpuError> {
+    held.check_read(what, walk, rows, (first, m), pos0)?;
+    let at = pos0 - 1;
+    if !at
+        .checked_sub(final_rows.parts().0)
+        .is_some_and(|r| final_rows.holds(r as usize, m, at))
+    {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "the {walk:?} arena's final hidden rows hold {}, requested positions {at}..{}",
+                final_rows.shown(),
+                u64::from(at) + m as u64
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn put_held(w: &mut Put<'_>, h: Held) -> Result<(), Fail> {
+    let (first, rows) = h.parts();
+    w.vals(&[first, rows])
+}
+
+fn take_held(r: &mut Take<'_>) -> Result<Held, Fail> {
+    let first = r.one("an arena's record")?;
+    Ok(Held::at(first, r.one("an arena's record")?))
 }
 
 /// The target's streams a [`Hidden::Target`] feed copies from, and the
@@ -1882,23 +1965,13 @@ impl Mtp38 {
                 Hidden::Host(_) => {}
                 Hidden::Target { walk, first } => {
                     let t = target.ok_or(GpuError::state(WHAT, "the target's streams to copy"))?;
-                    t.held
-                        .check_read(WHAT, walk, t.buf.len() / WIDE, (first, m), pos0)?;
-                    let at = pos0 - 1;
-                    if !at
-                        .checked_sub(t.final_rows.parts().0)
-                        .is_some_and(|r| t.final_rows.holds(r as usize, m, at))
-                    {
-                        return Err(GpuError::shape(
-                            WHAT,
-                            format!(
-                                "the {walk:?} arena's final hidden rows hold {}, requested \
-                             positions {at}..{}",
-                                t.final_rows.shown(),
-                                u64::from(at) + m as u64
-                            ),
-                        ));
-                    }
+                    check_target_rows(
+                        WHAT,
+                        walk,
+                        (t.held, t.final_rows, t.buf.len() / WIDE),
+                        (first, m),
+                        pos0,
+                    )?;
                     src = Some((t.buf, first));
                 }
             }
@@ -3254,6 +3327,73 @@ mod tests {
     use super::{TargetRows, call_rows, geo};
     use crate::draft::{DraftFeed, Feed, Hidden, WalkMode};
     use crate::media::CallRows;
+
+    /// A walk reads an arena's rows only where both its record and its final
+    /// rows hold the positions before the walk's.
+    #[test]
+    fn target_rows_are_read_where_their_final_rows_hold_them() {
+        use super::{Held, TargetRows, check_target_rows};
+
+        let check = |rows, pos0| {
+            check_target_rows(
+                "test",
+                TargetRows::Pass,
+                (Held::at(9, 4), Held::at(10, 3), 8),
+                rows,
+                pos0,
+            )
+        };
+        check((1, 2), 11).expect("rows 1 and 2 hold the final positions 10 and 11");
+        for (rows, pos0, says) in [
+            ((0, 2), 11, "as positions 10..12"),
+            ((0, 2), 10, "final hidden rows hold positions 10..13"),
+            ((3, 2), 13, "as positions 12..14"),
+            ((7, 2), 17, "2 rows from row 7"),
+            ((1, 2), 0, "at position 0"),
+        ] {
+            let why = check(rows, pos0).unwrap_err().to_string();
+            assert!(why.contains(says), "{rows:?} from {pos0}: {why}");
+        }
+    }
+
+    /// Every carried draft row and its position survive the byte form.
+    #[test]
+    fn draft_rows_go_to_bytes_and_back() {
+        use super::{DraftRows38, Held, Put, Take};
+
+        let rows = DraftRows38 {
+            held: 7,
+            step: (Held::at(6, 1), vec![1.25, -2.5]),
+            pass: (Held::at(3, 4), vec![3.5, 4.25, -5.0, 6.5]),
+            final_rows: [Held::at(6, 1), Held::at(4, 3)],
+            point_rows: vec![(2, vec![7.5, -8.25]), (5, vec![9.0, 10.5])],
+        };
+        let mut b = Vec::new();
+        let mut w = Put::new(&mut b);
+        rows.put(&mut w).unwrap();
+        w.flush().unwrap();
+        let mut input = b.as_slice();
+        let mut r = Take::new(&mut input);
+        let back = DraftRows38::take(&mut r).unwrap();
+        r.end().unwrap();
+        assert_eq!(back.held, rows.held, "the draft store keeps its position");
+        assert_eq!(
+            back.step, rows.step,
+            "the step arena keeps its positions and rows"
+        );
+        assert_eq!(
+            back.pass, rows.pass,
+            "the pass arena keeps its positions and rows"
+        );
+        assert_eq!(
+            back.final_rows, rows.final_rows,
+            "both arenas keep their final row ranges"
+        );
+        assert_eq!(
+            back.point_rows, rows.point_rows,
+            "every point keeps its position and hidden row"
+        );
+    }
 
     /// Media rows are a store walk's alone, at the embedding's width: a store
     /// walk takes them, an eager or a captured walk refuses them by name

@@ -14,8 +14,9 @@
 //! one, or laid out otherwise, is refused by name before any copy
 //! ([`check`]), in either form.
 //!
-//! The byte form, little-endian throughout; a count is a u64, a name a u32
-//! length and its bytes:
+//! The byte form, written and read through the shared
+//! [`bloomery_gpu::checkpoint::bytes`] (little-endian throughout; a count is
+//! a u64, a name a u32 length and its bytes):
 //!
 //! | part | fields, in order |
 //! |---|---|
@@ -44,6 +45,7 @@ use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
+use bloomery_gpu::checkpoint::bytes::{self, Put, Take};
 use bloomery_gpu::checkpoint::saved::Identity;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{DeviceBuffer, DeviceCopy};
@@ -63,12 +65,6 @@ const STATE_TAG: [u8; 8] = *b"BLMV41SQ";
 /// The byte form's layout (the module table): raised whenever a part, its
 /// order or its encoding changes.
 const STATE_FORMAT: u32 = 2;
-
-/// Bytes of the byte form's write and read buffer.
-const CHUNK: usize = 1 << 16;
-
-/// The longest name the byte form carries: a path's limit.
-const NAME_MAX: usize = 4096;
 
 /// Why [`save_state`] or [`restore_state`] failed.
 #[derive(Debug)]
@@ -122,9 +118,15 @@ fn refused(detail: String) -> StateFail {
     StateFail::Refused(refuse(detail))
 }
 
-/// An error of the stream itself ([`StateFail::Io`]): never the model's.
-fn stream_fail(e: io::Error) -> StateFail {
-    StateFail::Io(e)
+/// A failure of the shared byte form as this state's: its refusal by name or
+/// its stream's error, never the model's.
+impl From<bytes::Fail> for StateFail {
+    fn from(e: bytes::Fail) -> StateFail {
+        match e {
+            bytes::Fail::Refused(e) => StateFail::Refused(e),
+            bytes::Fail::Io(e) => StateFail::Io(e),
+        }
+    }
 }
 
 /// The selected sequence's state ([`snapshot`]) written to `out` in the byte
@@ -135,7 +137,7 @@ pub fn save_state(m: &mut Deepseek41Model, out: &mut dyn Write) -> Result<u64, S
     let mut w = Put::new(out);
     s.write(&mut w)?;
     w.flush()?;
-    Ok(w.bytes)
+    Ok(w.bytes())
 }
 
 /// The state `input` carries, which [`save_state`] wrote, put back into the
@@ -323,7 +325,7 @@ impl SeqSnapshot {
             w.vals(&l.values)?;
             w.vals(&l.scores)?;
         }
-        w.vals(&self.shadow)
+        Ok(w.vals(&self.shadow)?)
     }
 
     /// The values after header `h` (the module table), read from `r`.
@@ -364,10 +366,10 @@ impl SeqSnapshot {
                 .collect::<Result<Vec<_>, _>>()?;
             states.push((ratio, slots));
         }
-        let restore = match r.array::<1>("the pending restore")? {
-            [0] => false,
-            [1] => true,
-            [b] => return Err(refused(format!("a pending restore of {b}: 0 or 1"))),
+        let restore = match r.one::<u8>("the pending restore")? {
+            0 => false,
+            1 => true,
+            b => return Err(refused(format!("a pending restore of {b}: 0 or 1"))),
         };
         let mut kv = Vec::with_capacity(h.shape.kv.len());
         for &[ring, rows, keys, values, scores] in &h.shape.kv {
@@ -493,17 +495,17 @@ impl Header {
             w.count(r)?;
         }
         w.count(self.shadow_from)?;
-        w.runs(&self.holes)?;
-        w.runs(&self.runs)?;
-        w.runs(&self.media)
+        put_runs(w, &self.holes)?;
+        put_runs(w, &self.runs)?;
+        put_runs(w, &self.media)
     }
 
     /// The header `r` starts with: refused by name when the stream ends
     /// inside it, or when its tag, format or architecture is not this
     /// reader's — whatever follows those is another layout.
     fn read(r: &mut Take<'_>) -> Result<Header, StateFail> {
-        let tag = r.array::<8>("the tag")?;
-        let format = u32::from_le_bytes(r.array("the format")?);
+        let tag = r.vals::<u8>(STATE_TAG.len(), "the tag")?;
+        let format: u32 = r.one("the format")?;
         if tag != STATE_TAG || format != STATE_FORMAT {
             return Err(refused(format!(
                 "a stream of tag {tag:02x?} and format {format}; this build reads tag \
@@ -546,9 +548,9 @@ impl Header {
             .map(|_| r.count("the state rings"))
             .collect::<Result<Vec<_>, _>>()?;
         let shadow_from = r.count("the shadow's start")?;
-        let holes = r.runs("the holes")?;
-        let runs = r.runs("the shadow's runs")?;
-        let media = r.runs("the history's media spans")?;
+        let holes = take_runs(r, "the holes")?;
+        let runs = take_runs(r, "the shadow's runs")?;
+        let media = take_runs(r, "the history's media spans")?;
         Ok(Header {
             who,
             slots,
@@ -637,194 +639,25 @@ fn refuse(detail: String) -> GpuError {
     GpuError::Shape { what: WHAT, detail }
 }
 
-/// A value the byte form carries, little-endian.
-trait Le: Copy + Default {
-    const SIZE: usize;
-    fn put(self, out: &mut Vec<u8>);
-    /// The value of `b`, [`Le::SIZE`] bytes.
-    fn get(b: &[u8]) -> Self;
+/// `runs` in the byte form: their count, then each run's start and end.
+fn put_runs(w: &mut Put<'_>, runs: &[Range<usize>]) -> Result<(), StateFail> {
+    w.count(runs.len())?;
+    for r in runs {
+        w.count(r.start)?;
+        w.count(r.end)?;
+    }
+    Ok(())
 }
 
-macro_rules! le {
-    ($($t:ty),*) => {$(
-        impl Le for $t {
-            const SIZE: usize = size_of::<$t>();
-            fn put(self, out: &mut Vec<u8>) {
-                out.extend_from_slice(&self.to_le_bytes());
-            }
-            fn get(b: &[u8]) -> $t {
-                let mut a = [0u8; size_of::<$t>()];
-                a.copy_from_slice(b);
-                <$t>::from_le_bytes(a)
-            }
-        }
-    )*};
-}
-
-le!(u8, u16, u32, u64, f32);
-
-/// The byte form's writer: `out` through a buffer of at most [`CHUNK`]
-/// bytes, the bytes written counted. An error of `out` is the stream's
-/// ([`StateFail::Io`]).
-struct Put<'a> {
-    out: &'a mut dyn Write,
-    buf: Vec<u8>,
-    bytes: u64,
-}
-
-impl<'a> Put<'a> {
-    fn new(out: &'a mut dyn Write) -> Put<'a> {
-        Put {
-            out,
-            buf: Vec::with_capacity(CHUNK),
-            bytes: 0,
-        }
+/// What [`put_runs`] wrote.
+fn take_runs(r: &mut Take<'_>, part: &str) -> Result<Vec<Range<usize>>, StateFail> {
+    let n = r.count(part)?;
+    let mut runs = Vec::new();
+    for _ in 0..n {
+        let start = r.count(part)?;
+        runs.push(start..r.count(part)?);
     }
-
-    fn vals<T: Le>(&mut self, vals: &[T]) -> Result<(), StateFail> {
-        for c in vals.chunks(CHUNK / T::SIZE) {
-            if self.buf.len() + c.len() * T::SIZE > CHUNK {
-                self.flush()?;
-            }
-            for &v in c {
-                v.put(&mut self.buf);
-            }
-        }
-        Ok(())
-    }
-
-    fn count(&mut self, v: usize) -> Result<(), StateFail> {
-        self.vals(&[v as u64])
-    }
-
-    /// `b` as a name: its length (u32), then its bytes; refused by name past
-    /// [`NAME_MAX`].
-    fn name(&mut self, b: &[u8]) -> Result<(), StateFail> {
-        let len = u32::try_from(b.len())
-            .ok()
-            .filter(|&l| l as usize <= NAME_MAX)
-            .ok_or_else(|| {
-                refused(format!(
-                    "a name of {} bytes, past the {NAME_MAX} the format carries",
-                    b.len()
-                ))
-            })?;
-        self.vals(&[len])?;
-        self.vals(b)
-    }
-
-    fn runs(&mut self, runs: &[Range<usize>]) -> Result<(), StateFail> {
-        self.count(runs.len())?;
-        for r in runs {
-            self.count(r.start)?;
-            self.count(r.end)?;
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<(), StateFail> {
-        self.out.write_all(&self.buf).map_err(stream_fail)?;
-        self.bytes += self.buf.len() as u64;
-        self.buf.clear();
-        Ok(())
-    }
-}
-
-/// The byte form's reader: `input` through a buffer of at most [`CHUNK`]
-/// bytes, the bytes read counted. A stream that ends early is refused by
-/// name, with the part it ends in; any other error of `input` is the
-/// stream's ([`StateFail::Io`]).
-struct Take<'a> {
-    input: &'a mut dyn Read,
-    buf: Vec<u8>,
-    bytes: u64,
-}
-
-impl<'a> Take<'a> {
-    fn new(input: &'a mut dyn Read) -> Take<'a> {
-        Take {
-            input,
-            buf: Vec::with_capacity(CHUNK),
-            bytes: 0,
-        }
-    }
-
-    /// The next `len` bytes, `len` at most [`CHUNK`].
-    fn exact(&mut self, len: usize, part: &str) -> Result<&[u8], StateFail> {
-        self.buf.resize(len, 0);
-        self.input
-            .read_exact(&mut self.buf)
-            .map_err(|e| match e.kind() {
-                io::ErrorKind::UnexpectedEof => refused(format!(
-                    "a short stream: it ends inside {part}, past byte {}",
-                    self.bytes
-                )),
-                _ => stream_fail(e),
-            })?;
-        self.bytes += len as u64;
-        Ok(&self.buf)
-    }
-
-    fn array<const N: usize>(&mut self, part: &str) -> Result<[u8; N], StateFail> {
-        let mut a = [0u8; N];
-        a.copy_from_slice(self.exact(N, part)?);
-        Ok(a)
-    }
-
-    fn count(&mut self, part: &str) -> Result<usize, StateFail> {
-        let v = u64::from_le_bytes(self.array(part)?);
-        usize::try_from(v).map_err(|_| refused(format!("{part}: {v} passes usize")))
-    }
-
-    fn name(&mut self, part: &str) -> Result<Vec<u8>, StateFail> {
-        let len = u32::from_le_bytes(self.array(part)?) as usize;
-        if len > NAME_MAX {
-            return Err(refused(format!(
-                "{part} of {len} bytes, past the {NAME_MAX} the format carries"
-            )));
-        }
-        Ok(self.exact(len, part)?.to_vec())
-    }
-
-    fn runs(&mut self, part: &str) -> Result<Vec<Range<usize>>, StateFail> {
-        let n = self.count(part)?;
-        let mut runs = Vec::new();
-        for _ in 0..n {
-            let start = self.count(part)?;
-            runs.push(start..self.count(part)?);
-        }
-        Ok(runs)
-    }
-
-    /// `len` values, their host memory allocated first.
-    fn vals<T: Le>(&mut self, len: usize, part: &str) -> Result<Vec<T>, StateFail> {
-        let mut v: Vec<T> = host_vec(len).map_err(StateFail::Refused)?;
-        for c in v.chunks_mut(CHUNK / T::SIZE) {
-            let b = self.exact(c.len() * T::SIZE, part)?;
-            for (x, b) in c.iter_mut().zip(b.chunks_exact(T::SIZE)) {
-                *x = T::get(b);
-            }
-        }
-        Ok(v)
-    }
-
-    /// Refused by name unless the stream ends here.
-    fn end(&mut self) -> Result<(), StateFail> {
-        let mut b = [0u8; 1];
-        loop {
-            match self.input.read(&mut b) {
-                Ok(0) => return Ok(()),
-                Ok(_) => {
-                    return Err(refused(format!(
-                        "trailing bytes past the state's {}: the format names none",
-                        self.bytes
-                    )));
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(stream_fail(e)),
-            }
-        }
-    }
+    Ok(runs)
 }
 
 /// `len` values of host memory, refused by name when the allocation fails.
@@ -1149,7 +982,7 @@ mod tests {
             let mut w = Put::new(&mut out);
             h.write(&mut w).expect("a header into memory");
             w.flush().expect("a flush into memory");
-            w.bytes
+            w.bytes()
         };
         assert_eq!(written, out.len() as u64);
         out
@@ -1232,7 +1065,7 @@ mod tests {
         let mut input = b.as_slice();
         let mut r = Take::new(&mut input);
         assert_eq!(Header::read(&mut r).expect("its own header"), h);
-        assert_eq!(r.bytes, b.len() as u64);
+        assert_eq!(r.bytes(), b.len() as u64);
         r.end().expect("the stream ends with the header");
     }
 
@@ -1255,7 +1088,10 @@ mod tests {
         let mut input = past.as_slice();
         let mut r = Take::new(&mut input);
         Header::read(&mut r).expect("its own header");
-        named(r.end(), "trailing bytes past the state's");
+        named(
+            r.end().map_err(StateFail::from),
+            "trailing bytes past the state's",
+        );
     }
 
     /// A header cut anywhere is a short stream, refused by name.
@@ -1277,7 +1113,7 @@ mod tests {
         for left in [0, 10, b.len() - 1] {
             let mut out = FullAfter { left };
             let mut w = Put::new(&mut out);
-            let r = h.write(&mut w).and_then(|()| w.flush());
+            let r = h.write(&mut w).and_then(|()| Ok(w.flush()?));
             assert!(
                 matches!(&r, Err(StateFail::Io(e)) if e.kind() == io::ErrorKind::StorageFull),
                 "a write failing after {left} bytes: {r:?}"
@@ -1294,7 +1130,7 @@ mod tests {
         let mut input = BrokenAfter { bytes: &b };
         let mut r = Take::new(&mut input);
         Header::read(&mut r).expect("its own header");
-        assert!(matches!(r.end(), Err(StateFail::Io(_))));
+        assert!(matches!(r.end(), Err(bytes::Fail::Io(_))));
     }
 
     /// The owner, the positions, the runs and the layout: each other one is

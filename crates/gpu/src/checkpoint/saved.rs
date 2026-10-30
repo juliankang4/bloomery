@@ -50,6 +50,22 @@
 //! ([`Spans::by_position`], [`Spans::by_pool`]), and any prefix of it is a valid
 //! cut: [`SeqState::keep_point`] is every position up to the state's, and
 //! [`SeqState::load_rows`] moves the rows of the first `k` positions.
+//!
+//! A landed state goes to bytes and back ([`SeqState::put`],
+//! [`SeqState::take`], the byte form of [`super::bytes`]), each position's host
+//! value by its own [`HostBytes`]; a state read back is the one written, and
+//! puts back as it would have. In order:
+//!
+//! | part | fields |
+//! |---|---|
+//! | identity | the architecture, the first shard's path and the card (names); the context (count) |
+//! | positions | the positions (u32), the cut rule (u8: 0 at points, 1 anywhere) |
+//! | runs | a count; per run its planes, stride and length (counts) and its growth (u8: 0 whole, 1 per position then its values, 2 per pool then its spacing and values) |
+//! | stores | the recurrent stores' lengths (a count, then each) |
+//! | values | the current position's host value; the points (a count, then each position, u32, and its host value) |
+//! | arrays | the rows (a count, then the u16s); the recurrent stores (a count, then the f32s) |
+//!
+//! A state of another identity is refused by name before any array is read.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -60,6 +76,7 @@ use gguf::Split;
 use runtime::savemap::{Per, Run, Strip, plan_prefix, plan_whole};
 
 use super::Checkpoints;
+use super::bytes::{Fail, Put, Take, refused};
 use super::staging::{NoRoom, Staged, Staging};
 use crate::tensor::{Pitched, dtoh_2d, host_filled, htod_2d};
 use crate::{Gpu, GpuError};
@@ -256,11 +273,6 @@ impl<'a> Spans<'a> {
         }
         Ok(Spans { buf, run })
     }
-
-    /// The values of each run, in order.
-    fn sizes(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.run.planes).map(|_| self.run.len)
-    }
 }
 
 /// The stores a state is read from or put back into, lent for one call:
@@ -290,10 +302,6 @@ impl Lent<'_, '_, '_> {
         })
         .and_then(|n| u64::try_from(n).ok())
         .ok_or_else(|| shape("a snapshot's host bytes pass the address space".to_owned()))
-    }
-
-    fn spans(&self) -> Vec<usize> {
-        self.positional.iter().flat_map(Spans::sizes).collect()
     }
 
     fn lens(&self) -> Vec<usize> {
@@ -958,19 +966,11 @@ impl<T> SeqState<T> {
                 "a state whose copy is still running put back: wait for the save to land first",
             ));
         }
-        let spans = lent.spans();
-        let mine: Vec<usize> = self
-            .runs
-            .iter()
-            .flat_map(|r| (0..r.planes).map(|_| r.len))
-            .collect();
-        if spans != mine {
+        let runs = lent.runs();
+        if runs != self.runs {
             return Err(shape(format!(
-                "a state of {} positional runs ({} values) put back into {} ({} values)",
-                mine.len(),
-                mine.iter().sum::<usize>(),
-                spans.len(),
-                spans.iter().sum::<usize>()
+                "a state of positional runs {:?} put back into {runs:?}",
+                self.runs
             )));
         }
         let lens = lent.lens();
@@ -1071,6 +1071,12 @@ impl<T> SeqState<T> {
         self.points.iter().map(|&(p, _)| p).collect()
     }
 
+    /// The host values it carries: the current position's, then each
+    /// point's in order.
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        std::iter::once(&self.current).chain(self.points.iter().map(|(_, v)| v))
+    }
+
     /// The longest prefix of at most `n` positions a model holds right after
     /// the state is put back: every position when `n` reaches them, else the
     /// nearest carried point at or below `n`, else none; for a state of rows
@@ -1089,6 +1095,167 @@ impl<T> SeqState<T> {
             .map(|&(p, _)| p)
             .find(|&p| p <= n)
             .unwrap_or(0)
+    }
+}
+
+/// A host value a state carries beside a position, in the byte form
+/// ([`SeqState::put`]).
+pub trait HostBytes: Sized {
+    fn put(&self, w: &mut Put<'_>) -> Result<(), Fail>;
+    fn take(r: &mut Take<'_>) -> Result<Self, Fail>;
+}
+
+impl<T: HostBytes> SeqState<T> {
+    /// The state in the byte form (the module doc). Refused by name while
+    /// its copy has not landed.
+    pub fn put(&self, w: &mut Put<'_>) -> Result<(), Fail> {
+        if self.landed.get().is_none() {
+            return Err(refused(
+                "a state whose copy is still running written: wait for the save to land first",
+            ));
+        }
+        let who = &self.who;
+        w.name(who.arch.as_bytes())?;
+        w.name(who.file.as_os_str().as_encoded_bytes())?;
+        w.name(who.card.as_bytes())?;
+        w.count(who.ctx)?;
+        w.one(self.positions)?;
+        w.one(u8::from(self.cuts == Cuts::Anywhere))?;
+        w.count(self.runs.len())?;
+        for r in &self.runs {
+            for v in [r.planes, r.stride, r.len] {
+                w.count(v)?;
+            }
+            match r.per {
+                Per::Whole => w.one(0u8)?,
+                Per::Position { values } => {
+                    w.one(1u8)?;
+                    w.count(values)?;
+                }
+                Per::Pool { every, values } => {
+                    w.one(2u8)?;
+                    w.count(every)?;
+                    w.count(values)?;
+                }
+            }
+        }
+        w.count(self.lens.len())?;
+        for &l in &self.lens {
+            w.count(l)?;
+        }
+        self.current.put(w)?;
+        w.count(self.points.len())?;
+        for (p, v) in &self.points {
+            w.one(*p)?;
+            v.put(w)?;
+        }
+        w.array(self.host.rows())?;
+        w.array(self.host.recurrent())
+    }
+
+    /// The state [`SeqState::put`] wrote, of `who`'s model: refused by name
+    /// for another identity before any array is read, for a position past
+    /// the context, points that do not ascend inside the positions, and
+    /// arrays whose lengths are not the runs' and the stores'. The layout
+    /// against the model's own stores is the put back's to check.
+    pub fn take(r: &mut Take<'_>, who: &Identity) -> Result<SeqState<T>, Fail> {
+        let (arch, file, card) = (
+            r.name("the architecture")?,
+            r.name("the model file")?,
+            r.name("the card")?,
+        );
+        let ctx = r.count("the context")?;
+        if arch != who.arch.as_bytes()
+            || file != who.file.as_os_str().as_encoded_bytes()
+            || card != who.card.as_bytes()
+            || ctx != who.ctx
+        {
+            let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+            return Err(refused(format!(
+                "a state of {} {} on {} at {ctx} positions put back on {who}",
+                text(&arch),
+                text(&file),
+                text(&card)
+            )));
+        }
+        let positions: u32 = r.one("the positions")?;
+        if positions as usize > ctx {
+            return Err(refused(format!(
+                "a state of {positions} positions past its context of {ctx}"
+            )));
+        }
+        let cuts = match r.one::<u8>("the cut rule")? {
+            0 => Cuts::AtPoints,
+            1 => Cuts::Anywhere,
+            c => return Err(refused(format!("a cut rule of code {c}"))),
+        };
+        let n_runs = r.count("the runs")?;
+        let mut runs = Vec::new();
+        for _ in 0..n_runs {
+            let (planes, stride, len) = (r.count("a run")?, r.count("a run")?, r.count("a run")?);
+            let per = match r.one::<u8>("a run's growth")? {
+                0 => Per::Whole,
+                1 => Per::Position {
+                    values: r.count("a run's growth")?,
+                },
+                2 => Per::Pool {
+                    every: r.count("a run's growth")?,
+                    values: r.count("a run's growth")?,
+                },
+                g => return Err(refused(format!("a run's growth of code {g}"))),
+            };
+            runs.push(Run {
+                planes,
+                stride,
+                len,
+                per,
+            });
+        }
+        let n_lens = r.count("the recurrent stores")?;
+        let lens = (0..n_lens)
+            .map(|_| r.count("the recurrent stores"))
+            .collect::<Result<Vec<usize>, Fail>>()?;
+        let current = T::take(r)?;
+        let n_points = r.count("the points")?;
+        let mut points = Vec::new();
+        for _ in 0..n_points {
+            let p: u32 = r.one("a point")?;
+            points.push((p, T::take(r)?));
+        }
+        check_points(positions, points.iter().map(|&(p, _)| p)).map_err(Fail::Refused)?;
+        let rows_n = runs.iter().try_fold(0usize, |n, run| {
+            run.planes.checked_mul(run.len)?.checked_add(n)
+        });
+        let rec_n = lens
+            .iter()
+            .try_fold(0usize, |n, &l| n.checked_add(l))
+            .and_then(|one| one.checked_mul(1 + points.len()));
+        let rows_at = r.count("the rows")?;
+        if rows_n != Some(rows_at) {
+            return Err(refused(format!(
+                "{rows_at} rows beside runs of {rows_n:?} values"
+            )));
+        }
+        let rows = r.vals(rows_at, "the rows")?;
+        let rec_at = r.count("the recurrent stores' values")?;
+        if rec_n != Some(rec_at) {
+            return Err(refused(format!(
+                "{rec_at} recurrent values beside stores of {lens:?} f32s at {} positions",
+                1 + points.len()
+            )));
+        }
+        let recurrent = r.vals(rec_at, "the recurrent stores' values")?;
+        Ok(SeqState {
+            who: who.clone(),
+            positions,
+            host: Host::Owned { rows, recurrent },
+            runs,
+            lens,
+            current,
+            points,
+            cuts,
+            landed: OnceLock::from(SaveCost::default()),
+        })
     }
 }
 
@@ -1415,11 +1582,157 @@ mod tests {
         );
     }
 
+    /// A test host value: one u32.
+    struct Val(u32);
+
+    impl HostBytes for Val {
+        fn put(&self, w: &mut Put<'_>) -> Result<(), Fail> {
+            w.one(self.0)
+        }
+
+        fn take(r: &mut Take<'_>) -> Result<Val, Fail> {
+            r.one("a value").map(Val)
+        }
+    }
+
+    fn put_bytes(s: &SeqState<Val>) -> Result<Vec<u8>, Fail> {
+        let mut out = Vec::new();
+        let mut w = Put::new(&mut out);
+        s.put(&mut w)?;
+        w.flush()?;
+        assert_eq!(w.bytes(), out.len() as u64);
+        Ok(out)
+    }
+
+    fn take_bytes(mut b: &[u8], who: &Identity) -> Result<SeqState<Val>, Fail> {
+        SeqState::take(&mut Take::new(&mut b), who)
+    }
+
+    /// `r` is a refusal by name whose words hold `says`.
+    fn refused_with<T>(r: Result<T, Fail>, says: &str) {
+        match r {
+            Err(Fail::Refused(e)) => assert!(e.to_string().contains(says), "{e}: not {says:?}"),
+            Err(e) => panic!("{e}: not refused by name ({says:?})"),
+            Ok(_) => panic!("read back: not refused ({says:?})"),
+        }
+    }
+
+    /// A landed state of every growth rule and two points goes to bytes and
+    /// back whole: the state read writes the same bytes, holds the same
+    /// positions and keeps the same cuts, and a state cut anywhere comes
+    /// back cut anywhere. Refused by name: a state of another
+    /// identity, before any array is read (its stream cut past the header
+    /// names the identity, not a short stream); a stream cut short; arrays
+    /// whose lengths are not the runs' and the stores'; a state whose copy has
+    /// not landed; points that do not ascend inside the positions; a
+    /// position past the context.
+    #[test]
+    fn a_state_goes_to_bytes_and_back() {
+        let runs = vec![
+            Run {
+                planes: 2,
+                stride: 8,
+                len: 4,
+                per: Per::Position { values: 2 },
+            },
+            Run {
+                planes: 1,
+                stride: 2,
+                len: 2,
+                per: Per::Pool {
+                    every: 2,
+                    values: 1,
+                },
+            },
+            Run {
+                planes: 1,
+                stride: 1,
+                len: 1,
+                per: Per::Whole,
+            },
+        ];
+        let lens = vec![3, 2];
+        let state = |rows: usize| SeqState {
+            who: who(),
+            positions: 4,
+            host: Host::Owned {
+                rows: (0..rows as u16).collect(),
+                recurrent: (0..15).map(|v| v as f32 / 4.0).collect(),
+            },
+            runs: runs.clone(),
+            lens: lens.clone(),
+            current: Val(7),
+            points: vec![(1, Val(5)), (3, Val(6))],
+            cuts: Cuts::AtPoints,
+            landed: OnceLock::from(SaveCost::default()),
+        };
+        let s = state(11);
+        let b = put_bytes(&s).expect("a landed state into memory");
+        let back = take_bytes(&b, &who()).expect("the state back");
+        assert_eq!(put_bytes(&back).expect("the read state"), b);
+        assert_eq!(
+            (back.positions(), back.points(), back.keep_point(2)),
+            (4, vec![1, 3], 1)
+        );
+        let other = Identity {
+            ctx: CTX * 2,
+            ..who()
+        };
+        refused_with(take_bytes(&b, &other), "put back on");
+        refused_with(take_bytes(&b[..b.len() / 2], &other), "put back on");
+        refused_with(take_bytes(&b[..b.len() - 1], &who()), "a short stream");
+        let short = put_bytes(&state(10)).expect("a state of 10 rows into memory");
+        refused_with(
+            take_bytes(&short, &who()),
+            "10 rows beside runs of Some(11)",
+        );
+        for points in [
+            vec![(3, Val(5)), (1, Val(6))],
+            vec![(1, Val(5)), (4, Val(6))],
+        ] {
+            let bad = SeqState {
+                points,
+                ..state(11)
+            };
+            let b = put_bytes(&bad).expect("unchecked points into bytes");
+            refused_with(take_bytes(&b, &who()), "the points ascend");
+        }
+        let past = SeqState {
+            positions: u32::try_from(CTX).expect("the test context fits a position") + 1,
+            ..state(11)
+        };
+        let b = put_bytes(&past).expect("unchecked position into bytes");
+        refused_with(take_bytes(&b, &who()), "positions past its context");
+        let running = SeqState {
+            landed: OnceLock::new(),
+            ..state(11)
+        };
+        refused_with(put_bytes(&running), "still running");
+        let anywhere = SeqState {
+            host: Host::Owned {
+                rows: (0..11).collect(),
+                recurrent: Vec::new(),
+            },
+            lens: Vec::new(),
+            points: Vec::new(),
+            cuts: Cuts::Anywhere,
+            ..state(11)
+        };
+        let b = put_bytes(&anywhere).expect("a state cut anywhere into memory");
+        let back = take_bytes(&b, &who()).expect("the state back");
+        assert_eq!(
+            back.keep_point(3),
+            3,
+            "a state cut anywhere keeps any prefix"
+        );
+    }
+
     /// A state of 5 positions of a two-plane store, rows alone: it saves
     /// rows 0..5 of each plane, a recurrent store lent to it is refused by
     /// name, and put back on an empty model it restores exactly the first 3
     /// positions of each plane when asked for 3 (nothing past them moves), and
-    /// is refused by name for a prefix past its positions.
+    /// is refused by name for a prefix past its positions and for stores of
+    /// the same lengths laid out apart otherwise.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_a_state_of_rows_alone_comes_back_at_any_prefix() {
@@ -1454,6 +1767,19 @@ mod tests {
             (3, 5, 0)
         );
         kv.copy_from_host(&stream, &[9u16; 32]).expect("kv");
+        {
+            // The same values a plane, its planes another distance apart.
+            let mut spans = [Spans::by_position(&mut kv, 2, 10, 5, 2).expect("spans")];
+            let mut lent = Lent {
+                positional: &mut spans,
+                recurrent: &mut [],
+            };
+            let other = s
+                .load_rows(&stream, &who(), &mut lent, 3)
+                .err()
+                .expect("another layout of the same lengths is refused");
+            assert!(other.to_string().contains("positional runs"), "{other}");
+        }
         let put = {
             let mut spans = [Spans::by_position(&mut kv, 2, 16, 5, 2).expect("spans")];
             let mut lent = Lent {
