@@ -973,15 +973,15 @@ impl FileSwap {
 
     /// Where the host reads stack `stack` of layer `layer`'s expert `id`: the
     /// sidecar's run when it holds the stack and the pair reads one, else the
-    /// source's; a planes stack's codes run then its scales run, the second
-    /// empty for a stack of whole runs ([`expert_runs`]).
+    /// source's; a planes stack's codes run then its scales run, each in its
+    /// file, the second empty for a stack of whole runs ([`expert_runs`]).
     fn runs(
         &self,
         layer: usize,
         id: u32,
         stack: usize,
         what: &'static str,
-    ) -> Result<(HostFile, [Range<u64>; 2]), GpuError> {
+    ) -> Result<[(HostFile, Range<u64>); 2], GpuError> {
         let t = &self.layer(layer, what)?.tensors[stack];
         expert_runs(self.pair.source(), t, self.experts, id, true)
             .map_err(|e| GpuError::plan(what, e))
@@ -1169,10 +1169,12 @@ impl SwapSource for FileSwap {
         }
         let stacks = self.layer(layer, WHAT)?.tensors.len();
         for stack in 0..stacks {
-            let (file, runs) = self.runs(layer, id, stack, WHAT)?;
-            for at in runs.iter().filter(|r| !r.is_empty()) {
+            for (file, at) in self.runs(layer, id, stack, WHAT)? {
+                if at.is_empty() {
+                    continue;
+                }
                 self.set
-                    .populate_run(self.pair.source(), &file, at)
+                    .populate_run(self.pair.source(), &file, &at)
                     .map_err(|e| GpuError::plan(WHAT, e))?;
             }
         }
@@ -1188,11 +1190,13 @@ impl SwapSource for FileSwap {
         }
         let stacks = self.layer(layer, WHAT)?.tensors.len();
         for stack in 0..stacks {
-            let (file, runs) = self.runs(layer, id, stack, WHAT)?;
-            for at in runs.iter().filter(|r| !r.is_empty()) {
+            for (file, at) in self.runs(layer, id, stack, WHAT)? {
+                if at.is_empty() {
+                    continue;
+                }
                 let serves = self
                     .set
-                    .serves(self.pair.source(), &file, at)
+                    .serves(self.pair.source(), &file, &at)
                     .map_err(|e| GpuError::plan(WHAT, e))?;
                 if !serves {
                     return Ok(false);

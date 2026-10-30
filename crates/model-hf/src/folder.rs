@@ -583,8 +583,9 @@ enum Spot {
     Made,
     File(PathBuf, std::ops::Range<u64>),
     Stack {
-        file: PathBuf,
+        codes_in: Vec<PathBuf>,
         codes_at: Vec<u64>,
+        scales_in: Vec<PathBuf>,
         scales_at: Vec<u64>,
         codes_per: u64,
         scales_per: u64,
@@ -645,9 +646,14 @@ fn assemble<M: FolderMap>(
     }
     let used: BTreeSet<&PathBuf> = spots
         .iter()
-        .filter_map(|s| match s {
-            Spot::Made => None,
-            Spot::File(file, _) | Spot::Stack { file, .. } => Some(file),
+        .flat_map(|s| match s {
+            Spot::Made => Vec::new(),
+            Spot::File(file, _) => vec![file],
+            Spot::Stack {
+                codes_in,
+                scales_in,
+                ..
+            } => codes_in.iter().chain(scales_in).collect(),
         })
         .collect();
     let mut files: Vec<PathBuf> = used.into_iter().cloned().collect();
@@ -658,27 +664,35 @@ fn assemble<M: FolderMap>(
         }
         files.sort();
     }
-    let index = |file: &PathBuf| files.iter().position(|f| f == file);
+    let index = |file: &PathBuf| {
+        files
+            .iter()
+            .position(|f| f == file)
+            .ok_or_else(|| format!("{} is no shard", file.display()))
+    };
+    let indices = |runs: Vec<PathBuf>| runs.iter().map(index).collect::<Result<Vec<_>, _>>();
     let places = spots
         .into_iter()
         .map(|spot| {
             Ok(match spot {
                 Spot::Made => Place::Made,
                 Spot::File(file, range) => Place::File {
-                    shard: index(&file).ok_or_else(|| format!("{} is no shard", file.display()))?,
+                    shard: index(&file)?,
                     range,
                 },
                 Spot::Stack {
-                    file,
+                    codes_in,
                     codes_at,
+                    scales_in,
                     scales_at,
                     codes_per,
                     scales_per,
                     layout,
                     scales,
                 } => Place::Stack {
-                    shard: index(&file).ok_or_else(|| format!("{} is no shard", file.display()))?,
+                    codes_in: indices(codes_in)?,
                     codes_at,
+                    scales_in: indices(scales_in)?,
                     scales_at,
                     codes_per,
                     scales_per,
@@ -752,7 +766,7 @@ fn scale_name(name: &str) -> String {
 }
 
 /// The stack `decl`, mapped as `m`, where `folder` stores it: each expert's code plane and its
-/// block-scale plane, two runs of one file wherever the folder keeps them
+/// block-scale plane, two runs wherever the folder keeps them, each in its own shard
 /// ([`StackLayout::Planes`]), with the expert's tensor scale, the factor its results are
 /// multiplied by. Every code plane has the stack's size, and every block-scale plane.
 fn stack_in_place<S>(
@@ -769,30 +783,14 @@ fn stack_in_place<S>(
         );
     }
     let get = |n: &str| folder.raw(n);
-    let mut file: Option<PathBuf> = None;
-    let (mut codes_at, mut scales_at) = (Vec::new(), Vec::new());
+    let (mut codes_in, mut codes_at) = (Vec::new(), Vec::new());
+    let (mut scales_in, mut scales_at) = (Vec::new(), Vec::new());
     let mut scales = Vec::with_capacity(m.sources.len());
     let mut per: Option<(u64, u64)> = None;
     for (source, placed) in m.placed(plan)? {
         let (scale, block_scale) = modelopt::nvfp4_rows_scale(&get, source, placed)?;
         let (codes_file, codes) = folder.file_range(source)?;
         let (scale_file, planes) = folder.file_range(block_scale)?;
-        if scale_file != codes_file {
-            return Err(format!(
-                "{source}: its block scales {block_scale} are in {}, its codes in {}, the one \
-                 matrix a stack of planes holds",
-                scale_file.display(),
-                codes_file.display()
-            )
-            .into());
-        }
-        if file.as_ref().is_some_and(|f| *f != codes_file) {
-            return Err(format!(
-                "{source}: in {}, not the stack's file",
-                codes_file.display()
-            )
-            .into());
-        }
         let sizes = (codes.end - codes.start, planes.end - planes.start);
         if let Some(of) = per.filter(|&of| of != sizes) {
             return Err(format!(
@@ -802,17 +800,19 @@ fn stack_in_place<S>(
             .into());
         }
         per = Some(sizes);
-        file = Some(codes_file);
+        codes_in.push(codes_file);
         codes_at.push(codes.start);
+        scales_in.push(scale_file);
         scales_at.push(planes.start);
         scales.push(scale);
     }
-    let (Some(file), Some((codes_per, scales_per))) = (file, per) else {
+    let Some((codes_per, scales_per)) = per else {
         return Err(format!("{name}: a stack of no matrix").into());
     };
     Ok(Spot::Stack {
-        file,
+        codes_in,
         codes_at,
+        scales_in,
         scales_at,
         codes_per,
         scales_per,
@@ -1718,22 +1718,34 @@ mod tests {
         assemble(&checkpoint, dir, folder, plan, planned, &kvs)
     }
 
-    /// The toy folder opens as a located split over its two files: the embedding and the router
-    /// are the files' bytes where they lie, the stack's matrices are read at their places with
-    /// the experts' tensor scales beside them (each matrix's block scales directly after its
-    /// codes when the folder stores them so, a plane apart when it keeps every code plane before
-    /// every scale plane), the norm and every `.scale` are made, and the part source holds every
-    /// tensor.
+    /// The toy folder opens as a located split over its files: the embedding and the router are
+    /// the files' bytes where they lie, the stack's matrices are read at their places with the
+    /// experts' tensor scales beside them (each matrix's block scales directly after its codes
+    /// when the folder stores them so, a plane apart when it keeps every code plane before every
+    /// scale plane, in the file that holds each plane when a matrix or its block scales lie in
+    /// another), the norm and every `.scale` are made, and the part source holds every tensor.
+    /// FAIL-first: the stack's runs all named in its first matrix's file read another file's
+    /// bytes, or refuse the stack.
     #[test]
     fn a_folder_opens_as_a_located_split() {
-        for experts in [Experts::Planes, Experts::Apart] {
+        for (experts, codes_shards, scales_shards) in [
+            (Experts::Planes, [1, 1, 1], [1, 1, 1]),
+            (Experts::Apart, [1, 1, 1], [1, 1, 1]),
+            (Experts::TwoFiles, [1, 1, 2], [1, 1, 2]),
+            (Experts::ScalesElsewhere, [1, 1, 1], [2, 2, 2]),
+        ] {
             let dir = temp_dir("folder-located");
             toy_folder(&dir, experts, &[]);
             let a = toy_assembled(&dir).unwrap();
             let split = &a.header;
-            assert_eq!(split.shard_count(), 2);
-            assert_eq!(split.shard_path(0).unwrap(), dir.join("a.safetensors"));
-            assert_eq!(split.shard_path(1).unwrap(), dir.join("b.safetensors"));
+            let files = 1 + codes_shards.iter().chain(&scales_shards).max().unwrap();
+            assert_eq!(split.shard_count(), files);
+            for (i, f) in ["a", "b", "c"][..files].iter().enumerate() {
+                assert_eq!(
+                    split.shard_path(i).unwrap(),
+                    dir.join(format!("{f}.safetensors"))
+                );
+            }
             assert_eq!(split.architecture(), Some("toy"));
             assert!(!split.is_header_only());
             let emb: Vec<u8> = (0..64).collect();
@@ -1748,13 +1760,14 @@ mod tests {
                 assert_eq!(m.block_scales, block_scales(e), "expert {e}");
             }
             let Some(Place::Stack {
+                codes_in,
                 codes_at,
+                scales_in,
                 scales_at,
                 codes_per,
                 scales_per,
                 layout,
                 scales,
-                ..
             }) = split.place("exps.weight")
             else {
                 panic!("the stack is a stack");
@@ -1764,8 +1777,14 @@ mod tests {
                 (128, 16, StackLayout::Planes)
             );
             assert_eq!(scales, &TENSOR_SCALES);
+            assert_eq!(
+                (&codes_in[..], &scales_in[..]),
+                (&codes_shards[..], &scales_shards[..]),
+                "each run's shard"
+            );
             let next_to_codes = |e: usize| scales_at[e] == codes_at[e] + 128;
             match experts {
+                Experts::TwoFiles | Experts::ScalesElsewhere => {}
                 Experts::Planes => {
                     assert!((0..3).all(next_to_codes), "{codes_at:?} {scales_at:?}");
                     assert!(
@@ -1944,8 +1963,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A stack the folder does not store as planes of one file (a matrix's two planes in two
-    /// files, matrices in two files), one whose planes differ in size, a stack of rows, and a tensor the map neither reads nor skips are refused by name.
+    /// A stack whose planes differ in size, a stack of rows, and a tensor the map neither reads
+    /// nor skips are refused by name.
+    // PIN(2026-10-31): a stack across files opens, each run in its own shard
+    // (`a_folder_opens_as_a_located_split`).
     #[test]
     fn what_the_folder_does_not_store_as_the_map_says_is_refused_by_name() {
         let refusal = |experts, extra: &[(&str, &'static str, Vec<usize>, Vec<u8>)]| {
@@ -1958,18 +1979,6 @@ mod tests {
             std::fs::remove_dir_all(&dir).unwrap();
             e
         };
-        let e = refusal(Experts::TwoFiles, &[]);
-        assert!(
-            e.contains("ex.2.weight: in ") && e.contains("c.safetensors, not the stack's file"),
-            "{e}"
-        );
-        let e = refusal(Experts::ScalesElsewhere, &[]);
-        assert!(
-            e.contains("ex.0.weight: its block scales ex.0.weight_scale are in ")
-                && e.contains("c.safetensors, its codes in ")
-                && e.contains("b.safetensors"),
-            "{e}"
-        );
         let dir = temp_dir("folder-uneven");
         toy_folder(&dir, Experts::Uneven, &[]);
         let folder = Folder::open(&dir).unwrap();

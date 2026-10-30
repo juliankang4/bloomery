@@ -623,16 +623,19 @@ pub enum Place {
     /// The declared type's bytes, at `range` (file offsets) of shard `shard`: [`Split::data`] is
     /// those bytes.
     File { shard: usize, range: Range<u64> },
-    /// A stack of equal matrices in shard `shard`, each read where the file keeps it
-    /// ([`Split::matrix`]); [`Split::data`] refuses the stack as one run. Matrix `e`'s codes are
-    /// the `codes_per` bytes at file offset `codes_at[e]`. Under [`StackLayout::Planes`] its
-    /// block scales are the `scales_per` bytes at `scales_at[e]`, and `scales[e]` is the factor
-    /// its results are multiplied by (what the `.scale` tensor of the stack holds for it, one
-    /// finite positive value an expert); under [`StackLayout::Rows`] all three are empty or 0.
-    /// No two runs overlap, and no order of codes and scales is assumed.
+    /// A stack of equal matrices, each read where the files keep it ([`Split::matrix`]);
+    /// [`Split::data`] refuses the stack as one run. Matrix `e`'s codes are the `codes_per`
+    /// bytes at file offset `codes_at[e]` of shard `codes_in[e]`. Under [`StackLayout::Planes`]
+    /// its block scales are the `scales_per` bytes at `scales_at[e]` of shard `scales_in[e]`,
+    /// and `scales[e]` is the factor its results are multiplied by (what the `.scale` tensor of
+    /// the stack holds for it, one finite positive value an expert); under [`StackLayout::Rows`]
+    /// those four are empty or 0. A run lies in any shard, apart from its matrix's other run and
+    /// from the stack's other matrices; no two runs of a shard overlap, and no order of codes and
+    /// scales is assumed. The first matrix's codes shard lists the stack in its table.
     Stack {
-        shard: usize,
+        codes_in: Vec<usize>,
         codes_at: Vec<u64>,
+        scales_in: Vec<usize>,
         scales_at: Vec<u64>,
         codes_per: u64,
         scales_per: u64,
@@ -657,12 +660,28 @@ const UNREAD_STACK: &str =
 const UNREAD_MADE: &str = "is made by a step from the file's tensors: no run of any file holds it";
 
 impl Place {
-    /// Whether this place describes `nbytes` declared bytes inside a file of `file_len` bytes
-    /// (the shard's; unread for [`Place::Made`]): the refusal names what is wrong.
-    fn check(&self, name: &str, file_len: u64, nbytes: u64) -> Result<(), String> {
+    /// The shard whose table lists the tensor: a file run's, a stack's first matrix's codes
+    /// shard; `None` for a made tensor, which no shard holds.
+    fn listed_in(&self) -> Option<usize> {
+        match self {
+            Place::File { shard, .. } => Some(*shard),
+            Place::Stack { codes_in, .. } => Some(codes_in.first().copied().unwrap_or(0)),
+            Place::Made => None,
+        }
+    }
+
+    /// Whether this place describes `nbytes` declared bytes inside the files of `lens` bytes
+    /// (by shard; unread for [`Place::Made`]): the refusal names what is wrong.
+    fn check(&self, name: &str, lens: &[u64], nbytes: u64) -> Result<(), String> {
+        let len = |shard: usize| {
+            lens.get(shard)
+                .copied()
+                .ok_or_else(|| format!("{name}: shard {shard}, of {} files", lens.len()))
+        };
         match self {
             Place::Made => Ok(()),
             Place::File { shard, range } => {
+                let file_len = len(*shard)?;
                 if range.start > range.end || range.end > file_len {
                     return Err(format!(
                         "{name}: bytes {range:?} lie outside shard {shard}'s {file_len}"
@@ -677,8 +696,9 @@ impl Place {
                 Ok(())
             }
             Place::Stack {
-                shard,
+                codes_in,
                 codes_at,
+                scales_in,
                 scales_at,
                 codes_per,
                 scales_per,
@@ -688,6 +708,15 @@ impl Place {
                 let n = codes_at.len() as u64;
                 if n == 0 || *codes_per == 0 {
                     return Err(format!("{name}: a stack of no matrix, or of no bytes"));
+                }
+                if codes_in.len() != codes_at.len() || scales_in.len() != scales_at.len() {
+                    return Err(format!(
+                        "{name}: {} codes runs in {} shards, {} scale runs in {}",
+                        codes_at.len(),
+                        codes_in.len(),
+                        scales_at.len(),
+                        scales_in.len()
+                    ));
                 }
                 match layout {
                     StackLayout::Rows => {
@@ -724,22 +753,32 @@ impl Place {
                         "{name}: {n} matrices of {codes_per} + {scales_per} bytes, the declared {nbytes}"
                     ));
                 }
-                let mut runs: Vec<(u64, u64)> = codes_at
+                let mut runs: Vec<(usize, u64, u64)> = codes_in
                     .iter()
-                    .map(|&at| (at, *codes_per))
-                    .chain(scales_at.iter().map(|&at| (at, *scales_per)))
+                    .zip(codes_at)
+                    .map(|(&shard, &at)| (shard, at, *codes_per))
+                    .chain(
+                        scales_in
+                            .iter()
+                            .zip(scales_at)
+                            .map(|(&shard, &at)| (shard, at, *scales_per)),
+                    )
                     .collect();
                 runs.sort_unstable();
-                for (i, &(start, len)) in runs.iter().enumerate() {
+                for (i, &(shard, start, run)) in runs.iter().enumerate() {
+                    let file_len = len(shard)?;
                     let end = start
-                        .checked_add(len)
+                        .checked_add(run)
                         .filter(|&e| e <= file_len)
                         .ok_or_else(|| {
                             format!(
                                 "{name}: the run at {start} runs outside shard {shard}'s {file_len}"
                             )
                         })?;
-                    if runs.get(i + 1).is_some_and(|&(next, _)| next < end) {
+                    if runs
+                        .get(i + 1)
+                        .is_some_and(|&(s, next, _)| s == shard && next < end)
+                    {
                         return Err(format!("{name}: the run at {start} overlaps the next"));
                     }
                 }
@@ -856,10 +895,10 @@ impl Split {
             )));
         }
         if files.is_empty() {
-            let kept = tensors.iter().zip(&places).find_map(|(t, p)| match p {
-                Place::File { shard, .. } | Place::Stack { shard, .. } => Some((&t.name, *shard)),
-                Place::Made => None,
-            });
+            let kept = tensors
+                .iter()
+                .zip(&places)
+                .find_map(|(t, p)| Some((&t.name, p.listed_in()?)));
             if let Some((name, shard)) = kept {
                 return Err(bad(format!("{name}: shard {shard}, of 0 files")));
             }
@@ -898,18 +937,8 @@ impl Split {
         let mut placed = HashMap::with_capacity(places.len());
         for (mut info, place) in tensors.into_iter().zip(places) {
             let name = info.name.clone();
-            let shard = match &place {
-                Place::File { shard, .. } | Place::Stack { shard, .. } => *shard,
-                Place::Made => 0,
-            };
-            let len = if matches!(place, Place::Made) {
-                0
-            } else {
-                lens.get(shard).copied().ok_or_else(|| {
-                    bad(format!("{name}: shard {shard}, of {} files", files.len()))
-                })?
-            };
-            place.check(&name, len, info.nbytes).map_err(bad)?;
+            place.check(&name, &lens, info.nbytes).map_err(bad)?;
+            let shard = place.listed_in().unwrap_or(0);
             match &place {
                 Place::File { range, .. } => info.offset = range.start,
                 Place::Stack { .. } => {
@@ -1051,8 +1080,9 @@ impl Split {
             what,
         };
         let Some(Place::Stack {
-            shard,
+            codes_in,
             codes_at,
+            scales_in,
             scales_at,
             codes_per,
             scales_per,
@@ -1061,18 +1091,19 @@ impl Split {
         else {
             return Err(unread("is not a stack of a located split"));
         };
-        let codes_at = codes_at
-            .get(e)
-            .ok_or_else(|| unread("has no matrix of that index"))?;
-        let map = self.shards[*shard].mapping();
+        if e >= codes_at.len() {
+            return Err(unread("has no matrix of that index"));
+        }
         // `located` checked every run inside its file.
-        let run = |at: u64, len: u64| {
+        let run = |shard: usize, at: u64, len: u64| {
             let end = at.checked_add(len)?;
-            map.get(usize::try_from(at).ok()?..usize::try_from(end).ok()?)
+            self.shards[shard]
+                .mapping()
+                .get(usize::try_from(at).ok()?..usize::try_from(end).ok()?)
         };
-        let codes = run(*codes_at, *codes_per);
+        let codes = run(codes_in[e], codes_at[e], *codes_per);
         let block_scales = match scales_at.get(e) {
-            Some(at) => run(*at, *scales_per),
+            Some(&at) => run(scales_in[e], at, *scales_per),
             None => Some(&[][..]),
         };
         codes
@@ -2590,8 +2621,9 @@ mod located_tests {
         scales: &[f32],
     ) -> Place {
         Place::Stack {
-            shard: 1,
+            codes_in: vec![1; codes_at.len()],
             codes_at: codes_at.to_vec(),
+            scales_in: vec![1; scales_at.len()],
             scales_at: scales_at.to_vec(),
             codes_per,
             scales_per,
@@ -2600,8 +2632,23 @@ mod located_tests {
         }
     }
 
+    /// `t.weight`'s two matrices of 8 + 4 bytes, their runs in shards `codes_in` and
+    /// `scales_in`: both codes at offset 32, the block scales at 28 and 80.
+    fn across(codes_in: [usize; 2], scales_in: [usize; 2]) -> Place {
+        Place::Stack {
+            codes_in: codes_in.to_vec(),
+            codes_at: vec![32, 32],
+            scales_in: scales_in.to_vec(),
+            scales_at: vec![28, 80],
+            codes_per: 8,
+            scales_per: 4,
+            layout: StackLayout::Planes,
+            scales: vec![4.0, 0.125],
+        }
+    }
+
     /// The places of the five: `s.weight`'s block scales each directly after its codes, the
-    /// matrices out of order; `t.weight`'s a gap away from its codes, before and after them.
+    /// matrices out of order; `t.weight`'s runs over both files ([`across`]).
     fn places() -> Vec<Place> {
         vec![
             Place::File {
@@ -2613,7 +2660,7 @@ mod located_tests {
                 range: 56..64,
             },
             planes(&[64, 0, 16], &[76, 12, 28], (12, 4), &[0.5, 2.0, 0.25]),
-            planes(&[32, 44], &[88, 80], (8, 4), &[4.0, 0.125]),
+            across([1, 0], [0, 1]),
             Place::Made,
         ]
     }
@@ -2636,9 +2683,11 @@ mod located_tests {
     }
 
     /// A two-file folder's split holds each file tensor's bytes where the file keeps them, reads
-    /// a stack's matrices out of order with their block scales both next to their codes and a
-    /// gap away, and refuses a made tensor and a stack as one run by name. A header alone, for
-    /// the same header, ends every read in `OutOfBounds`.
+    /// a stack's matrices out of order with their block scales next to their codes, and a
+    /// stack's runs each in its own file, and refuses a made tensor and a stack as one run by
+    /// name. A header alone, for the same header, ends every read in `OutOfBounds`. FAIL-first:
+    /// runs read from the stack's first file, or checked for overlap across files, read or
+    /// refuse `t.weight`, whose two files hold a run at the same offset.
     #[test]
     fn a_located_split_reads_the_files_bytes_in_place() {
         let d = dir("reads");
@@ -2662,12 +2711,14 @@ mod located_tests {
             assert_eq!(m.codes, &b[at..at + 12]);
             assert_eq!(m.block_scales, &b[at + 12..at + 16]);
         }
-        // Separated: the planes of one matrix lie in different regions, scales before codes.
-        for (e, (codes, scales)) in [(32usize, 88usize), (44, 80)].into_iter().enumerate() {
+        // Across: the planes of one matrix lie in different files, scales before codes.
+        let t = [(&b[32..40], &a[28..32]), (&a[32..40], &b[80..84])];
+        for (e, (codes, scales)) in t.into_iter().enumerate() {
             let m = s.matrix("t.weight", e).unwrap();
-            assert_eq!(m.codes, &b[codes..codes + 8]);
-            assert_eq!(m.block_scales, &b[scales..scales + 4]);
+            assert_eq!((m.codes, m.block_scales), (codes, scales), "matrix {e}");
         }
+        let (shard, _) = s.find("t.weight").unwrap();
+        assert_eq!(shard, 1, "the first matrix's codes shard lists the stack");
         named(s.data("m.weight"), &["m.weight", "made"]);
         named(s.data("s.weight"), &["s.weight", "stack"]);
         named(s.data("t.weight"), &["t.weight", "stack"]);
@@ -2731,17 +2782,23 @@ mod located_tests {
         let three = |codes: &[u64], scales: &[u64], s: &[f32]| planes(codes, scales, (12, 4), s);
         let ok = [0.5, 2.0, 0.25];
         let stack_in_file_a = Place::Stack {
-            shard: 0,
+            codes_in: vec![0; 3],
             codes_at: vec![0, 16, 52],
+            scales_in: vec![0; 3],
             scales_at: vec![12, 28, 64],
             codes_per: 12,
             scales_per: 4,
             layout: StackLayout::Planes,
             scales: ok.to_vec(),
         };
+        let mut one_codes_shard = across([1, 0], [0, 1]);
+        if let Place::Stack { codes_in, .. } = &mut one_codes_shard {
+            codes_in.pop();
+        }
         let rows_with_planes = Place::Stack {
-            shard: 1,
+            codes_in: vec![1; 2],
             codes_at: vec![32, 48],
+            scales_in: vec![1; 2],
             scales_at: vec![88, 92],
             codes_per: 12,
             scales_per: 0,
@@ -2749,8 +2806,9 @@ mod located_tests {
             scales: vec![],
         };
         let rows_with_scales = Place::Stack {
-            shard: 1,
+            codes_in: vec![1; 2],
             codes_at: vec![32, 48],
+            scales_in: vec![],
             scales_at: vec![],
             codes_per: 12,
             scales_per: 0,
@@ -2839,6 +2897,17 @@ mod located_tests {
                 three(&codes, &scales, &[0.5, f32::INFINITY, 0.25]),
                 "s.weight: the scale of matrix 1 is inf, not finite and positive",
             ),
+            (3, across([1, 2], [0, 1]), "t.weight: shard 2, of 2 files"),
+            (
+                3,
+                across([1, 1], [0, 1]),
+                "t.weight: the run at 32 overlaps the next",
+            ),
+            (
+                3,
+                one_codes_shard,
+                "t.weight: 2 codes runs in 1 shards, 2 scale runs in 2",
+            ),
             (
                 3,
                 rows_with_planes,
@@ -2854,8 +2923,9 @@ mod located_tests {
             assert!(e.contains(want), "{want}: {e}");
         }
         let rows = Place::Stack {
-            shard: 1,
+            codes_in: vec![1; 2],
             codes_at: vec![32, 48],
+            scales_in: vec![],
             scales_at: vec![],
             codes_per: 12,
             scales_per: 0,
