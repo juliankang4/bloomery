@@ -157,12 +157,12 @@ impl HermesScan {
                     self.after_call = false;
                 }
             } else if let Some(at) = self.specials.find(&self.buf, CALL_OPEN) {
-                out.content.push_str(&self.buf.take_front(at).text);
+                self.buf.take_text_into(at, &mut out.content);
                 self.buf.take_front(CALL_OPEN.len());
                 self.inside = true;
             } else {
                 let upto = self.buf.text.len() - partial_suffix(&self.buf.text, CALL_OPEN);
-                out.content.push_str(&self.buf.take_front(upto).text);
+                self.buf.take_text_into(upto, &mut out.content);
                 return Ok(out);
             }
         }

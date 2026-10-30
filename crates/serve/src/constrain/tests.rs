@@ -35,8 +35,8 @@ const QWEN_COMPACT: ToolFormat = ToolFormat::QwenXml(Framing::Compact);
 const BYTES: u32 = SPECIALS.len() as u32;
 const PIECES: u32 = BYTES + 256;
 
-/// The mock's vocabulary with merged pieces on top: a greedy longest match, so
-/// a piece like `",` is one id where a byte-level vocabulary spells two.
+/// The mock's vocabulary with merged pieces on top: special tokens split
+/// first, then ordinary pieces take the longest match, so `",` is one id.
 struct PieceTok(&'static [&'static str]);
 
 impl PieceTok {
@@ -86,19 +86,44 @@ struct Pieces(Arc<PieceTok>);
 impl Tokenizer for Pieces {
     fn encode(&self, text: &str) -> Vec<u32> {
         let b = text.as_bytes();
+        let tokens: Vec<_> = SPECIALS
+            .iter()
+            .enumerate()
+            .map(|(k, s)| (k as u32, *s))
+            .chain(
+                self.0
+                    .0
+                    .iter()
+                    .enumerate()
+                    .map(|(k, s)| (PIECES + k as u32, *s)),
+            )
+            .collect();
+        let specials: Vec<_> = tokens
+            .iter()
+            .copied()
+            .filter(|&(id, _)| self.is_special(id))
+            .collect();
+        // Canonical encoding splits specials before matching ordinary pieces.
+        let boundaries: Vec<_> = (0..b.len())
+            .filter(|&at| {
+                specials
+                    .iter()
+                    .any(|(_, s)| b[at..].starts_with(s.as_bytes()))
+            })
+            .collect();
         let mut out = Vec::new();
         let mut i = 0;
         while i < b.len() {
-            let specials = SPECIALS.iter().enumerate().map(|(k, s)| (k as u32, *s));
-            let pieces = self
-                .0
-                .0
+            let boundary = boundaries
+                .get(boundaries.partition_point(|&at| at < i))
+                .copied()
+                .unwrap_or(b.len());
+            let candidates = if boundary == i { &specials } else { &tokens };
+            let end = if boundary == i { b.len() } else { boundary };
+            let best = candidates
                 .iter()
-                .enumerate()
-                .map(|(k, s)| (PIECES + k as u32, *s));
-            let best = specials
-                .chain(pieces)
-                .filter(|(_, s)| b[i..].starts_with(s.as_bytes()))
+                .copied()
+                .filter(|(_, s)| b[i..end].starts_with(s.as_bytes()))
                 .max_by_key(|(_, s)| s.len());
             match best {
                 Some((id, s)) => {
@@ -2620,6 +2645,103 @@ fn a_tag_spelled_in_ordinary_ids_is_text() {
     want.extend(plain(&"z".repeat(40)));
     let o = run_read(&tok, &p, &want).0;
     assert_eq!(o.tokens[20], ids(&tok, "</think>")[0], "{:?}", o.content);
+    let mut want = plain("why ");
+    want.extend(ids(&tok, "</think>"));
+    want.extend(plain(&"z".repeat(40)));
+    let o = run_read(&tok, &p, &want).0;
+    assert_eq!(o.tokens, with_eos(&tok, want), "{:?}", o.content);
+}
+
+/// A string or number's closing piece may cross forced grammar steps, but
+/// must stop before a special tag. Required calls retain real special tags
+/// even when the model favours a piece that swallows the close tag's start.
+#[test]
+fn constrained_calls_keep_special_markers_whole() {
+    let pieces = Arc::new(PieceTok(&[
+        CALL_OPEN, CALL_CLOSE, "}}\n<", "\"}}\n<", "]}}\n<",
+    ]));
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::clone(&pieces)));
+    for (raw, schema, crossing) in [
+        ("7", json!({"type": "integer"}), "}}\n<"),
+        (
+            "\"x\"",
+            json!({"type": "string", "maxLength": 1}),
+            "\"}}\n<",
+        ),
+        (
+            "[7]",
+            json!({"type": "array", "items": {"type": "integer"}}),
+            "]}}\n<",
+        ),
+    ] {
+        let body = call_body(&json!({"type": "object", "properties": {"n": schema}}));
+        let text = format!(
+            "{CALL_OPEN}\n{{\"name\": \"f\", \"arguments\": {{\"n\": {raw}}}}}\n{CALL_CLOSE}"
+        );
+        assert!(
+            tok.encode(&text).contains(&pieces.piece(CALL_CLOSE)),
+            "canonical encoding preserves the special"
+        );
+        let before = text.len() - CALL_CLOSE.len() - (crossing.len() - 1);
+        let mut want = tok.encode(&text[..before]);
+        want.push(pieces.piece(crossing));
+        want.extend(tok.encode(&CALL_CLOSE[1..]));
+        let mut slot = Slot::new(Box::new(Rows {
+            tok: Arc::clone(&tok),
+            want,
+            k: 0,
+            read: Arc::default(),
+        }))
+        .schema_jump(false);
+        let mut p = params(
+            Some(build(&tok, ToolFormat::Hermes, &body).expect("required call")),
+            ThinkEntry::Closed,
+        );
+        p.logit_bias = (*b"}\"]").map(|b| (BYTES + u32::from(b), 4.0)).to_vec();
+        let mut events = Vec::new();
+        let o = generate(
+            &mut slot,
+            &sampling::reference_factory(),
+            &tok.encode("hi"),
+            &p,
+            &mut |ev| {
+                if let Event::Text(text, specials, _) = ev {
+                    events.push((text.to_owned(), specials.to_vec()));
+                }
+                Ok(())
+            },
+            &mut |_| {},
+            &mut Timings::default(),
+        )
+        .expect("constrained generation");
+        assert_eq!(o.stop, StopKind::Eos, "{}", o.content);
+        assert!(
+            o.tokens.contains(&pieces.piece(CALL_CLOSE)),
+            "{}",
+            o.content
+        );
+        let parser = || {
+            ChatParser::with_tools("assistant\n", ReasoningFormat::None, Some(Tools::Hermes))
+                .reading_specials(&*tok)
+        };
+        let mut whole = parser();
+        whole.try_push(&o.content, &o.specials).expect("whole call");
+        whole.try_finish().expect("whole call closes");
+        let mut stream = parser().streaming_calls();
+        for (text, specials) in events {
+            stream.try_push(&text, &specials).expect("call piece");
+        }
+        stream.try_finish().expect("streamed call closes");
+        assert_eq!(whole.message(), stream.message(), "whole and stream agree");
+        let calls = &whole.message().calls;
+        assert_eq!(calls.len(), 1, "{}", o.content);
+        assert_eq!(calls[0].name, "f", "the requested function");
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].arguments).expect("arguments"),
+            json!({"n": serde_json::from_str::<Value>(raw).expect("expected value")}),
+            "{raw}"
+        );
+    }
 }
 
 /// A special opener needs a special close. In Qwen XML an ordinary close

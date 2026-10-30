@@ -149,6 +149,9 @@ enum Step {
 struct Forced {
     ids: Vec<u32>,
     text: String,
+    /// The first special token's byte offset and id: an end piece cannot
+    /// consume its text as ordinary tokens.
+    first_special: Option<(usize, u32)>,
     /// For each token-reachable character boundary inside the text, by byte
     /// offset ascending, the ids after it. No end token reaches beyond the
     /// longest vocabulary piece. Empty for a text no end token reaches.
@@ -353,6 +356,10 @@ fn compile_in(parts: &[Part], env: &Env<'_>, reached: bool) -> Result<Program, R
 fn forced(text: &str, reached: bool, env: &Env<'_>) -> Result<Forced, Refusal> {
     let ids = env.encode(text)?;
     no_stop(&ids, text, env)?;
+    let first_special = ids
+        .iter()
+        .position(|&id| env.tok.is_special(id))
+        .map(|i| (env.tok.decode(&ids[..i]).len(), ids[i]));
     let mut rests = Vec::new();
     if reached {
         let max_bytes = env.vocab.longest_piece();
@@ -369,6 +376,7 @@ fn forced(text: &str, reached: bool, env: &Env<'_>) -> Result<Forced, Refusal> {
     Ok(Forced {
         ids,
         text: text.to_owned(),
+        first_special,
         rests,
     })
 }
@@ -1080,8 +1088,9 @@ impl Walk {
 
     /// The heads `h` (past a string or a number, nothing forced) leads to once
     /// it takes `text`, into `out`: through forced texts, forks and rules,
-    /// ending inside a forced text with the rest of it forced.
-    fn eat(&self, mut h: Head, mut text: &str, out: &mut Vec<Head>) {
+    /// ending inside a forced text with the rest of it forced. The ending
+    /// `id` may reach a special token only when it is that token itself.
+    fn eat(&self, mut h: Head, mut text: &str, id: u32, out: &mut Vec<Head>) {
         loop {
             if text.is_empty() {
                 push_new(out, h);
@@ -1096,7 +1105,7 @@ impl Walk {
             }
             if let Some(next) = self.enter(&h) {
                 for k in next {
-                    self.eat(k, text, out);
+                    self.eat(k, text, id, out);
                 }
                 return;
             }
@@ -1107,6 +1116,11 @@ impl Walk {
             let Step::Forced(f) = &prog.steps[frame.at] else {
                 return;
             };
+            if f.first_special
+                .is_some_and(|(at, tag)| at < text.len() && (at != 0 || id != tag))
+            {
+                return;
+            }
             frame.at += 1;
             if let Some(rest) = text.strip_prefix(f.text.as_str()) {
                 text = rest;
@@ -1162,7 +1176,7 @@ impl Walk {
                     continue;
                 }
                 out.clear();
-                self.eat(after.clone(), self.vocab.piece(id), &mut out);
+                self.eat(after.clone(), self.vocab.piece(id), id, &mut out);
                 if !out.is_empty() {
                     ids.push(id);
                 }
@@ -1300,7 +1314,7 @@ impl Walk {
                     return;
                 };
                 if ends(&e) {
-                    self.eat(h, self.vocab.piece(id), out);
+                    self.eat(h, self.vocab.piece(id), id, out);
                 } else if f.class.fits(id, f.room(chars)) {
                     h.ctx = Ctx::Free {
                         prog: Arc::clone(&prog),
@@ -1322,7 +1336,7 @@ impl Walk {
                 };
                 let piece = self.vocab.piece(id);
                 if at.whole() && ends(&e) {
-                    self.eat(h, piece, out);
+                    self.eat(h, piece, id, out);
                 } else if let Some(at) = at.after(piece, integer) {
                     h.ctx = Ctx::Num {
                         prog,
