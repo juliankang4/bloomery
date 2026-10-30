@@ -2,10 +2,10 @@
 
 use jinja::{ChatTemplate, Floats};
 use serde_json::{Value, json};
-use serve::dsml::{DsmlScan, Scanned};
+use serve::dsml::{DsmlScan, Scanned, Spelling};
 use serve::glmxml::{ArgTypes, KvScan, KvSpelling};
 use serve::hermes::HermesScan;
-use serve::qwenxml::{ParamKinds, QwenScan};
+use serve::qwenxml::{Framing, ParamKinds, QwenScan};
 
 #[derive(Clone, Copy)]
 pub enum Format {
@@ -26,8 +26,8 @@ impl Scan {
     fn new(format: Format, tools: Option<&Value>) -> Self {
         match format {
             Format::Glm => Self::Glm(KvScan::new(KvSpelling::Glm, ArgTypes::of_tools(tools))),
-            Format::Qwen => Self::Qwen(QwenScan::new(ParamKinds::of_tools(tools))),
-            Format::Dsml => Self::Dsml(DsmlScan::default()),
+            Format::Qwen => Self::Qwen(QwenScan::new(ParamKinds::of_tools(tools), Framing::Lines)),
+            Format::Dsml => Self::Dsml(DsmlScan::new(Spelling::Joined)),
             Format::Hermes => Self::Hermes(HermesScan::default()),
         }
     }
@@ -40,7 +40,7 @@ impl Scan {
             (Self::Glm(s), None) => s.finish().map_err(|_| ()),
             (Self::Qwen(s), Some(p)) => s.push(p).map_err(|_| ()),
             (Self::Qwen(s), None) => s.finish().map_err(|_| ()),
-            (Self::Hermes(s), Some(p)) => s.push(p).map_err(|_| ()),
+            (Self::Hermes(s), Some(p)) => s.push(p, &[]).map_err(|_| ()),
             (Self::Hermes(s), None) => s.finish().map_err(|_| ()),
             (Self::Dsml(s), Some(p)) => Ok(s.push(p)),
             (Self::Dsml(s), None) => Ok(s.finish()),
