@@ -327,8 +327,8 @@ def self_test():
     with tempfile.TemporaryDirectory() as tmp:
         def tree(name, **edits):
             """A copy of this tree's checked files under `tmp/name`, each `file=(old, new[, n])` edit applied to every
-            occurrence. An `old` that is not in the file exactly `n` times (default once) is the test's own fault, never
-            a pass."""
+            occurrence. An `old` that is not in the file exactly `n` times (default once; `"all"`: at least once) is the
+            test's own fault, never a pass."""
             base = os.path.join(tmp, name)
             for rel in FILES:
                 os.makedirs(os.path.dirname(os.path.join(base, rel)), exist_ok=True)
@@ -338,6 +338,8 @@ def self_test():
                 path = os.path.join(base, paths[key])
                 with open(path, encoding="utf-8") as f:
                     body = f.read()
+                if want == "all":
+                    want = max(body.count(old), 1)
                 if body.count(old) != want:
                     raise AssertionError(f"the test's edit of {paths[key]}: {old!r} is in it {body.count(old)} times, not {want}")
                 with open(path, "w", encoding="utf-8") as f:
@@ -389,9 +391,9 @@ def self_test():
         red("a stop cause the docs do not name is red", "stop cause `listener`", agents=("`listener`", "`socket`"))
         red("a loading phase the docs do not name is red", "phase `plan`", agents=("`plan`", "`planning`"))
         red("a README with no pointer is red", "README.md: it does not point at docs/agents.md",
-            readme=("docs/agents.md", "docs/agent.md", 5))
+            readme=("docs/agents.md", "docs/agent.md", "all"))
         red("an llms.txt with no pointer is red", "llms.txt: it does not point at docs/agents.md",
-            llms=("docs/agents.md", "docs/agent.md", 2))
+            llms=("docs/agents.md", "docs/agent.md", "all"))
         base = tree("missing-owner")
         os.remove(os.path.join(base, EXIT_RS))
         try:
