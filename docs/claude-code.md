@@ -75,6 +75,14 @@ Qwen3.6 or Qwen3.8 model (400 "System message must be at the beginning"); the re
 script, pin Claude Code's version. Other coding agents, and how large a first request each sends, are compared in
 [`research/coding-agents.md`](research/coding-agents.md); on a slow machine a smaller one starts much sooner.
 
+## When a turn takes long
+
+A long turn is usually a long generation, not a hang. The server says so itself: it prints one stderr line when a
+request ends, and a `generating` line every 30 s while one runs past that — `serve.log`, where the launcher's first
+script writes the server's output. Between the lines, `GET /slots` (`n_past`, `n_decoded`) and `GET /metrics`
+(`predicted_tokens_seconds`) show the request still running. The lines' fields are in
+[`serving.md`](serving.md).
+
 ## A launcher
 
 Two short scripts keep the shell's own settings untouched: one starts the server and waits for it, the other runs
