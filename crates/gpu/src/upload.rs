@@ -189,11 +189,13 @@ impl UploadRing {
             )));
         }
         let rows = take / row;
-        if rows * code_row > codes.dst_bytes || rows * head_row > heads.dst_bytes {
+        if rows * code_row != codes.dst_bytes || rows * head_row != heads.dst_bytes {
             let detail = format!(
-                "{rows} rows split into {} and {} plane bytes",
+                "{rows} rows split into {} and {} plane bytes, the buffers hold {} and {}",
                 rows * code_row,
-                rows * head_row
+                rows * head_row,
+                codes.dst_bytes,
+                heads.dst_bytes
             );
             return Err(shape(detail));
         }
