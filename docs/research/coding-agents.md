@@ -28,12 +28,14 @@ What it means for a first turn `[derived]`, as ids ÷ the prompt rate:
 
 ## 1. Compatibility with bloomery-serve
 
-Read from the code, not yet run against a live server:
+Read from the code. Claude Code and dsh were also run against a live server; their entries say so.
 
 - **Claude Code 2.1.314** sends its environment block as a `system` message after the first user message. bloomery
   0.3.11 passes the role through, and templates that take a system message only first (the Qwen3.6 and Qwen3.8
   families) answer 400 "System message must be at the beginning." Claude Code 2.1.312 did not send it. Fixed after
-  0.3.11: such a message renders as a `user` message in its place (`crates/serve/src/anthropic.rs`, #995).
+  0.3.11: such a message renders as a `user` message in its place (`crates/serve/src/anthropic.rs`, #995). Run live
+  with the fix (Qwen3.8-Flash-Next UD-Q4_K_XL, RTX A6000 + RTX 3090): one task of 13 turns wrote a three.js page in
+  122 s.
 - **Codex 0.153.4** speaks only `/v1/responses` (`wire_api = "chat"` is refused by the CLI). Its `developer` item
   reaches the template as `system` (`crates/serve/src/api.rs`). Its tools include one of `type: "namespace"`
   (`multi_agent_v1`, sub-agent functions nested inside it). bloomery 0.3.11 runs function tools only and refuses any
@@ -49,7 +51,12 @@ Read from the code, not yet run against a live server:
   speaks `/v1/chat/completions` through a `pi-ai` provider: a `developer` message first, then two `user` messages,
   `chat_template_kwargs` (`enable_thinking`, `reasoning_effort` from the profile), `max_completion_tokens`,
   `stream_options`. The `developer` message reaches the template as `system` (`crates/serve/src/api.rs`). It
-  served the DeepSeek-V4.1-Flash 1017 clip of 2026-10-19 on this server.
+  served the DeepSeek-V4.1-Flash 1017 clip of 2026-10-19 on this server. Run live after 0.3.11 (DeepSeek-V4.1-Flash
+  1017 Q3_K_M, RTX A6000, `--place` unset, the profile's reasoning effort `high`), `dsh headless` with a one-file
+  three.js task: no error in 10 requests (the last ended `cancel` when the run's 900 s bound stopped dsh). The first full prompt was 5,483 ids in 18.78 s; every later turn reused the
+  cache and sent 15 to 2,718 new ids. Generation ran at 40 to 43 ids/s. The first two answers were 16,997 and 13,206
+  ids (398 s and 313 s), and the page was written 12 to 13 minutes after the server came up. At effort `high`, the wait is the model's
+  answer length, not the harness's prompt.
 - **pi** speaks plain `/v1/chat/completions`: `system`, `user`, four tools (`read`, `bash`, `edit`, `write`),
   `stream_options`. Nothing in it is new to the server.
 
