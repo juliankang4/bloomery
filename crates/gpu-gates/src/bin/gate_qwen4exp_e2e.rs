@@ -751,9 +751,12 @@ mod gate {
     /// PIN(2026-10-30): a delta layer's state is [`LANES`] lane with its
     /// stamp, and a verify's [`ROWS`] rows go into a record beside it, a key,
     /// an update and a decay word of 128 f32 each a row and value head.
+    /// PIN(2026-10-30): the carry holds 16 rows, a chunk, where it held 15: a
+    /// prompt's closing call keeps the chunk its last id completes
+    /// (`runtime::stores::DELTA_CARRY_ROWS`).
     fn store_bytes() -> usize {
         let conv_ch = 2 * K_HEADS * HEAD_V + V_HEADS * HEAD_V;
-        let carry = (4 + 15 * ((K_HEADS + V_HEADS) * HEAD_V + 2 * V_HEADS)) * 4;
+        let carry = (4 + 16 * ((K_HEADS + V_HEADS) * HEAD_V + 2 * V_HEADS)) * 4;
         let record = ROWS * V_HEADS * 3 * HEAD_V * 4;
         let rec =
             LANES * (V_HEADS * HEAD_V * HEAD_V * 4 + 4) + record + CONV_RING * conv_ch * 4 + carry;

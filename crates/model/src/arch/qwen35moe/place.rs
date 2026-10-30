@@ -2871,10 +2871,10 @@ mod tests {
             q8: false,
             rope_row: 64 * 4,
         };
-        assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 294_916 + 497_296);
+        assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 294_916 + 530_448);
         assert_eq!(
             kv.layer_bytes(1, 4096),
-            3_596_288 + 294_916 + 497_296 + 696_320
+            3_596_288 + 294_916 + 530_448 + 696_320
         );
         assert_eq!(kv.layer_bytes(2, 4096), 4096 * 2048 + 1024 * 256 + 2816);
         assert_eq!(kv.layer_bytes(2, 4097), 4097 * 2048 + 1025 * 256 + 2816);
@@ -3005,7 +3005,7 @@ mod tests {
     /// One saved sequence state of Qwen3.8's 48 layers (36 GDN, every fourth
     /// one attention, the PLE ring on layer 1) at a context of whole pools
     /// [derived]: twelve attention layers' 2,048 B a position and 256 B a
-    /// pool of four, and checkpoint copies of 36 · 4,093,584 B (the committed
+    /// pool of four, and checkpoint copies of 36 · 4,126,736 B (the committed
     /// lane, conv ring and carry, not the record a layer holds), the
     /// PLE ring's 696,320 B and twelve raw key rings of 2,816 B.
     #[test]
@@ -3035,13 +3035,13 @@ mod tests {
             q8: false,
             rope_row: 64 * 4,
         };
-        let checkpoint = 36 * 4_093_584 + 696_320 + 12 * 2816;
+        let checkpoint = 36 * 4_126_736 + 696_320 + 12 * 2816;
         assert_eq!(kv.state_bytes(0), checkpoint);
         assert_eq!(
             kv.state_bytes(262_144),
             12 * (262_144 * 2048 + 65_536 * 256) + 9 * checkpoint
         );
-        assert_eq!(kv.state_bytes(262_144), 7_976_669_760);
+        assert_eq!(kv.state_bytes(262_144), 7_987_411_008);
         assert_eq!(
             kv.state_bytes(4097),
             12 * (4097 * 2048 + 1025 * 256) + 4 * checkpoint
@@ -4224,12 +4224,12 @@ mod tests {
         #[test]
         fn the_description_gives_the_qwen38_layer_bytes() {
             let kv = KvLayout::of_spec(&description()).expect("the description's layout");
-            assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 294_916 + 497_296);
+            assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 294_916 + 530_448);
             assert_eq!(
                 kv.layer_bytes(1, 4096),
-                3_596_288 + 294_916 + 497_296 + 696_320
+                3_596_288 + 294_916 + 530_448 + 696_320
             );
-            assert_eq!(kv.layer_bytes(2, 4096), 3_596_288 + 294_916 + 497_296);
+            assert_eq!(kv.layer_bytes(2, 4096), 3_596_288 + 294_916 + 530_448);
             assert_eq!(kv.layer_bytes(3, 4096), 4096 * 2048 + 1024 * 256 + 2816);
             assert_eq!(kv.layer_bytes(3, 4097), 4097 * 2048 + 1025 * 256 + 2816);
             assert_eq!(kv.layer_bytes(4, 4096), 0);

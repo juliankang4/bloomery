@@ -2693,14 +2693,24 @@ mod gate {
         ))
     }
 
-    /// The input boundary on an existing checkpoint, without an oracle set or a server.
+    /// The positions and the ubatch of [`hw_mtp_input_validity`]'s load, room for
+    /// [`media_prompt`]'s image, and of [`hw_close_fold`]'s, whose small ubatch
+    /// puts a closing call's last id past a ubatch edge.
     #[cfg(all(test, feature = "checkpoint"))]
-    #[test]
-    #[ignore = "needs one NVIDIA card and a Qwen3.8 checkpoint folder with MTP at $BLOOMERY_QWEN38_FOLDER"]
-    fn hw_mtp_input_validity() -> Result<(), GateError> {
+    const CTX_INPUT: u64 = 192;
+    #[cfg(all(test, feature = "checkpoint"))]
+    const UB_INPUT: usize = 128;
+    #[cfg(all(test, feature = "checkpoint"))]
+    const CTX_CLOSE: u64 = 64;
+    #[cfg(all(test, feature = "checkpoint"))]
+    const UB_CLOSE: usize = 8;
+
+    /// The checkpoint folder at `$BLOOMERY_QWEN38_FOLDER` loaded with its MTP
+    /// layer, two slots of `ctx` positions and ubatches of `ub` rows, its
+    /// rope sections read z first.
+    #[cfg(all(test, feature = "checkpoint"))]
+    fn folder_load(ctx: u64, ub: usize) -> Result<Qwen38Model, GateError> {
         use bloomery_gpu::arch::qwen3moe::Folder38;
-        const CTX_INPUT: u64 = 192;
-        const UB: usize = 128;
         let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
         let path = PathBuf::from(
             std::env::var_os("BLOOMERY_QWEN38_FOLDER")
@@ -2750,7 +2760,7 @@ mod gate {
         let machine = machine_for_experts(
             model::placement::devices::spec_of_device(device),
             inputs.spec.layers.len(),
-            UB as u64,
+            ub as u64,
             Experts::Card,
         );
         let plan_levers = PlanLevers {
@@ -2758,7 +2768,7 @@ mod gate {
         };
         let plan = inputs.plan_mtp_with_slots(
             &machine,
-            (CTX_INPUT, UB as u64),
+            (ctx, ub as u64),
             &plan_levers,
             &mtp,
             Experts::Card,
@@ -2768,17 +2778,25 @@ mod gate {
             .rows
             .remove(&model::arch::qwen35moe::names::per_layer_token_embd());
         let model = Folder38::with(f.header, f.source, ple);
-        let mut m = Body38::open_placed_mtp_slots(
+        Ok(Body38::open_placed_mtp_slots(
             model,
             &plan,
             &inputs,
             0,
             levers.host(),
-            UB,
+            ub,
             &draft,
             &mtp,
             2,
-        )?;
+        )?)
+    }
+
+    /// The input boundary on an existing checkpoint, without an oracle set or a server.
+    #[cfg(all(test, feature = "checkpoint"))]
+    #[test]
+    #[ignore = "needs one NVIDIA card and a Qwen3.8 checkpoint folder with MTP at $BLOOMERY_QWEN38_FOLDER"]
+    fn hw_mtp_input_validity() -> Result<(), GateError> {
+        let mut m = folder_load(CTX_INPUT, UB_INPUT)?;
         m.enable_media()?;
         let (mut m, media_ok) = media_prompt(m)?;
         m.reset()?;
@@ -2979,6 +2997,192 @@ mod gate {
                 "draft share {entry}: {at} positions mapped, source rewritten, other slot K/V bit-identical PASS"
             );
         }
+        Ok(())
+    }
+
+    /// (cl) A prompt's last id run as its last call's last row
+    /// ([`Body38::set_close`]), held to the prompt fed in one `Auto` call
+    /// ([`close_case`]): at 21 ids from a reset the last id leaves a delta
+    /// chunk open, at 32 it completes one, which the call keeps out of the
+    /// state; both fold into the last ubatch. At 5 the call is passes. Then a
+    /// drafted
+    /// run whose prompt call closes gives the plain run's greedy ids, its
+    /// draft able to rejoin at the end mark.
+    #[cfg(all(test, feature = "checkpoint"))]
+    #[test]
+    #[ignore = "needs one NVIDIA card and a Qwen3.8 checkpoint folder with MTP at $BLOOMERY_QWEN38_FOLDER"]
+    fn hw_close_fold() -> Result<(), GateError> {
+        let mut m = folder_load(CTX_CLOSE, UB_CLOSE)?;
+        m.set_mode(bloomery_gpu::model::StepMode::Graph);
+        let ids: Vec<u32> = (1..=32).collect();
+        let mut ok = true;
+        let mut rides = Vec::new();
+        for (n, folds) in [(21, true), (32, true), (5, false)] {
+            ok &= close_case(&mut m, &ids[..n], folds)?;
+            rides.push(m.closes_by_ubatch(n, Prompt38::Auto)?);
+        }
+        let rides_ok = rides == [true, true, false];
+        println!(
+            "(cl) the last id rides the ubatch walk at 21, 32 and 5 ids from a reset (the seat \
+             steps it otherwise): {rides:?} {}",
+            verdict(rides_ok)
+        );
+        ok &= rides_ok;
+        ok &= close_steps(&mut m, &ids[..5])?;
+        let prompt = &ids[..21];
+        let end = 20;
+        let (m, plain, _) = plain_to(m, prompt, Prompt38::Auto, 8)?;
+        let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), CTX_CLOSE as u32)?;
+        s.model_mut().body_parts("(cl)")?.2.set_checkpoints(true);
+        close_on(s.model_mut(), true)?;
+        let first = spec.prompt(&mut s, prompt);
+        close_on(s.model_mut(), false)?;
+        let first = first?;
+        let rejoins = s.model().body("(cl)")?.draft_rejoins(end);
+        let drafted = runtime::generate(
+            &mut s,
+            &mut spec,
+            prompt,
+            first,
+            &runtime::Stop::new(8, CTX_CLOSE as u32)?,
+            &mut Kept::default(),
+        )?;
+        s.model_mut().body_parts("(cl)")?.2.set_checkpoints(false);
+        let same = drafted.tokens.get(..plain.len()) == Some(plain.as_slice());
+        println!(
+            "(cl) a drafted run whose prompt call closes: the draft rejoins at {end} {rejoins}; \
+             greedy ids {:?} = the plain run's {plain:?} {}",
+            drafted.tokens,
+            verdict(same && rejoins)
+        );
+        if ok && same && rejoins {
+            Ok(())
+        } else {
+            Err(checks_failed())
+        }
+    }
+
+    /// One (cl) case on `ids` from a reset, checkpoints on: the closing call
+    /// whole gives the one `Auto` call's argmax, logits' bits and three steps
+    /// after it ([`closed_run`]), but where its last id completes a delta
+    /// chunk: the call keeps that chunk out of the state, and the next step
+    /// folds it by the step's rule (`gate_linear`'s clause 16), not the
+    /// walk's, so there the steps' ids against the one call's and the former
+    /// cut's are printed, not held. The call cut after its first half gives
+    /// the whole call's. Its end mark
+    /// stands before the last id and not past it, and that id stepped from
+    /// the mark (a rollback there) gives the server's former cut: the call
+    /// less its last id, then its step. The call's last ubatch holds more
+    /// than one row (it folded) exactly when `folds`.
+    #[cfg(all(test, feature = "checkpoint"))]
+    fn close_case(m: &mut Qwen38Model, ids: &[u32], folds: bool) -> Result<bool, GateError> {
+        const WHAT: &str = "(cl)";
+        let (n, k) = (ids.len(), ids.len() / 2);
+        let end = u32::try_from(n - 1)?;
+        m.body_parts(WHAT)?.2.set_checkpoints(true);
+        m.reset()?;
+        let want = closed_run(m, ids, false)?;
+        m.reset()?;
+        m.prompt38(&ids[..n - 1], Prompt38::Auto)?;
+        let cut = closed_run(m, &ids[n - 1..], false)?;
+        m.reset()?;
+        let whole = closed_run(m, ids, true)?;
+        let body = m.body(WHAT)?;
+        let rows = body.ubatch_split().map_or(0, |(a, b)| a + b);
+        let points = body.checkpoints().positions();
+        m.rollback(end)?;
+        let stepped = closed_run(m, &ids[n - 1..], false)?;
+        m.reset()?;
+        m.prompt38(&ids[..k], Prompt38::Auto)?;
+        let split = closed_run(m, &ids[k..], true)?;
+        m.body_parts(WHAT)?.2.set_checkpoints(false);
+        m.reset()?;
+        let marked = points.contains(&end) && !points.contains(&(end + 1));
+        let ids = |c: &Closed| c.2.iter().map(|s| s.0).collect::<Vec<_>>();
+        let kept = n.is_multiple_of(bloomery_gpu::linear::CHUNK_ROWS);
+        let first = (whole.0, &whole.1) == (want.0, &want.1);
+        let like = first && (kept || whole == want);
+        let ok = like && split == whole && stepped == cut && marked && (rows > 1) == folds;
+        println!(
+            "(cl) {n} ids: the closing call whole = the one call's argmax and logits {first}, \
+             its steps' bits {} (held {}), step ids {:?} (the one call's {:?}, the former cut's \
+             {:?}); cut at {k} = whole {}; its last id stepped from the end mark = the former \
+             cut {}; points {points:?}; the last ubatch {rows} rows (folds {folds}) {}",
+            whole.2 == want.2,
+            !kept,
+            ids(&whole),
+            ids(&want),
+            ids(&cut),
+            split == whole,
+            stepped == cut,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// The argmax after `ids` fed from where a model stands, the logits'
+    /// bits, and three greedy steps' ids and logits' bits.
+    #[cfg(all(test, feature = "checkpoint"))]
+    type Closed = (u32, Vec<u32>, Vec<(u32, Vec<u32>)>);
+
+    /// [`Closed`] of one `Auto` call, closing when `close`
+    /// ([`Body38::set_close`]).
+    #[cfg(all(test, feature = "checkpoint"))]
+    fn closed_run(m: &mut Qwen38Model, ids: &[u32], close: bool) -> Result<Closed, GateError> {
+        let bits = |m: &Qwen38Model| -> Result<Vec<u32>, GateError> {
+            Ok(m.logits()?.iter().map(|v| v.to_bits()).collect())
+        };
+        close_on(m, close)?;
+        let first = m.prompt38(ids, Prompt38::Auto);
+        close_on(m, false)?;
+        let first = first?;
+        let row = bits(m)?;
+        let (mut steps, mut feed) = (Vec::new(), first);
+        for _ in 0..3 {
+            feed = m.step(&[feed])?;
+            steps.push((feed, bits(m)?));
+        }
+        Ok((first, row, steps))
+    }
+
+    /// (cl) A closing call fed by steps, checkpoints on: it runs every id, its
+    /// end mark before the last, and stands where the steps of the same ids
+    /// stand with their argmax and logits' bits.
+    #[cfg(all(test, feature = "checkpoint"))]
+    fn close_steps(m: &mut Qwen38Model, ids: &[u32]) -> Result<bool, GateError> {
+        let run = |m: &mut Qwen38Model, close: bool| -> Result<_, GateError> {
+            m.reset()?;
+            close_on(m, close)?;
+            let next = m.prompt38(ids, Prompt38::Step);
+            close_on(m, false)?;
+            let bits: Vec<u32> = m.logits()?.iter().map(|v| v.to_bits()).collect();
+            Ok((next?, m.pos(), bits))
+        };
+        m.body_parts("(cl)")?.2.set_checkpoints(true);
+        let plain = run(m, false)?;
+        let closed = run(m, true)?;
+        let points = m.body("(cl)")?.checkpoints().positions();
+        m.body_parts("(cl)")?.2.set_checkpoints(false);
+        m.reset()?;
+        let end = u32::try_from(ids.len())?;
+        let ok = closed == plain && closed.1 == end && points.contains(&(end - 1));
+        println!(
+            "(cl) {} ids by steps: the closing call stands at {} (want {end}), argmax {} = the \
+             steps' {} and their logits {}; points {points:?} {}",
+            ids.len(),
+            closed.1,
+            closed.0,
+            plain.0,
+            closed.2 == plain.2,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// The body's closing call on or off ([`Body38::set_close`]).
+    #[cfg(all(test, feature = "checkpoint"))]
+    fn close_on(m: &mut Qwen38Model, on: bool) -> Result<(), GateError> {
+        m.body_parts("(cl)")?.2.set_close(on);
         Ok(())
     }
 

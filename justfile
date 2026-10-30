@@ -1784,11 +1784,14 @@ gate-gpu-qwen4exp-mtp-share:
 # Qwen3.8's MTP input boundary on a checkpoint folder (BLOOMERY_QWEN38_FOLDER names a Qwen3.8-Flash-Next folder with its MTP layer,
 # such as FP4-Local): MTP reads only target hidden rows the last layer completed, in both prompt walks, and refuses the rows of a
 # tapped call that failed past its launch; the draft's own row runs only at the refreshed walk's next position and is refused after
-# a state adoption, reset, store walk, slot exchange or cut; the drafted greedy ids equal the plain ones. The whole model on one card:
-# without BLOOMERY_QWEN38_FOLDER a batch defers it by name (needs-env).
+# a state adoption, reset, store walk, slot exchange or cut; the drafted greedy ids equal the plain ones. Then the serve seat's closing
+# call (hw_close_fold): a prompt's last call that runs its last id as its last row, cut anywhere or kept by a cache, gives the one
+# call's first token and its bits (and the later steps' unless that id completes a delta chunk, which the next step folds), its end
+# mark before that id. The whole model on one card, one test at a time: without BLOOMERY_QWEN38_FOLDER a batch
+# defers it by name (needs-env).
 [group('v41-load')]
 gate-gpu-qwen4exp-mtp-input:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen4exp-mtp-input BLOOMERY_QWEN38_FOLDER && export BLOOMERY_GATE_V41_LOAD=1 && BLOOMERY_REF_MODEL="$BLOOMERY_QWEN38_FOLDER" bash tools/gate.sh --gpu --oxide -p bloomery-gpu-gates --release --features gpu,checkpoint --bin gate_qwen4exp_mtp -- --ignored hw_mtp_input_validity --nocapture'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen4exp-mtp-input BLOOMERY_QWEN38_FOLDER && export BLOOMERY_GATE_V41_LOAD=1 && BLOOMERY_REF_MODEL="$BLOOMERY_QWEN38_FOLDER" bash tools/gate.sh --gpu --oxide -p bloomery-gpu-gates --release --features gpu,checkpoint --bin gate_qwen4exp_mtp -- --ignored hw_mtp_input_validity hw_close_fold --nocapture --test-threads 1'
 
 # 그룹 int8 텐서코어 GEMM(bloomery_gpu::gemm): 실파일 Qwen3 gate(Q4_K)·down(Q4_K, Q6_K) 스택과 V4.1 routed gate(Q3_K)
 # 하나, 같은 형상의 합성 스택(+ Q5_K), T ∈ {1,15,16,17,64,511,512,4096} × 라우팅 넷을 f64 참조의 유도 밴드에 대고 잰다.
@@ -3028,8 +3031,8 @@ gate-gpu-qwen38-nodes-remote:
 # ("The capital of France is") and its ids the profile's REF_TOKENS — ik's llama-tokenize on this model's
 # vocabulary, never our own tokenizer (the derivation command is the profile comment's) — and five is at most the
 # eight the gate needs: below Prompt38::GEMM_FROM both engines feed the prompt by bit-for-bit passes, so the
-# server's greedy ids are generate_qwen3moe's; at nine or more each runs the prompt's last position through a
-# different arm of the ubatch walk. generate_qwen3moe --tokens <those ids> -n 16 under its own gate-lock hold,
+# server's greedy ids are generate_qwen3moe's; at nine or more the server runs the last id as the ubatch walk's last
+# row as the CLI does, a delta chunk it completes left to the next step to fold. generate_qwen3moe --tokens <those ids> -n 16 under its own gate-lock hold,
 # then gate_qwen38_serve as two processes under another, the arms one after another. --arm plain first: it starts
 # bloomery-serve-qwen38 --port 0 --place gate with BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off, and checks /props'
 # engine object against its own plan of the file (architecture qwen4exp, each device's bytes = the plan's, the KV

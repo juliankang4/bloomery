@@ -107,7 +107,7 @@ impl Ring {
 /// began at, whatever calls cut the rows. `runtime::stores` owns the count.
 pub const CHUNK_ROWS: usize = stores::DELTA_CHUNK_ROWS;
 
-/// Rows of the carry: the tokens of the chunk a call left incomplete.
+/// Rows of the carry: the tokens of the chunk a call left out of the state.
 pub const CARRY_ROWS: usize = stores::DELTA_CARRY_ROWS;
 
 /// Words before the carry's rows: the rows' count, the position after them

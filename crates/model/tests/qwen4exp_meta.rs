@@ -211,7 +211,11 @@ const HOST_TABLES: u64 = 28_800_138_240;
 // f32, 294,912 B), where it kept four lanes (the removed DELTA_LANES) [derived: 9,437,200 −
 // 294,916 = 9,142,284 B less a layer, 329,122,224 B over the 36 layers; KV_AT was 591,647,360 and
 // 1,318,310,528].
-const KV_AT: [(u64, u64); 2] = [(4096, 262_525_136), (32_768, 989_188_304)];
+// PIN(2026-10-30): each GDN layer's carry holds a chunk, 16 rows (runtime::stores::DELTA_CARRY_ROWS,
+// a prompt's closing call keeps the chunk its last id completes), where it held 15: 33,152 B more a
+// layer [derived: (16 + 48) · 128 + 2 · 48 = 8,288 f32], 1,193,472 B over the 36 layers; KV_AT
+// was 262,525,136 and 989,188,304.
+const KV_AT: [(u64, u64); 2] = [(4096, 263_718_608), (32_768, 990_381_776)];
 // The largest context each card holds, as predicted [derived: (usable − margin − the dense
 // granules − context − scratch − 487,804,544 B of recurrent bytes) over 28,672 B a position —
 // the cache's 28,416 plus the stage rope table's 256 — the last pool counted whole, then one
@@ -245,7 +249,9 @@ const KV_AT: [(u64, u64); 2] = [(4096, 262_525_136), (32_768, 989_188_304)];
 // PIN(2026-10-30): the delta layers' one state lane and record (KV_AT, 329,122,224 B) and the
 // ubatch arena's BF16 stream buffer (CARD_SCRATCH, 83,886,080 B at 4,096) leave the room: the
 // planner on this tree holds 1,590,867 and 590,788; the pin is one fewer.
-const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_590_866), ("3090", 590_787)];
+// PIN(2026-10-30): the GDN layers' carries of 16 rows (KV_AT, 1,193,472 B more) leave the room: the
+// planner on this tree holds 1,590,820 and 590,741; the pin is one fewer.
+const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_590_819), ("3090", 590_740)];
 // PIN(2026-09-28): the card's scratch, the m = 1 scratch and the ubatch walk's at 4,096
 // positions [derived: 64 MiB + place::ubatch_scratch_bytes(4096) = 67,108,864 + 4,096 ·
 // 668,277 + 32 MiB].
@@ -791,6 +797,10 @@ type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
 // their granules, 91 to 172 experts a row [derived: the planner on this tree over the pinned Q4
 // headers printed each row's expert count, expert bytes and rounding; the counts' split over the
 // file's per-layer expert sizes gives those expert bytes].
+// PIN(2026-10-30): the GDN layers' carries of 16 rows leave the card's kv 1,193,472 B (KV_AT): eight
+// rows lose one expert of the first layers' split and their rounding moves, and the other eight keep
+// theirs [derived: the planner on this tree over the pinned Q4 headers printed each row's per-layer
+// counts, expert bytes and rounding].
 const CARD_PLANS: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -831,10 +841,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         264,
-        22,
+        21,
         263,
-        39_630_950_400,
-        598_155_776,
+        39_627_878_400,
+        597_033_472,
     ),
     (
         "A6000",
@@ -853,10 +863,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         512,
         278,
-        35,
+        34,
         277,
-        41_777_356_800,
-        561_484_288,
+        41_774_284_800,
+        560_361_984,
     ),
     (
         "A6000",
@@ -875,10 +885,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         260,
-        3,
+        2,
         259,
-        38_970_368_000,
-        466_014_720,
+        38_966_374_400,
+        467_911_168,
     ),
     (
         "3090",
@@ -897,10 +907,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         512,
         113,
-        15,
+        14,
         112,
-        16_895_180_800,
-        575_631_872,
+        16_892_108_800,
+        576_606_720,
     ),
     (
         "3090",
@@ -919,10 +929,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         94,
-        25,
+        24,
         93,
-        14_067_814_400,
-        559_260_160,
+        14_064_742_400,
+        556_040_704,
     ),
     (
         "3090",
@@ -930,10 +940,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         4_096,
         92,
-        31,
+        30,
         91,
-        13_785_907_200,
-        507_720_192,
+        13_782_323_200,
+        505_012_736,
     ),
     (
         "3090",
@@ -941,10 +951,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         512,
         108,
-        6,
+        5,
         107,
-        16_115_404_800,
-        621_404_672,
+        16_112_332_800,
+        622_379_520,
     ),
     (
         "3090",
@@ -963,10 +973,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         89,
-        14,
+        13,
         88,
-        13_281_894_400,
-        552_456_704,
+        13_278_822_400,
+        549_237_248,
     ),
 ];
 // PIN(2026-09-28): the routed stacks no card expert kernel of the program reads, which keep their
@@ -1152,9 +1162,14 @@ fn hw_qwen4exp_card_plan() {
             &mut o,
             format!(
                 "{name} ctx {ctx} draft {with_draft} U {u}: n_l {high} on the first {at_high} of the {eligible}, \
-                 {low} on the rest, 0 on {off:?} ({}; {held} experts); segments off the rule \
+                 {low} on the rest, 0 on {off:?} ({}; {held} experts{}); segments off the rule \
                  {segs_bad:?}; the draft's plan the host-routed one's {draft_same}; {}; headroom {}",
                 plan.n_l == want,
+                if plan.n_l == want {
+                    String::new()
+                } else {
+                    format!(": {:?}", plan.n_l)
+                },
                 shown.join(", "),
                 c.headroom_bytes
             ),
@@ -1294,6 +1309,10 @@ const CARD_ROUNDING_Q3: u64 = 398_764_544;
 // the ubatch arena's BF16 stream buffer, as CARD_PLANS: 136 to 198 experts a row [derived: the planner on this tree over the
 // Q3 file's headers printed each row's expert and rounding bytes; the counts are the one split of
 // those bytes over the file's per-layer expert sizes].
+// PIN(2026-10-30): the GDN layers' carries of 16 rows leave the card's kv 1,193,472 B (KV_AT): five
+// rows lose one expert of the first layers' split and their rounding moves, and the other eleven keep
+// theirs [derived: the planner on this tree over the Q3 file's headers printed each row's per-layer
+// counts, expert bytes and rounding].
 const CARD_PLANS_Q3: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -1301,10 +1320,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         4_096,
         369,
-        19,
+        18,
         368,
-        40_166_656_000,
-        616_964_608,
+        40_164_480_000,
+        617_043_456,
     ),
     (
         "A6000",
@@ -1334,10 +1353,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         365,
-        42,
+        41,
         364,
-        39_781_401_600,
-        601_662_976,
+        39_779_225_600,
+        597_547_520,
     ),
     (
         "A6000",
@@ -1389,10 +1408,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         4_096,
         134,
-        42,
+        41,
         133,
-        14_595_379_200,
-        586_209_792,
+        14_593_203_200,
+        584_191_488,
     ),
     (
         "3090",
@@ -1422,10 +1441,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         131,
-        24,
+        23,
         130,
-        14_228_300_800,
-        552_732_160,
+        14_226_124_800,
+        550_713_856,
     ),
     (
         "3090",
@@ -1466,10 +1485,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         124,
-        10,
+        9,
         123,
-        13_434_624_000,
-        553_685_504,
+        13_432_448_000,
+        551_667_200,
     ),
 ];
 
@@ -1637,9 +1656,14 @@ fn hw_qwen4exp_q3_card_plan() {
             &mut o,
             format!(
                 "{name} ctx {ctx} draft {with_draft} U {u}: n_l {high} on the first {at_high}, \
-                 {low} on the rest ({}); segments off the rule {segs_bad:?}; the draft's plan \
+                 {low} on the rest ({}{}); segments off the rule {segs_bad:?}; the draft's plan \
                  the host-routed one's {draft_same}; {}; headroom {}",
                 plan.n_l == want,
+                if plan.n_l == want {
+                    String::new()
+                } else {
+                    format!(": {:?}", plan.n_l)
+                },
                 shown.join(", "),
                 c.headroom_bytes
             ),
@@ -1768,7 +1792,11 @@ type BpRow = (u64, usize, u64, u64, usize, u64, u64, u64);
 // (KV_AT) and the BF16 stream buffer the stage's scratch 83,886,080 B at 4,096 positions; the tier
 // keeps its 7,236 experts, on other layers [derived: the planner on this tree over the pinned
 // headers printed this row].
-const BP_PLAIN: BpRow = (265, 37, 264, 416, 25, 7_236, 22_676_889_600, 146_415_616);
+// PIN(2026-10-30): the A6000 265 on the first 36 layers (was 37), both cards 416 on the first 24
+// layers (was 25). The GDN layers' carries of 16 rows leave the card's kv 1,193,472 B (KV_AT); the
+// tier keeps its 7,236 experts, its bytes and rounding [derived: the planner on this tree over the
+// pinned headers printed this row].
+const BP_PLAIN: BpRow = (265, 36, 264, 416, 24, 7_236, 22_676_889_600, 146_415_616);
 
 /// Plan (b′) of the Qwen3.8 file without the draft (`place::machine_bp`,
 /// `plan_with` under `Experts::Card`): the A6000's counts and card bytes

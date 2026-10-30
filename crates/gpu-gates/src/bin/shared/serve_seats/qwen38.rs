@@ -45,9 +45,13 @@
 //! binds a free one). Sampling is the sampler crate's chain with no
 //! repetition penalty; `temperature <= 0` is the engine's argmax, the ids
 //! `generate_qwen3moe --tokens <the prompt's ids>` prints for a prompt of at
-//! most eight ids (past that the ubatch walk the server and the CLI both take
-//! leaves a position's bits a function of its own inputs, so a longer
-//! prompt's greedy ids are the walk's, not a step-fed run's).
+//! most eight ids (passes, bit for bit the server's prompt call less its last
+//! id and that id's step). Past that the server's last call runs its last id
+//! as the ubatch walk's last row, as the CLI's one call does
+//! (`Q38::prefill_next`), a delta chunk that id completes kept out of the
+//! state for the next step to fold, where the CLI's walk folds it; the walk
+//! leaves a position's bits a function of its own inputs wherever the server
+//! cuts the prompt.
 //!
 //! `--place` is `a`, `gate`, `bp` or a card list `<stage>[+<tier>…]`
 //! (`generate::Place`, read by `bind::place_word` as every seat reads it); a
@@ -114,7 +118,8 @@
 //! recurrent stores (each delta layer's committed state lane and conv ring,
 //! the PLE ring) and the PLE hash's history to the host at its start when it
 //! continues a sequence, every `CHECKPOINT_EVERY` positions inside it and at
-//! its end (`Body38::set_checkpoints`), so a request that resends the
+//! its end (`Body38::set_checkpoints`; a prompt's last call takes its end
+//! mark before its last id, `Body38::set_close`), so a request that resends the
 //! conversation with the last turn's reasoning taken out keeps everything up
 //! to the last prompt's end. The server cuts a prompt call at the first and
 //! the last message start inside it (`<|im_start|>`, when the vocabulary and
@@ -433,7 +438,7 @@ use bloomery_gpu_gates::bind::{
     AutoSlots, CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine,
     SlotAsk, SlotFlags, SlotPassRow, SlotStep, SlotsFrom, TemplateFile, Vocab, arm_screen, begin,
     bind_server, eprint_noted, model_props, note_line, parallel_line, place_word, placement_of,
-    put_back, slots_of,
+    prefill_then_step, put_back, slots_of,
 };
 use bloomery_gpu_gates::generate::{BreakEven, FloorShort, Lane, Place, lane_of};
 use bloomery_gpu_gates::need;
@@ -3019,6 +3024,22 @@ impl Q38 {
         }
     }
 
+    /// Whether the MTP draft serves more than one slot. A prompt call leaves
+    /// the draft's waiting row in the ubatch arena, whose record a slot
+    /// change clears (a slot parks only the step's and the pass's rows,
+    /// [`Seq38`]), so there a prompt ends with its last id stepped, which
+    /// leaves the row in the step's arena.
+    fn drafts_slots(&self) -> bool {
+        self.drafts.mtp() && self.s.slots() > 1
+    }
+
+    /// The body's closing call on or off ([`Body38::set_close`]).
+    fn set_close(&mut self, on: bool) -> Result<(), GateError> {
+        let (_, _, body) = self.s.model_mut().body_parts("bloomery-serve-qwen38")?;
+        body.set_close(on);
+        Ok(())
+    }
+
     /// The PLE rows of `out`'s one id read ahead ([`Body38::prefetch_input`])
     /// while the server takes the answer, where that id is the input of the
     /// body's next call ([`Q38::reads_ahead`]), one plain step of the slot
@@ -3287,6 +3308,36 @@ impl Seat for Q38 {
             |rows| rows.image_spans(),
             |spans| self.drafts.prefill_media(&mut self.s, sel, ids, spans),
         )?;
+        self.print_passes()?;
+        Ok(next)
+    }
+
+    /// A prompt's last call with its last id the call's last row, which the
+    /// server would step after it: the body's closing call
+    /// ([`Body38::set_close`]: the last id the call's last row, the end mark
+    /// before it) through the slot's prompt call ([`SlotDrafts::prompt_close`],
+    /// the draft's window anchored at the prompt's end), the target's row
+    /// read after it. That runs where the last id rides the ubatch walk
+    /// (`GpuModel::closes_by_ubatch`); a call of passes, a last ubatch that
+    /// would hold that id alone and `BLOOMERY_PREFILL=steps` take the call
+    /// less that id, then its step.
+    fn prefill_next(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
+        if self.feed == Prompt38::Step
+            || self.drafts_slots()
+            || !self.s.model_mut().closes_by_ubatch(ids.len(), self.feed)?
+        {
+            return prefill_then_step(self, ids, row);
+        }
+        self.before_call();
+        let sel = self.s.selected();
+        self.set_close(true)?;
+        let closed = self.drafts.prompt_close(&mut self.s, sel, ids);
+        self.set_close(false)?;
+        let next = closed?;
+        if let Some(row) = row {
+            self.logits_into(row)?;
+        }
+        self.read_ahead(&[next])?;
         self.print_passes()?;
         Ok(next)
     }

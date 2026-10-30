@@ -1840,6 +1840,9 @@ pub(super) struct WideParts<'a> {
     /// enqueued: what a checkpoint's copy of the layer's stores waits for
     /// (`Body38`'s end mark).
     pub(super) done: Option<&'a [CudaEvent]>,
+    /// Whether the walk's delta layers keep its last chunk out of the state
+    /// (`Body38::keep_last`): its last unit's prompt form keeps it.
+    pub(super) keep: bool,
 }
 
 /// [`WideParts::ple_rows`]: the walk's PLE rows landed in the arena's `e`
@@ -2182,7 +2185,8 @@ impl WideParts<'_> {
                     WHAT,
                     "the record's lane word (a chain with delta layers carries one)",
                 ))?;
-                gdn(c, g, (rec, stamp, lane), (s, &mut *x), u, sink)?;
+                let chunk = self.keep && u.r0 + u.m == self.m;
+                gdn(c, g, (rec, stamp, lane), (s, &mut *x), (u, chunk), sink)?;
                 narrow(c, x, u, keep)
             }
             (Mixer38::Qsa(q), Store38::Qsa { kv, ring, pooled }) => {
@@ -2556,14 +2560,16 @@ impl WideParts<'_> {
 }
 
 /// A delta layer's mixer over unit `u`'s rows and its store `r`, its lanes'
-/// stamps and the lane word, the committed lane in place; the attention
+/// stamps and the lane word, the committed lane in place, the unit's last
+/// chunk kept out of the state when `keep` (the walk's last unit of a
+/// closing call, [`WideParts::keep`]); the attention
 /// site's mix in `s.mixed`, its output projection into the unit's `y`.
 fn gdn(
     c: &Ctx38<'_>,
     gp: &GdnPlan,
     (r, stamp, lane): (&mut RecStore, &mut DeviceBuffer<u32>, &DeviceBuffer<u32>),
     (s, x): (&mut Arena38, &mut Wide38),
-    u: &mut UnitRows38,
+    (u, keep): (&mut UnitRows38, bool),
     sink: FaultSink,
 ) -> Result<(), GpuError> {
     let (w, stream, m) = (c.w, c.gpu.stream(), u.m);
@@ -2636,6 +2642,7 @@ fn gdn(
         },
         carry,
         &mut work,
+        keep,
     )?;
     if reads_q8_1(c, &gp.z)? {
         // A K-quant `z` has no tile epilogue to finish the norm in: the

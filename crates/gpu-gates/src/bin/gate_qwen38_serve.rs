@@ -43,9 +43,11 @@
 //!   stopped there (`generate_qwen3moe` does not stop at it). The prompt must
 //!   hold at most eight ids: the passes both engines take below
 //!   [`GEMM_FROM`](bloomery_gpu::arch::qwen3moe::Prompt38::GEMM_FROM) are bit
-//!   for bit steps, so the server's prompt feed (the prompt less its last id)
-//!   and `generate_qwen3moe`'s (the whole prompt) leave the same state, while
-//!   past that each runs the prompt's last position through a different arm;
+//!   for bit steps, so the server's prompt feed (the prompt less its last id,
+//!   then its step) and `generate_qwen3moe`'s (the whole prompt) leave the
+//!   same state, while past that the server runs the last id as the ubatch
+//!   walk's last row (`Q38::prefill_next`), a delta chunk it completes left
+//!   to the next step to fold where the CLI's walk folds it;
 //! - `/completion` once more after one chat turn of another conversation
 //!   (`/v1/chat/completions` at temperature 0): the same ids again (a
 //!   request that does not extend the held sequence keeps the checkpoint at
