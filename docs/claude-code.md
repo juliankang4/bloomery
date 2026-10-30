@@ -70,6 +70,11 @@ only its new messages. A request that does not start with that prompt, such as a
 from position 0 again. A 1.7B model answers fast but gets small tasks wrong. Use a coding model of the size your
 memory holds.
 
+Claude Code 2.1.314 and later send a `system` message after the first user message. bloomery 0.3.11 refuses it on a
+Qwen3.6 or Qwen3.8 model (400 "System message must be at the beginning"); the release after it accepts it. For a demo or a
+script, pin Claude Code's version. Other coding agents, and how large a first request each sends, are compared in
+[`research/coding-agents.md`](research/coding-agents.md); on a slow machine a smaller one starts much sooner.
+
 ## A launcher
 
 Two short scripts keep the shell's own settings untouched: one starts the server and waits for it, the other runs
