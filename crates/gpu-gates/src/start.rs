@@ -40,6 +40,7 @@ struct NeedNote {
 
 /// What the plan printed, as the seats noted it.
 struct Report {
+    per_slot: bool,
     seat: Option<&'static str>,
     place: Option<(String, String)>,
     ctx: Option<CtxNote>,
@@ -47,6 +48,7 @@ struct Report {
 }
 
 static REPORT: Mutex<Report> = Mutex::new(Report {
+    per_slot: false,
     seat: None,
     place: None,
     ctx: None,
@@ -66,6 +68,17 @@ fn report() -> MutexGuard<'static, Report> {
 /// Names the seat this run serves, which the plan line carries.
 pub fn note_seat(word: &'static str) {
     report().seat = Some(word);
+}
+
+/// Keeps the effective context flag's units for refusals after the slot parser has read it.
+pub fn note_slot_ctx(per_slot: bool) {
+    report().per_slot = per_slot;
+}
+
+/// Whether the effective context flag [`note_slot_ctx`] kept is `--slot-ctx`.
+#[must_use]
+pub fn slot_ctx_noted() -> bool {
+    report().per_slot
 }
 
 /// The placement the run takes and why, as the `place unset` record prints them.
@@ -290,9 +303,10 @@ mod agent {
     /// The class an error of the start path names, and the argument lists it offers: the first
     /// error of the chain that names one; `None` for a chain no type names.
     fn classify(e: &(dyn Error + 'static)) -> Option<Named> {
+        let per_slot = report().per_slot;
         let mut link: Option<&(dyn Error + 'static)> = Some(e);
         while let Some(err) = link {
-            if let Some(found) = named_by(err) {
+            if let Some(found) = named_by(err, per_slot) {
                 return Some(found);
             }
             link = err.source();
@@ -302,8 +316,11 @@ mod agent {
 
     /// What `err` itself says of its class: a [`Refusal`], or one of the types the start path
     /// calls.
-    fn named_by(err: &(dyn Error + 'static)) -> Option<Named> {
-        let ctx_next = |ctx: u64| vec![vec!["--ctx-size".to_owned(), ctx.to_string()]];
+    fn named_by(err: &(dyn Error + 'static), per_slot: bool) -> Option<Named> {
+        let ctx_next = |ctx: u64| {
+            let flag = if per_slot { "--slot-ctx" } else { "--ctx-size" };
+            vec![vec![flag.to_owned(), ctx.to_string()]]
+        };
         if let Some(r) = err.downcast_ref::<Refusal>() {
             return Some((r.code, r.next.clone(), None));
         }
@@ -321,7 +338,12 @@ mod agent {
             return Some((Code::NoFit, Vec::new(), Some(f.short.need)));
         }
         if let Some(c) = err.downcast_ref::<CtxDoesNotFit>() {
-            let next = c.largest_total.map(ctx_next).unwrap_or_default();
+            let largest = if per_slot {
+                c.largest_slot
+            } else {
+                c.largest_total
+            };
+            let next = largest.map(ctx_next).unwrap_or_default();
             return Some((Code::NoFit, next, Some(c.short.need)));
         }
         if let Some(h) = err.downcast_ref::<HostShort>() {
@@ -561,8 +583,50 @@ mod agent {
             assert!(classify(unnamed.as_ref()).is_none());
         }
 
+        /// A context refusal offers the retry in the units of the flag the run noted:
+        /// `--slot-ctx` takes one slot's largest share, `--ctx-size` the total over the slots,
+        /// for both a capacity refusal and the model's limit.
+        #[test]
+        fn context_retry_names_the_flag_and_its_units() {
+            use model::placement::ctx_ask::{Probe, Short, Side};
+            let _note = super::super::slot_note_tests();
+            for (total, slots, per_slot, flag, expected) in [
+                (16_384, 1, true, "--slot-ctx", 8192),
+                (131_072, 1, true, "--slot-ctx", 65_536),
+                (65_536, 4, false, "--ctx-size", 32_768),
+                (65_536, 4, true, "--slot-ctx", 8192),
+            ] {
+                let e = crate::generate::choose_ctx_of(
+                    65_536,
+                    (Some(total), slots),
+                    (None, None),
+                    |ctx| -> Result<Probe<()>, GateError> {
+                        Ok(if ctx <= 8192 {
+                            Probe::Holds(())
+                        } else {
+                            Probe::Short(Short {
+                                on: Side::Card,
+                                need: ctx,
+                                room: 8192,
+                            })
+                        })
+                    },
+                )
+                .err()
+                .expect("capacity or model limit refusal");
+                super::super::note_slot_ctx(per_slot);
+                let (_, next, _) = classify(e.as_ref()).expect("a named refusal");
+                assert_eq!(
+                    next,
+                    vec![vec![flag.to_owned(), expected.to_string()]],
+                    "{total} over {slots}"
+                );
+            }
+        }
+
         fn report_of(ctx: bool, place: bool, need: bool) -> Report {
             Report {
+                per_slot: false,
                 seat: Some("glm"),
                 place: place.then(|| ("a".to_owned(), "one card".to_owned())),
                 ctx: ctx.then_some(CtxNote {
@@ -663,4 +727,11 @@ mod agent {
             assert!(take_early("127.0.0.1", 0).expect("taken").is_none());
         }
     }
+}
+
+/// Serializes the tests that write or read the [`note_slot_ctx`] note, which is process-wide.
+#[cfg(test)]
+pub(crate) fn slot_note_tests() -> MutexGuard<'static, ()> {
+    static TESTS: Mutex<()> = Mutex::new(());
+    TESTS.lock().unwrap_or_else(PoisonError::into_inner)
 }

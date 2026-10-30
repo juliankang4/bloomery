@@ -3879,6 +3879,38 @@ mod gate {
             "ctx_set_parallel_unset_is_one_slot",
             agrees && text.contains(&one_request),
         );
+
+        // The auto count preserves the requested share in both lines. Passing the share
+        // as the total makes the context line read 4096 / slots and turns this clause red.
+        // The clause asks for two slots or more to tell a share from a total, so a card
+        // that holds one 4096-position slot cannot run it.
+        let args: Vec<&str> = DEFAULT_ARGS
+            .iter()
+            .copied()
+            .chain(["--parallel", "auto", "--slot-ctx", "4096", "--plan"])
+            .collect();
+        let mut served = spawn(&args)?;
+        let status = served.wait_exit()?;
+        if status.is_none() {
+            println!("ctx: the auto plan stopped: {}", served.stop()?);
+        }
+        let text = std::fs::read_to_string(&err_log)?;
+        let parallel = parallel_line(&err_log)?.ok_or("the auto plan printed no parallel line")?;
+        let context = ctx_line(&text).ok_or("the auto plan printed no context line")?;
+        let slots = ctx_ladder::field(&parallel, "slots").ok_or("no auto slot count")?;
+        println!("ctx auto: {parallel}; {context}");
+        check(
+            &mut ok,
+            "hw_auto_slots_preserve_the_requested_context",
+            status.is_some_and(|s| s.success())
+                && (2..=model::placement::ctx_ask::AUTO_MOST as u64).contains(&slots)
+                && word_of(&parallel, "from") == Some("auto")
+                && ctx_ladder::field(&parallel, "slot_ctx") == Some(4096)
+                && ctx_ladder::field(&parallel, "total") == Some(4096 * slots)
+                && ctx_ladder::field(context, "ctx") == Some(4096)
+                && ctx_ladder::field(context, "slots") == Some(slots)
+                && ctx_ladder::field(context, "total") == Some(4096 * slots),
+        );
         Ok(ok)
     }
 

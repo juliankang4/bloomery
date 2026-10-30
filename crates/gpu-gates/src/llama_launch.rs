@@ -164,7 +164,8 @@ pub const SERVE: Reads = Reads {
 pub const SEAT_FLAGS: &[EnvFlag] = &[
     EnvFlag {
         flag: "--ctx-size",
-        spelled: &["-c", "--ctx-size", "--ctx"],
+        // `--slot-ctx` sets the same context a slot at a time, so it replaces the variable too.
+        spelled: &["-c", "--ctx-size", "--ctx", "--slot-ctx"],
         var: "LLAMA_ARG_CTX_SIZE", // line 1651
         meet: Meet::Replace,
     },
@@ -958,6 +959,15 @@ mod tests {
             ]
         );
         assert_eq!(notes.len(), 4, "{notes:?}");
+        let (carried, notes) = carry_env(&env, &["--slot-ctx", "8192"], SEAT);
+        assert!(
+            carried.iter().all(|(f, _)| *f != "--ctx-size"),
+            "{carried:?}"
+        );
+        assert_eq!(
+            notes[0],
+            "LLAMA_ARG_CTX_SIZE is set, and the command line's --slot-ctx replaces it"
+        );
         let (none, notes) = carry_env(&env, &[], NONE);
         assert!(none.is_empty());
         assert_eq!(

@@ -1,5 +1,6 @@
 //! The seats' flags as llama-server spells them: the context flag's
-//! spellings ([`CTX`]), the prompt pass size's ([`UBATCH`]), a flag's number,
+//! spellings ([`CTX`]) and bloomery's one request's context beside it
+//! ([`SLOT_CTX`]), the prompt pass size's ([`UBATCH`]), a flag's number,
 //! whose refusal names the flag and the value ([`number`]), and the API keys
 //! ([`ApiKeys`]) both key flags add to and every request of both servers is
 //! checked against.
@@ -26,6 +27,10 @@ pub(crate) fn file_snapshot(path: &Path) -> Result<String, String> {
 /// The spellings of the context flag: `--ctx`, and llama-server's
 /// `--ctx-size` and `-c`.
 pub const CTX: [&str; 3] = ["--ctx", "--ctx-size", "-c"];
+
+/// The flag that names one request's context, a slot's, apart from the slot count: `--ctx`
+/// is the total the slots split, and `--slot-ctx S` beside `--parallel N` asks `S × N`.
+pub const SLOT_CTX: &str = "--slot-ctx";
 
 /// The spellings of the prompt pass's size flag: `--ubatch-size` and
 /// llama-server's `-ub`. Unset, a seat's load chooses the rows from the

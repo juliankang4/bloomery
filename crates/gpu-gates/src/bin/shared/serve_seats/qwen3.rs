@@ -6,7 +6,7 @@
 //!
 //!     bloomery-serve --model qwen3 [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--place W]
-//!                    [--cache-type-k f16|q8_0] [--parallel N] [--queue-depth Q] [--plan]
+//!                    [--cache-type-k f16|q8_0] [--parallel N] [--slot-ctx S] [--queue-depth Q] [--plan]
 //!                    [-ub N | --ubatch-size N]
 //!                    [--chat-template-file PATH] [--mmproj FILE | --no-mmproj]
 //!                    [--image-min-tokens N] [--image-max-tokens N]
@@ -225,8 +225,8 @@ use bloomery_gpu::weights::{DevWeight, head_tensor};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::beside::Beside;
 use bloomery_gpu_gates::bind::{
-    self, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, TemplateFile, Vocab, arm_screen,
-    bind_server, note_line, parallel_line, placement_of, slots_given,
+    self, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotFlags, SlotStep, TemplateFile, Vocab,
+    arm_screen, bind_server, note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::qwen_seat::Family;
@@ -261,8 +261,9 @@ const NAME: &str = "bloomery-serve-qwen3";
 
 const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--place W] [--cache-type-k f16|q8_0] \
-                     [--parallel N] [--queue-depth Q] [--plan] [-ub N | --ubatch-size N] \
-                     [--chat-template-file PATH] [--mmproj FILE | --no-mmproj] \
+                     [--parallel N] [--slot-ctx S] [--queue-depth Q] [--plan] \
+                     [-ub N | --ubatch-size N] [--chat-template-file PATH] \
+                     [--mmproj FILE | --no-mmproj] \
                      [--image-min-tokens N] \
                      [--image-max-tokens N] [--api-key KEY] [--api-key-file FNAME]";
 
@@ -357,6 +358,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         plan_only: false,
         template_file: TemplateFile::default(),
     };
+    let mut slots = SlotFlags::default();
     let mut it = args.iter().map(String::as_str);
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -394,14 +396,6 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                         .into(),
                 );
             }
-            "--parallel" | "-np" => match v.parse::<usize>() {
-                Ok(n) if n > 0 => a.parallel = Some(n),
-                _ => {
-                    return Err(
-                        format!("{flag} takes a whole number of at least 1, not {v:?}").into(),
-                    );
-                }
-            },
             "--queue-depth" => match v.parse::<usize>() {
                 Ok(q) => a.queue_depth = Some(q),
                 _ => return Err(format!("{flag} takes a whole number, not {v:?}").into()),
@@ -422,9 +416,11 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                         .into(),
                 );
             }
+            f if slots.take(f, v)? => {}
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
+    (a.ctx, a.parallel) = slots.given(a.ctx)?;
     if let Some(total) = a.ctx {
         slot_ctx(total, a.parallel.unwrap_or(1))?;
     }

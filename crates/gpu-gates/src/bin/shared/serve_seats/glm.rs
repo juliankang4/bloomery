@@ -6,7 +6,7 @@
 //!
 //!     [--host 127.0.0.1] [--port 8080] [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C]
 //!     [--alias NAME] [--cache-ram MIB] [--slot-save-path DIR] [--chat-template-file PATH]
-//!     [--prefill batch|steps] [--parallel N] [--queue-depth Q] [--plan]
+//!     [--prefill batch|steps] [--parallel N] [--slot-ctx S] [--queue-depth Q] [--plan]
 //!     [--mmproj FILE | --no-mmproj] [--image-min-tokens N] [--image-max-tokens N]
 //!
 //! `--ctx` is also spelled `--ctx-size` and `-c`, as llama-server spells it
@@ -252,9 +252,9 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{StepMode, slots_a_pass};
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
-    CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
-    SlotStep, TemplateFile, Vocab, arm_screen, begin, bind_server, eprint_noted, model_props,
-    note_line, parallel_line, placement_of, put_back, slots_given,
+    CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotFlags,
+    SlotPassRow, SlotStep, TemplateFile, Vocab, arm_screen, begin, bind_server, eprint_noted,
+    model_props, note_line, parallel_line, placement_of, put_back, slots_given,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, lane_at, mode_name, with_cards};
 use bloomery_gpu_gates::need;
@@ -304,7 +304,7 @@ const USAGE: &str = "usage: bloomery-serve [--model glm] [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] \
                      [--ctx C] [--alias NAME] [--cache-ram MIB] [--slot-save-path DIR] \
                      [--chat-template-file PATH] [--prefill batch|steps] [--parallel N] \
-                     [--queue-depth Q] [--plan] [--mmproj FILE | --no-mmproj] \
+                     [--slot-ctx S] [--queue-depth Q] [--plan] [--mmproj FILE | --no-mmproj] \
                      [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
                      [--api-key-file FNAME]";
 
@@ -710,6 +710,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         vision: vision_seat::Flags::default(),
         api_keys: serve::flag::ApiKeys::default(),
     };
+    let mut slots = SlotFlags::default();
     let mut it = args.iter().map(|s| s.as_str());
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -733,7 +734,6 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(flag, v)?),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
-            "--parallel" | "-np" => a.parallel = Some(number(flag, v)?),
             "--queue-depth" => a.queue_depth = Some(number(flag, v)?),
             f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
             "--park-ram" => {
@@ -749,14 +749,13 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                 a.prefill = PrefillMode::from_name(v)
                     .ok_or_else(|| format!("--prefill is batch or steps, not {v}"))?;
             }
+            f if slots.take(f, v)? => {}
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
+    (a.ctx, a.parallel) = slots.given(a.ctx)?;
     if a.ctx == Some(0) {
         return Err("--ctx 0: the stores hold no position".into());
-    }
-    if a.parallel == Some(0) {
-        return Err("--parallel 0: the server serves no slot".into());
     }
     if a.vision.mmproj()?.is_some() && a.prefill == PrefillMode::Steps {
         return Err(

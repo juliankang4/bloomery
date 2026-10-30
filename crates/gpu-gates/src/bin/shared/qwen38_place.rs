@@ -129,9 +129,19 @@ pub fn ctx_choice(
         u64::from(inputs.spec.ctx_train),
         asked,
         (Some((KERNEL_POSITIONS, "KERNEL_POSITIONS")), None),
-        |c| match holds(c) {
-            Ok(()) => Ok(Probe::Holds(())),
-            Err(e) => short_in::<PlaceError>(&e).map(Probe::Short).ok_or(e),
-        },
+        |c| probe(holds(c)),
     )
+}
+
+/// A plan's outcome (`held`) as the common choices read it: a refusal short of a memory is
+/// [`Probe::Short`], any other refusal the error.
+#[allow(
+    dead_code,
+    reason = "generate_qwen3moe includes this file and runs one sequence at its own --ctx"
+)]
+pub fn probe(held: Result<(), GateError>) -> Result<Probe<()>, GateError> {
+    match held {
+        Ok(()) => Ok(Probe::Holds(())),
+        Err(e) => short_in::<PlaceError>(&e).map(Probe::Short).ok_or(e),
+    }
 }
