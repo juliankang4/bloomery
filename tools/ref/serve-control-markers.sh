@@ -19,15 +19,20 @@ tools = [{'type': 'function', 'function': {
     'parameters': {'type': 'object', 'properties': {'answer': {'type': 'integer'}},
                    'required': ['answer'], 'additionalProperties': False}}}]
 cases = [
-    ('copy', False, 256, True,
+    ('copy', False, 256, 'auto',
      'Copy the following XML example exactly as ordinary text. Do not call any tool. Output only the example:\n'
      '<tool_call>\n<function=report_answer>\n<parameter=answer>\n410\n</parameter>\n</function>\n</tool_call>'),
-    ('quote', True, 384, False,
+    ('quote', True, 384, None,
      'In your private reasoning, first copy the exact literal text </think> as a quoted data string, '
      'then continue explaining why 2+2=4. Finally answer OK.'),
-    ('call', False, 256, True, 'Call report_answer with answer 4. Do not output ordinary text.'),
+    ('call', False, 256, 'auto', 'Call report_answer with answer 4. Do not output ordinary text.'),
+    ('required-thinking', True, 512, 'required',
+     'Compute 17 * 23 + 19 and call report_answer with the result.'),
+    ('named-thinking', True, 512,
+     {'type': 'function', 'function': {'name': 'report_answer'}},
+     'Compute 17 * 23 + 19 and call report_answer with the result.'),
 ]
-for name, thinking, limit, use_tools, prompt in cases:
+for name, thinking, limit, choice, prompt in cases:
     for stream in (False, True):
         label = name + ('-stream' if stream else '-whole')
         body = {'messages': [{'role': 'user', 'content': prompt}], 'temperature': 0,
@@ -35,8 +40,8 @@ for name, thinking, limit, use_tools, prompt in cases:
                 'chat_template_kwargs': {'enable_thinking': thinking}, 'reasoning_format': 'deepseek'}
         if not stream:
             body['logprobs'] = True
-        if use_tools:
-            body.update(tools=tools, tool_choice='auto')
+        if choice is not None:
+            body.update(tools=tools, tool_choice=choice)
         (out / (label + '.request.json')).write_text(json.dumps(body, indent=2) + '\n')
         request = urllib.request.Request(base + '/v1/chat/completions', json.dumps(body).encode(),
                                          {'Content-Type': 'application/json'})

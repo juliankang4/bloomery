@@ -2919,3 +2919,261 @@ fn a_held_special_is_reported_only_when_its_text_is_sent() {
         "the stopped special has no content offset"
     );
 }
+
+/// A forced call after a prompt that left the think span open follows the
+/// model's own reasoning: every id before the special close is the model's
+/// (an ordinary `</think>`, a special `</th` spelled on to one and a special
+/// call opener among them), the close is taken and fed once, and only then
+/// does the program pick the call, required and named alike, on both arms.
+/// A JSON document still closes the span first
+/// ([`an_open_think_span_is_closed_before_the_program`]).
+#[test]
+fn a_forced_call_follows_the_models_own_close() {
+    let pieces = Arc::new(PieceTok(&TAG_PIECES));
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::clone(&pieces)));
+    let plain = |text: &str| -> Vec<u32> { text.bytes().map(|b| BYTES + u32::from(b)).collect() };
+    let mut want = plain("a </think> b");
+    want.push(pieces.piece("</th"));
+    want.extend(plain("ink> c "));
+    want.push(pieces.piece(CALL_OPEN));
+    want.extend(plain(" d"));
+    let reasoning = tok.decode(&want);
+    want.extend(ids(&tok, "</think>"));
+    let peaks: Peaks = (0..want.len())
+        .map(|i| (want[..i].to_vec(), vec![(want[i], 50.0)]))
+        .collect();
+    let tools = json!([
+        {"type": "function", "function": {"name": "f", "parameters": {"type": "object",
+            "properties": {"n": {"type": "integer"}}, "required": ["n"]}}},
+        {"type": "function", "function": {"name": "g", "parameters": {"type": "object",
+            "properties": {}}}},
+    ]);
+    for (choice, named) in [
+        (json!("required"), None),
+        (
+            json!({"type": "function", "function": {"name": "g"}}),
+            Some("g"),
+        ),
+    ] {
+        let body = json!({"tools": tools, "tool_choice": choice});
+        let p = params(
+            Some(build(&tok, QWEN, &body).expect("served")),
+            ThinkEntry::Open,
+        );
+        let jump = scripted_in(&tok, &p, 7, peaks.clone(), true, 4096);
+        let step = scripted_in(&tok, &p, 7, peaks.clone(), false, 4096);
+        assert_step_arms_ids(&tok, &jump, &step, &format!("{choice}"));
+        assert_fed_the_answer(&tok, &jump);
+        assert_eq!(jump.out.tokens[..want.len()], want, "{}", jump.out.content);
+        let mut m = ChatParser::with_tools(
+            "<think>\n",
+            ReasoningFormat::Deepseek,
+            Some(Tools::QwenXml(
+                Framing::Lines,
+                ParamKinds::of_tools(Some(&tools)),
+            )),
+        )
+        .for_template(QWEN)
+        .following_reasoning()
+        .reading_specials(&*tok);
+        m.try_push(&jump.out.content, &jump.out.specials)
+            .and_then(|_| m.try_finish())
+            .expect("the answer parses");
+        let m = m.message();
+        assert_eq!(m.reasoning, reasoning, "{choice}");
+        assert_eq!(m.calls.len(), 1, "{choice}: {}", jump.out.content);
+        let name = m.calls[0].name.as_str();
+        assert!(
+            named.map_or(["f", "g"].contains(&name), |n| n == name),
+            "{name}"
+        );
+    }
+}
+
+/// A held call's reasoning draws with the request's bias, greedy and
+/// sampled, and a model that ends inside the span is a named error, not a
+/// call.
+#[test]
+fn a_held_calls_reasoning_takes_the_bias_and_ends_by_name() {
+    let tok = bytes_tok();
+    let c = build(&tok, QWEN, &call_body(&json!({"type": "object"}))).expect("served");
+    let mut p = params(Some(c), ThinkEntry::Open);
+    let raised = BYTES + u32::from(b'c');
+    p.logit_bias = vec![(raised, 20.0)];
+    p.n_predict = 4;
+    let mut want = ids(&tok, "ab");
+    want.extend(ids(&tok, "</think>"));
+    for temperature in [0.0, 0.1] {
+        p.sampling.temperature = temperature;
+        let o = run_read(&tok, &p, &want).0;
+        assert_eq!(o.tokens, [raised; 4], "{temperature}: {}", o.content);
+    }
+    p.sampling.temperature = 0.0;
+    p.logit_bias.clear();
+    p.n_predict = 400;
+    let mut slot = Slot::new(Box::new(Rows {
+        tok: Arc::clone(&tok),
+        want: ids(&tok, "x"),
+        k: 0,
+        read: Arc::default(),
+    }));
+    let ended = generate(
+        &mut slot,
+        &sampling::reference_factory(),
+        &tok.encode("hi"),
+        &p,
+        &mut |_| Ok(()),
+        &mut |_| {},
+        &mut Timings::default(),
+    );
+    assert!(
+        matches!(ended, Err(GenError::Unclosed)),
+        "{:?}",
+        ended.err()
+    );
+}
+
+/// A text close hands off only with ASCII whitespace after it and no
+/// decoder tail. Stop prefixes and token limits cannot release an unchosen
+/// suffix later; a matched stop discards the decoder tail as usual. The
+/// production vocabulary decoder reads the merged pieces, including raw
+/// incomplete and invalid UTF-8, on the step, jump and probabilities paths.
+#[test]
+fn a_merged_close_writes_nothing_outside_the_held_program() {
+    use gguf::Value as Gguf;
+
+    const CLOSE: &str = ThinkTags::SOLAR.close;
+    const MERGED: &[&[u8]] = &[
+        b"<|think:end|>\xC3",
+        b"<|think:end|>\xFF",
+        b"<|think:end|>\xC2\xA0",
+        b"<|think:end|>x!",
+        b"<|think:end|>x",
+        b"<|think:end|>\n!\xC3",
+        b"<|think:end|>\n!",
+        b"<|think:end|>\n",
+        b"!<|think:end|>x\xC3",
+    ];
+    let byte_chars = tokenizer::byte_to_cpt_table().map(|c| char::from_u32(c).unwrap());
+    let tokens =
+        SPECIALS
+            .iter()
+            .map(|s| Gguf::String((*s).to_owned()))
+            .chain(byte_chars.iter().map(|c| Gguf::String(c.to_string())))
+            .chain(MERGED.iter().map(|bytes| {
+                Gguf::String(bytes.iter().map(|&b| byte_chars[usize::from(b)]).collect())
+            }))
+            .collect();
+    let types = std::iter::repeat_n(Gguf::I32(3), SPECIALS.len())
+        .chain(std::iter::repeat_n(Gguf::I32(1), 256 + MERGED.len()))
+        .collect();
+    let vocab = tokenizer::Tokenizer::from_keys(&[
+        ("tokenizer.ggml.model".into(), Gguf::String("gpt2".into())),
+        ("tokenizer.ggml.pre".into(), Gguf::String("qwen2".into())),
+        ("tokenizer.ggml.tokens".into(), Gguf::Array(tokens)),
+        ("tokenizer.ggml.token_type".into(), Gguf::Array(types)),
+        ("tokenizer.ggml.merges".into(), Gguf::Array(vec![])),
+        ("tokenizer.ggml.bos_token_id".into(), Gguf::U32(0)),
+        ("tokenizer.ggml.eos_token_id".into(), Gguf::U32(1)),
+    ])
+    .expect("a byte vocabulary with raw merged pieces");
+    let tok: Arc<dyn Tokenizer> = Arc::new(crate::vocab::Vocab::new(vocab).unwrap());
+    let c = build(
+        &tok,
+        ToolFormat::Hermes,
+        &call_body(&json!({"type": "object"})),
+    );
+    let mut p = params(Some(c.expect("served")), ThinkEntry::Open);
+    p.think = ThinkTags::SOLAR;
+    let mut bad = Vec::new();
+    for (piece, stop, word) in [
+        (0, None, None),
+        (1, None, None),
+        (2, None, None),
+        (3, Some("!"), None),
+        (4, None, None),
+        (4, Some("x!"), None),
+        (8, Some("!"), Some("ab")),
+        (5, Some("!"), Some("ab<|think:end|>\n")),
+        (6, Some("!"), Some("ab<|think:end|>\n")),
+        (7, None, Some("")),
+        (7, Some("\n!"), Some("")),
+        (7, Some("b<|think:end|>\n!"), Some("")),
+        (7, Some("b<|think:end|>\n<"), Some("a")),
+    ] {
+        for (jump, probs) in [(false, false), (true, false), (false, true)] {
+            for limit in [3, 400] {
+                p.n_predict = limit;
+                p.stop = stop.into_iter().map(str::to_owned).collect();
+                p.logprobs = probs.then(|| Probs::new(0, tok.n_vocab()));
+                let mut want = ids(&tok, "ab");
+                want.push(PIECES + u32::try_from(piece).unwrap());
+                let mut slot = Slot::new(Box::new(Rows {
+                    tok: Arc::clone(&tok),
+                    want,
+                    k: 0,
+                    read: Arc::default(),
+                }))
+                .schema_jump(jump);
+                let mut sent = String::new();
+                let o = generate(
+                    &mut slot,
+                    &sampling::reference_factory(),
+                    &tok.encode("hi"),
+                    &p,
+                    &mut |ev| {
+                        if let Event::Text(text, _, _) = ev {
+                            sent.push_str(text);
+                        }
+                        Ok(())
+                    },
+                    &mut |_| {},
+                    &mut Timings::default(),
+                );
+                let label =
+                    format!("piece={piece} stop={stop:?} jump={jump} probs={probs} limit={limit}");
+                let valid = match (word, &o) {
+                    (None, Err(GenError::Constrained(super::StepError::NoAllowed { why, .. }))) => {
+                        why == "the think span's close also wrote text outside the forced call's program"
+                            && sent == "ab"
+                            && p.logprobs.as_ref().is_none_or(|p| p.len() == 2)
+                    }
+                    (Some(""), Ok(o)) => {
+                        let prefix = format!("ab{CLOSE}\n");
+                        let expected = if limit == 3 {
+                            prefix
+                        } else {
+                            format!("{prefix}{CALL_OPEN}")
+                        };
+                        o.content.starts_with(&expected)
+                            && o.content == sent
+                            && (limit != 3 || o.stop == StopKind::Limit)
+                    }
+                    (Some(content), Ok(o)) => {
+                        // This stop needs a program token after the close.
+                        let pending = stop == Some("b<|think:end|>\n<") && limit == 3;
+                        let expected = if pending {
+                            "ab<|think:end|>\n"
+                        } else {
+                            content
+                        };
+                        let end = if pending {
+                            StopKind::Limit
+                        } else {
+                            StopKind::Word
+                        };
+                        o.stop == end && o.content == expected && sent == expected
+                    }
+                    _ => false,
+                };
+                if !valid {
+                    bad.push(format!(
+                        "{label}: {:?}; sent={sent:?}",
+                        o.as_ref().map(|o| (&o.content, o.stop))
+                    ));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

@@ -1323,6 +1323,60 @@ fn hw_a_call_ends_the_span_for_the_budget_and_the_loop_guard() {
     }
 }
 
+/// A forced call with thinking on reasons first: the script's reasoning, with
+/// a `<tool_call>` among it (the mock spells it a byte an id), runs to the
+/// script's `</think>`, and only then is the named call written, on the chat
+/// route whole and streamed and on `/completion`, whose prompt ends in
+/// `<think>`. A script that ends inside the span is an error naming the
+/// missing call.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_forced_call_follows_the_models_own_close() {
+    const REASONING: &str = "r <tool_call> s";
+    let named = json!({"type": "function", "function": {"name": "get_time"}});
+    let called = json!([{"name": "get_time", "arguments": "{}"}]);
+    let served = json!([tools()[0], tools()[1]]);
+    let addr = start(&format!("{REASONING}</think>"));
+    let mut body = tool_body(false);
+    body["tools"] = served.clone();
+    body["tool_choice"] = named.clone();
+    let r = post(addr, "/v1/chat/completions", &body);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    let c = &v["choices"][0];
+    assert_eq!(c["finish_reason"], "tool_calls", "{v}");
+    assert_eq!(c["message"]["reasoning_content"], REASONING, "{v}");
+    let calls: Vec<Value> = c["message"]["tool_calls"]
+        .as_array()
+        .expect("tool_calls")
+        .iter()
+        .map(|tc| tc["function"].clone())
+        .collect();
+    assert_eq!(json!(calls), called, "{v}");
+    body["stream"] = json!(true);
+    let r = post(addr, "/v1/chat/completions", &body);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let (finish, folded) = fold_stream(&r.body).expect("no error event");
+    assert_eq!(finish, "tool_calls");
+    assert_eq!(folded["reasoning_content"], REASONING);
+    assert_eq!(folded["calls"], called);
+    let completion = json!({"prompt": "q<think>", "n_predict": 256, "temperature": 0,
+        "tools": served, "tool_choice": named});
+    let r = post(addr, "/completion", &completion);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        r.json()["content"],
+        format!("{REASONING}</think>{CALL_IN_SPAN}"),
+        "{}",
+        r.body
+    );
+    let addr = start(REASONING);
+    body["stream"] = json!(false);
+    let r = post(addr, "/v1/chat/completions", &body);
+    assert_eq!(r.status, 500, "{}", r.body);
+    assert!(r.body.contains("before the forced tool call"), "{}", r.body);
+}
+
 /// MiMo's compact calls return the reference arguments,
 /// `get_weather {"city":"Seoul"}`, in streamed and non-streamed responses.
 #[test]

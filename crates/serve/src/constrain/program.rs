@@ -653,8 +653,12 @@ pub(crate) struct Constraint {
     /// The programs a [`Step::Rule`] names, by index.
     rules: Arc<[Arc<Program>]>,
     /// The ids that close an open think span, forced first when the prompt
-    /// leaves one open.
+    /// leaves one open and the program does not follow the reasoning.
     close: Arc<[u32]>,
+    /// The program starts where the model closes an open think span itself
+    /// (a forced tool call), not at once with the span force-closed (a JSON
+    /// document).
+    follows_reasoning: bool,
     vocab: Arc<Vocab>,
     /// Where its walks write their decisions, `None` for a request that reads
     /// none.
@@ -680,9 +684,24 @@ impl Constraint {
             prog: Arc::new(prog),
             rules: rules.into(),
             close: close.into(),
+            follows_reasoning: false,
             vocab,
             watch: None,
         }
+    }
+
+    /// This constraint starting after the model's own close of an open think
+    /// span ([`Constraint::follows_reasoning`]).
+    pub(crate) fn following_reasoning(mut self) -> Constraint {
+        self.follows_reasoning = true;
+        self
+    }
+
+    /// Whether a prompt that left the think span open lets the model reason
+    /// to its own close before the program starts: a forced tool call does,
+    /// a JSON document closes the span first ([`Walk::new`]).
+    pub(crate) fn follows_reasoning(&self) -> bool {
+        self.follows_reasoning
     }
 
     /// This constraint with its walks writing their decisions to `watch`.

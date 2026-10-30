@@ -799,7 +799,9 @@ fn hw_a_forced_call_is_served_on_every_template() {
         (GLM5, "glm xml"),
         (V41_TEMPLATE, "dsml"),
     ] {
-        let addr = start_templated(Box::new(ScriptedEngine::new(4096, "")), template);
+        // The templates that open the think span hold the call until the
+        // model closes it.
+        let addr = start_templated(Box::new(ScriptedEngine::new(4096, "</think>")), template);
         for (choice, name, args) in [
             (json!("required"), "get_weather", weather.clone()),
             (
