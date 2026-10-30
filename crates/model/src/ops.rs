@@ -9,6 +9,7 @@ use crate::profile;
 use crate::r8file::{R8Error, R8Source, Sidecar};
 use gguf::{GgmlType, Gguf, Split, TensorInfo, dequant_row, quantize_activations};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1123,7 +1124,7 @@ impl ShardTensor {
                 RowLayout::Rows,
                 scale,
             ),
-            Some(runs) => runs.cut(&self.info, file.mapping(), e, scale),
+            Some(runs) => runs.cut(&self.info, split, e, scale),
         }
     }
 
@@ -1137,7 +1138,7 @@ impl ShardTensor {
         let scale = self.scale.as_deref();
         match &self.runs {
             None => ExpertStack::of(&self.info, file.data(&self.info)?, scale),
-            Some(runs) => ExpertStack::located(&self.info, file.mapping(), runs, scale),
+            Some(runs) => ExpertStack::located(&self.info, split, runs, scale),
         }
     }
 }
@@ -1300,36 +1301,55 @@ fn planes_scales_bytes(k: usize, n: usize) -> usize {
     n * (k / 16)
 }
 
-/// Where a stack's matrices lie in the file that holds them, when they are
+/// Where a stack's matrices lie in the files that hold them, when they are
 /// not the `n_expert` equal runs of one tensor: matrix `e` is the `codes_per`
-/// bytes at file offset `codes_at[e]` (the offsets a checkpoint folder's shard
-/// header gives, in no order) and, in [`RowLayout::Planes`], the `scales_per`
-/// bytes of group scales at `scales_at[e]` — wherever the folder keeps them,
-/// adjacent to the codes or a region away. Made only by [`StackRuns::new`].
+/// bytes at file offset `codes_at[e]` of shard `codes_in[e]` (the offsets a
+/// checkpoint folder's shard headers give, in no order) and, in
+/// [`RowLayout::Planes`], the `scales_per` bytes of group scales at
+/// `scales_at[e]` of shard `scales_in[e]`: wherever the folder keeps them,
+/// adjacent to the codes, a region away or in another shard. Made only by
+/// [`StackRuns::new`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct StackRuns {
     layout: RowLayout,
+    codes_in: Vec<usize>,
     codes_at: Vec<u64>,
+    scales_in: Vec<usize>,
     scales_at: Vec<u64>,
     codes_per: u64,
     scales_per: u64,
-    /// The largest offset of each table, so a stack over a file checks its
-    /// bounds once.
-    codes_last: u64,
-    scales_last: u64,
+    /// Per shard a run lies in, the largest offset of each table's runs
+    /// there and its run's bytes, so a stack over its files checks its
+    /// bounds once a shard.
+    last: Vec<(usize, u64, u64)>,
+}
+
+/// The files a located stack's runs lie in ([`StackRuns`]), by shard: a
+/// split's shard mappings.
+pub(crate) trait Files: Sync {
+    /// Shard `shard`'s bytes, file offset `o` at index `o`; `None` for a
+    /// shard the files lack.
+    fn file(&self, shard: usize) -> Option<&[u8]>;
+}
+
+impl Files for Split {
+    fn file(&self, shard: usize) -> Option<&[u8]> {
+        self.shard(shard).map(Gguf::mapping)
+    }
 }
 
 impl StackRuns {
-    /// The runs of `layout`: `codes_at` (file offsets, one an expert) of
-    /// `codes_per` bytes and, for planes, `scales_at` of `scales_per` bytes.
-    /// Whether the counts and sizes fit a stack's header is checked where a
-    /// stack is made over them ([`StackRuns::shape`]). Refused by name: the r8
-    /// layout, which reads a sidecar, not file runs; a second run for a layout
-    /// that has none; planes without one a matrix.
+    /// The runs of `layout`: `codes_at` (file offsets, one an expert, in
+    /// shards `codes_in`) of `codes_per` bytes and, for planes, `scales_at`
+    /// (in shards `scales_in`) of `scales_per` bytes. Whether the counts and
+    /// sizes fit a stack's header is checked where a stack is made over them
+    /// ([`StackRuns::shape`]). Refused by name: the r8 layout, which reads a
+    /// sidecar, not file runs; a second run for a layout that has none;
+    /// planes without one a matrix; a run without its shard.
     pub fn new(
         layout: RowLayout,
-        codes_at: Vec<u64>,
-        scales_at: Vec<u64>,
+        (codes_in, codes_at): (Vec<usize>, Vec<u64>),
+        (scales_in, scales_at): (Vec<usize>, Vec<u64>),
         codes_per: u64,
         scales_per: u64,
     ) -> Result<StackRuns, crate::ModelError> {
@@ -1354,27 +1374,45 @@ impl StackRuns {
             }
             RowLayout::Rows | RowLayout::Planes => {}
         }
-        let last = |at: &[u64]| at.iter().copied().max().unwrap_or(0);
+        if codes_in.len() != codes_at.len() || scales_in.len() != scales_at.len() {
+            return refuse("located runs: every run names the shard it lies in");
+        }
+        let mut last: Vec<(usize, u64, u64)> = Vec::new();
+        for (ins, ats, per) in [
+            (&codes_in, &codes_at, codes_per),
+            (&scales_in, &scales_at, scales_per),
+        ] {
+            let mut most: BTreeMap<usize, u64> = BTreeMap::new();
+            for (&shard, &at) in ins.iter().zip(ats) {
+                let m = most.entry(shard).or_insert(at);
+                *m = (*m).max(at);
+            }
+            last.extend(most.into_iter().map(|(shard, at)| (shard, at, per)));
+        }
         Ok(StackRuns {
             layout,
-            codes_last: last(&codes_at),
-            scales_last: last(&scales_at),
+            codes_in,
             codes_at,
+            scales_in,
             scales_at,
             codes_per,
             scales_per,
+            last,
         })
     }
 
-    /// Expert `e`'s file ranges, its codes (or rows) run then its group scales
-    /// run, which is empty for a layout with one. `None` for an expert past
-    /// the stack.
-    pub(crate) fn ranges(&self, e: usize) -> Option<[Range<u64>; 2]> {
-        let codes = *self.codes_at.get(e)?;
-        let scales = self.scales_at.get(e).copied().unwrap_or(0);
+    /// Expert `e`'s shards and file ranges, its codes (or rows) run then its
+    /// group scales run, which is empty, in the codes' shard, for a layout
+    /// with one. `None` for an expert past the stack.
+    pub(crate) fn ranges(&self, e: usize) -> Option<[(usize, Range<u64>); 2]> {
+        let (codes_in, codes) = (*self.codes_in.get(e)?, *self.codes_at.get(e)?);
+        let (scales_in, scales) = match self.scales_at.get(e) {
+            Some(&at) => (self.scales_in[e], at),
+            None => (codes_in, 0),
+        };
         Some([
-            codes..codes + self.codes_per,
-            scales..scales + self.scales_per,
+            (codes_in, codes..codes + self.codes_per),
+            (scales_in, scales..scales + self.scales_per),
         ])
     }
 
@@ -1384,12 +1422,17 @@ impl StackRuns {
     }
 
     /// The stack `info`'s `n_expert` and the bytes of one matrix, checked
-    /// against these runs over a file of `len` bytes. Refused by name: a
-    /// header that is not a stack, an offset count other than `n_expert`, the
-    /// planes layout on a type that is not `NVFP4_ROWS` (or the reverse), runs
-    /// whose sizes are not the header's matrix (planes: `n · k / 2` code bytes
-    /// and `n · k / 16` scale bytes), and a run that ends past the file.
-    fn shape(&self, info: &TensorInfo, len: usize) -> Result<(usize, usize), crate::ModelError> {
+    /// against these runs over `files`. Refused by name: a header that is
+    /// not a stack, an offset count other than `n_expert`, the planes layout
+    /// on a type that is not `NVFP4_ROWS` (or the reverse), runs whose sizes
+    /// are not the header's matrix (planes: `n · k / 2` code bytes and
+    /// `n · k / 16` scale bytes), a run in a shard the files lack, and a run
+    /// that ends past its file.
+    fn shape(
+        &self,
+        info: &TensorInfo,
+        files: &dyn Files,
+    ) -> Result<(usize, usize), crate::ModelError> {
         let (n_expert, per) = stack_cut(info)?;
         if self.codes_at.len() != n_expert {
             return Err(crate::ModelError::Shape {
@@ -1422,10 +1465,10 @@ impl StackRuns {
                 got_ne1: self.scales_per as usize,
             });
         }
-        for (last, per) in [
-            (self.codes_last, self.codes_per),
-            (self.scales_last, self.scales_per),
-        ] {
+        for &(shard, last, per) in &self.last {
+            let len = files.file(shard).map(<[u8]>::len).ok_or_else(|| {
+                crate::ModelError::MissingTensor(format!("{} (shard {shard})", info.name))
+            })?;
             if last.checked_add(per).is_none_or(|end| end > len as u64) {
                 return Err(crate::ModelError::Gguf(gguf::LoadError::OutOfBounds {
                     name: info.name.clone(),
@@ -1439,25 +1482,25 @@ impl StackRuns {
         Ok((n_expert, per))
     }
 
-    /// Matrix `e` of stack `info` over the file's bytes `span` (file offset `o`
-    /// at index `o`) as a dispatch weight: its runs at their offsets, in the
-    /// runs' layout, dotted at `scale`. An expert past the stack is refused by
-    /// name, as [`StackRuns::shape`] refuses the rest.
+    /// Matrix `e` of stack `info` over `files` as a dispatch weight: its runs
+    /// at their offsets, in the runs' layout, dotted at `scale`. An expert
+    /// past the stack is refused by name, as [`StackRuns::shape`] refuses the
+    /// rest.
     fn cut<'s>(
         &self,
         info: &TensorInfo,
-        span: &'s [u8],
+        files: &'s dyn Files,
         e: usize,
         scale: f32,
     ) -> Result<Weight<'s>, crate::ModelError> {
-        let (n_expert, _) = self.shape(info, span.len())?;
+        let (n_expert, _) = self.shape(info, files)?;
         if e >= n_expert {
             return Err(crate::ModelError::MissingTensor(format!(
                 "expert {e} of {}",
                 info.name
             )));
         }
-        let (bytes, scale_plane) = self.runs_in(span, e);
+        let (bytes, scale_plane) = self.runs_in(files, e);
         Ok(Weight {
             ty: info.ty,
             k: k_of(info),
@@ -1469,16 +1512,22 @@ impl StackRuns {
         })
     }
 
-    /// Expert `e`'s runs of `span`: its codes (or rows) and its group scales,
-    /// which are empty for a layout with none. `e` and the runs' fit to
-    /// `span` are [`StackRuns::shape`]'s.
-    fn runs_in<'s>(&self, span: &'s [u8], e: usize) -> (&'s [u8], &'s [u8]) {
-        let codes = self.codes_at[e] as usize;
-        let scales = self.scales_at.get(e).map_or(0, |&at| at as usize);
-        (
-            &span[codes..codes + self.codes_per as usize],
-            &span[scales..scales + self.scales_per as usize],
-        )
+    /// Expert `e`'s runs of `files`: its codes (or rows) and its group
+    /// scales, which are empty for a layout with none. `e` and the runs' fit
+    /// to `files` are [`StackRuns::shape`]'s.
+    fn runs_in<'s>(&self, files: &'s dyn Files, e: usize) -> (&'s [u8], &'s [u8]) {
+        let run = |shard: usize, at: u64, len: u64| {
+            let span = files
+                .file(shard)
+                .expect("StackRuns::shape checked every run's shard");
+            &span[at as usize..(at + len) as usize]
+        };
+        let codes = run(self.codes_in[e], self.codes_at[e], self.codes_per);
+        let scales = match self.scales_at.get(e) {
+            Some(&at) => run(self.scales_in[e], at, self.scales_per),
+            None => &[],
+        };
+        (codes, scales)
     }
 }
 
@@ -1491,7 +1540,7 @@ pub(crate) struct Placed {
 }
 
 /// The placement `split` keeps for stack `name`: `Some` when its matrices lie
-/// at offsets of their own in the shard — a checkpoint folder's experts, each
+/// at offsets of their own in its shards — a checkpoint folder's experts, each
 /// where the folder stores it — `None` for a tensor that is the `n_expert`
 /// equal runs from its header's offset, as every GGUF's is. The one place a
 /// split's own placement enters the host tier ([`ShardTensor::find`], and
@@ -1499,13 +1548,14 @@ pub(crate) struct Placed {
 /// answers `None` for every name.
 pub(crate) fn placed(split: &Split, name: &str) -> Result<Option<Placed>, crate::ModelError> {
     let Some(gguf::Place::Stack {
+        codes_in,
         codes_at,
+        scales_in,
         scales_at,
         codes_per,
         scales_per,
         layout,
         scales,
-        ..
     }) = split.place(name)
     else {
         return Ok(None);
@@ -1517,8 +1567,8 @@ pub(crate) fn placed(split: &Split, name: &str) -> Result<Option<Placed>, crate:
     Ok(Some(Placed {
         runs: StackRuns::new(
             layout,
-            codes_at.clone(),
-            scales_at.clone(),
+            (codes_in.clone(), codes_at.clone()),
+            (scales_in.clone(), scales_at.clone()),
             *codes_per,
             *scales_per,
         )?,
@@ -1634,10 +1684,11 @@ pub(crate) struct ExpertStack<'w> {
     n_expert: usize,
     /// Bytes of one expert's matrix, all its runs.
     per: usize,
+    /// The stack's bytes, matrix `e` the `per` bytes at `e · per`; empty for
+    /// a located stack.
     bytes: &'w [u8],
-    /// Where each matrix's runs lie in `bytes`; `None`: the matrix is the
-    /// `per` bytes at `e · per`.
-    runs: Option<&'w StackRuns>,
+    /// Where each matrix's runs lie in which files, for a located stack.
+    runs: Option<(&'w StackRuns, &'w dyn Files)>,
     /// The tensor scale each expert's matrix is dotted with, `n_expert` of
     /// them for a type that reads one ([`GgmlType::reads_scale`]), indexed by
     /// id whichever bytes a tier lends; `None` for a type that reads none.
@@ -1709,17 +1760,16 @@ impl<'w> ExpertStack<'w> {
         })
     }
 
-    /// The stack `info` whose matrices lie where `runs` puts them in `span`,
-    /// the bytes of the file that holds them (file offset `o` at index `o`),
+    /// The stack `info` whose matrices lie where `runs` puts them in `files`,
     /// in the runs' layout and dotted with `scale` as for [`ExpertStack::of`].
     /// Refused by name as [`StackRuns::shape`] refuses.
     pub(crate) fn located(
         info: &'w TensorInfo,
-        span: &'w [u8],
+        files: &'w dyn Files,
         runs: &'w StackRuns,
         scale: Option<&'w [f32]>,
     ) -> Result<Self, crate::ModelError> {
-        let (n_expert, per) = runs.shape(info, span.len())?;
+        let (n_expert, per) = runs.shape(info, files)?;
         check_stack_scale(info, n_expert, scale)?;
         Ok(ExpertStack {
             name: &info.name,
@@ -1728,8 +1778,8 @@ impl<'w> ExpertStack<'w> {
             n: n_of(info),
             n_expert,
             per,
-            bytes: span,
-            runs: Some(runs),
+            bytes: &[],
+            runs: Some((runs, files)),
             scale,
             layout: runs.layout,
             tier: None,
@@ -1820,8 +1870,8 @@ impl<'w> ExpertStack<'w> {
         }
         let e = e as usize;
         Some(match self.runs {
-            Some(runs) => {
-                let (rows, scale_plane) = runs.runs_in(self.bytes, e);
+            Some((runs, files)) => {
+                let (rows, scale_plane) = runs.runs_in(files, e);
                 MatrixBytes { rows, scale_plane }
             }
             None => MatrixBytes {
@@ -8217,8 +8267,8 @@ mod ccd_tests {
 #[cfg(test)]
 pub(crate) mod planes_tests {
     use super::{
-        ExpertStack, RowLayout, ShardTensor, StackRuns, Tensor2, UnionStack, matmul_q_group_into,
-        placed_scales, planes_codes_bytes, planes_scales_bytes,
+        ExpertStack, Files, RowLayout, ShardTensor, StackRuns, Tensor2, UnionStack,
+        matmul_q_group_into, placed_scales, planes_codes_bytes, planes_scales_bytes,
     };
     use gguf::quant::Nvfp4Rows;
     use gguf::write::{Layout, TensorDecl, Writer};
@@ -8255,6 +8305,15 @@ pub(crate) mod planes_tests {
             ty: GgmlType::NVFP4_ROWS,
             offset: 0,
             nbytes: (n_expert * (planes_codes_bytes(k, n) + planes_scales_bytes(k, n))) as u64,
+        }
+    }
+
+    /// Files of the spans' bytes, shard `s` the `s`-th ([`Files`]).
+    pub(crate) struct Shards<'a>(pub(crate) Vec<&'a [u8]>);
+
+    impl Files for Shards<'_> {
+        fn file(&self, shard: usize) -> Option<&[u8]> {
+            self.0.get(shard).copied()
         }
     }
 
@@ -8310,8 +8369,14 @@ pub(crate) mod planes_tests {
                 }
             }
         }
-        StackRuns::new(RowLayout::Planes, codes_at, scales_at, cp as u64, sp as u64)
-            .expect("planes runs of equal counts")
+        StackRuns::new(
+            RowLayout::Planes,
+            (vec![0; n_expert], codes_at),
+            (vec![0; n_expert], scales_at),
+            cp as u64,
+            sp as u64,
+        )
+        .expect("planes runs of equal counts")
     }
 
     /// The runs of `n_expert` matrices of `n` rows of `k` values laid expert
@@ -8325,8 +8390,11 @@ pub(crate) mod planes_tests {
         let at = |e: usize| e as u64 * (cp + sp);
         StackRuns::new(
             RowLayout::Planes,
-            (0..n_expert).map(at).collect(),
-            (0..n_expert).map(|e| at(e) + cp).collect(),
+            (vec![0; n_expert], (0..n_expert).map(at).collect()),
+            (
+                vec![0; n_expert],
+                (0..n_expert).map(|e| at(e) + cp).collect(),
+            ),
             cp,
             sp,
         )
@@ -8348,16 +8416,19 @@ pub(crate) mod planes_tests {
 
     /// A located stack's matrix `e` is its two runs at their offsets and its
     /// scale `scale[e]`, wherever the experts lie and whether an expert's
-    /// scales run follows its codes run or lies a region away. The equal-run
-    /// cut a stack had before reads another matrix for the same span.
+    /// scales run follows its codes run, lies a region away or in another
+    /// file. The equal-run cut a stack had before reads another matrix for the
+    /// same span. FAIL-first: every run read from the first file reads
+    /// another matrix for a stack over two.
     #[test]
     fn a_located_stack_cuts_its_matrices_at_its_runs() {
         let (k, n) = (96, 4);
         let scale = scales_of_five();
         for order in super::planes_tests::ORDERS {
             let (mats, span, runs) = scattered(k, n, order);
+            let files = Shards(vec![&span]);
             let info = stack_info("exps", [k, n, 5]);
-            let stack = ExpertStack::located(&info, &span, &runs, Some(&scale)).unwrap();
+            let stack = ExpertStack::located(&info, &files, &runs, Some(&scale)).unwrap();
             let equal = ExpertStack::of(&info, &span, Some(&scale)).unwrap();
             for (e, want) in mats.iter().enumerate() {
                 let (codes, scales) = want.split_at(planes_codes_bytes(k, n));
@@ -8368,7 +8439,7 @@ pub(crate) mod planes_tests {
                     "{order:?}: expert {e}'s runs"
                 );
                 assert_eq!(stack.scale(e as u32), scale[e], "{order:?}: expert {e}");
-                let w = runs.cut(&info, &span, e, scale[e]).unwrap();
+                let w = runs.cut(&info, &files, e, scale[e]).unwrap();
                 assert_eq!(
                     (w.bytes, w.scale_plane, w.layout, w.scale, w.ty),
                     (
@@ -8380,7 +8451,9 @@ pub(crate) mod planes_tests {
                     ),
                     "{order:?}: expert {e}'s weight"
                 );
-                let [c, sc] = runs.ranges(e).unwrap();
+                let [(0, c), (0, sc)] = runs.ranges(e).unwrap() else {
+                    panic!("{order:?}: expert {e}'s runs in the one file")
+                };
                 match order {
                     Order::Adjacent => assert_eq!(sc.start, c.end, "{order:?}: adjacent runs"),
                     Order::Separated => assert!(sc.start > c.end, "{order:?}: a region away"),
@@ -8392,11 +8465,52 @@ pub(crate) mod planes_tests {
                 "{order:?}: the stack's old cut reads another matrix for a scattered expert"
             );
             let past = runs
-                .cut(&info, &span, 5, 1.0)
+                .cut(&info, &files, 5, 1.0)
                 .map(drop)
                 .unwrap_err()
                 .to_string();
             assert!(past.contains("expert 5 of exps"), "{past}");
+        }
+        // Over two files: expert `e`'s codes in file `e % 2`, its scales in
+        // the other, each file's runs at the same offsets.
+        let mats: Vec<Vec<u8>> = (0..5).map(|e| planes_matrix(k, n, 100 + e)).collect();
+        let (cp, sp) = (planes_codes_bytes(k, n), planes_scales_bytes(k, n));
+        let mut spans = [vec![0xEE; 5 * (cp + sp)], vec![0xDD; 5 * (cp + sp)]];
+        let (codes_at, scales_at): (Vec<u64>, Vec<u64>) = (0..5)
+            .map(|e| ((e * cp) as u64, (5 * cp + e * sp) as u64))
+            .unzip();
+        for (e, m) in mats.iter().enumerate() {
+            let (codes, scales) = m.split_at(cp);
+            let (c, s) = (codes_at[e] as usize, scales_at[e] as usize);
+            spans[e % 2][c..c + cp].copy_from_slice(codes);
+            spans[1 - e % 2][s..s + sp].copy_from_slice(scales);
+        }
+        let runs = StackRuns::new(
+            RowLayout::Planes,
+            ((0..5).map(|e| e % 2).collect(), codes_at),
+            ((0..5).map(|e| 1 - e % 2).collect(), scales_at),
+            cp as u64,
+            sp as u64,
+        )
+        .unwrap();
+        let files = Shards(spans.iter().map(Vec::as_slice).collect());
+        let info = stack_info("exps", [k, n, 5]);
+        let stack = ExpertStack::located(&info, &files, &runs, Some(&scale)).unwrap();
+        for (e, want) in mats.iter().enumerate() {
+            let m = stack.matrix(e as u32);
+            assert_eq!(
+                (m.rows, m.scale_plane),
+                want.split_at(cp),
+                "expert {e} over two files"
+            );
+            let w = runs.cut(&info, &files, e, scale[e]).unwrap();
+            assert_eq!(
+                (w.bytes, w.scale_plane),
+                want.split_at(cp),
+                "expert {e}'s weight"
+            );
+            let [(c, _), (s, _)] = runs.ranges(e).unwrap();
+            assert_eq!((c, s), (e % 2, 1 - e % 2), "expert {e}'s shards");
         }
     }
 
@@ -8412,14 +8526,22 @@ pub(crate) mod planes_tests {
             planes_codes_bytes(k, n) as u64,
             planes_scales_bytes(k, n) as u64,
         );
+        let files = Shards(vec![&span]);
         let refused = |info: &TensorInfo, runs: &StackRuns, scale: Option<&[f32]>| {
-            ExpertStack::located(info, &span, runs, scale)
+            ExpertStack::located(info, &files, runs, scale)
                 .map(drop)
                 .unwrap_err()
                 .to_string()
         };
+        let zero = |at: &[u64]| vec![0; at.len()];
         let planes = |codes: Vec<u64>, scales: Vec<u64>, cp: u64, sp: u64| {
-            StackRuns::new(RowLayout::Planes, codes, scales, cp, sp)
+            StackRuns::new(
+                RowLayout::Planes,
+                (zero(&codes), codes),
+                (zero(&scales), scales),
+                cp,
+                sp,
+            )
         };
         let (codes_at, scales_at) = (runs.codes_at.clone(), runs.scales_at.clone());
 
@@ -8470,21 +8592,62 @@ pub(crate) mod planes_tests {
             planes_of_q4k.contains("planes layout holds NVFP4_ROWS"),
             "{planes_of_q4k}"
         );
-        let rows =
-            StackRuns::new(RowLayout::Rows, codes_at.clone(), Vec::new(), cp + sp, 0).unwrap();
+        let in_two = StackRuns::new(
+            RowLayout::Planes,
+            ([0, 0, 1, 0, 0].into(), codes_at.clone()),
+            (zero(&scales_at), scales_at.clone()),
+            cp,
+            sp,
+        )
+        .unwrap();
+        let in_two = refused(&info, &in_two, Some(&scale));
+        assert!(in_two.contains("exps (shard 1)"), "{in_two}");
+        let unnamed = StackRuns::new(
+            RowLayout::Planes,
+            (vec![0; 4], codes_at.clone()),
+            (zero(&scales_at), scales_at.clone()),
+            cp,
+            sp,
+        )
+        .unwrap_err();
+        assert!(
+            unnamed.to_string().contains("names the shard it lies in"),
+            "{unnamed}"
+        );
+        let rows = StackRuns::new(
+            RowLayout::Rows,
+            (zero(&codes_at), codes_at.clone()),
+            (Vec::new(), Vec::new()),
+            cp + sp,
+            0,
+        )
+        .unwrap();
         let rows_of_fp4 = refused(&info, &rows, Some(&scale));
         assert!(
             rows_of_fp4.contains("located in no other layout"),
             "{rows_of_fp4}"
         );
-        let second = StackRuns::new(RowLayout::Rows, codes_at.clone(), scales_at, cp, sp);
+        let second = StackRuns::new(
+            RowLayout::Rows,
+            (zero(&codes_at), codes_at.clone()),
+            (zero(&scales_at), scales_at),
+            cp,
+            sp,
+        );
         assert!(
             second
                 .unwrap_err()
                 .to_string()
                 .contains("rows layout has no second run")
         );
-        let r8 = StackRuns::new(RowLayout::R8, codes_at, Vec::new(), cp + sp, 0).unwrap_err();
+        let r8 = StackRuns::new(
+            RowLayout::R8,
+            (zero(&codes_at), codes_at),
+            (Vec::new(), Vec::new()),
+            cp + sp,
+            0,
+        )
+        .unwrap_err();
         assert!(r8.to_string().contains("r8 layout"), "{r8}");
 
         let none = refused(&info, &runs, None);
@@ -8639,8 +8802,8 @@ pub(crate) mod planes_tests {
         let shift = |v: &[u64]| v.iter().map(|&o| o + base).collect::<Vec<u64>>();
         let runs = StackRuns::new(
             RowLayout::Planes,
-            shift(&at_local.codes_at),
-            shift(&at_local.scales_at),
+            (vec![0; 5], shift(&at_local.codes_at)),
+            (vec![0; 5], shift(&at_local.scales_at)),
             at_local.codes_per,
             at_local.scales_per,
         )
@@ -8690,13 +8853,14 @@ pub(crate) mod planes_tests {
         let at = |s: usize, e: usize| (e * (cp + sp) + s * cp) as u64;
         let runs = StackRuns::new(
             RowLayout::Planes,
-            (0..3).map(|e| at(0, e)).collect(),
-            (0..3).map(|e| at(0, e) + cp as u64).collect(),
+            (vec![0; 3], (0..3).map(|e| at(0, e)).collect()),
+            (vec![0; 3], (0..3).map(|e| at(0, e) + cp as u64).collect()),
             cp as u64,
             sp as u64,
         )
         .unwrap();
-        let planes = ExpertStack::located(&info, &bytes, &runs, Some(&scale)).unwrap();
+        let files = Shards(vec![&bytes]);
+        let planes = ExpertStack::located(&info, &files, &runs, Some(&scale)).unwrap();
         UnionStack::of(&planes, "the gate", k, n).expect("planes NVFP4_ROWS with its scales");
         for ty in [GgmlType::NVFP4, GgmlType::NVFP4_ROWS] {
             let mut unscaled = info.clone();
@@ -8774,7 +8938,8 @@ pub(crate) mod planes_tests {
             let info = stack_info("w", [k, n, 1]);
             let mut span = vec![0xEE; 3];
             let runs = place(&mut span, std::slice::from_ref(&m), (k, n), order);
-            let w = runs.cut(&info, &span, 0, scale).unwrap();
+            let files = Shards(vec![&span]);
+            let w = runs.cut(&info, &files, 0, scale).unwrap();
             let xs: Vec<Vec<f32>> = (0..cols).map(|c| column(k, c, 41)).collect();
             let x = Tensor2::from_vec(k, cols, xs.concat());
             let mut out = [Tensor2::zeros(n, cols)];

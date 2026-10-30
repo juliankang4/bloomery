@@ -5625,7 +5625,9 @@ mod tests {
 #[cfg(test)]
 mod planes_union_tests {
     use super::{Claim, LegRun, TierError, TierPin, TierSlots, UnionScratch, serve_union};
-    use crate::ops::planes_tests::{ORDERS, Order, contiguous, place, planes_matrix, stack_info};
+    use crate::ops::planes_tests::{
+        ORDERS, Order, Shards, contiguous, place, planes_matrix, stack_info,
+    };
     use crate::ops::{ExpertForm, ExpertInput, ExpertStack, Lanes, StackRuns, StackTier, Tensor2};
     use gguf::GgmlType;
     use gguf::quant::Nvfp4Rows;
@@ -5728,9 +5730,10 @@ mod planes_union_tests {
             stack_info("down_exps", [FF, EMBD, N_EXPERT]),
         ];
         let tensor_scales = [scales(0), scales(1), scales(2)];
+        let files = spans.map(|span| Shards(vec![span]));
         let stacks: [ExpertStack<'_>; 3] = std::array::from_fn(|s| {
             let stack =
-                ExpertStack::located(&infos[s], spans[s], &runs[s], Some(&tensor_scales[s]))
+                ExpertStack::located(&infos[s], &files[s], &runs[s], Some(&tensor_scales[s]))
                     .expect("a stack that fits its runs");
             match &tier {
                 Some((slots, host)) => stack.with_tier(StackTier::new(*slots, 0, host, s)),
@@ -5858,10 +5861,11 @@ mod planes_union_tests {
             stack_info("down_exps", [FF, EMBD, N_EXPERT]),
         ];
         let tensor_scales = [scales(1), scales(2)];
+        let files = spans.map(|span| Shards(vec![span]));
         let stack = |at: usize, part: usize| {
             ExpertStack::located(
                 &infos[at],
-                spans[part],
+                &files[part],
                 &runs[part],
                 Some(&tensor_scales[at]),
             )
@@ -6009,8 +6013,9 @@ mod planes_union_tests {
         };
         let info = stack_info("gate_exps", [EMBD, FF, N_EXPERT]);
         let tensor_scales = scales(0);
+        let files = Shards(vec![&f.span]);
         let located =
-            || ExpertStack::located(&info, &f.span, &f.runs[0], Some(&tensor_scales)).unwrap();
+            || ExpertStack::located(&info, &files, &f.runs[0], Some(&tensor_scales)).unwrap();
         let lent = located().with_tier(StackTier::new(&slots, 0, &host, 0));
         let unfilled = located().with_tier(StackTier::new(&empty, 0, &host, 0));
         let cp = EMBD * FF / 2;
