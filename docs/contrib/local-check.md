@@ -399,7 +399,9 @@ its own budget, planned on the variant's file (`fixture variant-budget`), since 
 bytes and its card-eligible layers; a gate re-plans it the same way and names a stale one.
 
 Regenerate the affected family with the current checkout's `fixture fetch` command from step 2. Use a new output
-directory, since `fetch` refuses an existing one, and keep the old fixture until the replacement passes. For qwen38:
+directory, since `fetch` refuses an existing one, and keep the old fixture until the replacement passes. Add
+`--rev <original-source-revision>` when the source repository's default branch has moved, so a budget refresh keeps
+the source headers that the fixture's reference sets were dumped from. For qwen38:
 
 ```sh
 mkdir -p /models/fixtures-refresh
