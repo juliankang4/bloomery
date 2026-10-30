@@ -422,7 +422,8 @@ start. The release archive and every other machine keep `sm_86`.
   because `spill` follows the arch ptxas assembles for and `jit_local` the capability the driver JITs for.
   `tools/ref/ptx-shapes.tsv` is `sm_86` on cc 8.6 (the RTX 3090). In `tools/ref/ptx-shapes/`, `sm_86-cc12.1.tsv`,
   `sm_121-cc12.1.tsv` and `sm_121a-cc12.1.tsv` were pinned on GB10 (driver 595.84); the `sm_121a` table also holds the
-  native FP4 entries its `# cfg: bloomery_nvfp4_mma` line names. The recipe names the base table and that directory, and
+  native FP4 entries its `# cfg: bloomery_nvfp4_mma` line names, and so does `sm_120a-cc12.0.tsv`, the RTX 50 series'
+  target, pinned on an RTX 5090 (driver 595.99.02). The recipe names the base table and that directory, and
   `tools/ptx-spill-check.sh` reads each binary against the one its scan's banner names (`arch=`, `jit-cc=`). On cc 12.1 the JIT keeps more local memory than on
   cc 8.6 for 23 rows, 22 of which have none on cc 8.6 (14 rows of `generate_ds41`, 9 of `gate_e2e`; the largest is
   `q4k_gemv_tiles`, 184 bytes a thread). The two arches give these rows the same `jit_local`, and at `sm_121` ptxas also spills on them; each nonzero
