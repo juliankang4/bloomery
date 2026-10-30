@@ -67,10 +67,11 @@
 //! one captured pass through the step port's `Cols` chain into one head of
 //! its rows, each row bit for bit its step, and stands the model that many
 //! positions on until its commit ([`Rollback`], `GpuModel::rollback` to the
-//! first position not kept) keeps the first `k`: every delta layer's state
-//! after each row is in a lane of its own, so the commit moves the lane
-//! word to row `k − 1`'s ([`LaneWord::keep`]) and copies nothing; the PLE hash's
-//! history is replayed over the kept rows. Every other store is by
+//! first position not kept) keeps the first `k`: every delta layer records
+//! its rows beside its one state lane and leaves the state as it stood, so
+//! the commit replays the `k` kept records into the lane
+//! ([`Body38::commit`]); the PLE hash's history is replayed over the kept
+//! rows. Every other store is by
 //! position, and nothing reads a row past the count: a pooled key a
 //! rejected row completed is read only at a count that completes it again,
 //! and the row at that count writes it before its select reads it. A step,
@@ -381,11 +382,12 @@ fn recovery_table(stream: &CudaStream, stores: &[Store38]) -> Result<RecoveryTab
         .iter()
         .enumerate()
         .filter_map(|(layer, s)| match s {
-            Store38::Rec { rec, stamp } => Some(RecoveryStore {
+            Store38::Rec { rec, stamp, record } => Some(RecoveryStore {
                 layer,
                 state: &rec.state,
                 stamp,
                 carry: rec.carry.as_ref(),
+                record,
             }),
             Store38::Qsa { .. } => None,
         })
@@ -393,7 +395,7 @@ fn recovery_table(stream: &CudaStream, stores: &[Store38]) -> Result<RecoveryTab
     // SAFETY: the stores live in the body beside the table and are never
     // replaced or reallocated after the load, and the commit's replay is
     // the only launch on them while it runs (the stream orders the rest).
-    unsafe { RecoveryTable::new(stream, GDN, LANES, &rows) }
+    unsafe { RecoveryTable::new(stream, GDN, (LANES, VERIFY_ROWS), &rows) }
 }
 
 /// The bytes one checkpoint of a load of `gdn` delta layers and `qsa`
@@ -2921,13 +2923,6 @@ impl Body38 {
         self.lane.lane()
     }
 
-    /// The lane word set to `lane` with no verify behind it — a gate's
-    /// stand-in for a commit that moved the word to a lane no call wrote:
-    /// the next launch that reads it raises the stamp's fault. Gate use.
-    pub fn plant_lane(&mut self, gpu: &Gpu, lane: u32) -> Result<(), GpuError> {
-        self.lane.set(gpu.stream(), lane)
-    }
-
     /// The captured verify's nodes at `m` rows: its walk's launches
     /// ([`super::program38`]'s count) and its PLE rows' arrival
     /// ([`PLE_ARRIVAL_NODES`]) at each PLE site.
@@ -2963,7 +2958,7 @@ impl Body38 {
     /// What a cut to at most `n` positions of a model standing at `pos`
     /// keeps, and why: with a verify waiting, `n` when it lies past the
     /// verify's first position (`Rule`: its commit replays the accepted
-    /// recovery records and moves the lane word) and every position when
+    /// recovery records into the state lane) and every position when
     /// `n` reaches them (`Current`);
     /// else the checkpoints' rule ([`Checkpoints::kept`]): every position, the
     /// empty model at 0, or the nearest point at or below `n`, nothing
@@ -5916,7 +5911,7 @@ impl Body38 {
         if !(2..=VERIFY_ROWS).contains(&n) {
             return Err(GpuError::shape(
                 WHAT_V,
-                format!("a verify of {n} rows; the lanes hold 2..={VERIFY_ROWS}"),
+                format!("a verify of {n} rows; the records hold 2..={VERIFY_ROWS}"),
             ));
         }
         if self.taps.is_some() {
@@ -6021,8 +6016,8 @@ impl Body38 {
 
     /// Keep the first `pos − pos0` rows of the verify waiting for its commit
     /// and take the rest back: replay the accepted recovery records into
-    /// the last kept row's state lane and move the lane word there
-    /// ([`LaneWord::keep`]), the PLE history over the kept rows, and the MTP
+    /// the one state lane, where the lane word stays, the PLE history over
+    /// the kept rows, and the MTP
     /// draft's records — the arenas' held rows and the store's held
     /// positions — cut to `pos`, the rejected rows no longer any walk's to
     /// read. With no verify
@@ -6061,7 +6056,9 @@ impl Body38 {
             &self.recovery,
             gpu.unlabelled_sink(),
         )?;
-        self.lane.keep(stream, kept)?;
+        // One lane: the replay's lane, the last kept row's
+        // (`linear::delta::kept_lane`), is the one it read, so the word stays.
+        const _: () = assert!(LANES == 1);
         if kept < rows {
             self.ple.keep(p.hist, p.pos0, &p.tokens[..kept])?;
         }
@@ -6299,7 +6296,7 @@ impl Body38 {
     /// other than the ranges past slot 0, a load planned for one sequence,
     /// the layer taps armed, a route trace attached, more rows than the step port's columns, a slot map with a
     /// routed expert on a tier card ([`MapCheck::refuse`]), and for each
-    /// slot on its own sequence a row count outside `1..=LANES`, a position
+    /// slot on its own sequence a row count outside `1..=VERIFY_ROWS`, a position
     /// other than its stores' or past them, a verify waiting, an id the
     /// embedding or the PLE hash does not take. Then each slot's call, on
     /// its sequence: its waiting cut settled, its PLE rows read into its
@@ -6354,19 +6351,18 @@ impl Body38 {
     }
 
     /// Refused by name unless the live sequence takes a verify of slot
-    /// `r.slot`'s `tokens` from `r.pos0` as one slot of a pass: `1..=LANES`
-    /// rows (each keeps its state in a lane of its own), from where its
+    /// `r.slot`'s `tokens` from `r.pos0` as one slot of a pass:
+    /// `1..=VERIFY_ROWS` rows (the rows a delta store records), from where its
     /// stores stand, no verify waiting, ids the embedding and the PLE hash
     /// take.
     fn check_slot(&self, r: &SlotRange, tokens: &[u32]) -> Result<(), GpuError> {
         let named = |e: GpuError| GpuError::shape(WHAT_SLOTS, format!("slot {}: {e}", r.slot));
         let m = tokens.len();
-        if !(1..=LANES).contains(&m) {
+        if !(1..=VERIFY_ROWS).contains(&m) {
             return Err(GpuError::shape(
                 WHAT_SLOTS,
                 format!(
-                    "slot {}'s {m} rows; a slot's rows each keep their state in a lane of their \
-                     own: 1..={LANES}",
+                    "slot {}'s {m} rows; a delta store records 1..={VERIFY_ROWS} rows of a verify",
                     r.slot
                 ),
             ));
@@ -6572,8 +6568,8 @@ impl Body38 {
     }
 
     /// The pass's slot keeps its rows below position `at`: the commit of
-    /// its waiting verify ([`Body38::commit`]: the lane word to the last
-    /// kept row's lane, the PLE history replayed over the kept rows, the
+    /// its waiting verify ([`Body38::commit`]: the kept rows replayed into
+    /// the state lane, the PLE history replayed over the kept rows, the
     /// held count and the draft's records cut), on `seq` — a parked slot's
     /// sequence, exchanged in and back out — or on the live sequence.
     pub(super) fn keep_slot(
@@ -6608,8 +6604,8 @@ impl SlotRows for Body38 {
     /// port's columns).
     const MAX_ROWS: usize = PASS_ROWS;
     const HEADS: RowHeads = RowHeads::One;
-    /// The commit settles a partial keep ([`Body38::keep_slot`]: the lane
-    /// word, the PLE history and the held count cut to the kept rows).
+    /// The commit settles a partial keep ([`Body38::keep_slot`]: the state
+    /// lane, the PLE history and the held count cut to the kept rows).
     const SETTLES_PARTIAL_KEEP: bool = true;
 
     /// One row of the pass's columns through the step port: the step's

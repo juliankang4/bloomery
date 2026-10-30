@@ -112,9 +112,8 @@
 //!   `commit(k)` is `k` steps for every k, a
 //!   scripted draft keeping each exactly through the same verify and commit,
 //!   at the deep prompt its rejected row completing a pool leaving the
-//!   pooled planes the plain run's; and the lane word planted on a lane no
-//!   call wrote makes the next drafted pass raise the delta stamp fault, by
-//!   name, and poisons the model. Last, prompt calls that continue the held
+//!   pooled planes the plain run's (PIN(2026-10-30): the planted-lane case is
+//!   removed, as `gate_qwen4exp_e2e`'s (v) says). Last, prompt calls that continue the held
 //!   sequence: the draft joins at the call's start and drafts with the plain
 //!   run's ids, and restarted beside the held sequence it skips the next
 //!   call by name, proposing nothing, the ids still the plain run's.
@@ -4288,9 +4287,7 @@ mod gate {
     /// live stores after the run the plain run's at the same position;
     /// `commit(k)` is `k` steps for every k, a scripted draft keeping each
     /// exactly through the same verify and commit, at the deep prompt its
-    /// second row completing a pool; and the lane word planted on a lane no
-    /// call wrote makes the next drafted pass raise the delta stamp fault,
-    /// by name, and poisons the model.
+    /// second row completing a pool.
     fn windows(
         m: Qwen38Model,
         prompt: &[u32],
@@ -4434,34 +4431,6 @@ mod gate {
         )?;
         m = model;
         ok &= p_ok;
-
-        // The lane word planted on a lane no call wrote: the next drafted
-        // pass raises the delta stamp fault by name and poisons the model.
-        let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Step), ctx)?;
-        let first = spec.prompt(&mut s, prompt)?;
-        {
-            let (gpu, _, b) = s.model_mut().body_parts("plant")?;
-            b.plant_lane(gpu, 2)?;
-        }
-        let r = runtime::generate(
-            &mut s,
-            &mut spec,
-            prompt,
-            first,
-            &runtime::Stop::new(2, ctx)?,
-            &mut QuietSink,
-        );
-        let fault_ok = matches!(&r, Err(e) if e.to_string().contains("delta_stamp"));
-        ok &= fault_ok;
-        println!(
-            "(w) the lane word planted on lane 2, never written -> {} {}",
-            match &r {
-                Ok(o) => format!("accepted, {} tokens", o.tokens.len()),
-                Err(e) => e.to_string(),
-            },
-            verdict(fault_ok)
-        );
-        let mut m = s.into_model();
         m.reset()?;
         Ok((m, ok))
     }
@@ -6146,7 +6115,7 @@ mod gate {
 
     /// (z) step after's passes: each pass's rows a slot (slot 0, slot 1) —
     /// the token before a proposal, then its window's next ids — each
-    /// slot's up to a verify's lanes and both slots' up to the widest pass
+    /// slot's up to a verify's rows and both slots' up to the widest pass
     /// of two (8 rows).
     const AFTER_WINDOWS: [(usize, usize); 5] = [(4, 4), (4, 3), (3, 4), (4, 2), (3, 2)];
     /// Each [`AFTER_WINDOWS`] pass's kept rows a slot, fixed: every pass

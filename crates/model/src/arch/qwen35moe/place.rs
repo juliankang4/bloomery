@@ -68,8 +68,8 @@ use crate::placement::{
 use gguf::digest::hex;
 
 use runtime::stores::{
-    DELTA_LANES, F32_BYTES, delta_carry_bytes, delta_lane_bytes, index_ring_bytes, kv_plane_bytes,
-    ple_ring_bytes, recurrent_bytes, selecting_rows_bytes,
+    DELTA_VERIFY_ROWS, F32_BYTES, delta_carry_bytes, delta_lane_bytes, delta_record_bytes,
+    index_ring_bytes, kv_plane_bytes, ple_ring_bytes, recurrent_bytes, selecting_rows_bytes,
 };
 pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 
@@ -815,7 +815,7 @@ impl PlanInputs {
             self.place_rows(&mut plan, room, floor, ubatch, page)?;
             plan.host.step_slots(
                 if beside.mtp.is_some() {
-                    beside.slots.saturating_mul(DELTA_LANES)
+                    beside.slots.saturating_mul(DELTA_VERIFY_ROWS)
                 } else {
                     beside.slots
                 },
@@ -1784,11 +1784,12 @@ fn check_draft_reserve(machine: &Machine, want: Option<u64>) -> Result<(), Place
 /// - a GDN layer: its recurrent state (`v_heads` heads of `state × state`
 ///   f32) and its conv ring (`conv − 1 + PASS_ROWS` rows of the conv's
 ///   channels, `2·k_heads·state + v_heads·state`, in f32), both fixed by the
-///   file; on a qwen4exp file its state keeps
-///   `runtime::stores::DELTA_LANES` lanes, each stamped
-///   (`runtime::stores::delta_lane_bytes`), and a carry
-///   (`runtime::stores::delta_carry_bytes`); a qwen35moe load that verifies
-///   drafted rows asks for its own count ([`KvLayout::of_spec_lanes`]);
+///   file; on a qwen4exp file its one state lane is stamped
+///   (`runtime::stores::delta_lane_bytes`) and beside it are a carry
+///   (`runtime::stores::delta_carry_bytes`) and a verify record of
+///   `runtime::stores::DELTA_VERIFY_ROWS` rows
+///   (`runtime::stores::delta_record_bytes`); a qwen35moe load that verifies
+///   drafted rows asks for its own lane count ([`KvLayout::of_spec_lanes`]);
 /// - the PLE site's layer, beside that: the PLE conv ring
 ///   (`(taps − 1)·dilation + PASS_ROWS` rows of `streams · n_embd` f32);
 /// - an attention layer: a position's K and V (`2 · kv_heads · head_dim`
@@ -1826,21 +1827,16 @@ pub struct KvLayout {
 }
 
 impl KvLayout {
-    /// The layout `spec` describes, its GDN layers keeping the lanes the
-    /// file's program verifies by: [`DELTA_LANES`] under [`PROGRAM`] (its
-    /// drafted rows always verify), one under the Qwen3.5 body (a load that
-    /// verifies drafted rows asks for more, [`KvLayout::of_spec_lanes`]).
+    /// The layout `spec` describes, its GDN layers keeping one lane: under
+    /// [`PROGRAM`] a verify records its rows beside the lane, and under the
+    /// Qwen3.5 body a load that verifies drafted rows asks for more lanes
+    /// ([`KvLayout::of_spec_lanes`]).
     ///
     /// # Errors
     ///
     /// The layout's refusal of the description ([`KvLayout::of_spec_lanes`]).
     pub fn of_spec(spec: &ModelSpec) -> Result<KvLayout, PlacementError> {
-        let lanes = if program_of(spec.arch) == Some(PROGRAM) {
-            DELTA_LANES
-        } else {
-            1
-        };
-        KvLayout::of_spec_lanes(spec, lanes)
+        KvLayout::of_spec_lanes(spec, 1)
     }
 
     /// The layout `spec` describes with every GDN layer keeping `lanes`
@@ -1914,16 +1910,25 @@ impl KvLayout {
             )
         });
         // The Qwen3.8 body's chunked prompt rule keeps a chunk's rows beside
-        // each GDN layer's lanes; a checkpoint copies them with the state.
-        let carry = gdn
-            .filter(|_| program_of(spec.arch) == Some(PROGRAM))
-            .map_or(0, |d| {
-                delta_carry_bytes(d.v_heads as usize, d.k_heads as usize, d.d as usize)
-            });
+        // each GDN layer's lane; a checkpoint copies them with the state. Its
+        // verify record and the lane's stamp stay on the card.
+        let program = gdn.filter(|_| program_of(spec.arch) == Some(PROGRAM));
+        let carry = program.map_or(0, |d| {
+            delta_carry_bytes(d.v_heads as usize, d.k_heads as usize, d.d as usize)
+        });
+        let record = program.map_or(0, |d| {
+            let (v, s) = (d.v_heads as usize, d.d as usize);
+            delta_record_bytes(v, s, DELTA_VERIFY_ROWS)
+                + if lanes == 1 {
+                    delta_lane_bytes(v, s, 1)
+                } else {
+                    0
+                }
+        });
         let (kv_heads, head_dim, idx_dim) = attn.unwrap_or((0, 0, None));
         Ok(KvLayout {
             kinds,
-            recurrent: recurrent + carry,
+            recurrent: recurrent + carry + record,
             copy: copy + carry,
             ple: ple_site(spec)?,
             kv_heads: kv_heads as usize,
@@ -2763,9 +2768,9 @@ mod tests {
     };
 
     use super::{
-        DELTA_LANES, Ffn, Kind, KvBytes, KvLayout, Mixer, ModelSpec, OutGate, PlacementError,
-        delta_carry_bytes, delta_lane_bytes, gdn_bytes, ple_ring_bytes, recurrent_bytes,
-        refuse_other_program,
+        DELTA_VERIFY_ROWS, Ffn, Kind, KvBytes, KvLayout, Mixer, ModelSpec, OutGate, PlacementError,
+        delta_carry_bytes, delta_lane_bytes, delta_record_bytes, gdn_bytes, ple_ring_bytes,
+        recurrent_bytes, refuse_other_program,
     };
 
     /// A GQA mixer of `kv_heads` key heads of 256 values, rotating `rope_dims` values of
@@ -2845,15 +2850,16 @@ mod tests {
     }
 
     /// Qwen3.8's layers by kind (the sizes themselves are
-    /// `runtime::stores`'s, pinned there): a GDN layer's state lanes, conv
-    /// ring and carry, the PLE ring beside it on its layer, an attention layer's K/V and
+    /// `runtime::stores`'s, pinned there): a GDN layer's state lane and its
+    /// stamp, verify record, conv ring and carry, the PLE ring beside it on its layer, an attention layer's K/V and
     /// pooled keys at a context of whole pools and one past and its raw key ring.
     #[test]
     fn qwen38_layer_bytes() {
         let kv = KvLayout {
             kinds: vec![Kind::DeltaRule, Kind::DeltaRule, Kind::Attention],
             recurrent: recurrent_bytes(48, 16, 128, 4)
-                + delta_lane_bytes(48, 128, DELTA_LANES)
+                + delta_lane_bytes(48, 128, 1)
+                + delta_record_bytes(48, 128, DELTA_VERIFY_ROWS)
                 + delta_carry_bytes(48, 16, 128),
             copy: recurrent_bytes(48, 16, 128, 4) + delta_carry_bytes(48, 16, 128),
             ple: Some((1, ple_ring_bytes(4, 3, 4, 2560))),
@@ -2863,10 +2869,10 @@ mod tests {
             q8: false,
             rope_row: 64 * 4,
         };
-        assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 9_437_200 + 497_296);
+        assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 294_916 + 497_296);
         assert_eq!(
             kv.layer_bytes(1, 4096),
-            3_596_288 + 9_437_200 + 497_296 + 696_320
+            3_596_288 + 294_916 + 497_296 + 696_320
         );
         assert_eq!(kv.layer_bytes(2, 4096), 4096 * 2048 + 1024 * 256 + 2816);
         assert_eq!(kv.layer_bytes(2, 4097), 4097 * 2048 + 1025 * 256 + 2816);
@@ -2998,7 +3004,7 @@ mod tests {
     /// one attention, the PLE ring on layer 1) at a context of whole pools
     /// [derived]: twelve attention layers' 2,048 B a position and 256 B a
     /// pool of four, and checkpoint copies of 36 · 4,093,584 B (the committed
-    /// lane, conv ring and carry, not the four lanes a layer holds), the
+    /// lane, conv ring and carry, not the record a layer holds), the
     /// PLE ring's 696,320 B and twelve raw key rings of 2,816 B.
     #[test]
     fn qwen38_state_bytes() {
@@ -3013,7 +3019,8 @@ mod tests {
                 })
                 .collect(),
             recurrent: recurrent_bytes(48, 16, 128, 4)
-                + delta_lane_bytes(48, 128, DELTA_LANES)
+                + delta_lane_bytes(48, 128, 1)
+                + delta_record_bytes(48, 128, DELTA_VERIFY_ROWS)
                 + delta_carry_bytes(48, 16, 128),
             copy: recurrent_bytes(48, 16, 128, 4) + delta_carry_bytes(48, 16, 128),
             ple: Some((1, ple_ring_bytes(4, 3, 4, 2560))),
@@ -3047,8 +3054,7 @@ mod tests {
     /// lane are the state in place with no stamp; at eight each holds seven
     /// more lanes of 2,097,152 B and a stamp a lane, so 30 layers add 420 MiB
     /// and 960 B [derived]. A checkpoint copies one lane whatever the count.
-    /// The layer's bytes follow the term, and Qwen3.8's count is the term at
-    /// `DELTA_LANES`.
+    /// The layer's bytes follow the term.
     #[test]
     fn the_lane_count_is_the_layouts_input() {
         let one = gdn_bytes(32, 16, 128, 4, 1);
@@ -3064,10 +3070,6 @@ mod tests {
         assert_eq!(eight.1, one.1, "a checkpoint copies one lane");
         assert_eq!(eight.0 - one.0, 7 * 2_097_152 + 8 * 4);
         assert_eq!(30 * (eight.0 - one.0), 420 * (1 << 20) + 960);
-        assert_eq!(
-            gdn_bytes(48, 16, 128, 4, DELTA_LANES).0,
-            recurrent_bytes(48, 16, 128, 4) + delta_lane_bytes(48, 128, DELTA_LANES)
-        );
         let kinds = vec![Kind::DeltaRule, Kind::Attention];
         let layout = |lanes| KvLayout {
             kinds: kinds.clone(),
@@ -4214,18 +4216,18 @@ mod tests {
         }
 
         /// The layout the description gives is the one `qwen38_layer_bytes` pins layer by layer: a
-        /// GDN layer's state lanes, conv ring and carry, the PLE ring on layer 1, the selecting
-        /// layer's K/V and pooled keys at a context of whole pools and one past and its raw key
-        /// ring.
+        /// GDN layer's state lane and stamp, verify record, conv ring and carry, the PLE ring on
+        /// layer 1, the selecting layer's K/V and pooled keys at a context of whole pools and one
+        /// past and its raw key ring.
         #[test]
         fn the_description_gives_the_qwen38_layer_bytes() {
             let kv = KvLayout::of_spec(&description()).expect("the description's layout");
-            assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 9_437_200 + 497_296);
+            assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 294_916 + 497_296);
             assert_eq!(
                 kv.layer_bytes(1, 4096),
-                3_596_288 + 9_437_200 + 497_296 + 696_320
+                3_596_288 + 294_916 + 497_296 + 696_320
             );
-            assert_eq!(kv.layer_bytes(2, 4096), 3_596_288 + 9_437_200 + 497_296);
+            assert_eq!(kv.layer_bytes(2, 4096), 3_596_288 + 294_916 + 497_296);
             assert_eq!(kv.layer_bytes(3, 4096), 4096 * 2048 + 1024 * 256 + 2816);
             assert_eq!(kv.layer_bytes(3, 4097), 4097 * 2048 + 1025 * 256 + 2816);
             assert_eq!(kv.layer_bytes(4, 4096), 0);
@@ -4296,7 +4298,7 @@ mod tests {
             slots: u64,
             reserve: u64,
         ) -> Plan<'a> {
-            let rows = (slot_resident_bytes(&inputs.spec) + 96) * (slots - 1);
+            let rows = (slot_resident_bytes(&inputs.spec) + 120) * (slots - 1);
             let kv = Times {
                 kv: &inputs.kv,
                 slots,
@@ -4363,7 +4365,7 @@ mod tests {
             let (inputs, machine) = (inputs(), machine());
             assert_eq!(
                 inputs.seq_terms(None).beside,
-                slot_resident_bytes(&inputs.spec) + 96
+                slot_resident_bytes(&inputs.spec) + 120
             );
             let mtp =
                 MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
@@ -4916,7 +4918,10 @@ mod tests {
                 .unwrap();
             assert_eq!(plan.n_l, vec![256; LAYERS]);
             assert_eq!(plan.tier_n_l, vec![vec![256; LAYERS]]);
-            for budget in [None, Some(64 << 20), Some(u64::MAX)] {
+            // PIN(2026-10-30): 64 MiB -> 32 MiB. The delta layers' one lane and record put the
+            // floor at 25,661,116 B, and 64 MiB now holds an expert on layer 0 ([1, 0, 0, 0]);
+            // 32 MiB is past the floor and short of an expert, as 64 MiB was.
+            for budget in [None, Some(32 << 20), Some(u64::MAX)] {
                 let levers = PlanLevers {
                     card_budget_bytes: budget.into(),
                 };
@@ -4949,7 +4954,7 @@ mod tests {
                     );
                     assert_eq!(plan.tier_n_l, vec![vec![owned[1]; LAYERS]]);
                     assert!(plan.n_l.iter().all(|&n| n <= owned[0]));
-                    if budget == Some(64 << 20) {
+                    if budget == Some(32 << 20) {
                         assert_eq!(plan.n_l, vec![0; LAYERS]);
                     }
                     assert_eq!(plan.cards[1].kv_bytes, 0);

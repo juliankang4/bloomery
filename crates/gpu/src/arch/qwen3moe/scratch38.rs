@@ -74,16 +74,21 @@ const _: () = assert!(
 // GEMM route table, so a card route of the whole ubatch takes one table.
 const _: () = assert!(super::ubatch::UBATCH * geo::N_USED == crate::gemm::GEMM_MAX_SLOTS);
 
-/// Lanes of a delta store's state: a verify of up to this many rows keeps
-/// the state after each of its rows in a lane of its own
-/// (`linear::delta`'s `gdn_delta_lanes`). `runtime::stores` owns the count.
-pub(super) const LANES: usize = stores::DELTA_LANES;
+/// Lanes of a delta store's state: one. A verify records its rows beside
+/// the state and the commit replays the kept ones into that lane
+/// (`linear::delta`'s `enqueue_delta_recovery`).
+// PIN(2026-10-30): the lane-rotation test and the gates' planted-lane cases
+// (`delta_stamp` on a lane no call wrote) are removed: a delta store has one
+// lane, a verify's rows go to its record, and a commit moves no lane word.
+pub(super) const LANES: usize = 1;
 
-/// The most rows a verify runs: a row a lane.
-pub(super) const VERIFY_ROWS: usize = LANES;
+/// The most rows a verify runs, which a delta store's record holds.
+/// `runtime::stores` owns the count.
+pub(super) const VERIFY_ROWS: usize = stores::DELTA_VERIFY_ROWS;
 
-/// A layer's store: the delta rule's recurrent state ([`LANES`] lanes), its
-/// lanes' stamps (`linear::delta`'s module doc), conv ring and carry, or a
+/// A layer's store: the delta rule's recurrent state ([`LANES`] lane), its
+/// lane's stamp (`linear::delta`'s module doc), conv ring, carry and verify
+/// record ([`VERIFY_ROWS`] rows), or a
 /// selecting attention layer's K/V planes, its raw indexer key ring
 /// (`[qsa::RING_ROWS][IDX_DIM]` f16, `crate::qsa`'s module doc) and its pooled
 /// keys (`[pools][IDX_DIM]` f16), the planes and the pooled keys each in a
@@ -93,6 +98,7 @@ pub(super) enum Store38 {
     Rec {
         rec: RecStore,
         stamp: DeviceBuffer<u32>,
+        record: DeviceBuffer<f32>,
     },
     Qsa {
         kv: Roomed<KvPlanes>,
@@ -102,17 +108,21 @@ pub(super) enum Store38 {
 }
 
 impl Store38 {
-    /// A zeroed delta store of [`LANES`] lanes with a carry, lane 0 stamped
-    /// at position 0 and every other never written.
+    /// A zeroed delta store of [`LANES`] lane with a carry and a record,
+    /// the lane stamped at position 0.
     pub(super) fn rec(stream: &CudaStream) -> Result<Store38, GpuError> {
         Ok(Store38::Rec {
             rec: RecStore::carried(stream, GDN.lens(LANES), LANES, GDN.carry_len())?,
             stamp: DeviceBuffer::from_host(stream, &fresh_stamps(LANES))?,
+            record: DeviceBuffer::zeroed(
+                stream,
+                linear::delta::recovery_record_len(GDN, VERIFY_ROWS),
+            )?,
         })
     }
 
-    /// A delta store's stamps back to a fresh store's: lane 0 at position
-    /// 0, every other never written. Never inside a capture.
+    /// A delta store's stamp back to a fresh store's: the lane at position
+    /// 0. Never inside a capture.
     pub(super) fn restamp(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         if let Store38::Rec { stamp, .. } = self {
             stamp.copy_from_host(stream, &fresh_stamps(LANES))?;
@@ -141,7 +151,9 @@ impl Store38 {
     /// Device bytes the store's layout takes: what the plan counts it at.
     pub(super) fn bytes(&self) -> usize {
         match self {
-            Store38::Rec { rec, stamp } => rec.bytes() + stamp.num_bytes(),
+            Store38::Rec { rec, stamp, record } => {
+                rec.bytes() + stamp.num_bytes() + record.num_bytes()
+            }
             Store38::Qsa { kv, ring, pooled } => kv.bytes() + ring.num_bytes() + pooled.num_bytes(),
         }
     }
@@ -203,13 +215,14 @@ pub(super) fn no_carry() -> GpuError {
     )
 }
 
-/// The bytes `runtime::stores` counts for a delta store of [`LANES`] lanes
-/// and for a selecting store at `ctx` positions in the cache format `kv`:
+/// The bytes `runtime::stores` counts for a delta store of [`LANES`] lane
+/// with its record and for a selecting store at `ctx` positions in the cache format `kv`:
 /// what the load's allocations must equal.
 pub(super) fn store_rule_bytes(ctx: usize, kv: KvQ8) -> (u64, u64) {
     (
         stores::recurrent_bytes(GDN.n_v, GDN.n_k, linear::HEAD, linear::CONV_TAPS)
             + stores::delta_lane_bytes(GDN.n_v, linear::HEAD, LANES)
+            + stores::delta_record_bytes(GDN.n_v, linear::HEAD, VERIFY_ROWS)
             + stores::delta_carry_bytes(GDN.n_v, GDN.n_k, linear::HEAD),
         stores::selecting_bytes(
             geo::N_KV,
@@ -674,8 +687,7 @@ impl WideRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arena38, LANES, ROUTE_ROWS, RouterDims, geo};
-    use crate::linear::delta::{kept_lane, row_lane};
+    use super::{Arena38, ROUTE_ROWS, RouterDims, geo};
     use crate::site::ByName;
     use crate::weights::Weights;
     use model::arch::models::shape::{MoeShape, rules};
@@ -839,30 +851,5 @@ mod tests {
         eprintln!("ubatch arena: {grown} B over {rows} rows, the plan counts {plan} B a row");
         assert_eq!(grown % rows, 0, "the arena grows by whole rows");
         assert_eq!(grown / rows, plan);
-    }
-
-    /// A verify from lane `c` writes its rows into `c, c + 1, …` mod
-    /// [`LANES`], every row a lane of its own; keeping `k` rows moves the
-    /// word to the lane row `k − 1` wrote, `(c + k − 1) mod LANES`, and
-    /// keeping them all leaves it on the last row's (the common rule,
-    /// `linear::delta::kept_lane`, at this body's lane count).
-    #[test]
-    fn a_commit_moves_the_word_to_the_last_kept_row() {
-        let lanes_n = LANES as u32;
-        for c in 0..lanes_n {
-            let lanes: Vec<u32> = (0..lanes_n).map(|j| row_lane(c, j, lanes_n)).collect();
-            let mut sorted = lanes.clone();
-            sorted.sort_unstable();
-            assert_eq!(sorted, (0..lanes_n).collect::<Vec<_>>(), "c {c}");
-            assert_eq!(lanes[0], c, "row 0 overwrites the lane it read");
-            for k in 1..=lanes_n {
-                assert_eq!(
-                    kept_lane(c, k, lanes_n),
-                    (c + k - 1) % lanes_n,
-                    "c {c} k {k}"
-                );
-                assert_eq!(kept_lane(c, k, lanes_n), lanes[k as usize - 1]);
-            }
-        }
     }
 }

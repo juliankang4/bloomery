@@ -2163,7 +2163,7 @@ impl WideParts<'_> {
             .get_mut(l)
             .ok_or(GpuError::state(WHAT, "a store for every layer"))?;
         match (&p.mixer, store) {
-            (Mixer38::Gdn(g), Store38::Rec { rec, stamp }) => {
+            (Mixer38::Gdn(g), Store38::Rec { rec, stamp, .. }) => {
                 let lane = self.io.lane.ok_or(GpuError::state(
                     WHAT,
                     "the record's lane word (a chain with delta layers carries one)",

@@ -4,9 +4,10 @@
 //! port's `Cols(m)` chain ([`Verify38`], captured), an eager pass `(1, m <=
 //! 8, Batch)` through its batch port ([`Pass38`]). The walks share every
 //! card launch ([`Parts38`]); they differ in how a layer's routed experts
-//! reach the host and come back, and a verify keeps each row's delta state
-//! in a lane of its own where the step and the pass write the last row's
-//! back into the committed lane. A prompt's ubatch walk `(1, m, Batch)` over
+//! reach the host and come back, and a verify records each row's delta
+//! update in the store's record, leaving the committed lane for its commit
+//! to replay into, where the step and the pass write the last row's state
+//! back into the lane. A prompt's ubatch walk `(1, m, Batch)` over
 //! the ubatch's rows is `wide38`'s, its launches the wide family's.
 //!
 //! A layer's parts, by its plan ([`Layer38`]), never its number:
@@ -403,9 +404,9 @@ pub(super) struct Parts38<'a> {
     pub(super) card: &'a mut Card38,
     /// The stage card's tier side on a load with an expert tier.
     pub(super) tier: Option<&'a mut TierSide38>,
-    /// A verify's row mode: each row's delta state into a lane of its own
-    /// (`linear::delta`'s `gdn_delta_lanes`); else the last row's back into
-    /// the committed lane.
+    /// A verify's row mode: each row's delta update into the store's record
+    /// (`linear::delta`'s `enqueue_delta_recovery`); else the last row's state
+    /// back into the committed lane.
     pub(super) each: bool,
 }
 
@@ -480,13 +481,19 @@ fn rows_mut<'b, T>(
     WindowMut::of_mut(parent, r.start * width * size_of::<T>(), r.len() * width)
 }
 
-/// Layer `l`'s delta store of `stores`: its state, ring and stamps.
-fn rec_of(
-    stores: &mut [Store38],
-    l: usize,
-) -> Result<(&mut super::scratch::RecStore, &mut DeviceBuffer<u32>), GpuError> {
+/// A delta store's state and ring, stamps and verify record, lent for one
+/// launch.
+type RecOf<'a> = (
+    &'a mut super::scratch::RecStore,
+    &'a mut DeviceBuffer<u32>,
+    &'a mut DeviceBuffer<f32>,
+);
+
+/// Layer `l`'s delta store of `stores`: its state, ring, stamps and verify
+/// record.
+fn rec_of(stores: &mut [Store38], l: usize) -> Result<RecOf<'_>, GpuError> {
     match stores.get_mut(l) {
-        Some(Store38::Rec { rec, stamp }) => Ok((rec, stamp)),
+        Some(Store38::Rec { rec, stamp, record }) => Ok((rec, stamp, record)),
         Some(Store38::Qsa { .. }) => Err(GpuError::shape(
             WHAT,
             format!("layer {l}'s plan and store are of two kinds"),
@@ -1075,11 +1082,10 @@ fn gdn(
         match seqs {
             Seqs38::One { stores, io, .. } => {
                 let lane = lane_of(io)?;
-                let (rec, stamp) = rec_of(stores, l)?;
                 gdn_seq(
                     c,
                     gp,
-                    (rec, stamp, lane),
+                    (rec_of(stores, l)?, lane),
                     GdnIo {
                         x: &g.x,
                         b,
@@ -1099,11 +1105,10 @@ fn gdn(
                 for q in seqs {
                     let r = &q.rows;
                     let lane = lane_of(&q.io)?;
-                    let (rec, stamp) = rec_of(q.stores, l)?;
                     gdn_seq(
                         c,
                         gp,
-                        (rec, stamp, lane),
+                        (rec_of(q.stores, l)?, lane),
                         GdnIo {
                             x: &*rows_of(&g.x, r, ch)?,
                             b: &*rows_of(b, r, nv)?,
@@ -1195,16 +1200,12 @@ pub(super) fn beta_alpha_mut(
 
 /// A delta layer's launches bound to one sequence, over `io`'s `m` rows:
 /// the conv over the store's ring `r.ring`, then the delta step over its
-/// state, its lanes' stamps and the lane word `lane`, in row mode when
-/// `each`.
+/// state, its lane's stamp and the lane word `lane`: in place, or a verify
+/// recorded into the store's record when `each`.
 fn gdn_seq(
     c: &Ctx38<'_>,
     gp: &GdnPlan,
-    (r, stamp, lane): (
-        &mut super::scratch::RecStore,
-        &mut DeviceBuffer<u32>,
-        &DeviceBuffer<u32>,
-    ),
+    ((r, stamp, record), lane): (RecOf<'_>, &DeviceBuffer<u32>),
     io: GdnIo<'_>,
     (m, each): (usize, bool),
     sink: FaultSink,
@@ -1241,34 +1242,31 @@ fn gdn_seq(
             ring: &mut r.ring,
         },
     )?;
-    let enqueue = if each {
-        crate::linear::delta::DeltaKernels::enqueue_delta_recovery
-    } else {
-        crate::linear::delta::DeltaKernels::enqueue_delta_lanes
-    };
-    enqueue(
-        &lin.delta,
-        stream,
-        DeltaLanesArgs {
-            delta: DeltaArgs {
-                qkv: conv,
-                beta,
-                decay,
-                lane,
-                lane_at: 0,
-                lanes: r.lanes,
-                shape: GDN,
-                m,
-                fault: sink,
-                o,
-                state: &mut r.state,
-            },
-            each,
-            pos,
-            stamp,
+    let args = DeltaLanesArgs {
+        delta: DeltaArgs {
+            qkv: conv,
+            beta,
+            decay,
+            lane,
+            lane_at: 0,
+            lanes: r.lanes,
+            shape: GDN,
+            m,
+            fault: sink,
+            o,
+            state: &mut r.state,
         },
-        r.carry.as_ref(),
-    )
+        each,
+        pos,
+        stamp,
+    };
+    if each {
+        lin.delta
+            .enqueue_delta_recovery(stream, args, r.carry.as_ref(), record)
+    } else {
+        lin.delta
+            .enqueue_delta_lanes(stream, args, r.carry.as_ref())
+    }
 }
 
 /// A delta layer's gated norm and output projection over every row, into
@@ -1728,8 +1726,8 @@ impl<'a> LayerProgram for Step38<'a> {
 /// rows, each slot's consecutive positions ([`Seqs38::Slots`]): every
 /// layer through the step port's `Cols(m)` chain — one handoff launch
 /// writing the `m` columns' image, one go, one union call on the host, one
-/// wait; at one row the step's chain and handoff — each delta row's state
-/// into a lane of its own, then the head's mix over the `m` columns into
+/// wait; at one row the step's chain and handoff — each delta row's update
+/// into its store's record, then the head's mix over the `m` columns into
 /// `head`, a head of `m` rows (one projection and one argmax for every
 /// row), and each of `copies` after it. Each row is bit for bit its step.
 /// A verify's walk enqueues its PLE rows' `arrival` (one staged row of its

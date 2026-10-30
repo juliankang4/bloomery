@@ -116,8 +116,8 @@
 //!   of four rows ([`verify_rows`]; T = 2, 3, 4, `step_rows`, captured) — one
 //!   row completing pool 0 — returns every row's argmax and logits bit for
 //!   bit the steps' of those rows; for every k in 1..=T the commit of k rows
-//!   (`rollback` to the first position not kept) leaves the lane word at
-//!   `(c + k − 1) mod 4`, computed here from the lane before the verify, and
+//!   (`rollback` to the first position not kept) leaves the lane word on
+//!   the one lane it read (the commit replays the kept rows into it), and
 //!   the live stores bit for bit the k steps' — each delta layer's committed
 //!   lane, the conv ring's slots of the eight positions before the count,
 //!   the K/V planes below it, the raw key ring's slots of the count's pool
@@ -125,8 +125,8 @@
 //!   count (a rejected row wrote position-indexed rows past the count —
 //!   among them the pool it completed — which nothing reads until the row
 //!   at that position rewrites them first) — and the step after the commit
-//!   its token and logits; a second verify from a moved lane (4 rows after a
-//!   commit of 3, lanes 2, 3, 0, 1) the same against its steps; an eager
+//!   its token and logits; a second verify (4 rows after a commit of 3) the
+//!   same against its steps; an eager
 //!   verify bit for bit the replay; and a deep verify in the selector
 //!   region, after [`DEEP`] positions of D3K's prefill by one ubatch, its row
 //!   completing pool 513 rejected, the same against its steps — with every
@@ -138,8 +138,10 @@
 //!   replay's host tier serves each layer once with one call into the host
 //!   experts (48 services, 48 calls, 48 `Cols` services). Refusals: a step
 //!   while a verify waits for its commit, and a commit with no verify
-//!   waiting, by name; the lane word planted on a lane no call wrote makes
-//!   the next step's first delta layer raise `delta_stamp` there, alone.
+//!   waiting, by name. PIN(2026-10-30): the planted-lane refusal
+//!   (`delta_stamp` on a lane no call wrote) is removed: a delta store has
+//!   one lane, a verify's rows go to its record, and the commit moves no
+//!   lane word (`scratch38::LANES`).
 //! - (h) the head of m rows: from the prefix, a head of two rows over the
 //!   loaded lm_head, its input written from the host, reads back two
 //!   equal tokens for two equal finite rows, and with a NaN in row 0's
@@ -673,8 +675,14 @@ mod gate {
         ok
     }
 
-    /// Lanes of a delta layer's state, a verify's rows at most.
-    const LANES: usize = 4;
+    /// Lanes of a delta layer's state: one, a verify's rows recorded beside
+    /// it.
+    const LANES: usize = 1;
+
+    /// A verify's rows at most, which a delta layer's record holds
+    /// (`runtime::stores::DELTA_VERIFY_ROWS`).
+    const ROWS: usize = 4;
+    const _: () = assert!(ROWS == runtime::stores::DELTA_VERIFY_ROWS);
 
     /// Rows of the conv ring and of the PLE ring: the reach of the conv and
     /// a pass.
@@ -726,10 +734,15 @@ mod gate {
     /// PIN(2026-10-24): a delta layer keeps a carry beside them, four words
     /// and 15 rows of the `16 + 48` key and value heads of 128 and a β and a
     /// decay a value head, in f32.
+    /// PIN(2026-10-30): a delta layer's state is [`LANES`] lane with its
+    /// stamp, and a verify's [`ROWS`] rows go into a record beside it, a key,
+    /// an update and a decay word of 128 f32 each a row and value head.
     fn store_bytes() -> usize {
         let conv_ch = 2 * K_HEADS * HEAD_V + V_HEADS * HEAD_V;
         let carry = (4 + 15 * ((K_HEADS + V_HEADS) * HEAD_V + 2 * V_HEADS)) * 4;
-        let rec = LANES * (V_HEADS * HEAD_V * HEAD_V * 4 + 4) + CONV_RING * conv_ch * 4 + carry;
+        let record = ROWS * V_HEADS * 3 * HEAD_V * 4;
+        let rec =
+            LANES * (V_HEADS * HEAD_V * HEAD_V * 4 + 4) + record + CONV_RING * conv_ch * 4 + carry;
         let sel =
             CTX * 2 * N_KV * HEAD * 2 + CTX.div_ceil(POOL) * IDX_DIM * 2 + KEY_RING * IDX_DIM * 2;
         let ple = ((PLE_TAPS - 1) * PLE_DILATION + PASS_ROWS) * STREAMS * HIDDEN * 4;
@@ -1690,7 +1703,7 @@ mod gate {
     /// The rows the verifies feed, the first T of them a verify's, and the
     /// token of the step after a commit: the batch set's tokens, rotated
     /// past the prefix.
-    fn verify_rows(toks: &[u32]) -> Result<([u32; LANES], u32), GateError> {
+    fn verify_rows(toks: &[u32]) -> Result<([u32; ROWS], u32), GateError> {
         let t = |i: usize| -> Result<u32, GateError> {
             Ok(*toks
                 .get(i % toks.len())
@@ -1977,7 +1990,7 @@ mod gate {
     fn verify_case<const T: usize>(
         m: &mut Qwen38Model,
         toks: &[u32],
-        rows: [u32; LANES],
+        rows: [u32; ROWS],
         next: u32,
         k: usize,
         refs: &[VRun],
@@ -2000,13 +2013,7 @@ mod gate {
             }
         };
         let want = refs.get(k - 1).ok_or("a reference for every kept count")?;
-        let mut ok = same_vrun(
-            &label,
-            &v,
-            want,
-            PREFIX + k,
-            (c + k as u32 - 1) % LANES as u32,
-        );
+        let mut ok = same_vrun(&label, &v, want, PREFIX + k, c);
         // Rows past k: the verify's own, against the steps of all four.
         let all = refs.last().ok_or("the reference of four rows")?;
         let rows_ok = v.tokens[..] == all.tokens[..T]
@@ -2028,7 +2035,7 @@ mod gate {
         ok &= verify_structure::<2>(m, (nodes_verify(), memops()))?;
         ok &= verify_structure::<3>(m, (nodes_verify(), memops()))?;
         ok &= verify_structure::<4>(m, (nodes_verify(), memops()))?;
-        let refs = (1..=LANES)
+        let refs = (1..=ROWS)
             .map(|k| ref_run(m, Prefix::Steps(&toks[..PREFIX]), &[&rows[..k]], next))
             .collect::<Result<Vec<_>, _>>()?;
         for k in 1..=2 {
@@ -2040,8 +2047,8 @@ mod gate {
         for k in 1..=4 {
             ok &= verify_case::<4>(m, toks, rows, next, k, &refs, n_layer())?;
         }
-        // A second verify from a moved lane: four rows kept to three (lane 2),
-        // then four more kept whole (lanes 2, 3, 0, 1: the word to 1).
+        // A second verify after a commit: four rows kept to three, then four
+        // more kept whole, the word on its one lane throughout.
         let want = ref_run(
             m,
             Prefix::Steps(&toks[..PREFIX]),
@@ -2065,13 +2072,7 @@ mod gate {
                     lane: want.lane,
                     next: want.next,
                 };
-                ok &= same_vrun(
-                    "after a commit of 3, T=4 k=4 from lane 2",
-                    &v,
-                    &tail,
-                    PREFIX + 7,
-                    (2 + 4 - 1) % LANES as u32,
-                );
+                ok &= same_vrun("after a commit of 3, T=4 k=4", &v, &tail, PREFIX + 7, 0);
             }
             Err(e) => {
                 println!("verify chained: FAILED: {e} {}", verdict(false));
@@ -2112,11 +2113,11 @@ mod gate {
         let (man, d3k) = input_manifest(D3K)?;
         let (_, _, prefill) = man.step()?;
         let ids = prefill
-            .get(..DEEP + LANES)
+            .get(..DEEP + ROWS)
             .ok_or_else(|| format!("{d3k}: a prefill of {} ids", prefill.len()))?
             .to_vec();
         let (prefix, rows) = (Prefix::Gemm(&ids[..DEEP]), &ids[DEEP..]);
-        let rows: [u32; LANES] = std::array::from_fn(|i| rows[i]);
+        let rows: [u32; ROWS] = std::array::from_fn(|i| rows[i]);
         let (next, then) = (rows[DEEP_KEPT], rows[DEEP_KEPT + 1]);
         let want = ref_run(m, prefix, &[&rows[..DEEP_KEPT]], next)?;
         let want_then = next_step(m, then);
@@ -2142,7 +2143,7 @@ mod gate {
                     &v,
                     &want,
                     DEEP + DEEP_KEPT,
-                    (c + DEEP_KEPT as u32 - 1) % LANES as u32,
+                    c,
                 );
                 let then_ok = matches!(
                     (&got_then, &want_then),
@@ -2172,12 +2173,12 @@ mod gate {
         }
     }
 
-    /// (v)'s refusals: a step while a verify waits, a commit with no verify,
-    /// and the planted lane's fault.
+    /// (v)'s refusals: a step while a verify waits, and a commit with no
+    /// verify.
     fn verify_refusals(
         m: &mut Qwen38Model,
         toks: &[u32],
-        rows: [u32; LANES],
+        rows: [u32; ROWS],
     ) -> Result<bool, GateError> {
         let mut ok = true;
         fresh(m)?;
@@ -2206,24 +2207,6 @@ mod gate {
                 Err(e) => e.to_string(),
             },
             verdict(named)
-        );
-        fresh(m)?;
-        m.step(&toks[..PREFIX])?;
-        {
-            let (gpu, _, b) = m.body_parts("plant")?;
-            b.plant_lane(gpu, 2)?;
-        }
-        let got = m.step(&[rows[0]]);
-        let want = Fault::at(0, FaultSite::DeltaStamp);
-        let raised = matches!(&got, Err(GpuError::Fault { fault, .. }) if *fault == want);
-        ok &= raised;
-        println!(
-            "verify refusal: the lane word planted on lane 2, never written -> {} (want {want}) {}",
-            match &got {
-                Ok(t) => format!("accepted, next {t}"),
-                Err(e) => e.to_string(),
-            },
-            verdict(raised)
         );
         m.reset()?;
         Ok(ok)
@@ -3902,7 +3885,7 @@ mod gate {
         ok &= verify_structure::<3>(m, want)?;
         ok &= verify_structure::<4>(m, want)?;
         let (rows, next) = verify_rows(toks)?;
-        let refs = (1..=LANES)
+        let refs = (1..=ROWS)
             .map(|k| ref_run(m, Prefix::Steps(&toks[..PREFIX]), &[&rows[..k]], next))
             .collect::<Result<Vec<_>, _>>()?;
         let served = n_layer() - hostless(plan);
@@ -4148,7 +4131,7 @@ mod gate {
             let graph = run_steps(&mut m, toks, StepMode::Graph, true)?;
             let eager = run_steps(&mut m, toks, StepMode::Eager, true)?;
             Prefix::Steps(&toks[..PREFIX]).feed(&mut m)?;
-            let verified = verify::<LANES>(&mut m, rows, LANES, StepMode::Graph, Some(next))?;
+            let verified = verify::<ROWS>(&mut m, rows, ROWS, StepMode::Graph, Some(next))?;
             let refused = if route_trace {
                 true
             } else if whole == 0 {
@@ -4204,7 +4187,7 @@ mod gate {
             let label = format!("whole plan: {mode} steps vs host legs kept");
             ok &= same_run(&label, a, k, false);
         }
-        let pos = PREFIX + LANES;
+        let pos = PREFIX + ROWS;
         ok &= same_vrun("whole plan vs host legs kept", &v, &kv, pos, kv.lane);
         Ok(ok)
     }
@@ -4339,7 +4322,7 @@ mod gate {
             params: SwapParams::mid(1),
             pinned: vec![0; layers.len()],
             top_k: N_USED,
-            max_rows: LANES,
+            max_rows: ROWS,
             unrouted: Vec::new(),
             deadline: Duration::from_secs(10),
         };
@@ -4704,12 +4687,12 @@ mod gate {
         }
 
         /// The stores ([`Body38::store_bytes`], held to the header's
-        /// derivation by (s)), the commit's replay table (four u64 words a
+        /// derivation by (s)), the commit's replay table (five u64 words a
         /// delta layer), the lane word (one device word) and the two
         /// arena-row buffers (`(1 + PASS_ROWS) · STREAMS · HIDDEN` f32).
         fn seq_bytes_derived(&self, m: &Qwen38Model) -> Result<Derived, GateError> {
             let stores = m.body("slots")?.store_bytes();
-            let table = n_gdn() * 4 * 8;
+            let table = n_gdn() * runtime::stores::DELTA_REPLAY_WORDS * 8;
             let rows = (1 + PASS_ROWS) * STREAMS * HIDDEN * 4;
             Ok(Derived {
                 bytes: stores + table + 4 + rows,
@@ -4782,22 +4765,23 @@ mod gate {
     /// (y) the plan's slot count against the owners of the per-sequence
     /// bytes (module doc): the plan of two grows the card's kv class by
     /// exactly the bytes one sequence holds — its stores (a delta layer's
-    /// lanes, conv ring and carry) and PLE ring (`runtime::stores`'s own
+    /// lane, record, conv ring and carry) and PLE ring (`runtime::stores`'s own
     /// terms, the ones the load holds the allocations to), the lane word
     /// (one device word) and the two arena-row buffers (`(1 + PASS_ROWS) ·
     /// STREAMS · HIDDEN` f32, `seq38_bytes`' rows term), and the replay
-    /// table (four u64 words per delta layer) — and at one slot is
+    /// table (five u64 words per delta layer) — and at one slot is
     /// the plan every other clause loads by.
     fn slots_plan(experts: Experts) -> Result<bool, GateError> {
         let seq = {
             use runtime::stores as st;
             let rec = st::recurrent_bytes(V_HEADS, K_HEADS, HEAD_V, CONV)
                 + st::delta_lane_bytes(V_HEADS, HEAD_V, LANES)
+                + st::delta_record_bytes(V_HEADS, HEAD_V, ROWS)
                 + st::delta_carry_bytes(V_HEADS, K_HEADS, HEAD_V);
             let sel = st::selecting_bytes(N_KV, HEAD, false, IDX_DIM, POOL, CTX);
             let ple = st::ple_ring_bytes(PLE_TAPS, PLE_DILATION, STREAMS, HIDDEN);
             let rows = (1 + PASS_ROWS) * STREAMS * HIDDEN * 4;
-            u64::try_from(n_gdn())? * (rec + 32)
+            u64::try_from(n_gdn())? * (rec + st::DELTA_REPLAY_BYTES)
                 + u64::try_from(n_qsa())? * sel
                 + ple
                 + 4
