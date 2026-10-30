@@ -812,7 +812,10 @@ impl Weights {
             return Err(GpuError::shape(WHAT, "no parts to join"));
         };
         let cols = k / per;
-        let w = DeviceTensor::<T>::zeroed(stream, rows, cols)?;
+        // SAFETY: the parts' rows sum to `rows` and each is copied whole
+        // below, one after another, so every element is written on `stream`;
+        // a failed copy returns, dropping the tensor unread.
+        let w = unsafe { DeviceTensor::<T>::unfilled(stream, rows, cols)? };
         let base = w.buf().cu_deviceptr();
         let mut at = 0usize;
         for part in found {
@@ -896,8 +899,13 @@ impl Weights {
         let Some(k) = width else {
             return Err(GpuError::shape(WHAT, "no parts to join"));
         };
-        let qs = DeviceTensor::<u32>::zeroed(stream, rows, k / 4)?;
-        let d = DeviceTensor::<S>::zeroed(stream, rows, k / scale_values)?;
+        // SAFETY: the parts' rows sum to `rows` and each part's codes are
+        // copied whole below, one after another, so every code element is
+        // written on `stream`; a failed copy returns, dropping it unread.
+        let qs = unsafe { DeviceTensor::<u32>::unfilled(stream, rows, k / 4)? };
+        // SAFETY: as the codes, each part's scales are copied whole below, so
+        // every scale element is written; a failed copy drops it unread.
+        let d = unsafe { DeviceTensor::<S>::unfilled(stream, rows, k / scale_values)? };
         let (qs_base, d_base) = (qs.buf().cu_deviceptr(), d.buf().cu_deviceptr());
         let mut at = 0usize;
         for (part_qs, part_d) in found {
@@ -1497,8 +1505,9 @@ fn upload_budget(t: &TensorInfo) -> usize {
 /// per span, in span order) in card format `format`, and upload them through
 /// `ring`. The formats whose device bytes are the file bytes verbatim
 /// ([`CardFormat::KQuant`], [`CardFormat::F32`] — the host is little-endian,
-/// the module refuses to build otherwise) stage the slices themselves into a
-/// zeroed buffer, so no word is packed on the host; the formats that keep a
+/// the module refuses to build otherwise) stage the slices themselves into the
+/// device buffer (a K-quant's zeroed, so its layout's tail stays zero), so no
+/// word is packed on the host; the formats that keep a
 /// file's scale bytes and code bytes in two planes (Q8_0, NVFP4, MXFP8,
 /// FP8_B128: [`crate::planes`]) split their rows straight into the ring's
 /// slots; every other format packs its run on the host and stages the packed
@@ -1566,26 +1575,12 @@ fn upload_rows(
             ring.copy_bytes(stream, &stage, src, take)?;
             DevWeight::KQuant { ty: t.ty, w, k }
         }
-        CardFormat::F32 => {
-            // The file's f32 bytes are the device's f32 bytes on this host;
-            // a run that is not the rows' whole values is a broken file, the
-            // layout's size and the run's need disagreeing.
-            if take != rows * k * 4 {
-                let detail = format!(
-                    "tensor {name}: {take} bytes are not its {rows} rows of {k} f32 values"
-                );
-                return Err(GpuError::shape(what, detail));
-            }
-            let w = DeviceTensor::<f32>::zeroed(stream, rows, k)?;
-            let stage = Stage {
-                what,
-                name,
-                dst: w.buf().cu_deviceptr(),
-                dst_bytes: w.buf().num_bytes(),
-            };
-            ring.copy_bytes(stream, &stage, src, take)?;
-            DevWeight::F32 { w, k }
-        }
+        // The file's f32 bytes are the device's f32 bytes on this host; a run
+        // that is not the rows' whole values is refused ([`upload_whole`]).
+        CardFormat::F32 => DevWeight::F32 {
+            w: upload_whole(stream, ring, (what, name), (src, take), rows, k)?,
+            k,
+        },
         CardFormat::Q5_0 => {
             let packed = pack_q5_0(&flat_of(src, take)?, k, rows)?;
             let cols = packed.len() / rows;
@@ -1689,24 +1684,19 @@ fn upload_rows(
         }
         CardFormat::Bf16Raw => {
             // The file's bf16 bytes are the words' bytes on this host, two
-            // values a word, so the rows stream as they are; a run that is not
-            // the rows' whole values, or a row that ends inside a word, is
-            // refused.
-            if !k.is_multiple_of(2) || take != rows * k * 2 {
-                let detail = format!(
-                    "tensor {name}: {take} bytes are not its {rows} rows of {k} bf16 values in whole words"
-                );
-                return Err(GpuError::shape(what, detail));
+            // values a word, so the rows stream as they are; a row that ends
+            // inside a word is refused here, a run that is not the rows' whole
+            // values by [`upload_whole`].
+            if !k.is_multiple_of(2) {
+                return Err(GpuError::shape(
+                    what,
+                    format!("tensor {name}: {k} bf16 values do not fill whole words"),
+                ));
             }
-            let w = DeviceTensor::<u32>::zeroed(stream, rows, k / 2)?;
-            let stage = Stage {
-                what,
-                name,
-                dst: w.buf().cu_deviceptr(),
-                dst_bytes: w.buf().num_bytes(),
-            };
-            ring.copy_bytes(stream, &stage, src, take)?;
-            DevWeight::Bf16 { w, k }
+            DevWeight::Bf16 {
+                w: upload_whole(stream, ring, (what, name), (src, take), rows, k / 2)?,
+                k,
+            }
         }
         CardFormat::Bf16AsF32 => {
             let mut vals = vec![0.0f32; rows * k];
@@ -1761,10 +1751,8 @@ fn flat_of<'a>(src: &[&'a [u8]], take: usize) -> Result<Cow<'a, [u8]>, GpuError>
     }
 }
 
-/// `data` — exactly `rows * cols` elements, a format's finished packing — as
-/// a device tensor staged through `ring`, the buffer zeroed first so a short
-/// packing would leave a zero tail rather than stale bytes (the packed
-/// formats always fill theirs).
+/// `data`, a format's finished packing, as a `rows` x `cols` device tensor
+/// staged through `ring` ([`upload_whole`]).
 fn upload_packed<T: DeviceCopy>(
     stream: &CudaStream,
     ring: &mut UploadRing,
@@ -1774,33 +1762,61 @@ fn upload_packed<T: DeviceCopy>(
     rows: usize,
     cols: usize,
 ) -> Result<DeviceTensor<T>, GpuError> {
-    if data.len() != rows * cols {
-        return Err(GpuError::shape(
-            what,
-            format!(
-                "tensor {name}: {} elements for {rows} rows of {cols}",
-                data.len()
-            ),
-        ));
-    }
-    let t = DeviceTensor::zeroed(stream, rows, cols)?;
     let bytes = bytes_of(data);
+    upload_whole(
+        stream,
+        ring,
+        (what, name),
+        (&[bytes], bytes.len()),
+        rows,
+        cols,
+    )
+}
+
+/// The first `take` bytes of `src`'s slices, the device bytes of `rows` x
+/// `cols` elements of `T`, as a device tensor staged through `ring`. The copy
+/// writes every byte of the buffer, so the buffer is not zeroed first; a run
+/// that is not the tensor's whole bytes is refused before anything is
+/// allocated, and a copy that fails drops the buffer unread.
+fn upload_whole<T: DeviceCopy>(
+    stream: &CudaStream,
+    ring: &mut UploadRing,
+    (what, name): (&'static str, &str),
+    (src, take): (&[&[u8]], usize),
+    rows: usize,
+    cols: usize,
+) -> Result<DeviceTensor<T>, GpuError> {
+    let whole = rows
+        .checked_mul(cols)
+        .and_then(|n| n.checked_mul(size_of::<T>()));
+    if whole != Some(take) {
+        let detail = format!(
+            "tensor {name}: {take} bytes are not {rows} rows of {cols} {}-byte elements",
+            size_of::<T>()
+        );
+        return Err(GpuError::shape(what, detail));
+    }
+    // SAFETY: the copy below writes all `take` bytes, the tensor's whole
+    // buffer, on `stream`; when it fails the tensor is dropped here unread.
+    let t = unsafe { DeviceTensor::<T>::unfilled(stream, rows, cols)? };
     let stage = Stage {
         what,
         name,
         dst: t.buf().cu_deviceptr(),
         dst_bytes: t.buf().num_bytes(),
     };
-    ring.copy_bytes(stream, &stage, &[bytes], bytes.len())?;
+    ring.copy_bytes(stream, &stage, src, take)?;
     Ok(t)
 }
 
 /// `rows` rows of `format`, `row_recs` records a row, from `src`'s first `take`
 /// bytes (the file's own rows), as two device tensors of the planes
 /// ([`crate::planes`]): the codes `rows` x `code_cols` and the scale bytes
-/// `rows` x `head_cols`, each zeroed first, each element the plane's bytes as a
-/// little-endian word of its own type. The split writes into the ring's slots,
-/// so no host vector of the planes exists.
+/// `rows` x `head_cols`, each element the plane's bytes as a little-endian
+/// word of its own type. The split writes into the ring's slots, so no host
+/// vector of the planes exists. The split refuses rows that do not fill both
+/// planes before it writes anything (`UploadRing::copy_split`), so it writes
+/// every plane byte or none, and neither plane is zeroed first.
 fn upload_split<C: DeviceCopy, H: DeviceCopy>(
     stream: &CudaStream,
     ring: &mut UploadRing,
@@ -1809,8 +1825,12 @@ fn upload_split<C: DeviceCopy, H: DeviceCopy>(
     (src, take): (&[&[u8]], usize),
     (rows, code_cols, head_cols): (usize, usize, usize),
 ) -> Result<(DeviceTensor<C>, DeviceTensor<H>), GpuError> {
-    let codes = DeviceTensor::<C>::zeroed(stream, rows, code_cols)?;
-    let heads = DeviceTensor::<H>::zeroed(stream, rows, head_cols)?;
+    // SAFETY: `copy_split` writes every code byte on `stream` or fails,
+    // dropping the codes here unread.
+    let codes = unsafe { DeviceTensor::<C>::unfilled(stream, rows, code_cols)? };
+    // SAFETY: `copy_split` writes every scale byte on `stream` or fails,
+    // dropping the scales here unread.
+    let heads = unsafe { DeviceTensor::<H>::unfilled(stream, rows, head_cols)? };
     let stage = |dst: sys::CUdeviceptr, dst_bytes: usize| Stage {
         what,
         name,
@@ -1851,9 +1871,10 @@ pub fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<u16>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        HEAD_TENSOR, TensorPart, derived_slot_free, file_slot, head_tensor, part_format,
-        part_formats, upload_budget,
+        HEAD_TENSOR, PlaneFormat, TensorPart, UploadRing, derived_slot_free, file_slot,
+        head_tensor, part_format, part_formats, upload_budget, upload_split, upload_whole,
     };
+    use cuda_core::DeviceBuffer;
     use gguf::Split;
     use gguf::write::{Layout, TensorDecl, Writer};
     use gguf::{GgmlType, TensorInfo};
@@ -1901,6 +1922,85 @@ mod tests {
             assert_eq!(part_format(&t).unwrap().1, bytes, "{name} {ty} k={k}");
             assert_eq!(upload_budget(&t), bytes, "{name} {ty} k={k}");
         }
+    }
+
+    /// The uploads that write their buffers whole skip the zero fill and leave
+    /// none of the bytes the allocation held: device memory filled with 0xff
+    /// and freed just before an F32 upload and a Q8_0 split reads back as the
+    /// file's bytes, and runs that would leave bytes unwritten are refused by
+    /// name before anything is allocated.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_whole_uploads_leave_no_stale_byte() {
+        let (_ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let (rows, recs) = (6, 4);
+        let row = recs * 34;
+        let file: Vec<u8> = (0..rows * row).map(|i| (i * 7 + 3) as u8).collect();
+        let stale = || {
+            drop(
+                DeviceBuffer::from_host(&stream, &vec![0xffu8; file.len()]).expect("a dirty fill"),
+            );
+        };
+        let mut ring = UploadRing::new(&stream, file.len()).expect("a ring");
+        let f32s = |ring: &mut UploadRing, take| {
+            upload_whole::<f32>(
+                &stream,
+                ring,
+                ("test", "f"),
+                (&[&file[..]], take),
+                1,
+                file.len() / 4,
+            )
+        };
+        let q8 = |ring: &mut UploadRing, take| {
+            upload_split::<u32, u16>(
+                &stream,
+                ring,
+                ("test", "q"),
+                (PlaneFormat::Q8_0, recs),
+                (&[&file[..]], take),
+                (rows, recs * 8, recs),
+            )
+        };
+
+        stale();
+        let w = f32s(&mut ring, file.len()).expect("an f32 upload");
+        ring.finish(&stream).expect("the f32 copy");
+        let back = w.buf().to_host_vec(&stream).expect("the f32 read");
+        let bytes: Vec<u8> = back.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(bytes, file, "the f32 buffer holds the file's bytes");
+
+        stale();
+        let (qs, d) = q8(&mut ring, file.len()).expect("a q8_0 split");
+        ring.finish(&stream).expect("the split copies");
+        let (mut want_q, mut want_d) = (Vec::new(), Vec::new());
+        for rec in file.as_chunks::<34>().0 {
+            want_d.push(u16::from_le_bytes([rec[0], rec[1]]));
+            want_q.extend(
+                rec[2..]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|w| u32::from_le_bytes(*w)),
+            );
+        }
+        assert_eq!(qs.buf().to_host_vec(&stream).expect("the codes"), want_q);
+        assert_eq!(d.buf().to_host_vec(&stream).expect("the scales"), want_d);
+
+        let err = q8(&mut ring, file.len() - row)
+            .err()
+            .expect("rows short of the planes");
+        assert!(
+            err.to_string().contains("tensor q") && err.to_string().contains("plane bytes"),
+            "{err}"
+        );
+        let err = f32s(&mut ring, file.len() - 4)
+            .err()
+            .expect("a run short of the buffer");
+        assert!(
+            err.to_string().contains("tensor f") && err.to_string().contains("are not 1 rows"),
+            "{err}"
+        );
     }
 
     /// The head is `output.weight` when the file has it, the token embedding

@@ -596,6 +596,42 @@ impl<T: DeviceCopy> DeviceTensor<T> {
         Ok(DeviceTensor { buf, rows, cols })
     }
 
+    /// A tensor whose bytes are what the allocation held, for a load-time
+    /// buffer a copy writes whole: the memset [`DeviceTensor::zeroed`]
+    /// enqueues would only be written over. Load-time only, like `zeroed`;
+    /// `stream`'s context must be current.
+    ///
+    /// # Safety
+    ///
+    /// Every one of the `rows * cols` elements must be written on `stream`
+    /// before anything reads the tensor, and a tensor whose writing failed
+    /// must be dropped unread.
+    pub(crate) unsafe fn unfilled(
+        stream: &CudaStream,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self, GpuError> {
+        let size = rows
+            .checked_mul(cols)
+            .and_then(|len| Some((len, len.checked_mul(size_of::<T>())?)));
+        let Some((len, bytes)) = size else {
+            let detail = format!("{rows} rows of {cols} elements pass usize bytes");
+            return Err(GpuError::shape("DeviceTensor::unfilled", detail));
+        };
+        // No allocation is made for no bytes, which the driver refuses: a
+        // null pointer the drop skips, as `zeroed` gives.
+        let ptr = if bytes == 0 {
+            0
+        } else {
+            // SAFETY: the stream's context is current and `bytes` is positive.
+            unsafe { cuda_core::simt::memory::malloc_sync(bytes)? }
+        };
+        // SAFETY: `ptr` owns this context's allocation of `len` elements, or
+        // is null for no bytes; the buffer takes it over and frees it on drop.
+        let buf = unsafe { DeviceBuffer::from_raw_parts(ptr, len, stream.context().clone()) };
+        Ok(DeviceTensor { buf, rows, cols })
+    }
+
     /// A `rows × cols` tensor over memory it does not own, for a launcher
     /// that takes a tensor: [`window`] with a shape. Give it back with
     /// [`DeviceTensor::release`].
