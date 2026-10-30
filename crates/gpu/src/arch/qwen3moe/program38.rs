@@ -80,7 +80,7 @@ use crate::head::{Head, HeadLaunches};
 use crate::host::handoff::{Handoff, HandoffKernels, Places};
 use crate::host::run::HostRun;
 use crate::host::{BatchLeg, StepLeg};
-use crate::linear::conv::ConvArgs;
+use crate::linear::conv::{ConvArgs, ConvRows};
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
 use crate::linear::{self, LinearKernels};
@@ -1223,7 +1223,7 @@ fn gdn_seq(
     lin.conv.enqueue_conv_prep(
         stream,
         ConvArgs {
-            x,
+            x: ConvRows::F32(x),
             b_raw: b,
             a_raw: a,
             w: f32_gain(w, &gp.conv)?,

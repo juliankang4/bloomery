@@ -3680,7 +3680,7 @@ pub mod gated {
             ));
         }
         let t = if mma {
-            mma_launch(what, rows, k, x, n, &mut out.logits)?
+            mma_launch(what, rows, k, x, n, &out.logits)?
         } else {
             tile_launch(what, rows, k, x, n, &out.logits)?
         };

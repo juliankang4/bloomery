@@ -1823,7 +1823,7 @@ impl Gemm32Kernels {
                             slots: g.n_slots,
                             max_tiles: g.max_tiles,
                             slot_div: g.slot_div,
-                            y: super::nvfp4mma::ProductOut::F32(y),
+                            y: super::ProductOut::F32(y),
                         },
                     );
                 }
@@ -1869,7 +1869,7 @@ impl Gemm32Kernels {
                     slots: g.n_slots,
                     max_tiles: g.max_tiles,
                     slot_div: g.slot_div,
-                    y: super::nvfp4mma::ProductOut::Bf16(a.y),
+                    y: super::ProductOut::Bf16(a.y),
                 },
             );
         }

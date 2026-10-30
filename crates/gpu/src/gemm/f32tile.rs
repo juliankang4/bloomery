@@ -328,7 +328,8 @@ pub(crate) unsafe fn f32_tile_body<W: TileRows>(
 /// the tile at `(row0, c0)`, each thread `RT` rows by [`THREAD_COLS`]
 /// columns: pass `pass` covers the tile's rows `pass · ROW_GROUPS · RT ..`,
 /// so the one pass of [`FULL_ROWS`] covers them all. With `MARKED`, only
-/// outputs that hold NaN are written.
+/// outputs that hold NaN are written. Each output is stored as its
+/// [`ProductCell`].
 ///
 /// # Safety
 ///
@@ -344,7 +345,7 @@ unsafe fn f32_tile_at<W: TileRows, X: TileRows, const RT: usize, const MARKED: b
     w: W,
     x: X,
     (rows, kk, n): (usize, usize, usize),
-    y: &mut DisjointSlice<f32>,
+    y: &mut DisjointSlice<impl ProductCell>,
     sh: *mut f32,
     (row0, c0, pass): (usize, usize, usize),
 ) {
@@ -463,7 +464,7 @@ unsafe fn f32_tile_at<W: TileRows, X: TileRows, const RT: usize, const MARKED: b
                 // owning row r and column col is its only writer.
                 let slot = unsafe { y.get_unchecked_mut(col * rows + r) };
                 if !MARKED || slot.is_nan() {
-                    *slot = a + b;
+                    *slot = ProductCell::of(a + b);
                 }
             }
             i += 1;
@@ -1017,6 +1018,58 @@ pub(crate) const MMA_WARP_COLS: usize = 32;
 pub(crate) const MMA_WARP_SCRATCH: usize = 2 * STAGE_FLOATS / (MMA_THREADS as usize / 32);
 const _: () = assert!(MMA_ROWS == 2 * MMA_WARP_ROWS && MMA_COLS == 4 * MMA_WARP_COLS);
 
+/// A product's output cell: its F32 sum as stored, or the BF16 bits of that
+/// sum rounded to nearest even (a NaN stays NaN; a value past the BF16 range
+/// rounds to an infinity, which a reader's finite check sees).
+pub(crate) trait ProductCell: Copy {
+    fn of(v: f32) -> Self;
+    /// Whether the cell holds a NaN: the mark a replay overwrites.
+    fn is_nan(self) -> bool;
+}
+
+impl ProductCell for f32 {
+    #[inline(always)]
+    fn of(v: f32) -> Self {
+        v
+    }
+
+    #[inline(always)]
+    fn is_nan(self) -> bool {
+        f32::is_nan(self)
+    }
+}
+
+impl ProductCell for u16 {
+    #[inline(always)]
+    fn of(v: f32) -> Self {
+        cuda_device::convert::f32_to_bf16_rne(v)
+    }
+
+    #[inline(always)]
+    fn is_nan(self) -> bool {
+        self & 0x7fff > 0x7f80
+    }
+}
+
+/// Where a product launch stores its cells: F32 sums, or their BF16 bits
+/// ([`ProductCell`]). A `&mut DeviceBuffer` of either converts into it.
+pub enum ProductOut<'a> {
+    F32(&'a mut DeviceBuffer<f32>),
+    Bf16(&'a mut DeviceBuffer<u16>),
+}
+
+impl<'a> From<&'a mut DeviceBuffer<f32>> for ProductOut<'a> {
+    fn from(y: &'a mut DeviceBuffer<f32>) -> Self {
+        ProductOut::F32(y)
+    }
+}
+
+impl<'a> From<&'a mut DeviceBuffer<u16>> for ProductOut<'a> {
+    fn from(y: &'a mut DeviceBuffer<u16>) -> Self {
+        ProductOut::Bf16(y)
+    }
+}
+
 /// Row and column of warp `warp`'s outputs inside the tile.
 #[inline(always)]
 fn mma_warp_at(warp: usize) -> (usize, usize) {
@@ -1136,15 +1189,16 @@ impl MmaTile {
         true
     }
 
-    /// Stores this thread's live cells; with MARKED, a marked or non-finite
-    /// cell as NaN, which [`Self::replay`] recomputes.
+    /// Stores this thread's live cells, each as its [`ProductCell`]; with
+    /// MARKED, a marked or non-finite cell as NaN, which [`Self::replay`]
+    /// recomputes.
     ///
     /// # Safety
     /// y holds rows*n cells. This tile is disjoint from every other block's.
     #[inline(always)]
     pub(crate) unsafe fn store<const MARKED: bool>(
         &self,
-        y: &mut DisjointSlice<f32>,
+        y: &mut DisjointSlice<impl ProductCell>,
         rows: usize,
         n: usize,
     ) {
@@ -1159,7 +1213,7 @@ impl MmaTile {
                     value
                 };
                 // SAFETY: this thread owns the checked live output cell.
-                unsafe { *y.get_unchecked_mut(c * rows + r) = value };
+                unsafe { *y.get_unchecked_mut(c * rows + r) = ProductCell::of(value) };
             }
         }
     }
@@ -1177,7 +1231,7 @@ impl MmaTile {
         w: W,
         x: X,
         dims: (usize, usize, usize),
-        y: &mut DisjointSlice<f32>,
+        y: &mut DisjointSlice<impl ProductCell>,
         sh: *mut f32,
     ) {
         const { assert!(W::REPLAY_ROWS == 1 || W::REPLAY_ROWS == 2) };
@@ -1687,7 +1741,7 @@ pub(crate) unsafe fn bf16_mma_body<W: MmaRows, X: MmaCols>(
     rows: u32,
     k: u32,
     n: u32,
-    y: &mut DisjointSlice<f32>,
+    y: &mut DisjointSlice<impl ProductCell>,
     sh: *mut f32,
 ) {
     let units = if W::SCALED { k / 2 } else { k };
@@ -1700,7 +1754,8 @@ pub(crate) unsafe fn bf16_mma_body<W: MmaRows, X: MmaCols>(
 }
 
 /// [`bf16_mma_body`]'s store of a finished tile: its cells, those of an
-/// exceptional row or column replayed on the exact owner.
+/// exceptional row or column replayed on the exact owner, each stored as its
+/// [`ProductCell`].
 ///
 /// # Safety
 /// All 256 threads call converged with the tile's operands, checked spans
@@ -1711,7 +1766,7 @@ pub(crate) unsafe fn mma_tile_store<W: MmaRows, X: MmaCols>(
     w: W,
     x: X,
     (rows, k, n): (u32, u32, u32),
-    y: &mut DisjointSlice<f32>,
+    y: &mut DisjointSlice<impl ProductCell>,
     sh: *mut f32,
 ) {
     let units = if W::SCALED { k / 2 } else { k };
@@ -2307,36 +2362,38 @@ impl Gemm32Kernels {
     /// `Q8F32Kernels::enqueue_bf16_mma`'s product, bit for bit, over the BF16
     /// form `act` holds of the first `n` columns of `x`
     /// ([`Self::enqueue_bf16_cols`]): the tile copies the rounded words, and
-    /// only a replay reads `x`. A form of other rows or of fewer columns is a
-    /// named `State` error. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_bf16_mma_cols(
+    /// only a replay reads `x`. Each output is stored as its [`ProductOut`]'s
+    /// cell. A form of other rows or of fewer columns is a named `State`
+    /// error. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_bf16_mma_cols<'y>(
         &self,
         stream: &CudaStream,
         w: &DeviceTensor<u32>,
         x: &DeviceBuffer<f32>,
         act: &GemmAct32,
         n: usize,
-        y: &mut DeviceBuffer<f32>,
+        y: impl Into<ProductOut<'y>>,
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_bf16_mma_cols";
-        let t = bf16_mma_launch(what, w, x, n, y)?;
+        let y = y.into();
+        let t = match &y {
+            ProductOut::F32(y) => bf16_mma_launch(what, w, x, n, y)?,
+            ProductOut::Bf16(y) => bf16_mma_launch(what, w, x, n, y)?,
+        };
         let form = held_form(what, act, MmaForm::Bf16, x, &t)?;
-        let prep =
-            self.module
-                .prepare_bf16_mma_cols_gemm(LaunchConfig1D::new(t.grid, MMA_THREADS, 0))?;
-        let (words, refused) = (&form.words, &form.refused);
-        self.module.bf16_mma_cols_gemm(
-            stream,
-            &prep,
-            w.buf(),
-            x,
-            words,
-            refused,
-            t.rows,
-            t.k,
-            t.n,
-            y,
-        )?;
+        let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, 0);
+        let (m, words, refused) = (&self.module, &form.words, &form.refused);
+        let (w, rows, k, n) = (w.buf(), t.rows, t.k, t.n);
+        match y {
+            ProductOut::F32(y) => {
+                let prep = m.prepare_bf16_mma_cols_gemm(cfg)?;
+                m.bf16_mma_cols_gemm(stream, &prep, w, x, words, refused, rows, k, n, y)?;
+            }
+            ProductOut::Bf16(y) => {
+                let prep = m.prepare_bf16_mma_cols_gemm_bf16(cfg)?;
+                m.bf16_mma_cols_gemm_bf16(stream, &prep, w, x, words, refused, rows, k, n, y)?;
+            }
+        }
         Ok(())
     }
 
@@ -2392,23 +2449,28 @@ impl Gemm32Kernels {
     /// exact owner over `x`, as [`Self::enqueue_e4m3_mma`]'s do. The planes
     /// must be MXFP8 and 16-byte aligned ([`mxfp8_w8a8_reads`]); another, or a
     /// form of other rows or of fewer columns, is a named error, and so is a
-    /// build without the native block-scaled kernels. Asynchronous,
-    /// allocation-free, capturable.
+    /// build without the native block-scaled kernels. Each output is stored
+    /// as its [`ProductOut`]'s cell. Asynchronous, allocation-free,
+    /// capturable.
     #[cfg_attr(
         not(bloomery_nvfp4_mma),
         allow(unused_variables, reason = "the native build's launch reads them")
     )]
-    pub fn enqueue_mxfp8_w8a8(
+    pub fn enqueue_mxfp8_w8a8<'y>(
         &self,
         stream: &CudaStream,
         w: E4m3Weight<'_>,
         x: &DeviceBuffer<f32>,
         act: &GemmAct32,
         n: usize,
-        y: &mut DeviceBuffer<f32>,
+        y: impl Into<ProductOut<'y>>,
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_mxfp8_w8a8";
-        let t = mxfp8_mma_launch(what, w, x, n, y)?;
+        let y = y.into();
+        let t = match &y {
+            ProductOut::F32(y) => mxfp8_mma_launch(what, w, x, n, y)?,
+            ProductOut::Bf16(y) => mxfp8_mma_launch(what, w, x, n, y)?,
+        };
         let form = held_form(what, act, MmaForm::Mxfp8, x, &t)?;
         #[cfg(bloomery_nvfp4_mma)]
         return self.native.mxfp8_w8a8(stream, w, x, form, &t, y);
@@ -2544,12 +2606,12 @@ fn held_form<'a>(
 /// [`mma_launch`] for an MXFP8 weight's planes as stored. The tile copies
 /// the value plane in 16-byte pieces; other scales or alignment are a named
 /// `Shape` error.
-fn mxfp8_mma_launch(
+fn mxfp8_mma_launch<T>(
     what: &'static str,
     w: E4m3Weight<'_>,
     x: &DeviceBuffer<f32>,
     n: usize,
-    y: &mut DeviceBuffer<f32>,
+    y: &DeviceBuffer<T>,
 ) -> Result<TileLaunch, GpuError> {
     let (rows, k) = w.dimensions(what)?;
     if w.scales != E4m3Scales::Mxfp8 {
@@ -2563,13 +2625,13 @@ fn mxfp8_mma_launch(
 }
 
 /// Checked spans shared with the exact tile, with the MMA tile's grid.
-pub(crate) fn mma_launch(
+pub(crate) fn mma_launch<T>(
     what: &'static str,
     rows: usize,
     k: usize,
     x: &DeviceBuffer<f32>,
     n: usize,
-    y: &mut DeviceBuffer<f32>,
+    y: &DeviceBuffer<T>,
 ) -> Result<TileLaunch, GpuError> {
     let mut launch = tile_launch(what, rows, k, x, n, y)?;
     launch.grid = launch_u32(what, "grid", n.div_ceil(MMA_COLS) * rows.div_ceil(MMA_ROWS))?;
@@ -2584,7 +2646,7 @@ pub(crate) fn mma_launch_words(
     k: usize,
     x: &DeviceBuffer<f32>,
     n: usize,
-    y: &mut DeviceBuffer<f32>,
+    y: &DeviceBuffer<f32>,
 ) -> Result<TileLaunch, GpuError> {
     let values = x
         .len()
@@ -2598,12 +2660,12 @@ pub(crate) fn mma_launch_words(
 /// [`mma_launch`] for a BF16 weight's `rows × 2·cols` values. The tile copies
 /// its words in 16-byte pieces, so they must be 16-byte aligned; another is a
 /// named `Shape` error.
-pub(crate) fn bf16_mma_launch(
+pub(crate) fn bf16_mma_launch<T>(
     what: &'static str,
     w: &DeviceTensor<u32>,
     x: &DeviceBuffer<f32>,
     n: usize,
-    y: &mut DeviceBuffer<f32>,
+    y: &DeviceBuffer<T>,
 ) -> Result<TileLaunch, GpuError> {
     let k = w
         .cols()
@@ -2668,25 +2730,25 @@ pub(crate) struct TileLaunch {
 /// positive multiple of [`LINE`], `rows` and `n` positive, `x` holding `n`
 /// columns of `k` values 16-byte aligned and `y` `rows · n` outputs; each
 /// failure a named `Shape` error as `what`'s.
-pub(crate) fn tile_launch(
+pub(crate) fn tile_launch<T>(
     what: &'static str,
     rows: usize,
     k: usize,
     x: &DeviceBuffer<f32>,
     n: usize,
-    y: &DeviceBuffer<f32>,
+    y: &DeviceBuffer<T>,
 ) -> Result<TileLaunch, GpuError> {
     tile_spans(what, rows, k, (x.len(), x.cu_deviceptr()), n, y)
 }
 
 /// [`tile_launch`]'s checks over an `x` of `x_len` values at `x_at`.
-fn tile_spans(
+fn tile_spans<T>(
     what: &'static str,
     rows: usize,
     k: usize,
     (x_len_values, x_at): (usize, cuda_core::sys::CUdeviceptr),
     n: usize,
-    y: &DeviceBuffer<f32>,
+    y: &DeviceBuffer<T>,
 ) -> Result<TileLaunch, GpuError> {
     if k == 0 || !k.is_multiple_of(LINE) {
         return Err(GpuError::shape(

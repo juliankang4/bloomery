@@ -8374,16 +8374,18 @@ mod gate {
                 }
             }
             // Each cell's path, visible with unit weights against activations
-            // one bit below BF16 (1 + 2^-10): K on the tensor cores and
-            // K·(1 + 2^-10) on the exact owner. A subnormal activation in one
-            // column, then also weights of 2^60 in one row, send that column's
-            // and that row's cells to the exact tile's bits and leave every
-            // other cell of their tiles at K.
+            // below BF16's last bit (1 + 3·2^-10, which BF16 rounds to 1): K on
+            // the tensor cores and K·(1 + 3·2^-10) on the exact owner. A
+            // subnormal activation in one column, then also weights of 2^60 in
+            // one row, send that column's and that row's cells to the exact
+            // tile's bits and leave every other cell of their tiles at K. The
+            // subnormal column's 127·(1 + 3·2^-10) lies nearer BF16's step
+            // above, so a BF16 store that truncates misses its bits.
             {
                 use bloomery_gpu::q8f32::{E4m3Scales, E4m3Weight};
                 let (rows, k, n, odd_row, odd_col) = (130, 128, 130, 64, 129);
                 let x_of = |odd: bool| {
-                    let mut x = vec![f32::from_bits(0x3f80_2000); n * k];
+                    let mut x = vec![f32::from_bits(0x3f80_6000); n * k];
                     if odd {
                         x[odd_col * k] = f32::from_bits(0x200);
                     }
@@ -8439,8 +8441,11 @@ mod gate {
                             Ok::<_, GpuError>(y.to_host_vec(stream)?)
                         };
                         let (mma, exact) = (run(false)?, run(true)?);
-                        // A BF16 weight's site over the columns' BF16 form: the same bits.
-                        let cols_bits = scales.is_some() || {
+                        // A BF16 weight's site over the columns' BF16 form: the same
+                        // bits, and its BF16 store each cell's rounded to nearest even.
+                        let (cols_bits, store_bits) = if scales.is_some() {
+                            (true, None)
+                        } else {
                             let mut act = GemmAct32::new(stream, n, k)?
                                 .with_form(stream, bloomery_gpu::gemm::MmaForm::Bf16)?;
                             dev.g32.enqueue_bf16_cols(stream, &x, n, &mut act)?;
@@ -8448,9 +8453,21 @@ mod gate {
                             dev.g32
                                 .enqueue_bf16_mma_cols(stream, &w, &x, &act, n, &mut y)?;
                             let got = y.to_host_vec(stream)?;
-                            got.iter()
-                                .zip(&mma)
-                                .all(|(a, b)| a.to_bits() == b.to_bits())
+                            let mut half =
+                                DeviceBuffer::from_host(stream, &vec![0x1234u16; rows * n])?;
+                            dev.g32
+                                .enqueue_bf16_mma_cols(stream, &w, &x, &act, n, &mut half)?;
+                            let half = half.to_host_vec(stream)?;
+                            (
+                                got.iter()
+                                    .zip(&mma)
+                                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                                Some(
+                                    half.iter()
+                                        .zip(&mma)
+                                        .all(|(h, v)| *h == gguf::quant::fp32_to_bf16_bits(*v)),
+                                ),
+                            )
                         };
                         let odd = |i: usize| {
                             (odd_r && i % rows == odd_row) || (odd_c && i / rows == odd_col)
@@ -8461,13 +8478,15 @@ mod gate {
                         let replayed = (0..rows * n)
                             .filter(|&i| odd(i))
                             .all(|i| mma[i].to_bits() == exact[i].to_bits());
+                        let pass = kept && replayed && cols_bits && store_bits != Some(false);
                         println!(
                             "dense_mma {format} cells rows={rows} K={k} n={n} row{odd_row}_odd={odd_r} \
                              col{odd_col}_odd={odd_c} others_kept_k={kept} odd_lines_exact={replayed} \
-                             bf16_cols_bits={cols_bits} {}",
-                            verdict(kept && replayed && cols_bits)
+                             bf16_cols_bits={cols_bits} bf16_store_bits={} {}",
+                            store_bits.map_or("n/a".into(), |b| b.to_string()),
+                            verdict(pass)
                         );
-                        ok &= kept && replayed && cols_bits;
+                        ok &= pass;
                     }
                 }
             }
@@ -8740,9 +8759,27 @@ mod gate {
                 }
                 let graph_equal = bits_equal(&eager, &replay);
                 let guard = eager[rows * n..].iter().all(|v| *v == SENT);
-                let pass = off == 0 && graph_equal && guard;
+                // The BF16 store: each cell's F32 bits rounded to nearest even,
+                // a NaN as a NaN.
+                let same16 =
+                    |a: u16, b: u16| a == b || (a & 0x7fff > 0x7f80 && b & 0x7fff > 0x7f80);
+                let stored16 = |x: &DeviceBuffer<f32>, e: &DeviceTensor<u32>, want: &[f32]| {
+                    let mut half =
+                        DeviceBuffer::from_host(stream, &vec![0x1234u16; rows * n + 16])?;
+                    let mut a = GemmAct32::new(stream, n, k)?.with_form(stream, MmaForm::Mxfp8)?;
+                    g32.enqueue_mxfp8_cols(stream, x, n, &mut a)?;
+                    g32.enqueue_mxfp8_w8a8(stream, mxfp8(&qs, e), x, &a, n, &mut half)?;
+                    let half = half.to_host_vec(stream)?;
+                    Ok::<_, GateError>(
+                        (0..rows * n)
+                            .all(|at| same16(half[at], gguf::quant::fp32_to_bf16_bits(want[at])))
+                            && half[rows * n..].iter().all(|&h| h == 0x1234),
+                    )
+                };
+                let bf16 = stored16(&x, &e, &eager)?;
+                let pass = off == 0 && graph_equal && guard && bf16;
                 println!(
-                    "gemm32 case=mxfp8_w8a8 rows={rows} K={k} n={n} cells_off_oracle={off} eager_graph_eq={graph_equal} guard={guard} {}",
+                    "gemm32 case=mxfp8_w8a8 rows={rows} K={k} n={n} cells_off_oracle={off} eager_graph_eq={graph_equal} guard={guard} bf16_store_bits={bf16} {}",
                     verdict(pass)
                 );
                 ok &= pass;
@@ -8767,12 +8804,13 @@ mod gate {
                     let cells = (0..rows * n).all(|at| {
                         same(got[at], if at / rows == c { exact[at] } else { eager[at] })
                     });
+                    let bf16 = stored16(&dirty, &e, &got)?;
                     println!(
-                        "gemm32 case=mxfp8_w8a8_neighbours rows={rows} K={k} n={n} col={c} odd={:08x} cells={cells} {}",
+                        "gemm32 case=mxfp8_w8a8_neighbours rows={rows} K={k} n={n} col={c} odd={:08x} cells={cells} bf16_store_bits={bf16} {}",
                         odd.to_bits(),
-                        verdict(cells)
+                        verdict(cells && bf16)
                     );
-                    ok &= cells;
+                    ok &= cells && bf16;
                 }
                 let mut edges = eh.clone();
                 let per_row = k / 128;

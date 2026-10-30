@@ -5,9 +5,9 @@
 use super::act32::ColsForm;
 use super::f32tile::{
     Bf16Cols, Bf16Rows, ByteRows, F32Rows, HcUpMixArgs, MMA_BOX_BYTES, MMA_THREADS, MmaCols,
-    MmaRows, OutForm, STAGE_FLOATS, STAGES as MMA_STAGES, TileLaunch, TileRows,
-    bf16_mma_norm_gate_body, form_col, mma_fits, mma_tile_store, refuse_or, store_refused,
-    tma_mma_tile,
+    MmaRows, OutForm, ProductCell, ProductOut, STAGE_FLOATS, STAGES as MMA_STAGES, TileLaunch,
+    TileRows, bf16_mma_norm_gate_body, form_col, mma_fits, mma_tile_store, refuse_or,
+    store_refused, tma_mma_tile,
 };
 use super::{GemmAct32, GemmRoute};
 use crate::GpuError;
@@ -982,25 +982,6 @@ unsafe fn mxfp8_cols_body(
     unsafe { store_refused(refused, c, n, fits) };
 }
 
-/// A product entry's output cell: the F32 sum as stored.
-trait ProductCell: Copy {
-    fn of(v: f32) -> Self;
-}
-
-impl ProductCell for f32 {
-    #[inline(always)]
-    fn of(v: f32) -> Self {
-        v
-    }
-}
-
-impl ProductCell for u16 {
-    #[inline(always)]
-    fn of(v: f32) -> Self {
-        cuda_device::convert::f32_to_bf16_rne(v)
-    }
-}
-
 /// A product block's shared weight, activation and scale stages and its
 /// column words ([`TileColumns`]), as raw pointers.
 macro_rules! product_stages {
@@ -1829,6 +1810,88 @@ mod native {
         #[grid_constant] w_map: &TmaDescriptor,
         #[grid_constant] x_map: &TmaDescriptor,
     ) {
+        // SAFETY: the launch contract's threads, shared bytes and spans, and
+        // the maps of qs and xq.
+        unsafe {
+            mxfp8_w8a8_body(
+                (qs, e),
+                (x, xq, xe, refused),
+                (rows, k, n),
+                &mut y,
+                (w_map, x_map),
+            )
+        };
+    }
+
+    /// [`mxfp8_w8a8_gemm`]'s products as BF16, each value its F32 one
+    /// rounded to nearest even ([`ProductCell`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        dynamic_shared = 49200,
+        requires = (
+            rows >= 1,
+            n >= 1,
+            4 * qs.len() >= rows * k,
+            128 * e.len() >= rows * k,
+            x.len() >= n * k,
+            4 * xq.len() >= n * k,
+            128 * xe.len() >= n * k,
+            refused.len() >= n,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn mxfp8_w8a8_gemm_bf16(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        xq: &[u32],
+        xe: &[u32],
+        refused: &[u32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        mut y: DisjointSlice<u16>,
+        #[grid_constant] w_map: &TmaDescriptor,
+        #[grid_constant] x_map: &TmaDescriptor,
+    ) {
+        // SAFETY: 256 converged threads and the contract's dynamic shared
+        // bytes and spans; the maps encode the live qs and xq buffers.
+        unsafe {
+            mxfp8_w8a8_body(
+                (qs, e),
+                (x, xq, xe, refused),
+                (rows, k, n),
+                &mut y,
+                (w_map, x_map),
+            )
+        };
+    }
+
+    /// The two W8A8 product entries' tile and store, each value
+    /// [`ProductCell::of`] its F32 sum.
+    ///
+    /// # Safety
+    /// 256 converged threads, `TMA_SHARED_BYTES` dynamic shared bytes and
+    /// `ceil(rows / MMA_ROWS) * ceil(n / MMA_COLS)` blocks; `rows >= 128`, `n >= 1`.
+    /// The weight spans hold `rows*k` codes and `rows*k/128` scales; the
+    /// activation spans hold `n*k` exact values and codes, `n*k/128` scales
+    /// and `n` refusal flags. `y` holds `rows*n` writable cells. The maps
+    /// encode the live `qs` and `xq` buffers.
+    #[inline(always)]
+    unsafe fn mxfp8_w8a8_body(
+        (qs, e): (&[u32], &[u32]),
+        (x, xq, xe, refused): (&[f32], &[u32], &[u32], &[u32]),
+        (rows, k, n): (u32, u32, u32),
+        y: &mut DisjointSlice<impl ProductCell>,
+        (w_map, x_map): (&TmaDescriptor, &TmaDescriptor),
+    ) {
         // The stages, 1024-byte aligned for the boxes' swizzle, then the
         // stage barriers ([`TMA_SHARED_BYTES`]).
         let (sh, bars) = (
@@ -1844,7 +1907,7 @@ mod native {
             e: xe,
         };
         let w = Mxfp8Rows { qs, e };
-        // SAFETY: the checked launch supplies 256 converged threads, the grid,
+        // SAFETY: the caller's launch supplies 256 converged threads, the grid,
         // K a multiple of 128, the spans in the contract and the maps of qs
         // and xq; sh and bars are this block's.
         let Some(tile) =
@@ -1853,7 +1916,7 @@ mod native {
             return;
         };
         // SAFETY: the tile's operands, spans and staging allocation.
-        unsafe { mma_tile_store(tile, w, cols, (rows, k, n), &mut y, sh) };
+        unsafe { mma_tile_store(tile, w, cols, (rows, k, n), y, sh) };
     }
 
     /// [`mxfp8_w8a8_gemm`] as a gate projection with the shared sigmoid norm
@@ -2103,13 +2166,6 @@ pub(super) struct ProductArgs<'a> {
     pub(super) max_tiles: u32,
     pub(super) slot_div: u32,
     pub(super) y: ProductOut<'a>,
-}
-
-/// Where [`Kernels::product`] stores: F32 ([`native::gemm_nvfp4_mma`]) or
-/// BF16 ([`native::gemm_nvfp4_mma_bf16`]) cells, slot-major.
-pub(super) enum ProductOut<'a> {
-    F32(&'a mut DeviceBuffer<f32>),
-    Bf16(&'a mut DeviceBuffer<u16>),
 }
 
 impl Kernels {
@@ -2408,22 +2464,33 @@ impl Kernels {
         x: &DeviceBuffer<f32>,
         form: &ColsForm,
         t: &TileLaunch,
-        y: &mut DeviceBuffer<f32>,
+        y: ProductOut<'_>,
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_mxfp8_w8a8";
         let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, TMA_SHARED_BYTES);
-        let prep = self.module.prepare_mxfp8_w8a8_gemm(cfg)?;
-        let (qs, e) = (w.qs.buf(), w.e.buf());
+        let (m, qs, e) = (&self.module, w.qs.buf(), w.e.buf());
         let (xq, xe, refused) = (&form.words, &form.scales, &form.refused);
-        let w_map = mxfp8_tma_map(what, qs, t.k, t.rows)?;
-        let x_map = mxfp8_tma_map(what, xq, t.k, t.n)?;
+        let (rows, k, n) = (t.rows, t.k, t.n);
+        let w_map = mxfp8_tma_map(what, qs, k, rows)?;
+        let x_map = mxfp8_tma_map(what, xq, k, n)?;
         // SAFETY: the maps encode qs and xq, live and unmoved for the launch
         // as every buffer it takes; a captured launch keeps them as it keeps
         // their addresses.
         unsafe {
-            self.module.mxfp8_w8a8_gemm(
-                stream, &prep, qs, e, x, xq, xe, refused, t.rows, t.k, t.n, y, w_map, x_map,
-            )?;
+            match y {
+                ProductOut::F32(y) => {
+                    let prep = m.prepare_mxfp8_w8a8_gemm(cfg)?;
+                    m.mxfp8_w8a8_gemm(
+                        stream, &prep, qs, e, x, xq, xe, refused, rows, k, n, y, w_map, x_map,
+                    )?;
+                }
+                ProductOut::Bf16(y) => {
+                    let prep = m.prepare_mxfp8_w8a8_gemm_bf16(cfg)?;
+                    m.mxfp8_w8a8_gemm_bf16(
+                        stream, &prep, qs, e, x, xq, xe, refused, rows, k, n, y, w_map, x_map,
+                    )?;
+                }
+            }
         }
         Ok(())
     }

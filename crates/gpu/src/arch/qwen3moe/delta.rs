@@ -46,7 +46,7 @@ use super::scratch::{Arena, Io, LaneRun, RecStore};
 use super::wide::{self, GEMV_COLS};
 use crate::GpuError;
 use crate::linear;
-use crate::linear::conv::ConvArgs;
+use crate::linear::conv::{ConvArgs, ConvRows};
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
 use crate::model::lookup::{f32_gain, kq_weight};
@@ -141,7 +141,7 @@ pub(super) fn delta_core(
     lin.conv.enqueue_conv_prep(
         stream,
         ConvArgs {
-            x: &g.x,
+            x: ConvRows::F32(&g.x),
             b_raw: &g.b,
             a_raw: &g.a,
             w: f32_gain(w, &d.conv)?,
