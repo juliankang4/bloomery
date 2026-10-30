@@ -101,8 +101,9 @@
 //! the MTP draft's store) keep the slot context's addresses but hold on the
 //! card only the pages the rows its sequence reached lie on; a reset gives
 //! back those the ended sequence left. After a call that moved them, a
-//! `kv room` line names the slot, its positions, the mapped bytes and the
-//! bytes the plan counts the stores at.
+//! `kv room` line names the slot, its positions, the mapped bytes, those of
+//! them another slot maps too (a shared prefix, below) and the bytes the plan
+//! counts the stores at.
 //! `--plan` prints the records the decisions before the load make (the `ctx`
 //! line, the `plan` and `residency` records) and exits 0 before the route
 //! trace's directory is made or any model is loaded.
@@ -122,6 +123,18 @@
 //! prompt keeps it; each run is the ubatch walk, whose bits do not depend on
 //! where a call is cut. Every prefix a request keeps less of than it shares is
 //! a `cache reuse` record with the rule.
+//!
+//! Under `--parallel N` a request may take its prefix from another slot's
+//! sequence on the card when that keeps more than its own slot and every
+//! cached state (`GpuModel::seq_share_prefix`): the nearest checkpoint of the
+//! other sequence at or below the shared prefix, where under the MTP draft
+//! the draft rejoins. The slot's selecting stores, and the draft's store,
+//! map the other slot's pages that hold the prefix's whole rows alone and
+//! copy the page where it ends; the recurrent stores come from the other
+//! slot's point. Neither slot writes a page the two map: a write below the
+//! point first gives the pages it reaches memory of their own, and a reset
+//! gives the shared pages back. A `cache share` line names the other slot,
+//! the prefix kept and the bytes mapped and copied.
 //!
 //! The prompt cache (llama-server's `--cache-ram`, in MiB; 0 turns it off)
 //! holds the slot's sequence state when a request of another session takes
@@ -450,6 +463,7 @@ use runtime::width::Mode as WidthMode;
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
     CacheNote, DraftProps, Drafted, EngineProps, Pending, ResidencyReset, Saved, ServeError,
+    SharedPrefix,
 };
 use tokenizer::Tokenizer;
 
@@ -2510,9 +2524,10 @@ struct Q38 {
     /// ([`Q38::before_call_at`]) if the draft is still off then, so a request the
     /// server resets after the load (its keep below the break-even) prints none.
     cut_line: Vec<Option<(u32, String)>>,
-    /// The bytes each slot's stores by position held on the card at its
-    /// last `kv room` line ([`Q38::print_room`]).
-    room: Vec<usize>,
+    /// The bytes each slot's stores by position held on the card, and of
+    /// them those another slot maps too, at its last `kv room` line
+    /// ([`Q38::print_room`]).
+    room: Vec<(usize, usize)>,
     /// The copy stream and the pinned staging the prompt cache's saves are
     /// made on ([`Seat::snapshots_async`]); none with the cache off.
     lane: Option<SaveLane>,
@@ -2792,7 +2807,7 @@ impl Q38 {
             census,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
             cut_line: vec![None; a.slots],
-            room: vec![0; a.slots],
+            room: vec![(0, 0); a.slots],
             lane,
             #[cfg(feature = "vision")]
             vision,
@@ -2971,20 +2986,25 @@ impl Q38 {
     /// position hold on the card moved since its last one: the selecting
     /// stores' and the draft store's pages get memory as a call reaches
     /// them, and a reset gives back those the ended sequence left
-    /// (`Body38::store_room`). The line names the slot, its positions, the
-    /// bytes its pages hold and their unrounded layout bytes. The machine
-    /// reserves page rounding separately before admission.
+    /// (`Body38::store_room`), and a slot that took another's prefix maps
+    /// that slot's pages until either writes below it or resets
+    /// (`Body38::store_shared`). The line names the slot, its positions, the
+    /// bytes its pages hold, those of them another slot maps too, and their
+    /// unrounded layout bytes. The machine reserves page rounding separately
+    /// before admission.
     fn print_room(&mut self) -> Result<(), GateError> {
         let slot = self.s.selected();
-        let (mapped, layout) = self.s.model().body("bloomery-serve-qwen38")?.store_room();
-        if self.room[slot] != mapped {
+        let body = self.s.model().body("bloomery-serve-qwen38")?;
+        let ((mapped, layout), shared) = (body.store_room(), body.store_shared());
+        if self.room[slot] != (mapped, shared) {
             Record::new(&record::KV_ROOM)
                 .u("slot", slot)
                 .u("positions", self.s.pos())
                 .u("mapped_bytes", mapped)
+                .u("shared_bytes", shared)
                 .u("layout_bytes", layout)
                 .eprint();
-            self.room[slot] = mapped;
+            self.room[slot] = (mapped, shared);
         }
         Ok(())
     }
@@ -3518,6 +3538,46 @@ impl Seat for Q38 {
             }
         }
         Ok(at)
+    }
+
+    /// The body's share rule (`GpuModel::seq_share_point`): the nearest
+    /// point of slot `from`'s sequence at or below `n` the selected slot can
+    /// stand at, where under the MTP draft the draft rejoins.
+    fn share_keep(&self, from: usize, n: usize) -> usize {
+        let n = u32::try_from(n).unwrap_or(u32::MAX);
+        self.s.model().seq_share_point(from, n) as usize
+    }
+
+    /// Slot `from`'s prefix onto the selected slot after the session's reset
+    /// of it and its draft (`GpuModel::seq_share_prefix`): the selecting
+    /// stores' rows and the draft's store rows held on slot `from`'s pages,
+    /// the recurrent stores from its point. Under the MTP draft the slot's
+    /// draft rejoins at the point ([`SlotDrafts::rejoin`]), which the share
+    /// rule grants only where the body keeps the draft's side there; a share
+    /// that kept none is refused by name.
+    fn share_prefix(&mut self, from: usize, n: usize) -> Result<SharedPrefix, GateError> {
+        let n = u32::try_from(n).unwrap_or(u32::MAX);
+        self.reset_selected()?;
+        let (at, moved) = self.s.model_mut().seq_share_prefix(from, n)?;
+        let sel = self.s.selected();
+        if self.drafts.mtp() {
+            if !self.rejoins(sel, at as usize)? {
+                return Err(GpuError::shape(
+                    "qwen38::share_prefix",
+                    format!(
+                        "slot {sel}: the share of slot {from}'s first {at} positions kept no side \
+                         of the MTP draft"
+                    ),
+                )
+                .into());
+            }
+            self.drafts.rejoin(sel, at)?;
+        }
+        Ok(SharedPrefix {
+            positions: at as usize,
+            mapped_bytes: moved.mapped as u64,
+            copied_bytes: moved.copied as u64,
+        })
     }
 
     /// A prefix kept less of than shared is a `cache reuse` record; every

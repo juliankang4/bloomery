@@ -444,6 +444,11 @@ pub(super) trait ParkedSeq<B: ChainBody>: Send {
     fn seq(&mut self) -> &mut B::Seq
     where
         B: Slots;
+
+    /// [`ParkedSeq::seq`], read only.
+    fn seq_ref(&self) -> &B::Seq
+    where
+        B: Slots;
 }
 
 impl<B: Slots> ParkedSeq<B> for B::Seq {
@@ -452,6 +457,10 @@ impl<B: Slots> ParkedSeq<B> for B::Seq {
     }
 
     fn seq(&mut self) -> &mut B::Seq {
+        self
+    }
+
+    fn seq_ref(&self) -> &B::Seq {
         self
     }
 }
@@ -586,6 +595,57 @@ where
         } else {
             Some(slot - 1)
         }
+    }
+
+    /// Slot `slot`'s sequence while it is parked: `None` for the selected
+    /// slot and for a slot out of range.
+    pub(crate) fn parked_ref(&self, slot: usize) -> Option<&B::Seq> {
+        if slot >= self.slots() {
+            return None;
+        }
+        let p = self.parked.get(self.parked_home(slot)?)?;
+        // Called by name, as `swap_parked` calls `exchange`.
+        Some(ParkedSeq::<B>::seq_ref(p.seq.as_ref()))
+    }
+
+    /// `f` on the body with slot `from`'s parked sequence beside it, read
+    /// only: a call that builds the selected slot's sequence from another
+    /// slot's. The selected slot then stands at the position `f` returns
+    /// with its value; a fault `f` returns, or the word holds behind its
+    /// error, poisons the selected slot ([`GpuModel::note_fault`]). Refused
+    /// by name, `f` not run: a poisoned model, a pass of several slots
+    /// waiting for its commit, and `from` the selected slot or out of range.
+    pub(crate) fn beside<R>(
+        &mut self,
+        from: usize,
+        what: &'static str,
+        f: impl FnOnce(&Gpu, &mut B, &B::Seq) -> Result<(u32, R), GpuError>,
+    ) -> Result<(u32, R), GpuError> {
+        self.refuse_if_poisoned(what)?;
+        self.refuse_if_slots_wait(what)?;
+        let home = (from < self.slots())
+            .then(|| self.parked_home(from))
+            .flatten()
+            .ok_or_else(|| {
+                GpuError::shape(
+                    what,
+                    format!(
+                        "slot {from} beside slot {} of a model that serves 0..{}",
+                        self.selected,
+                        self.slots()
+                    ),
+                )
+            })?;
+        self.one_pass = None;
+        self.slot_rows = None;
+        let GpuModel {
+            parked, body, gpu, ..
+        } = self;
+        let p = parked.get(home).ok_or_else(|| no_home(from, what))?;
+        let r = f(gpu, body.as_mut(), ParkedSeq::<B>::seq_ref(p.seq.as_ref()));
+        let (pos, out) = self.note_fault(what, r)?;
+        self.stand_at(pos);
+        Ok((pos, out))
     }
 
     /// The cache row slot `slot`'s next token lands in, wherever its state

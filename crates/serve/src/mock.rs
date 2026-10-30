@@ -20,7 +20,8 @@
 //! of `ctx_max` positions, so a slot's ids are what it would give alone; its
 //! steps of several slots are [`Engine::step_slots`]'s default.
 //! [`MockEngine::with_cache_ram`] gives the server a prompt cache of the
-//! mock's states, and [`MockEngine::with_prompt_quantum`] lets the server
+//! mock's states, [`MockEngine::with_shares`] lets a slot take another's
+//! prefix, and [`MockEngine::with_prompt_quantum`] lets the server
 //! interleave its prompts with the other slots' decode rounds.
 //!
 //! [`MockEngine::with_media`] takes images: [`MediaTokenizer`]'s vocabulary
@@ -57,8 +58,8 @@ use vision::{GridPlan, MediaModel, Patches, Prepared, Rgb8, VisionError};
 
 use crate::engine::{
     Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, Flight, Landed, Pending,
-    ResidencyReset, Sampler, Saved, SavedState, SlotPass, StateError, Tokenizer, resume_bytes,
-    snapshot_bytes,
+    ResidencyReset, Sampler, Saved, SavedState, SharedPrefix, SlotPass, StateError, Tokenizer,
+    resume_bytes, snapshot_bytes,
 };
 use crate::media::{MediaFeed, MediaSpan, SharedMediaModel};
 use crate::slotfile;
@@ -111,6 +112,8 @@ pub struct MockEngine {
     /// Its saves, when it copies its states off the request path and puts a
     /// prefix back ([`MockEngine::with_async_snapshots`]).
     saves: Option<AsyncSaves>,
+    /// Whether a slot takes another slot's prefix ([`MockEngine::with_shares`]).
+    shares: bool,
 }
 
 /// The mock's copy stream: how long a copy takes, what the engine saw, and
@@ -260,6 +263,7 @@ impl MockEngine {
             prompt_quantum: None,
             media: None,
             saves: None,
+            shares: false,
         }
     }
 
@@ -297,6 +301,17 @@ impl MockEngine {
         );
         MockEngine {
             parked: vec![Vec::new(); n],
+            ..self
+        }
+    }
+
+    /// The same mock putting any prefix another slot holds on the selected
+    /// slot ([`Engine::share_prefix`]): the ids copied, four bytes an id
+    /// counted as mapped.
+    #[must_use]
+    pub fn with_shares(self) -> Self {
+        MockEngine {
+            shares: true,
             ..self
         }
     }
@@ -667,6 +682,30 @@ impl Engine for MockEngine {
             self.cur = slot;
         }
         Ok(())
+    }
+
+    fn share_keepable(&self, from: usize, n: usize) -> usize {
+        match self.parked.get(from) {
+            Some(held) if self.shares && from != self.cur => n.min(held.len()),
+            _ => 0,
+        }
+    }
+
+    fn share_prefix(&mut self, from: usize, n: usize) -> Result<SharedPrefix, StateError> {
+        let kept = self.share_keepable(from, n);
+        if kept == 0 {
+            return Err(StateError::Format(format!(
+                "mock: no prefix of slot {from} to share onto slot {}",
+                self.cur
+            )));
+        }
+        self.rewrites();
+        self.ctx = self.parked[from][..kept].to_vec();
+        Ok(SharedPrefix {
+            positions: kept,
+            mapped_bytes: 4 * kept as u64,
+            copied_bytes: 0,
+        })
     }
 
     fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, EngineError> {

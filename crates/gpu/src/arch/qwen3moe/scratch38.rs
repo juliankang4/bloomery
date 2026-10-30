@@ -14,6 +14,7 @@
 //! ([`store_rule_bytes`]).
 
 use super::body::KvQ8;
+use super::body38::WHAT_SHARE;
 use super::plan38::{GDN, Layer38, geo};
 use super::router::{RouterDims, RouterOut};
 use super::scratch::{
@@ -25,7 +26,7 @@ use crate::hc_gated::HcScratch;
 use crate::linear::{self, LinearShape};
 use crate::ple;
 use crate::qsa::{self, QsaScratch};
-use crate::room::{Room, Roomed, Run};
+use crate::room::{Room, Roomed, Run, SharedPages};
 use crate::site::ByName;
 use crate::tensor::WindowMut;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -192,6 +193,51 @@ impl Store38 {
     /// ([`Room::fit`]). Never inside a capture.
     pub(super) fn fit(&mut self, positions: usize) -> Result<(), GpuError> {
         self.rooms().try_for_each(|r| r.fit(positions))
+    }
+
+    /// A selecting store's pages a write from position `pos` on reaches given
+    /// memory no other sequence's store maps ([`Room::own_from`]): every
+    /// writer's first step after its fit. Never inside a capture.
+    pub(super) fn own_from(&mut self, pos: usize) -> Result<(), GpuError> {
+        self.rooms().try_for_each(|r| r.own_from(pos))
+    }
+
+    /// A selecting store's rows of the first `positions` positions taken
+    /// from `from`, the same layer's store of another sequence
+    /// ([`Roomed::share`]): its K/V planes' and its pooled keys' pages
+    /// below the prefix mapped, the page where it ends copied. Its raw key
+    /// ring is a checkpoint store, put back with the recurrent ones. Nothing
+    /// for a delta store. Refused by name for stores of two kinds, and as
+    /// [`Roomed::share`] refuses. Never inside a capture.
+    pub(super) fn share(
+        &mut self,
+        from: &Store38,
+        positions: usize,
+    ) -> Result<SharedPages, GpuError> {
+        match (self, from) {
+            (Store38::Rec { .. }, Store38::Rec { .. }) => Ok(SharedPages::default()),
+            (
+                Store38::Qsa { kv, pooled, .. },
+                Store38::Qsa {
+                    kv: kv_from,
+                    pooled: pooled_from,
+                    ..
+                },
+            ) => Ok(kv.share(kv_from, positions)? + pooled.share(pooled_from, positions)?),
+            _ => Err(GpuError::shape(
+                WHAT_SHARE,
+                "a store's share from another kind of store",
+            )),
+        }
+    }
+
+    /// Device bytes of a selecting store's pages another sequence's store
+    /// maps too; none for a delta store.
+    pub(super) fn shared(&self) -> usize {
+        match self {
+            Store38::Rec { .. } => 0,
+            Store38::Qsa { kv, pooled, .. } => kv.shared() + pooled.shared(),
+        }
     }
 
     /// Every row of a selecting store backed: what a read or write of its

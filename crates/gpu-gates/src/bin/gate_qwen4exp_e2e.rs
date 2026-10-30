@@ -282,7 +282,17 @@
 //!   body's own: a third `add_slots` past the plan is refused by name; a
 //!   select with a verify waiting for its commit is refused by name, moving
 //!   nothing; and a rollback of slot 1 (a verify's commit) leaves slot 0's
-//!   continuation its solo run's.
+//!   continuation its solo run's. A prefix shared between slots
+//!   (`GpuModel::seq_share_prefix`), on a load of three slots at a context
+//!   whose K/V rows lie on whole pages: slot 1 takes slot 0's point at 8,192,
+//!   the rows below it mapped onto slot 0's pages (derived bytes); slot 0 is
+//!   cut back to 4,096 and writes other ids on the shared pages, which first
+//!   take memory of their own; slot 1's rest call and steps are slot 0's
+//!   before the cut bit for bit, every live row of every store with them;
+//!   slot 2 has no share point while its verify waits for its commit, and
+//!   while slot 1's waits a share onto slot 0 is refused by name, slot 0
+//!   standing as it stood and the pass still committing; a share onto its
+//!   own slot and one below every point are refused by name.
 //! - (z) the PLE table on the NVMe tier: the host plan made with the host's
 //!   room given ([`PlanInputs::room`]) as the host arm's need less one byte,
 //!   so the placement leaves the table on the NVMe tier with its row room
@@ -820,12 +830,24 @@ mod gate {
         room: Option<u64>,
         kv: KvQ8,
     ) -> Result<Opened38, GateError> {
+        open_ctx(experts, slots, CTX, ub, room, kv)
+    }
+
+    /// [`open_at`] at a slot context of `ctx` rows.
+    fn open_ctx(
+        experts: Experts,
+        slots: usize,
+        ctx: usize,
+        ub: usize,
+        room: Option<u64>,
+        kv: KvQ8,
+    ) -> Result<Opened38, GateError> {
         let file = open_split()?;
         let t = Instant::now();
         let card = card()?;
         let planned = Open38 {
             card,
-            ctx: CTX,
+            ctx,
             ub,
             experts,
             slots,
@@ -860,7 +882,7 @@ mod gate {
             .2
             .set_split_walk(SplitWalk::Off)?;
         println!(
-            "load resident_bytes={} ctx={CTX} layers={} in {:.1} s (runtime value)",
+            "load resident_bytes={} ctx={ctx} layers={} in {:.1} s (runtime value)",
             o.model.resident_bytes(),
             o.model.layers().len(),
             t.elapsed().as_secs_f64()
@@ -4887,6 +4909,155 @@ mod gate {
         Ok(past && pending_ok && iso_ok && harness_ok)
     }
 
+    /// The slot context of (y)'s share clause: whole pages of K/V rows below
+    /// [`SHARE_AT`] ([`slots_share`]).
+    const SHARE_CTX: usize = 12_288;
+    /// (y)'s share point: the end of slot 0's second prompt call.
+    const SHARE_AT: usize = 8_192;
+    /// The point slot 0 is cut back to after the share: the end of its first
+    /// prompt call, inside the shared pages.
+    const SHARE_CUT: usize = 4_096;
+
+    /// (y) a prefix shared between slots (module doc), on a load of three
+    /// slots at [`SHARE_CTX`] with checkpoints on. Slot 0 prompts `ids` in
+    /// calls ending at [`SHARE_CUT`], [`SHARE_AT`] and [`KP_REST`] past it,
+    /// its stores read and [`KP_STEPS`] steps taken; slot 1 takes slot 0's
+    /// first `SHARE_AT + 3` asked (`GpuModel::seq_share_prefix`) and stands
+    /// at the point, which the share returns and the share point named. A
+    /// K/V plane's head holds `SHARE_CTX` rows of `HEAD` f16 values on whole
+    /// pages, so its rows below the point lie on whole pages mapped, none
+    /// copied; the pooled keys map their whole pages below the point and
+    /// copy the one where its rows end (derived from the card's page, every
+    /// selecting layer). Slot 0 is then cut back to [`SHARE_CUT`] and
+    /// prompts other ids there, writing rows on the shared pages from it on,
+    /// which first take memory of their own (`Store38::own_from`): half the
+    /// shared pages are slot 1's alone after. Slot 1's rest call leaves every
+    /// live row of every store slot 0's before the cut and its steps are
+    /// slot 0's ids and logits bit for bit: the cut slot's writes never
+    /// reached them. Slot 2 then prompts `ids` to [`SHARE_CUT`] and a pass of
+    /// its verify rows waits for its commit: slot 2 has no share point while
+    /// it waits and the one at the cut once its commit keeps a row. With a
+    /// verify of slot 1's rows waiting, a share of slot 2's point onto slot
+    /// 0 (the slot a verify leaves selected) is refused by name before the
+    /// reset, slot 0 standing as it stood and the pass still committing. A
+    /// share onto the slot it comes from, and one asked below every point,
+    /// are refused by name.
+    fn slots_share(experts: Experts, src: &[u32]) -> Result<bool, GateError> {
+        let n = SHARE_AT + KP_REST;
+        let ids: Vec<u32> = src.iter().copied().cycle().take(n + 1 + KP_REST).collect();
+        let other: Vec<u32> = ids[n + 1..].to_vec();
+        let last = ids[n];
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(SHARE_CTX)?;
+        let mut m = open_ctx(experts, 3, SHARE_CTX, ub, None, KvQ8::F16)?.model;
+        let (at, ask) = (u32::try_from(SHARE_AT)?, u32::try_from(SHARE_AT + 3)?);
+        let cut = u32::try_from(SHARE_CUT)?;
+        m.body_parts("(y) share")?.2.set_checkpoints(true);
+        m.add_slots(3)?;
+        m.select_slot(0)?;
+        for call in [0..SHARE_CUT, SHARE_CUT..SHARE_AT, SHARE_AT..n] {
+            m.prompt38(&ids[call], Prompt38::Pass)?;
+        }
+        let solo_stores = kp_stores(&mut m)?;
+        let solo = kp_steps(&mut m, last)?;
+        m.select_slot(1)?;
+        let point = m.seq_share_point(0, ask);
+        let (put, moved) = m.seq_share_prefix(0, ask)?;
+        let (pos, shared) = (m.pos(), m.body("(y) share")?.store_shared());
+        m.select_slot(0)?;
+        m.rollback(cut)?;
+        m.prompt38(&other, Prompt38::Pass)?;
+        m.select_slot(1)?;
+        let kept = m.body("(y) share")?.store_shared();
+        m.prompt38(&ids[SHARE_AT..n], Prompt38::Pass)?;
+        let (layers, ple) = live_diff(&kp_stores(&mut m)?, &solo_stores, n);
+        let after = kp_steps(&mut m, last)?;
+        // A verify leaves slot 0 selected and holds every select until its
+        // commit (`GpuModel::verify_slots`).
+        m.select_slot(2)?;
+        m.prompt38(&ids[..SHARE_CUT], Prompt38::Pass)?;
+        m.verify_slots(&[(2, &ids[SHARE_CUT..SHARE_CUT + 2])])?;
+        let waiting_point = m.seq_share_point(2, cut);
+        m.commit_slots(&[1])?;
+        let committed_point = m.seq_share_point(2, cut);
+        let point_ok = waiting_point == 0 && committed_point == cut;
+        println!(
+            "slots share point while a verify waits: slot 2's {waiting_point} with its verify \
+             waiting, {committed_point} once committed (want 0 and {cut}) {}",
+            verdict(point_ok)
+        );
+        let stood = (m.pos(), m.body("(y) share")?.store_shared());
+        m.verify_slots(&[(1, &other[..2])])?;
+        let waits = m.seq_share_prefix(2, cut).err().map(|e| e.to_string());
+        let now = (m.pos(), m.body("(y) share")?.store_shared());
+        let committed = m.commit_slots(&[1]).map_err(|e| e.to_string());
+        let waits_named = waits
+            .as_deref()
+            .is_some_and(|e| e.contains("waits for its commit"));
+        let wait_ok = waits_named && now == stood && committed.is_ok();
+        println!(
+            "slots share while a pass waits: slot 1's verify waiting, a share of slot 2's point \
+             onto slot 0 refused by name {waits_named} ({waits:?}), slot 0 at (position, shared \
+             bytes) {now:?} (want {stood:?}), the pass committed {committed:?} {}",
+            verdict(wait_ok)
+        );
+        m.select_slot(1)?;
+        let below = m.seq_share_prefix(0, cut - 1).err().map(|e| e.to_string());
+        m.select_slot(0)?;
+        let onto_itself = m.seq_share_prefix(0, ask).err().map(|e| e.to_string());
+        // Whole pages of a head's rows: a plane's head run, the point and the
+        // cut all end on a page boundary, so a head's rows below the point
+        // are mapped page by page. The pooled keys (a row of IDX_DIM f16
+        // values every POOL positions) map their whole pages below the point,
+        // and the page where the point's rows end, if any, is copied.
+        let page = m.gpu().allocation_granularity()?;
+        let head_row = HEAD * size_of::<u16>();
+        let whole = [SHARE_CTX, SHARE_AT, SHARE_CUT]
+            .iter()
+            .all(|&rows| (rows * head_row).is_multiple_of(page));
+        let pooled_row = IDX_DIM * size_of::<u16>();
+        let pooled_at = SHARE_AT / POOL * pooled_row;
+        let pooled_cut = SHARE_CUT / POOL * pooled_row;
+        let mapped = n_qsa() * (2 * N_KV * SHARE_AT * head_row + pooled_at / page * page);
+        let copied = n_qsa() * usize::from(!pooled_at.is_multiple_of(page)) * page;
+        // The cut writes from SHARE_CUT on: in every head, and in the pooled
+        // keys, the shared pages from it to the point become slot 0's own.
+        let kept_want = n_qsa() * (2 * N_KV * SHARE_CUT * head_row + pooled_cut / page * page);
+        let named = |e: &Option<String>| e.as_deref().is_some_and(|e| e.contains("holds no point"));
+        let ok = point_ok
+            && wait_ok
+            && whole
+            && point == at
+            && put == at
+            && pos == at
+            && moved.mapped == mapped
+            && moved.copied == copied
+            && shared == mapped
+            && kept == kept_want
+            && layers.is_empty()
+            && !ple
+            && after == solo
+            && named(&onto_itself)
+            && named(&below);
+        println!(
+            "slots share: slot 1 took slot 0's first {put} of {ask} asked (share point {point}), \
+             standing at {pos}, {} B mapped and {} B copied (derived {mapped} and {copied}, whole \
+             pages {whole}), {shared} B shared; slot 0 cut back to {SHARE_CUT} and prompted other \
+             ids, leaving {kept} B shared (derived {kept_want}); after the rest slot 1's stores \
+             differ from slot 0's before the cut at {layers:?} (PLE ring {ple}), its steps {:?} \
+             slot 0's {:?} {}; a share onto the slot it comes from refused by name {}, one below \
+             every point {} {}",
+            moved.mapped,
+            moved.copied,
+            after.0,
+            solo.0,
+            after == solo,
+            named(&onto_itself),
+            named(&below),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// The (z) arms' ubatch: D3K's 3,001-position prefill runs as one call of
     /// three ubatches (1,024, 1,024, 953), so the NVMe arm's first ubatch
     /// reads its own rows and the two after it are read ahead.
@@ -5923,6 +6094,7 @@ mod gate {
         tier::sc("(y) resident slots: the plan's bytes and the harness's contracts")?;
         ok &= slots_plan(Experts::Host)?;
         ok &= slots_two(Experts::Host)?;
+        ok &= slots_share(Experts::Host, &prefill_of(D3K)?)?;
         tier::sc("(k) the card leg: structure, places rule, vs the host plan, rows, ubatch walk")?;
         ok &= card_leg(&toks, &eager, &man)?;
         ok &= card_whole(&toks)?;

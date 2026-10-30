@@ -55,6 +55,13 @@
 //! every prefix the engine keeps less of than a request shares, reaches the
 //! engine's binary as a [`CacheNote`] ([`Engine::note`]).
 //!
+//! An engine whose slots can hold one prefix in common on the device
+//! ([`Engine::share_keepable`]) gives a request the longest prefix another
+//! slot holds when it keeps more than the request's own slot and every
+//! cached state ([`Engine::share_prefix`]): the slot takes those positions
+//! from the other slot's cache instead of evaluating them, and the other
+//! slot keeps serving its own request.
+//!
 //! An engine that copies a state on a stream of its own
 //! ([`Engine::snapshots_async`]) is asked for it when a request ends, off the
 //! request path ([`Engine::snapshot_begin`]): the state goes into the cache at
@@ -557,6 +564,26 @@ pub trait Engine: Send {
         self.resume(state)?;
         Ok(state.n_tokens())
     }
+    /// The most of the first `n` positions slot `from` holds that the
+    /// selected slot can take from it ([`Engine::share_prefix`]). The default
+    /// is 0: the engine shares nothing between its slots.
+    fn share_keepable(&self, from: usize, n: usize) -> usize {
+        let _ = (from, n);
+        0
+    }
+    /// Replaces the selected slot's cache with the first positions slot
+    /// `from` holds, at most `n` (a count [`Engine::share_keepable`]
+    /// granted), taken on the device from `from`'s cache: rows the two slots
+    /// then hold in common stay one copy until either writes below them.
+    /// `from` keeps its cache. Returns the positions the selected slot holds
+    /// after, `n` or fewer, and the bytes it holds on `from`'s memory and
+    /// copied. A refusal leaves the selected slot in no defined state (the
+    /// server resets it). The default refuses with
+    /// [`StateError::Unsupported`].
+    fn share_prefix(&mut self, from: usize, n: usize) -> Result<SharedPrefix, StateError> {
+        let _ = (from, n);
+        Err(StateError::Unsupported("a prefix shared between slots"))
+    }
     /// Where to cut a prompt call of positions `first .. end` into calls so
     /// that the `marks` (ascending, each inside the call) a later request may
     /// be cut back to stay keepable: a subset of `marks`, ascending. The
@@ -797,6 +824,16 @@ impl Flight for Landed0 {
     }
 }
 
+/// What [`Engine::share_prefix`] put on the selected slot: the positions it
+/// holds, the device bytes of its cache that map the other slot's memory,
+/// and the bytes copied from it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SharedPrefix {
+    pub positions: usize,
+    pub mapped_bytes: u64,
+    pub copied_bytes: u64,
+}
+
 /// A snapshot whose copy may still run ([`Engine::snapshot_begin`]): the
 /// state it becomes, which the cache ranks and counts from the moment it is
 /// begun, and the copy's [`Flight`]. The state's bytes are read only after
@@ -970,6 +1007,20 @@ pub enum CacheNote {
         resumed: usize,
         waited_ms: f64,
     },
+    /// The slot took the first `kept` positions of slot `from`'s cache on
+    /// the device ([`Engine::share_prefix`]) in place of its own, which kept
+    /// `slot_kept` of the `common` ids the request shares with `from`: of
+    /// its cache, `mapped_bytes` map `from`'s memory and `copied_bytes`
+    /// were copied, in `ms`.
+    Share {
+        from: usize,
+        common: usize,
+        kept: usize,
+        slot_kept: usize,
+        mapped_bytes: u64,
+        copied_bytes: u64,
+        ms: f64,
+    },
     /// A cached state left the cache: the budget needed its bytes, or a newer
     /// state keeps everything it did.
     Evict {
@@ -1043,6 +1094,19 @@ impl std::fmt::Display for CacheNote {
                 "cache load positions={positions} common={common} kept={kept} \
                  slot_kept={slot_kept} bytes={bytes} ms={ms:.3} resumed={resumed} \
                  waited_ms={waited_ms:.3}"
+            ),
+            CacheNote::Share {
+                from,
+                common,
+                kept,
+                slot_kept,
+                mapped_bytes,
+                copied_bytes,
+                ms,
+            } => write!(
+                f,
+                "cache share from={from} common={common} kept={kept} slot_kept={slot_kept} \
+                 mapped_bytes={mapped_bytes} copied_bytes={copied_bytes} ms={ms:.3}"
             ),
             CacheNote::Evict {
                 positions,

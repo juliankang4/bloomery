@@ -131,7 +131,7 @@ use crate::q8f32::{
     Q8_0GemvIdsArgs, SelArgs,
 };
 use crate::q38::{EmbedArgs, EmbedRows, OutGateArgs, SLOTS, SharedAddArgs, W_PITCH};
-use crate::room::Roomed;
+use crate::room::{Roomed, SharedPages};
 use crate::site::{self, WideIn, WideKernels};
 use crate::tensor::{Q8Act, Window, WindowMut};
 use crate::weights::{DevWeight, Weights};
@@ -247,6 +247,13 @@ pub(super) struct DraftSeq38 {
     store: Roomed<KvPlanes>,
     last: Option<(usize, DraftHead)>,
     held: usize,
+}
+
+impl DraftSeq38 {
+    /// Positions of the sequence the store holds ([`Mtp38::held`]'s, parked).
+    pub(super) fn held(&self) -> usize {
+        self.held
+    }
 }
 
 impl Mtp38 {
@@ -561,6 +568,37 @@ impl Mtp38 {
     /// moves them ([`Room::fit`](crate::room::Room::fit)).
     pub(super) fn fit_store(&mut self, n: usize) -> Result<(), GpuError> {
         self.store.fit(n)
+    }
+
+    /// The store's rows of the first `n` positions taken from `from`,
+    /// another sequence's side of the draft ([`Roomed::share`]), the store
+    /// counted at `n` positions ([`Mtp38::adopt`]): its pages below them
+    /// mapped, the page where they end copied. Refused by name, nothing
+    /// counted, past the positions `from`'s store holds. Never inside a
+    /// capture.
+    pub(super) fn share_store(
+        &mut self,
+        from: &DraftSeq38,
+        n: usize,
+    ) -> Result<SharedPages, GpuError> {
+        if n > from.held {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a share of {n} positions from a store that holds {}",
+                    from.held
+                ),
+            ));
+        }
+        let moved = self.store.share(&from.store, n)?;
+        self.adopt(n)?;
+        Ok(moved)
+    }
+
+    /// Device bytes of the live sequence's store pages another sequence's
+    /// store maps too.
+    pub(super) fn store_shared(&self) -> usize {
+        self.store.shared()
     }
 
     /// The store counted at `n` positions, whose rows a sequence state's
@@ -1649,6 +1687,7 @@ impl Mtp38 {
         let (m, pos0) = (w.m, w.pos0);
         self.own_at = None;
         self.store.fit(pos0 as usize + m)?;
+        self.store.own_from(pos0 as usize)?;
         if mode == WalkMode::Store {
             let b = StoreBlock { at: 0, m, pos0 };
             self.stage_hidden(stream, &w, b)?;
@@ -1809,6 +1848,7 @@ impl Mtp38 {
             ));
         }
         self.store.fit(w.pos0 as usize + w.m)?;
+        self.store.own_from(w.pos0 as usize)?;
         let b = StoreBlock {
             at,
             m: w.m,

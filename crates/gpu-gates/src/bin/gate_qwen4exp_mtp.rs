@@ -2652,6 +2652,172 @@ mod gate {
         }
     }
 
+    /// A shared draft prefix stays bit-identical while its source rewrites rows
+    /// through each walk entry. A reset releases shared mappings before a put-back.
+    /// Mutants: omit either walk's own_from, or retain shared pages in Room::settle.
+    #[cfg(test)]
+    #[test]
+    #[ignore = "needs one NVIDIA card and the Qwen3.8 target and draft files"]
+    fn hw_mtp_shared_store() -> Result<(), GateError> {
+        assert!(init()?, "the model header witness");
+        let (file, draft) = (open_target()?, open_draft()?);
+        let inputs = PlanInputs::describe(&file)?;
+        let mtp = MtpInputs::read(
+            &draft,
+            &file,
+            &inputs,
+            HeadSet::List {
+                ids: (0..64).collect::<Vec<_>>().into(),
+                digest: vocab_sha256(&file)?,
+            },
+        )?;
+        let (cut, at, ctx) = (
+            CHECKPOINT_EVERY as usize,
+            2 * CHECKPOINT_EVERY as usize,
+            3 * CHECKPOINT_EVERY as u64,
+        );
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(ctx as usize)?;
+        let machine = machine(card()?, inputs.spec.layers.len(), ub as u64);
+        let plan = inputs.plan_mtp_with_slots(
+            &machine,
+            (ctx, ub as u64),
+            &plan_levers(mtp.card_bytes_of(ctx, 2)?)?,
+            &mtp,
+            Experts::Host,
+            2,
+        )?;
+        let mut m = Body38::open_placed_mtp_slots(
+            file,
+            &plan,
+            &inputs,
+            0,
+            cfg().host,
+            ub,
+            &draft,
+            &mtp,
+            2,
+        )?;
+        m.add_slots(2)?;
+        m.body_parts("draft share")?.2.set_checkpoints(true);
+        // The MTP store is [2][ctx][256] f16 per plane. Whole pages
+        // below both points must actually be shared on the card under test.
+        let page = m.gpu().allocation_granularity()?;
+        let row_bytes = 256 * size_of::<u16>();
+        assert!(
+            [cut, at, ctx as usize]
+                .iter()
+                .all(|n| (n * row_bytes).is_multiple_of(page)),
+            "draft share points and head runs must end on whole pages ({page} B)"
+        );
+        let ids: Vec<u32> = (0..=at).map(|i| 1 + (i % 31) as u32).collect();
+        m.prompt38(&ids[..at], Prompt38::Auto)?;
+        // A saved state's points are below its end. Keep the share point
+        // inside the state so a resume carries it into the source slot.
+        m.prompt38(&ids[at..], Prompt38::Auto)?;
+        overwrite_store(&mut m, &ids, ids.len(), 0)?;
+        let original_rows = store_of(&m, at)?;
+        let original = m.seq_save()?;
+        overwrite_store(&mut m, &ids, ids.len(), 1)?;
+        let replacement_rows = store_of(&m, ids.len())?;
+        let replacement = m.seq_save()?;
+        assert!(
+            original_rows.0 != replacement_rows.0[..at * 2 * 256],
+            "different keys for the put-back"
+        );
+        assert!(
+            original_rows.1 != replacement_rows.1[..at * 2 * 256],
+            "different values for the put-back"
+        );
+        let zeros = vec![0.0f32; WIDE];
+        for entry in ["eager", "graph", "store", "slots", "resume", "prefix"] {
+            m.select_slot(1)?;
+            m.reset()?;
+            m.select_slot(0)?;
+            m.seq_resume(&original)?;
+            m.select_slot(1)?;
+            let (put, moved) = m.seq_share_prefix(0, at as u32)?;
+            assert_eq!(put as usize, at, "{entry}: shared point");
+            assert!(
+                moved.mapped >= 4 * at * row_bytes,
+                "{entry}: draft pages mapped"
+            );
+            assert!(
+                store_of(&m, at)? == original_rows,
+                "{entry}: shared draft rows"
+            );
+            let shared = m.body("draft share")?.store_shared();
+            m.select_slot(0)?;
+            if entry == "resume" || entry == "prefix" {
+                m.reset()?;
+                assert_eq!(
+                    m.body("draft share reset")?.store_shared(),
+                    0,
+                    "{entry}: reset must release shared pages before the put-back"
+                );
+                let n = if entry == "prefix" { cut } else { ids.len() };
+                let put = if entry == "prefix" {
+                    m.seq_resume_prefix(&replacement, n as u32)?
+                } else {
+                    m.seq_resume(&replacement)?;
+                    m.pos()
+                };
+                assert_eq!(put as usize, n, "{entry}: restored point");
+                let restored = store_of(&m, n)?;
+                assert!(
+                    restored.0 == replacement_rows.0[..n * 2 * 256]
+                        && restored.1 == replacement_rows.1[..n * 2 * 256],
+                    "{entry}: restored draft rows"
+                );
+                assert_eq!(
+                    m.body("draft share put-back")?.store_shared(),
+                    0,
+                    "{entry}: restored pages are owned"
+                );
+            } else {
+                let tokens = [ids[cut] + 1];
+                let feed = Feed {
+                    tokens: &tokens,
+                    pos0: cut as u32,
+                    hidden: Hidden::Host(&zeros),
+                    media: None,
+                };
+                if entry == "slots" {
+                    m.mtp_store_slots(&[(0, feed)], DraftHead::Rows)?;
+                } else {
+                    let mode = match entry {
+                        "eager" => WalkMode::Eager,
+                        "graph" => WalkMode::Graph,
+                        _ => WalkMode::Store,
+                    };
+                    m.mtp_walk(DraftFeed::Rows(feed), DraftHead::Rows, mode)?;
+                }
+                let rewritten = store_of(&m, at)?;
+                assert!(
+                    rewritten.0 != original_rows.0,
+                    "{entry}: keys actually changed"
+                );
+                assert!(
+                    rewritten.1 != original_rows.1,
+                    "{entry}: values actually changed"
+                );
+                assert_eq!(
+                    shared - m.body("draft share COW")?.store_shared(),
+                    4 * (at - cut) * row_bytes,
+                    "{entry}: only the draft tail detached"
+                );
+            }
+            m.select_slot(1)?;
+            assert!(
+                store_of(&m, at)? == original_rows,
+                "{entry}: the other slot's shared K/V must stay bit-identical"
+            );
+            println!(
+                "draft share {entry}: {at} positions mapped, source rewritten, other slot K/V bit-identical PASS"
+            );
+        }
+        Ok(())
+    }
+
     /// The target position and the draft's committed store count travel together in a state.
     #[derive(Clone, Copy, PartialEq)]
     struct DraftEnd {
