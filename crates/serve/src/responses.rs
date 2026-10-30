@@ -182,8 +182,8 @@ use serde_json::{Map, Value, json};
 use super::response_store::Refusal;
 use super::{
     ApiError, ChatPlan, Client, State, body, chat_input, chat_plan, check_effort, engine_error,
-    error_body, finish_stream, gen_body, get_b, get_i, get_i_in, invalid, json_type, progress,
-    run_gen, run_whole, send_error, send_json, sse, tool_markup_error, unix_now,
+    error_body, finish_stream, gen_body, get_b, get_i, get_i_in, invalid, json_type, not_found,
+    progress, run_gen, run_whole, send_error, send_json, sse, tool_markup_error, unix_now,
 };
 use crate::dsml::{ChatParser, Message, ToolCall};
 use crate::genloop::{Event, GenError, Outcome, StopKind, Timings};
@@ -1239,9 +1239,7 @@ fn run_background(
 /// The id of a stored response's path: `/v1/responses/{id}` (or
 /// `/responses/{id}`), with `/cancel` after it for a cancel.
 pub(super) fn stored_id(path: &str) -> Option<&str> {
-    path.strip_prefix("/v1/responses/")
-        .or_else(|| path.strip_prefix("/responses/"))
-        .filter(|rest| !rest.is_empty())
+    crate::http::below(path, "responses")
 }
 
 /// `GET /v1/responses/{id}`: the stored response as it stands (a background
@@ -1251,14 +1249,11 @@ pub(super) fn stored_id(path: &str) -> Option<&str> {
 /// and answers it `cancelled`. An id the store does not hold is a 404.
 pub(super) fn stored(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let rest = stored_id(&req.path).unwrap_or_default();
-    let missing = |id: &str| ApiError {
-        retry_after: false,
-        code: 404,
-        kind: "not_found_error",
-        message: format!(
+    let missing = |id: &str| {
+        not_found(format!(
             "no stored response {id}: it was not stored, was deleted, or the store dropped it as \
              the oldest"
-        ),
+        ))
     };
     let r = match (req.method.as_str(), rest.split_once('/')) {
         ("GET", None) if req.query_value("stream") == Some("true") => Err(invalid(
@@ -1276,12 +1271,7 @@ pub(super) fn stored(state: &State, req: &Request, w: &mut TcpStream) -> io::Res
                  cancelled"
             )),
         }),
-        (method, _) => Err(ApiError {
-            retry_after: false,
-            code: 404,
-            kind: "not_found_error",
-            message: format!("File Not Found: {method} {}", req.path),
-        }),
+        _ => Err(not_found(req.not_found())),
     };
     match r {
         Ok(v) => send_json(w, req, 200, &v),
