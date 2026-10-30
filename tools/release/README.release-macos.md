@@ -11,6 +11,7 @@ https://github.com/midagedev/bloomery (the Mac page: `docs/mac.md`).
 | `bin/bloomery-serve-metal` | llama-server's HTTP API (`/v1/chat/completions`, `/completion`, `/v1/models`, `/health`) on the Mac's GPU |
 | `bin/generate_metal` | one prompt from the command line; prints the rates on stderr |
 | `bin/prepare` | optional: writes an MLX 4-bit checkpoint folder (mlx-community) as one GGUF split |
+| `serving.md` | the HTTP API's reference: its routes, the request fields each reads or refuses and the error objects (its flags and seats are the Linux binary's) |
 
 ## Requirements
 

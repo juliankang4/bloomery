@@ -9,6 +9,7 @@ measurements and the full README: https://github.com/midagedev/bloomery
 | File | What it serves |
 |---|---|
 | `bin/bloomery-serve` | every seat in one binary (the model file's architecture picks it; `--help` lists them): llama-server's HTTP API (`/v1/chat/completions`, `/completion`, streaming) for DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B, MiMo-V2.6-Flash, and Cloudflare Clef-Flash's SystemOne API (`POST /v1/systemone`) as its decide seat |
+| `serving.md` | the server's reference: its routes, the request fields each reads or refuses, the error objects, each seat's flags and the order of settings |
 
 ## Requirements
 
@@ -86,7 +87,7 @@ Downloads go to `~/.cache/bloomery/hf` (`BLOOMERY_CACHE` overrides it). A gated 
 
 A generative seat takes `--parallel N` (one by default): the slots are resident sequences in the one model, and the busy ones advance together each round. The `nemotron`, `raon1`, `solar2` and `musespark` seats serve one slot and refuse `--parallel` above 1 by name. Unset, `--ctx-size` gives each slot the largest context its plan holds; a set `--ctx-size` is the total the slots share. A plan that cannot fit the card's free bytes is refused by name with its terms and the processes holding the card.
 
-A flag on the command line wins over its `LLAMA_ARG_*` variable and over the `BLOOMERY_*` lever it stands for, and `bin/bloomery-serve -m <model> --levers` prints the levers the model's seat applies. A request field the server does not know is ignored, as in llama-server. Each seat's flags, the order of settings and the request fields: https://github.com/midagedev/bloomery/blob/main/docs/serving.md#settings
+A flag on the command line wins over its `LLAMA_ARG_*` variable and over the `BLOOMERY_*` lever it stands for, and `bin/bloomery-serve -m <model> --levers` prints the levers the model's seat applies. A request field the server does not know is ignored, as in llama-server. Each seat's flags, the order of settings and the request fields: `serving.md` in this archive ("Settings").
 
 `--place` picks the cards for the models with CPU experts: `a` runs the model on the visible card with the most memory,
 `bp` adds the next card as an expert tier, and `0+1` names cards by CUDA index (`CUDA_DEVICE_ORDER=PCI_BUS_ID` makes it `nvidia-smi`'s numbering). The single-card models run on

@@ -357,7 +357,7 @@ if [ -n "$CUBIN" ]; then
   done
   bash "$0" --check "$STAGE/bin"
 fi
-cp LICENSE THIRD_PARTY_NOTICES.md "$STAGE/"
+cp LICENSE THIRD_PARTY_NOTICES.md docs/serving.md "$STAGE/"
 cp tools/release/README.release.md "$STAGE/README.md"
 printf '%s\n%s\n' "$VERSION" "$COMMIT" > "$STAGE/VERSION"
 (cd "$DIST" && tar -czf "$NAME.tar.gz" "$NAME" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")

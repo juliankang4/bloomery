@@ -97,7 +97,7 @@ STAGE="$DIST/$NAME"
 rm -rf "$STAGE" "$DIST/$NAME.tar.gz" "$DIST/$NAME.tar.gz.sha256"
 mkdir -p "$STAGE/bin"
 for b in "${BINS[@]}"; do cp "$OUT/$b" "$STAGE/bin/"; done
-cp LICENSE THIRD_PARTY_NOTICES.md "$STAGE/"
+cp LICENSE THIRD_PARTY_NOTICES.md docs/serving.md "$STAGE/"
 sed "s/@VERSION@/$VERSION/g; s/@COMMIT@/$head/g" "$(dirname "$0")/README.release-macos.md" > "$STAGE/README.md"
 (cd "$DIST" && COPYFILE_DISABLE=1 tar -czf "$NAME.tar.gz" "$NAME" && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
 echo "build-mac.sh: $DIST/$NAME.tar.gz ($(stat -f %z "$DIST/$NAME.tar.gz") bytes), sha256 $(cut -d' ' -f1 "$DIST/$NAME.tar.gz.sha256")"
