@@ -231,8 +231,8 @@ impl Layer38 {
 
     /// The layer's dense sites a walk projects by name ([`dense::ByName`]):
     /// the mixer's, the shared expert's three and the PLE site's. The joined
-    /// β·α stack is not among them: it reads the f32 rows, whole at one row
-    /// and by its two parts past it.
+    /// β·α stack is not among them: it reads the f32 rows, whole at every
+    /// row count.
     pub(super) fn projected(&self) -> Vec<&str> {
         let mut sites: Vec<&str> = match &self.mixer {
             Mixer38::Gdn(p) => vec![&p.qkv, &p.z, &p.ssm_out],
@@ -641,7 +641,7 @@ fn by_launches(w: &Weights, layer: &Layer38) -> Result<ByLaunches, GpuError> {
 
 /// The resident weight `name`, `rows` rows of `k` values, of a type the
 /// common dense site launches by name on both walks (`site::BY_NAME`): the f32
-/// rows' families, which the joined β·α stack reads whole and by its parts.
+/// rows' families, which the joined β·α stack reads whole.
 fn dense_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
     dense::resident_site(w, WHAT, name, (rows, k), &dense::BY_NAME).map(drop)
 }

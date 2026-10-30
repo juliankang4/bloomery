@@ -129,10 +129,6 @@ pub(super) const STEP_MEMOPS: usize = 2;
 /// head's input. The head's own launches are [`HeadLaunches::at`]'s.
 pub(super) const HEAD_MIX_LAUNCHES: usize = 3;
 
-/// A delta layer's launches past [`GDN_LAUNCHES`] at more than one row: the
-/// joined β·α projection runs as β's rows and α's rows, one launch each.
-pub(super) const GDN_ROWS_LAUNCHES: usize = 1;
-
 // A layer's launches past those the constants count are its by-name
 // projections' ([`Layer38::by_extra`]): the quantization of each K-quant
 // site's input rows, and past one row the token-major copy of a row-major
@@ -150,9 +146,10 @@ pub(super) fn step_launches(
 }
 
 /// The captured verify's launches for `plans` with `card`'s card experts and
-/// `tier`'s tier layers at `m >= 2` rows: the step's, plus each delta
-/// layer's [`GDN_ROWS_LAUNCHES`]; the handoff, the go, the wait and the card
-/// leg are one each whatever `m`, and the head's are [`HeadLaunches::at`]'s.
+/// `tier`'s tier layers at `m >= 2` rows: the step's, a delta layer's
+/// joined β·α projection one launch at every `m`; the handoff, the go, the
+/// wait and the card leg are one each whatever `m`, and the head's are
+/// [`HeadLaunches::at`]'s.
 pub(super) fn verify_launches(
     plans: &[Layer38],
     card: &Card38,
@@ -177,13 +174,12 @@ fn walk_launches(
     m: usize,
     head: HeadLaunches,
 ) -> usize {
-    let rows = m > 1;
     1 + plans
         .iter()
         .enumerate()
         .map(|(l, p)| {
             let mixer = match p.mixer {
-                Mixer38::Gdn(_) => GDN_LAUNCHES + usize::from(rows) * GDN_ROWS_LAUNCHES,
+                Mixer38::Gdn(_) => GDN_LAUNCHES,
                 Mixer38::Qsa(_) => QSA_LAUNCHES,
             };
             let ffn = if card.hostless(l) {
@@ -1043,12 +1039,11 @@ fn ple_conv(
 }
 
 /// The rows a delta layer's launches bound to one sequence read and write:
-/// the conv's inputs (`x`, β, α, each row's position) and outputs, and the
-/// delta step's output `o`.
+/// the conv's inputs (`x`, the joined β·α rows `ba`, each row's position)
+/// and outputs, and the delta step's output `o`.
 struct GdnIo<'b> {
     x: &'b DeviceBuffer<f32>,
-    b: &'b DeviceBuffer<f32>,
-    a: &'b DeviceBuffer<f32>,
+    ba: &'b DeviceBuffer<f32>,
     pos: &'b DeviceBuffer<u32>,
     conv: &'b mut DeviceBuffer<f32>,
     beta: &'b mut DeviceBuffer<f32>,
@@ -1075,8 +1070,6 @@ fn gdn(
     let nv = GDN.n_v;
     {
         let Arena38 { gdn: g, pos, .. } = &mut *s;
-        let (wb, wa) = beta_alpha_rows(&g.ba, m)?;
-        let (b, a): (&DeviceBuffer<f32>, &DeviceBuffer<f32>) = (&wb, &wa);
         match seqs {
             Seqs38::One { stores, io, .. } => {
                 let lane = lane_of(io)?;
@@ -1086,8 +1079,7 @@ fn gdn(
                     (rec_of(stores, l)?, lane),
                     GdnIo {
                         x: &g.x,
-                        b,
-                        a,
+                        ba: &g.ba,
                         pos,
                         conv: &mut g.conv,
                         beta: &mut g.beta,
@@ -1109,8 +1101,7 @@ fn gdn(
                         (rec_of(q.stores, l)?, lane),
                         GdnIo {
                             x: &*rows_of(&g.x, r, ch)?,
-                            b: &*rows_of(b, r, nv)?,
-                            a: &*rows_of(a, r, nv)?,
+                            ba: &*rows_of(&g.ba, r, BA_PITCH)?,
                             pos: &*rows_of(pos, r, 1)?,
                             conv: &mut *rows_mut(&mut g.conv, r, ch)?,
                             beta: &mut *rows_mut(&mut g.beta, r, nv)?,
@@ -1129,10 +1120,9 @@ fn gdn(
 }
 
 /// A delta layer's projections over every row of `s.mixed`: q·k·v, then
-/// `branch` forked, the joined β·α into `ba` ([`beta_alpha_rows`]: one
-/// launch at one row, past it β's rows and α's rows of the joined weight,
-/// one launch each) and `z` on the branch, beside the conv and the delta
-/// step. The fork returned is joined before the gated norm reads `z`.
+/// `branch` forked, the joined β·α into `ba` in one launch
+/// ([`beta_alpha_rows`]) and `z` on the branch, beside the conv and the
+/// delta step. The fork returned is joined before the gated norm reads `z`.
 fn gdn_in<'b>(
     c: &Ctx38<'_>,
     gp: &GdnPlan,
@@ -1140,7 +1130,6 @@ fn gdn_in<'b>(
     s: &mut Arena38,
     (m, sink): (usize, FaultSink),
 ) -> Result<Forked<'b>, GpuError> {
-    let nv = GDN.n_v;
     let Arena38 {
         mixed,
         gdn: g,
@@ -1154,10 +1143,7 @@ fn gdn_in<'b>(
         c.project(by, &gp.beta_alpha, mixed, 1, sink, Out::whole(&mut g.ba))?;
     } else {
         let g32 = Some(&c.k.g32);
-        for (i, part) in [(0, nv), (nv, nv)].into_iter().enumerate() {
-            let mut y = beta_alpha_mut(&mut g.ba, m, i)?;
-            site::resident_gemv_rows(c.gpu, g32, (c.w, &gp.beta_alpha, part), mixed, m, &mut y)?;
-        }
+        site::resident_gemv_cols(c.gpu, g32, (c.w, &gp.beta_alpha), mixed, m, &mut g.ba)?;
     }
     c.project_on(
         fork.stream(),
@@ -1171,29 +1157,23 @@ fn gdn_in<'b>(
     Ok(fork)
 }
 
-/// β's rows and α's rows of the joined projection `ba` over `m` rows, each
-/// token-major: its first `n_v·m` values, then the next. At one row they
-/// are the whole joined gemv's output, β's values then α's.
+/// Values a row of the joined β·α projection holds: β's `n_v`, then α's.
+pub(super) const BA_PITCH: usize = 2 * GDN.n_v;
+
+/// β's and α's values of the joined projection `ba` over `m` rows,
+/// token-major, [`BA_PITCH`] values a row: the window from its first β and
+/// the one from its first α, each to the last row's last value of its own,
+/// as the conv reads them (`ConvArgs::ba_pitch`).
 pub(super) fn beta_alpha_rows(
     ba: &DeviceBuffer<f32>,
     m: usize,
 ) -> Result<(Window<'_, f32>, Window<'_, f32>), GpuError> {
-    let n = GDN.n_v * m;
+    let nv = GDN.n_v;
+    let n = (BA_PITCH * m).saturating_sub(nv);
     Ok((
         Window::of(ba, 0, n)?,
-        Window::of(ba, n * size_of::<f32>(), n)?,
+        Window::of(ba, nv * size_of::<f32>(), n)?,
     ))
-}
-
-/// β's rows (`i` 0) or α's rows (`i` 1) of [`beta_alpha_rows`], to write
-/// through.
-pub(super) fn beta_alpha_mut(
-    ba: &mut DeviceBuffer<f32>,
-    m: usize,
-    i: usize,
-) -> Result<WindowMut<'_, f32>, GpuError> {
-    let n = GDN.n_v * m;
-    WindowMut::of_mut(ba, i * n * size_of::<f32>(), n)
 }
 
 /// A delta layer's launches bound to one sequence, over `io`'s `m` rows:
@@ -1211,21 +1191,22 @@ fn gdn_seq(
     let (w, stream) = (c.w, c.gpu.stream());
     let GdnIo {
         x,
-        b,
-        a,
+        ba,
         pos,
         conv,
         beta,
         decay,
         o,
     } = io;
+    let (b, a) = beta_alpha_rows(ba, m)?;
     let lin = &c.k.linear;
     lin.conv.enqueue_conv_prep(
         stream,
         ConvArgs {
             x: ConvRows::F32(x),
-            b_raw: b,
-            a_raw: a,
+            b_raw: &b,
+            a_raw: &a,
+            ba_pitch: BA_PITCH,
             w: f32_gain(w, &gp.conv)?,
             dt_bias: f32_gain(w, &gp.dt_bias)?,
             ssm_a: f32_gain(w, &gp.ssm_a)?,

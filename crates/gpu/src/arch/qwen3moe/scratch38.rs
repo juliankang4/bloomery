@@ -302,8 +302,8 @@ pub(super) struct Gdn38 {
     /// The q·k·v channels and `z`.
     pub(super) x: DeviceBuffer<f32>,
     pub(super) z: DeviceBuffer<f32>,
-    /// The joined β·α projection: β's rows token-major, then α's
-    /// (`program38::beta_alpha_rows`), which the conv reads in place.
+    /// The joined β·α projection token-major, each row's β values then its
+    /// α's (`program38::beta_alpha_rows`), which the conv reads in place.
     pub(super) ba: DeviceBuffer<f32>,
     pub(super) conv: DeviceBuffer<f32>,
     pub(super) beta: DeviceBuffer<f32>,

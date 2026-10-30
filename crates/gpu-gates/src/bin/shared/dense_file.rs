@@ -151,12 +151,14 @@ pub(crate) fn mma_neighbours(
 /// bit to another's, so it holds at any type the site launches by name.
 /// - `by_name.cols`: `site::resident_gemv_cols` at three columns, each
 ///   column the one-column `site::resident_gemv` of it;
-/// - `by_name.rows`: `site::resident_gemv_rows` over rows `at .. at + n`
-///   alone, the whole weight's outputs at those rows;
-/// - `by_name.wide`: `site::resident_gemm_rows` over the same rows on the
-///   one-expert table `route` filled for `wide` slots, `site::resident_gemm`'s
-///   at those rows;
-/// - `by_name.past`: rows past the weight refused by name.
+/// - `by_name.wide`: `site::resident_gemm_rows` over rows `at .. at + n`
+///   alone on the one-expert table `route` filled for `wide` slots,
+///   `site::resident_gemm`'s at those rows;
+/// - `by_name.past`: rows past the weight refused by name on the same call.
+///
+/// PIN(2026-10-31): `by_name.rows` (`site::resident_gemv_rows` over a part's rows) is removed with
+/// its function: no body projects rows of a joined weight on the gemv arm (Qwen3.8's joined β·α
+/// projection runs whole); `by_name.wide` keeps the part's rows and `by_name.past` its refusal.
 pub(crate) fn by_name(
     gpu: &Gpu,
     (g32, gemm, route, wide): (&Gemm32Kernels, &GemmKernels, &GemmRoute, usize),
@@ -195,16 +197,6 @@ pub(crate) fn by_name(
     let whole = whole.to_host_vec(stream)?;
     line("cols", &format!("m={M}"), bits(&whole, &one));
 
-    let mut y = DeviceBuffer::from_host(stream, &vec![f32::NAN; M * n])?;
-    site::resident_gemv_rows(gpu, Some(g32), (w, name, (at, n)), &x_dev, M, &mut y)?;
-    stream.synchronize()?;
-    let shown = format!("rows={at}+{n} of {rows} m={M}");
-    line(
-        "rows",
-        &shown,
-        bits(&y.to_host_vec(stream)?, &part(&whole, M)),
-    );
-
     let kernels = WideKernels {
         gemm,
         g32: Some(g32),
@@ -231,7 +223,8 @@ pub(crate) fn by_name(
     );
 
     let past = (w, name, (at, rows - at + 1));
-    let got = site::resident_gemv_rows(gpu, Some(g32), past, &x_dev, 1, &mut y);
+    let mut py = DeviceBuffer::from_host(stream, &vec![f32::NAN; wide * (rows - at + 1)])?;
+    let got = site::resident_gemm_rows(gpu, &kernels, past, &x_in, route, wide, &mut py);
     let refused = got
         .as_ref()
         .is_err_and(|e| e.to_string().contains(name) && e.to_string().contains("rows"));

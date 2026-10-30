@@ -144,6 +144,7 @@ pub(super) fn delta_core(
             x: ConvRows::F32(&g.x),
             b_raw: &g.b,
             a_raw: &g.a,
+            ba_pitch: d.shape.n_v,
             w: f32_gain(w, &d.conv)?,
             dt_bias: f32_gain(w, &d.dt_bias)?,
             ssm_a: f32_gain(w, &d.ssm_a)?,
