@@ -1098,14 +1098,19 @@ impl CardRoute38 {
             run,
             ids: DeviceBuffer::zeroed(stream, slots)?,
             sel: DeviceBuffer::zeroed(stream, kept)?,
-            x: if card.blocks32_gate_up() {
-                let x = GemmAct32::new_routed_for(
+            x: if fused {
+                RouteX::Blocks32(Box::new(GemmAct32::new_native_input(
+                    stream,
+                    run,
+                    geo::HIDDEN,
+                )?))
+            } else if card.blocks32_gate_up() {
+                RouteX::Blocks32(Box::new(GemmAct32::new_routed_for(
                     stream,
                     run,
                     geo::HIDDEN,
                     card.routed_types().map(|(gate, _)| gate),
-                )?;
-                RouteX::Blocks32(Box::new(if fused { x.native_input_only() } else { x }))
+                )?))
             } else {
                 RouteX::Q8_1(Box::new(GemmAct::new(stream, run, geo::HIDDEN)?))
             },

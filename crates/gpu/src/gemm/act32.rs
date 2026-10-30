@@ -51,7 +51,8 @@ pub struct GemmAct32 {
     pub(super) q: DeviceBuffer<u32>,
     pub(super) d: DeviceBuffer<f32>,
     pub(super) s: DeviceBuffer<i32>,
-    /// Whether the declared consumers include a Q8 reader.
+    /// Whether the scratch holds the Q8 planes: false for a native input
+    /// ([`GemmAct32::new_native_input`]), whose planes are empty.
     pub(super) q8_required: bool,
     pub(super) cols: usize,
     pub(super) k: usize,
@@ -91,6 +92,16 @@ impl GemmAct32 {
     /// Scratch for `cols` (1..=[`GEMM_MAX_SLOTS`]) columns of `k` values, `k`
     /// a positive multiple of 32 up to the quantizer's cap. Load-time only.
     pub fn new(stream: &CudaStream, cols: usize, k: usize) -> Result<GemmAct32, GpuError> {
+        Self::with_planes(stream, cols, k, true)
+    }
+
+    /// [`GemmAct32::new`]'s scratch, its Q8 planes empty unless `q8`.
+    fn with_planes(
+        stream: &CudaStream,
+        cols: usize,
+        k: usize,
+        q8: bool,
+    ) -> Result<GemmAct32, GpuError> {
         let what = "GemmAct32::new";
         if !(1..=GEMM_MAX_SLOTS).contains(&cols) {
             return Err(GpuError::shape(
@@ -104,14 +115,19 @@ impl GemmAct32 {
                 format!("k must be a multiple of 32 in 32..={Q8ACT_MAX_K}, got {k}"),
             ));
         }
-        let steps = k.div_ceil(GEMM32_STEP);
+        // The 64-value steps of every column the planes hold.
+        let steps = if q8 {
+            cols * k.div_ceil(GEMM32_STEP)
+        } else {
+            0
+        };
         Ok(GemmAct32 {
             #[cfg(bloomery_nvfp4_mma)]
             native: None,
-            q: DeviceBuffer::zeroed(stream, cols * 16 * steps)?,
-            d: DeviceBuffer::zeroed(stream, cols * 2 * steps)?,
-            s: DeviceBuffer::zeroed(stream, cols * 2 * steps)?,
-            q8_required: true,
+            q: DeviceBuffer::zeroed(stream, 16 * steps)?,
+            d: DeviceBuffer::zeroed(stream, 2 * steps)?,
+            s: DeviceBuffer::zeroed(stream, 2 * steps)?,
+            q8_required: q8,
             cols,
             k,
             filled: 0,
@@ -271,11 +287,22 @@ impl GemmAct32 {
         }
     }
 
-    /// Skip the input quantizer's Q8 stores when all readers use native FP4.
-    /// A non-native build keeps Q8; a Q8 reader of the native-only scratch is refused.
-    pub(crate) fn native_input_only(mut self) -> Self {
-        self.q8_required = !self.has_native_form();
-        self
+    /// Routed input columns every reader takes in the native FP4 form: that
+    /// form alone on a native FP4 build at `k` a multiple of 64, its Q8
+    /// planes empty (a Q8 reader and a launch that stores them are refused
+    /// by name); [`GemmAct32::new`]'s scratch otherwise. Load-time only.
+    pub(crate) fn new_native_input(
+        stream: &CudaStream,
+        cols: usize,
+        k: usize,
+    ) -> Result<Self, GpuError> {
+        #[cfg(bloomery_nvfp4_mma)]
+        if k.is_multiple_of(64) {
+            let mut act = Self::with_planes(stream, cols, k, false)?;
+            act.native = Some(super::nvfp4mma::Act::new(stream, cols, k)?);
+            return Ok(act);
+        }
+        Self::new(stream, cols, k)
     }
 
     /// Whether the scratch holds the native FP4 form beside the 32-value one
@@ -322,8 +349,8 @@ impl GemmAct32 {
         self.k.div_ceil(GEMM32_STEP)
     }
 
-    /// The codes, `16 · steps` words per column (struct doc). An input
-    /// quantizer on a native-only scratch leaves the Q8 planes untouched.
+    /// The codes, `16 · steps` words per column (struct doc); empty on a
+    /// native input ([`GemmAct32::new_native_input`]).
     #[must_use]
     pub fn q(&self) -> &DeviceBuffer<u32> {
         &self.q
@@ -358,11 +385,30 @@ impl GemmAct32 {
         bytes
     }
 
+    /// The launch shape a quantizer that stores the Q8 planes takes for
+    /// `n_cols` columns ([`GemmAct32::input_launch`]); a native input, which
+    /// holds none ([`GemmAct32::new_native_input`]), is refused by name.
+    pub(super) fn quant_launch(
+        &self,
+        what: &'static str,
+        n_cols: usize,
+    ) -> Result<(u32, u32, u32, u32, u32), GpuError> {
+        if !self.q8_required {
+            return Err(GpuError::state(
+                what,
+                "a scratch with Q8 planes; a native input holds none",
+            ));
+        }
+        self.input_launch(what, n_cols)
+    }
+
     /// The launch shape the quantizers take for `n_cols` columns: the grid
     /// (one 32-thread block per column and group of four 32-value blocks),
     /// then `n_cols`, the blocks, the groups and the steps per column, each
-    /// as the kernel's u32.
-    pub(super) fn quant_launch(
+    /// as the kernel's u32. The input quantizer's
+    /// ([`Gemm32Kernels::enqueue_quantize_gemm32`]), which stores the Q8
+    /// planes only where the scratch holds them.
+    fn input_launch(
         &self,
         what: &'static str,
         n_cols: usize,
@@ -499,7 +545,7 @@ impl Gemm32Kernels {
         fault: FaultSink,
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_quantize_gemm32";
-        let (grid, m, blocks, groups, steps) = act.quant_launch(what, n_cols)?;
+        let (grid, m, blocks, groups, steps) = act.input_launch(what, n_cols)?;
         if x.len() < n_cols * act.k {
             return Err(GpuError::shape(
                 what,
