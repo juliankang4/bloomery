@@ -12,7 +12,9 @@
 //!    functions (exp on [−87, 88], log on [1, 1 + e²⁰], the range softplus
 //!    passes it).
 //! 2. `conv`: the conv and prep of 512, 2 and 1 tokens at position 1,000
-//!    over a random conv ring — output, β, decay and the ring after it; 512
+//!    over a random conv ring — output, β, decay and the ring after it; the
+//!    same with each token's β and α read from one joined projection's rows
+//!    (`ba_pitch` 2·n_v), and a pitch below n_v refused by name; 512
 //!    one-token launches chained through the ring equal to the 512-token
 //!    launch; 8 tokens at the sequence start reading zeros over a random
 //!    ring; and a call resuming from the ring at position 20, then a
@@ -395,20 +397,24 @@ mod gate {
             pos: &[u32],
             m: usize,
         ) -> Result<ConvOut, GateError> {
-            self.conv_held(fault, l, tk, ring, pos, (m, false))
+            let nv = l.shape.n_v;
+            Ok(self.conv_held(fault, l, tk, ring, (pos, m), (nv, false))?)
         }
 
-        /// [`Ctx::conv`], with `bf16` the channels held as BF16 words, each
-        /// value rounded to nearest even.
+        /// [`Ctx::conv`] with each token's β and α `pitch` values past the
+        /// one before (from `2·n_v`, both read from one joined buffer, a
+        /// token's β then its α, then NaN up to the next token's), and with
+        /// `bf16` the channels held as BF16 words, each value rounded to
+        /// nearest even.
         fn conv_held(
             &self,
             fault: FaultSink,
             l: &Layer,
             tk: &Tokens,
             ring: &[f32],
-            pos: &[u32],
-            (m, bf16): (usize, bool),
-        ) -> Result<ConvOut, GateError> {
+            (pos, m): (&[u32], usize),
+            (pitch, bf16): (usize, bool),
+        ) -> Result<ConvOut, bloomery_gpu::GpuError> {
             let s = self.stream();
             let (ch, nv) = (l.shape.channels(), l.shape.n_v);
             let x = DeviceBuffer::from_host(s, &tk.x)?;
@@ -422,8 +428,24 @@ mod gate {
                 })
                 .collect();
             let words = DeviceBuffer::from_host(s, &words)?;
-            let b = DeviceBuffer::from_host(s, &tk.b)?;
-            let a = DeviceBuffer::from_host(s, &tk.a)?;
+            let (b, a) = if pitch < 2 * nv {
+                (
+                    DeviceBuffer::from_host(s, &tk.b)?,
+                    DeviceBuffer::from_host(s, &tk.a)?,
+                )
+            } else {
+                let mut ba = vec![f32::NAN; m * pitch];
+                for t in 0..m {
+                    let row = &mut ba[t * pitch..];
+                    row[..nv].copy_from_slice(&tk.b[t * nv..][..nv]);
+                    row[nv..2 * nv].copy_from_slice(&tk.a[t * nv..][..nv]);
+                }
+                let tail = (m - 1) * pitch + nv;
+                (
+                    DeviceBuffer::from_host(s, &ba[..tail])?,
+                    DeviceBuffer::from_host(s, &ba[nv..nv + tail])?,
+                )
+            };
             let w = DeviceBuffer::from_host(s, &l.w)?;
             let dt = DeviceBuffer::from_host(s, &l.dt)?;
             let sa = DeviceBuffer::from_host(s, &l.sa)?;
@@ -442,6 +464,7 @@ mod gate {
                     },
                     b_raw: &b,
                     a_raw: &a,
+                    ba_pitch: pitch,
                     w: &w,
                     dt_bias: &dt,
                     ssm_a: &sa,
@@ -907,8 +930,39 @@ mod gate {
             out.push(pass);
         }
 
-        // Channels held as BF16 words: the conv rule over their widened
-        // values on the BF16 entry's lanes, the ring included.
+        // Every token's β and α from one joined projection's rows, `2·n_v`
+        // values a token, as the Qwen3.8 walks read them; a pitch below
+        // `n_v` is refused by name.
+        let nv = SHAPE.n_v;
+        for m in [PROMPT, 2, 1] {
+            let t = tk.slice(0, m);
+            let pos = positions(P0, m);
+            let d = cx.conv_held(unl, &l, &t, &dirty, (&pos, m), (2 * nv, false))?;
+            let h = conv_host(&l, &t, &dirty, &pos, m);
+            let (pass, line) = conv_same(&d, &h);
+            println!(
+                "conv m={m} at p0={P0}, β·α joined at pitch {}: {line} {}",
+                2 * nv,
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+        let pos = positions(P0, 2);
+        let refused = cx.conv_held(unl, &l, &tk.slice(0, 2), &dirty, (&pos, 2), (nv - 1, false));
+        let pass = matches!(&refused, Err(e) if e.to_string().contains("ba_pitch"));
+        println!(
+            "conv at pitch n_v - 1 refused by name: {} {}",
+            match &refused {
+                Ok(_) => "launched".to_owned(),
+                Err(e) => e.to_string(),
+            },
+            verdict(pass)
+        );
+        out.push(pass);
+
+        // Channels held as BF16 words, β·α joined as the walk holds them: the
+        // conv rule over their widened values on the BF16 entry's lanes, the
+        // ring included.
         let widened = Tokens {
             shape: SHAPE,
             x: tk
@@ -921,7 +975,7 @@ mod gate {
         };
         for m in [PROMPT, 2, 1] {
             let pos = positions(P0, m);
-            let d = cx.conv_held(unl, &l, &tk.slice(0, m), &dirty, &pos, (m, true))?;
+            let d = cx.conv_held(unl, &l, &tk.slice(0, m), &dirty, (&pos, m), (2 * nv, true))?;
             let w = widened.slice(0, m);
             let h = conv_prep_host(
                 &w.x, &w.b, &w.a, &l.w, &l.dt, &l.sa, &pos, &dirty, l.shape, l.eps, m, true,
@@ -1230,6 +1284,7 @@ mod gate {
                 x: ConvRows::F32(&i.x),
                 b_raw: &i.b,
                 a_raw: &i.a,
+                ba_pitch: SHAPE.n_v,
                 w: &i.w,
                 dt_bias: &i.dt,
                 ssm_a: &i.sa,

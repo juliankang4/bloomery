@@ -490,7 +490,9 @@ mod gate {
     /// its launch: the wait on the host's flag and the rows' copy, two nodes
     /// more: 1151 + 36·1 + 2.
     /// PIN(2026-10-30): the step's 1139 (the gated merge): 1139 + 36·1 + 2.
-    const REAL_NODES_VERIFY: usize = 1177;
+    /// PIN(2026-10-31): the joined β·α projection is one launch at every
+    /// row count, so a delta layer adds none: 1139 + 2.
+    const REAL_NODES_VERIFY: usize = 1141;
 
     /// PIN(2026-10-05): the nodes one more busy slot adds to a captured pass
     /// of several slots' rows, derived before the pass was built: the
@@ -527,8 +529,9 @@ mod gate {
     /// PIN(2026-10-22): the verify's [`REAL_NODES_VERIFY`]: 1187 + 5·48.
     /// PIN(2026-10-27): the verify's [`REAL_NODES_VERIFY`]: 1189 + 5·48.
     /// PIN(2026-10-30): the gated merge: 1139 + 5·48 and 1177 + 5·48.
+    /// PIN(2026-10-31): the verify's [`REAL_NODES_VERIFY`]: 1141 + 5·48.
     const REAL_NODES_DECODE_CARD: usize = 1379;
-    const REAL_NODES_VERIFY_CARD: usize = 1417;
+    const REAL_NODES_VERIFY_CARD: usize = 1381;
 
     // PIN(2026-10-11): the split prompt walk moves none of the counts
     // above: it orders the eager ubatch walk's parts (`GROUP_WALK_ORDER`), and

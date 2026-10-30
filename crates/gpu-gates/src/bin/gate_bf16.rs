@@ -36,8 +36,8 @@
 //!    same parts loaded as f32 values the same. Over each joint the dense
 //!    calls by name hold their outputs to one another bit for bit
 //!    (`by_name`, `shared/dense_file.rs`): the m-column gemv, the last part's
-//!    rows alone through the gemv and the wide GEMM, and rows past the joint
-//!    refused by name.
+//!    rows alone through the wide GEMM, and rows past the joint refused by
+//!    name.
 //! 4. head: a BF16 `output.weight` of 4,099 rows through `head::Head` at one
 //!    and three rows (`HeadNorm::Mixed`): its logits the rule bit for bit,
 //!    each row's token the host argmax; the Q8_0 head of the same shape the

@@ -185,7 +185,7 @@ use super::body::ATTN_SCALE_256;
 use super::card38::Card38;
 use super::image::MediaRows;
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
-use super::program38::{Ctx38, beta_alpha_mut, beta_alpha_rows};
+use super::program38::{BA_PITCH, Ctx38, beta_alpha_rows};
 use super::router::gated;
 use super::scratch::{Append256, Io, KvPlanes, PrefillFlash, RecStore, cells_view, param_view};
 use super::scratch38::{Arena38, Ple38, ROUTE_ROWS, Store38, final_res, no_carry};
@@ -2591,31 +2591,20 @@ fn gdn(
     quantize_unheld(c, &gp.input_sites(), (mixed, m), &mut x.act_hid, sink)?;
     let dense = &x.dense[u.route];
     let act = (&*mixed, &x.act_hid, m);
+    let (k, x_in) = (dense_kernels(c), wide_in(mixed, &x.act_hid));
     let bf16 = if reads_q8_1(c, &gp.qkv)? {
         false
     } else {
         let mut half = WindowMut::<u16>::of_mut(&mut g.x, 0, m * GDN.channels())?;
-        site::resident_gemm_bf16(
-            c.gpu,
-            &dense_kernels(c),
-            (w, &gp.qkv),
-            &wide_in(mixed, &x.act_hid),
-            dense,
-            m,
-            &mut half,
-        )?
+        site::resident_gemm_bf16(c.gpu, &k, (c.w, &gp.qkv), &x_in, dense, m, &mut half)?
     };
     if !bf16 {
         dense_gemm(c, by, &gp.qkv, act, (dense, sink), &mut g.x)?;
     }
     // The joined stack is `2·nv` rows (`plan38::plans` refuses another shape
-    // at load), β's rows first and α's next.
-    let (k, x_in) = (dense_kernels(c), wide_in(mixed, &x.act_hid));
-    for (i, part) in [(0, nv), (nv, nv)].into_iter().enumerate() {
-        let mut y = beta_alpha_mut(&mut g.ba, m, i)?;
-        let src = (c.w, &*gp.beta_alpha, part);
-        site::resident_gemm_rows(c.gpu, &k, src, &x_in, dense, m, &mut y)?;
-    }
+    // at load), β's rows first and α's next: one product, each row's β then
+    // its α ([`beta_alpha_rows`]).
+    site::resident_gemm(c.gpu, &k, (c.w, &gp.beta_alpha), &x_in, dense, m, &mut g.ba)?;
     let (b, a) = beta_alpha_rows(&g.ba, m)?;
     let lin = &c.k.linear;
     let words = Window::<u32>::of(&g.x, 0, m * GDN.channels() / 2)?;
@@ -2629,6 +2618,7 @@ fn gdn(
             },
             b_raw: &b,
             a_raw: &a,
+            ba_pitch: BA_PITCH,
             w: f32_gain(w, &gp.conv)?,
             dt_bias: f32_gain(w, &gp.dt_bias)?,
             ssm_a: f32_gain(w, &gp.ssm_a)?,

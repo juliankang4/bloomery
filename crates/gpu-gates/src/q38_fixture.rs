@@ -37,11 +37,6 @@ const PLE_SITE_LAUNCHES: usize = 5;
 /// its input rows to q8_1 first, and a Q5_K one copies its token-major logits past one row
 /// ([`Shape::head`]), one more each.
 const HEAD_LAUNCHES: usize = 5;
-/// Nodes a verify of more than one row adds on a delta layer: the joined β·α projection runs as
-/// β's rows and α's rows, one launch each. A selecting layer adds none.
-/// PIN(2026-10-22): the token-major copies and the indexer's extra launch are gone, so a delta layer
-/// adds one launch (two before) and a selecting layer none (one before).
-const VERIFY_GDN_EXTRA: usize = 1;
 /// Nodes a verify's PLE rows' arrival adds at the PLE site: the wait on the host's flag (a batch
 /// memory operation) and the copy of the rows from the host's staging ([`Shape::arrivals`]).
 const ARRIVAL_NODES: usize = 2;
@@ -191,11 +186,12 @@ impl Shape {
         2 * (self.n_layer - hostless)
     }
 
-    /// The captured verify's nodes at 2, 3 and 4 rows.
+    /// The captured verify's nodes at 2, 3 and 4 rows: a layer's launches are the step's (a
+    /// delta layer's joined β·α projection is one launch at every row count), past the by-name
+    /// launches of more than one row, the head's row copy and the PLE rows' arrival.
     #[must_use]
     pub fn nodes_verify(&self) -> usize {
         self.nodes_decode() - self.by_name.one
-            + self.n_gdn() * VERIFY_GDN_EXTRA
             + self.by_name.rows
             + usize::from(self.head.copies_rows)
             + self.arrivals() * ARRIVAL_NODES
@@ -250,25 +246,25 @@ mod tests {
         assert_eq!((real.n_qsa(), real.n_gdn()), (12, 36));
         assert_eq!(real.nodes_decode(), 1139);
         assert_eq!(real.memops(), 96);
-        assert_eq!(real.nodes_verify(), 1177);
+        assert_eq!(real.nodes_verify(), 1141);
         assert_eq!(real.nodes_slot(), 171);
         assert_eq!(real.nodes_decode_card(48), 1379);
-        assert_eq!(real.nodes_verify_card(48), 1417);
+        assert_eq!(real.nodes_verify_card(48), 1381);
         assert_eq!((real.memops_card(0), real.memops_card(48)), (96, 0));
         let fix = Shape::from_layers(4, vec![1, 3], Some(2), Some(248_056)).expect("fixture");
         assert_eq!((fix.n_qsa(), fix.n_gdn()), (2, 2));
         assert_eq!(fix.nodes_decode(), 1 + 2 * 22 + 2 * 28 + 5 + 5);
         assert_eq!(fix.nodes_decode(), 111);
-        assert_eq!(fix.nodes_verify(), 115);
+        assert_eq!(fix.nodes_verify(), 113);
         assert_eq!(fix.nodes_slot(), 23);
         assert_eq!(fix.nodes_decode_card(4), 131);
-        assert_eq!(fix.nodes_verify_card(4), 135);
+        assert_eq!(fix.nodes_verify_card(4), 133);
         let kq = fix.clone().with_head(Head {
             quantizes: true,
             copies_rows: false,
         });
         assert_eq!(kq.nodes_decode(), 112);
-        assert_eq!(kq.nodes_verify(), 116);
+        assert_eq!(kq.nodes_verify(), 114);
         assert_eq!(kq.nodes_decode_card(4), 132);
         assert_eq!(kq.nodes_slot(), fix.nodes_slot());
         // A Q5_K head also copies its token-major logits past one row: the decode step at one
@@ -278,8 +274,8 @@ mod tests {
             copies_rows: true,
         });
         assert_eq!(q5.nodes_decode(), 112);
-        assert_eq!(q5.nodes_verify(), 117);
-        assert_eq!(q5.nodes_verify_card(4), 137);
+        assert_eq!(q5.nodes_verify(), 115);
+        assert_eq!(q5.nodes_verify_card(4), 135);
         assert_eq!(q5.nodes_slot(), fix.nodes_slot());
         // Dense sites that read q8_1 rows: a delta layer's q·k·v, z and output and the shared
         // expert's gate and up (five sites) and a selecting layer's six and the same two (eight)
@@ -290,7 +286,7 @@ mod tests {
             slot: 2,
         });
         assert_eq!(by.nodes_decode(), 111 + 26);
-        assert_eq!(by.nodes_verify(), 115 + 26 + 7);
+        assert_eq!(by.nodes_verify(), 113 + 26 + 7);
         assert_eq!(by.nodes_slot(), 23 + 2);
         assert_eq!(by.nodes_decode_card(4), 131 + 26);
     }
@@ -306,6 +302,6 @@ mod tests {
         let bare = Shape::from_layers(4, vec![1, 3], None, None).expect("no site");
         assert_eq!(bare.nodes_decode(), 106);
         assert_eq!(bare.nodes_slot(), 22);
-        assert_eq!((bare.nodes_verify(), bare.arrivals()), (108, 0));
+        assert_eq!((bare.nodes_verify(), bare.arrivals()), (106, 0));
     }
 }

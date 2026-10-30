@@ -69,8 +69,8 @@
 //! for bit the host walk over the parts' rows (`join`). Over each joint, and
 //! over the Q8_0 and F32 tensors, the dense calls by name hold their outputs
 //! to one another bit for bit (`by_name`, `shared/dense_file.rs`): the
-//! m-column gemv, a part's rows alone through the gemv and the wide GEMM,
-//! and rows past the weight refused by name.
+//! m-column gemv, a part's rows alone through the wide GEMM, and rows past
+//! the weight refused by name.
 //!
 //! The expert select (`sel`, through `site::resident_sel_f32`, the MTP
 //! draft's routed launch): a stack of 4 experts of 64 rows of 256 values in

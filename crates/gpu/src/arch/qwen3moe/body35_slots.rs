@@ -645,6 +645,7 @@ impl ChainOps for Slots35<'_, '_> {
                     x: ConvRows::F32(&*rows(&g.x, r, ch)?),
                     b_raw: &*rows(&g.b, r, nv)?,
                     a_raw: &*rows(&g.a, r, nv)?,
+                    ba_pitch: nv,
                     w: wc,
                     dt_bias: dt,
                     ssm_a: sa,

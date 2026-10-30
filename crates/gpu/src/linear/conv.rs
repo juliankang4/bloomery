@@ -423,7 +423,9 @@ impl ConvIn for Bf16Words<'_> {
 /// (`[m][n_v]`) with bias `dt_bias` (`[n_v]`) under
 /// [`DECAY_HEAD`], `f` (`[m][n_v·HEAD]`) with `dt_bias` (`[n_v·HEAD]`) under
 /// [`DECAY_KEY`] — `ssm_a` (`[n_v]`) and bound `lb`, which only
-/// [`KDA_GATE_SIGMOID`] reads.
+/// [`KDA_GATE_SIGMOID`] reads. Under [`DECAY_HEAD`] token `t`'s β and α
+/// are `ba_pitch·t` values into `b_raw` and `decay_raw`; under [`DECAY_KEY`]
+/// its β is `n_v·t` values into `b_raw`.
 #[derive(Clone, Copy)]
 struct PrepInputs<'a, X> {
     x: X,
@@ -436,6 +438,7 @@ struct PrepInputs<'a, X> {
     eps: f32,
     n_k: usize,
     n_v: usize,
+    ba_pitch: usize,
 }
 
 /// One decay (module doc) under the gate `GATE`, each product rounded on its
@@ -500,13 +503,14 @@ unsafe fn prep_token<const DECAY: u32, const GATE: u32, const BETA: u32, X: Conv
         // register allocation.
         if hp >= 2 * inp.n_k && lane == 0 {
             let h = hp - 2 * inp.n_k;
-            let at = t * inp.n_v + h;
-            // SAFETY: h < n_v and t < m: `at` < m·n_v <= b_raw, decay_raw,
-            // beta, decay lengths; h < n_v <= dt_bias, ssm_a lengths.
+            let (at, raw) = (t * inp.n_v + h, t * inp.ba_pitch + h);
+            // SAFETY: h < n_v and t < m: `at` < m·n_v <= beta, decay
+            // lengths, `raw` < (m − 1)·ba_pitch + n_v <= b_raw, decay_raw
+            // lengths; h < n_v <= dt_bias, ssm_a lengths.
             let (b, a, dt, sa) = unsafe {
                 (
-                    *inp.b_raw.get_unchecked(at),
-                    *inp.decay_raw.get_unchecked(at),
+                    *inp.b_raw.get_unchecked(raw),
+                    *inp.decay_raw.get_unchecked(raw),
                     *inp.dt_bias.get_unchecked(h),
                     *inp.ssm_a.get_unchecked(h),
                 )
@@ -568,8 +572,8 @@ unsafe fn prep_token<const DECAY: u32, const GATE: u32, const BETA: u32, X: Conv
 /// the ring. A value that was not finite raises [`FaultSite::LinearConv`].
 /// `gdn_conv_prep` and `gdn_conv_prep_bf16` are [`DECAY_HEAD`] under
 /// [`KDA_GATE_SOFTPLUS`] and [`KDA_BETA_X1`], the KDA entries [`DECAY_KEY`].
-/// `lb` is read by [`KDA_GATE_SIGMOID`] alone; `x` is read through
-/// [`ConvIn`].
+/// `lb` is read by [`KDA_GATE_SIGMOID`] alone, `ba_pitch` by [`DECAY_HEAD`]
+/// alone ([`PrepInputs`]); `x` is read through [`ConvIn`].
 ///
 /// # Safety
 ///
@@ -594,6 +598,7 @@ unsafe fn conv_body<const DECAY: u32, const GATE: u32, const BETA: u32, X: ConvI
     eps: f32,
     n_k: u32,
     n_v: u32,
+    ba_pitch: u32,
     m: u32,
     fault: FaultSink,
     y: &mut DisjointSlice<f32>,
@@ -623,6 +628,7 @@ unsafe fn conv_body<const DECAY: u32, const GATE: u32, const BETA: u32, X: ConvI
         eps,
         n_k: n_k as usize,
         n_v: n_v as usize,
+        ba_pitch: ba_pitch as usize,
     };
     let out = Outputs {
         y: y.as_mut_ptr(),
@@ -678,7 +684,8 @@ mod conv_kernels {
     /// The conv and prep of `m` tokens (module doc). Warp `w = 4·block +
     /// warp` is unit `w / H` ([`units`]) and conv head `w % H`, `H = 2·n_k +
     /// n_v`: heads below `n_k` are queries, below `2·n_k` keys, the rest
-    /// values.
+    /// values. Token `t`'s β and α are `ba_pitch·t` values into `b_raw` and
+    /// `a_raw`.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -691,8 +698,9 @@ mod conv_kernels {
         requires = (
             x.len() >= m * (2 * n_k + n_v) * 128,
             w.len() >= 4 * (2 * n_k + n_v) * 128,
-            b_raw.len() >= m * n_v,
-            a_raw.len() >= m * n_v,
+            ba_pitch >= n_v,
+            b_raw.len() >= (m - 1) * ba_pitch + n_v,
+            a_raw.len() >= (m - 1) * ba_pitch + n_v,
             dt_bias.len() >= n_v,
             ssm_a.len() >= n_v,
             pos.len() >= m,
@@ -714,6 +722,7 @@ mod conv_kernels {
         eps: f32,
         n_k: u32,
         n_v: u32,
+        ba_pitch: u32,
         m: u32,
         fault: FaultSink,
         mut y: DisjointSlice<f32>,
@@ -725,8 +734,8 @@ mod conv_kernels {
         // sigmoid gate alone reads it, and this entry's gate is softplus.
         unsafe {
             conv_body::<DECAY_HEAD, KDA_GATE_SOFTPLUS, KDA_BETA_X1, _>(
-                x, w, b_raw, a_raw, dt_bias, ssm_a, pos, 0.0, eps, n_k, n_v, m, fault, &mut y,
-                &mut beta, &mut decay, &mut ring,
+                x, w, b_raw, a_raw, dt_bias, ssm_a, pos, 0.0, eps, n_k, n_v, ba_pitch, m, fault,
+                &mut y, &mut beta, &mut decay, &mut ring,
             );
         }
     }
@@ -748,8 +757,9 @@ mod conv_kernels {
         requires = (
             x.len() >= m * (2 * n_k + n_v) * 64,
             w.len() >= 4 * (2 * n_k + n_v) * 128,
-            b_raw.len() >= m * n_v,
-            a_raw.len() >= m * n_v,
+            ba_pitch >= n_v,
+            b_raw.len() >= (m - 1) * ba_pitch + n_v,
+            a_raw.len() >= (m - 1) * ba_pitch + n_v,
             dt_bias.len() >= n_v,
             ssm_a.len() >= n_v,
             pos.len() >= m,
@@ -771,6 +781,7 @@ mod conv_kernels {
         eps: f32,
         n_k: u32,
         n_v: u32,
+        ba_pitch: u32,
         m: u32,
         fault: FaultSink,
         mut y: DisjointSlice<f32>,
@@ -793,6 +804,7 @@ mod conv_kernels {
                 eps,
                 n_k,
                 n_v,
+                ba_pitch,
                 m,
                 fault,
                 &mut y,
@@ -852,7 +864,7 @@ mod conv_kernels {
         // SAFETY: the launch contract's lengths and block.
         unsafe {
             conv_body::<DECAY_KEY, KDA_GATE_SIGMOID, KDA_BETA_X1, _>(
-                x, w, b_raw, f, dt_bias, ssm_a, pos, lb, eps, n_k, n_v, m, fault, &mut y,
+                x, w, b_raw, f, dt_bias, ssm_a, pos, lb, eps, n_k, n_v, n_v, m, fault, &mut y,
                 &mut beta, &mut decay, &mut ring,
             );
         }
@@ -907,7 +919,7 @@ mod conv_kernels {
         // sigmoid gate alone reads it.
         unsafe {
             conv_body::<DECAY_KEY, KDA_GATE_SOFTPLUS, KDA_BETA_X2, _>(
-                x, w, b_raw, f, dt_bias, ssm_a, pos, 0.0, eps, n_k, n_v, m, fault, &mut y,
+                x, w, b_raw, f, dt_bias, ssm_a, pos, 0.0, eps, n_k, n_v, n_v, m, fault, &mut y,
                 &mut beta, &mut decay, &mut ring,
             );
         }
@@ -923,9 +935,11 @@ pub enum ConvRows<'a> {
 }
 
 /// [`ConvKernels::enqueue_conv_prep`]'s arguments: `m` tokens of the
-/// projected channels `x` (`[m][C]`), `b_raw` and `a_raw` (`[m][n_v]`, the β
-/// and α projections), the layer's conv taps `w` (`[C][CONV_TAPS]`, oldest
-/// first), `dt_bias` and `ssm_a` (`[n_v]`), the tokens' positions `pos`
+/// projected channels `x` (`[m][C]`), `b_raw` and `a_raw` (the β and α
+/// projections, `n_v` values a token, each token's `ba_pitch` values past
+/// the one before: `n_v` for their own rows, `2·n_v` for two windows of one
+/// joined projection's rows, α's `n_v` values in), the layer's conv taps `w`
+/// (`[C][CONV_TAPS]`, oldest first), `dt_bias` and `ssm_a` (`[n_v]`), the tokens' positions `pos`
 /// (`[m]`, the words the rope reads), the buffers the call writes: the conv
 /// output `y` (`[m][C]`), β and decay (`[m][n_v]`), and the layer's conv ring
 /// (`[RING_ROWS][C]`), read and written in place.
@@ -933,6 +947,7 @@ pub struct ConvArgs<'a> {
     pub x: ConvRows<'a>,
     pub b_raw: &'a DeviceBuffer<f32>,
     pub a_raw: &'a DeviceBuffer<f32>,
+    pub ba_pitch: usize,
     pub w: &'a DeviceBuffer<f32>,
     pub dt_bias: &'a DeviceBuffer<f32>,
     pub ssm_a: &'a DeviceBuffer<f32>,
@@ -977,6 +992,7 @@ impl ConvKernels {
             x,
             b_raw,
             a_raw,
+            ba_pitch,
             w,
             dt_bias,
             ssm_a,
@@ -996,6 +1012,18 @@ impl ConvKernels {
         }
         let ch = shape.channels();
         let nv = shape.n_v;
+        if ba_pitch < nv {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "ba_pitch {ba_pitch} < n_v {nv}: a token's β and α rows overlap the next's"
+                ),
+            ));
+        }
+        let ba = (m - 1)
+            .checked_mul(ba_pitch)
+            .and_then(|v| v.checked_add(nv))
+            .ok_or_else(|| GpuError::shape(what, format!("m={m} rows of pitch {ba_pitch}")))?;
         let x_values = match x {
             ConvRows::F32(x) => x.len(),
             ConvRows::Bf16(x) => {
@@ -1005,8 +1033,8 @@ impl ConvKernels {
         };
         let lens = [
             ("x", x_values, m * ch),
-            ("b_raw", b_raw.len(), m * nv),
-            ("a_raw", a_raw.len(), m * nv),
+            ("b_raw", b_raw.len(), ba),
+            ("a_raw", a_raw.len(), ba),
             ("w", w.len(), CONV_TAPS * ch),
             ("dt_bias", dt_bias.len(), nv),
             ("ssm_a", ssm_a.len(), nv),
@@ -1025,6 +1053,7 @@ impl ConvKernels {
         let grid = launch_u32(what, "grid", (units(m) * shape.conv_heads()).div_ceil(4))?;
         let n_k = launch_u32(what, "n_k", shape.n_k)?;
         let n_v = launch_u32(what, "n_v", nv)?;
+        let ba_pitch = launch_u32(what, "ba_pitch", ba_pitch)?;
         let m = launch_u32(what, "m", m)?;
         let (k, cfg) = (&self.module, LaunchConfig1D::new(grid, BLOCK, 0));
         match x {
@@ -1041,6 +1070,7 @@ impl ConvKernels {
                 eps,
                 n_k,
                 n_v,
+                ba_pitch,
                 m,
                 fault,
                 y,
@@ -1061,6 +1091,7 @@ impl ConvKernels {
                 eps,
                 n_k,
                 n_v,
+                ba_pitch,
                 m,
                 fault,
                 y,

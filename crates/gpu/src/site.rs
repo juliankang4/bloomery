@@ -68,8 +68,8 @@
 //!
 //! A body that names a weight and leaves its type to the file calls a site
 //! by name: [`resident_gemv`] at one column, [`resident_gemv_cols`] at up to
-//! eight, [`resident_gemv_rows`] over rows of a joined weight, and on the
-//! wide arm [`resident_gemm`] and [`resident_gemm_rows`]. Each launches
+//! eight, and on the wide arm [`resident_gemm`] and [`resident_gemm_rows`]
+//! (over rows of a joined weight). Each launches
 //! what the typed call launches for the site type of the weight's resident
 //! form, which the kernel table's dense entry decides
 //! ([`of_resident`]); [`resident_site`] checks that type and shape
@@ -343,29 +343,6 @@ pub fn resident_gemv_cols_on(
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     launch(gpu, stream, g32, (None, w, name), x, m, y)
-}
-
-/// [`resident_gemv_cols`] over rows `at .. at + n` of the resident weight
-/// `name` alone ([`SiteWeight::Part`]), their `n` outputs of each column
-/// token-major into `y`, each bit for bit the whole weight's for its row
-/// and column.
-pub fn resident_gemv_rows(
-    gpu: &Gpu,
-    g32: Option<&Gemm32Kernels>,
-    (w, name, (at, n)): (&Weights, &str, (usize, usize)),
-    x: &DeviceBuffer<f32>,
-    m: usize,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    launch(
-        gpu,
-        gpu.stream(),
-        g32,
-        (None, w, SiteWeight::Part { name, at, n }),
-        x,
-        m,
-        y,
-    )
 }
 
 /// `y = W · x` at one column for the resident weight `name`, by the site
@@ -1125,7 +1102,7 @@ pub fn scatter(
 /// outside `Weights`. Each carries the site's name, which a refusal names.
 /// Words under a type with no grouped GEMM, and rows of a site whose
 /// launch reads neither the f32 rows nor q8 blocks of 32, are refused by
-/// name ([`gemm`], [`gated`], [`resident_gemv_rows`]).
+/// name ([`gemm`], [`gated`], [`resident_gemm_rows`]).
 #[derive(Clone, Copy)]
 pub enum SiteWeight<'a> {
     /// The resident weight of this name.
