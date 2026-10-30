@@ -30,6 +30,15 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   of several choices (`n` above 1) prints one line a choice, its index after the task id. The counts are the numbers
   `/metrics` books for the request; between the lines, a running request shows in `/slots` (`n_past`, `n_decoded`)
   and `/metrics` (`predicted_tokens_seconds`).
+- **Where a round's time goes.** `/metrics` splits the decode rounds by `width`, the slots one round stepped or
+  passed: `rounds_total`, `round_seconds_total` (the round's wall time on the engine thread, the engine's calls and
+  the server's work between them), `round_card_wait_seconds_total` (the part the engine waited for the card's work)
+  and `round_ple_wait_seconds_total` (the part a Qwen3.8 call waited for its PLE table rows read from NVMe); the rest
+  is host time. `card_wait_seconds_total` and `ple_wait_seconds_total` count the same waits over every call, prompts
+  and the prompt cache's work included. An engine that counts no waits reports 0. `spec_decode_num_draft_tokens_by_depth_total` and `spec_decode_num_accepted_tokens_by_depth_total`
+  count a drafted pass's ids by `depth` (the id's place in its draft) under `source`, the drafter's kind (`/props`'
+  `engine.draft.kind`). They sum to `spec_decode_num_draft_tokens_total` and
+  `spec_decode_num_accepted_tokens_total`, and like them are booked when a request ends.
 - **The Anthropic Messages API**: `POST /v1/messages` and `/v1/messages/count_tokens`, as llama-server serves
   them. Point Claude Code or the Anthropic SDK at `ANTHROPIC_BASE_URL=http://localhost:8080`.
 - **The OpenAI text completion API**: `POST /v1/completions` runs the `/completion` path under OpenAI's shape —

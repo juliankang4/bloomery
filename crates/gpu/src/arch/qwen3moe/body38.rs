@@ -650,7 +650,7 @@ impl PleRead {
     /// before its fills took it, or a new prompt call.
     fn drain(&mut self) -> Result<(), GpuError> {
         if std::mem::take(&mut self.flight) {
-            self.rows.wait().map_err(|e| GpuError::plan(WHAT, e))?;
+            ple_wait(|| self.rows.wait()).map_err(|e| GpuError::plan(WHAT, e))?;
         }
         Ok(())
     }
@@ -711,8 +711,7 @@ impl PleRead {
     /// ([`Prefetcher::read_now`]). [`PleRead::finish`] takes them.
     fn read_now(&mut self, pos: u32, n: usize, ids: &[u32]) -> Result<(), GpuError> {
         if !self.take_in(pos, n, ids)? {
-            self.rows
-                .read_now(std::iter::repeat_n(ids, self.planes))
+            ple_wait(|| self.rows.read_now(std::iter::repeat_n(ids, self.planes)))
                 .map_err(|e| GpuError::plan(WHAT, e))?;
             self.read = true;
         }
@@ -728,7 +727,7 @@ impl PleRead {
             std::mem::take(&mut self.read),
         );
         if helper {
-            self.rows.wait().map_err(|e| GpuError::plan(WHAT, e))?;
+            ple_wait(|| self.rows.wait()).map_err(|e| GpuError::plan(WHAT, e))?;
         } else if !read {
             return Err(GpuError::state(
                 WHAT,
@@ -737,6 +736,15 @@ impl PleRead {
         }
         self.start_front()
     }
+}
+
+/// `read`, the step thread waiting for PLE rows off the NVMe tier, timed as
+/// the engine's PLE wait ([`crate::waits`]).
+fn ple_wait<R>(read: impl FnOnce() -> R) -> R {
+    let t = Instant::now();
+    let r = read();
+    crate::waits::ple(t.elapsed());
+    r
 }
 
 /// How the PLE table's rows decode: IQ4_NL blocks, or bloomery's F8 or NVFP4
@@ -6940,7 +6948,8 @@ mod tests {
     /// A checkpoint folder's F8 table, its rows in runs of two files where the folder stores
     /// them and its header alone in the split, decodes from the NVMe tier's reader the values
     /// the split holding the same rows decodes on the host; on the host, and as rows of another
-    /// type, the folder's table is refused by name.
+    /// type, the folder's table is refused by name. The NVMe tier's fill counts its wait for the
+    /// rows as the engine's PLE wait.
     #[test]
     fn a_folder_s_stored_rows_decode_as_the_split_s() {
         let f8: Vec<u8> = (0..80 * 160u32)
@@ -6971,7 +6980,12 @@ mod tests {
             PleHost::new(Arc::new(header), Some(&stored), 16, 8, tier)
         };
         let mut got = open(GgmlType::F8E4M3_ROWS, Device::Nvme).unwrap();
+        let waited = crate::waits::ple_waited();
         got.fill(0, &tokens).unwrap();
+        assert!(
+            crate::waits::ple_waited() > waited,
+            "a fill off the NVMe tier waited for its rows"
+        );
         assert_eq!(got.ids[..got.named], want.ids[..want.named]);
         assert!(
             got.e.len() == want.e.len()
@@ -7045,7 +7059,12 @@ mod tests {
             let (pos, unit) = (at as u32, &tokens[at..at + m]);
             at += m;
             want.hist = want.fill(pos, unit).unwrap();
+            let waited = crate::waits::ple_waited();
             got.hist = got.fill(pos, unit).unwrap();
+            assert!(
+                crate::waits::ple_waited() > waited,
+                "unit {i}: the fill's wait for its rows on the helper is the engine's PLE wait"
+            );
             assert_eq!(got.ids[..got.named], want.ids[..want.named]);
             assert_eq!(got.e.len(), want.e.len());
             assert!(

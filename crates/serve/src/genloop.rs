@@ -263,6 +263,35 @@ impl Timings {
     }
 }
 
+/// One draft depth's counts: the passes that proposed an id at that depth
+/// (the `d`-th id of their draft), and those whose target kept it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Depth {
+    pub proposed: u64,
+    pub accepted: u64,
+}
+
+/// One pass's draft counts into `depths`, depth `d` at index `d - 1`: a pass
+/// that proposed `p` ids and kept `a` of them (the first `a`, as a target
+/// keeps a prefix) proposed at depths 1 to `p` and was accepted at depths 1
+/// to `a`.
+fn book_depths(depths: &mut Vec<Depth>, d: Drafted) {
+    if depths.len() < d.proposed {
+        depths.resize(d.proposed, Depth::default());
+    }
+    for (k, at) in depths[..d.proposed].iter_mut().enumerate() {
+        at.proposed += 1;
+        at.accepted += u64::from(k < d.accepted);
+    }
+}
+
+impl std::ops::AddAssign for Depth {
+    fn add_assign(&mut self, d: Depth) {
+        self.proposed += d.proposed;
+        self.accepted += d.accepted;
+    }
+}
+
 /// Why a generation ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StopKind {
@@ -1778,6 +1807,10 @@ pub(crate) struct Gen {
     /// `logit_bias`.
     biased_row: Vec<f32>,
     tim: Timings,
+    /// The draft's counts by depth ([`book_depths`]): their sums are the
+    /// timings' `draft_n` and `draft_n_accepted`. Kept apart from the
+    /// timings, which every event copies.
+    depths: Vec<Depth>,
     t1: Instant,
     budget: usize,
     scan: StopScan,
@@ -1902,6 +1935,7 @@ impl Gen {
             logits,
             biased_row: Vec::new(),
             tim: Timings::default(),
+            depths: Vec::new(),
             t1: Instant::now(),
             budget: usize::try_from(p.n_predict).unwrap_or(usize::MAX),
             scan: StopScan::new(p.stop.clone()),
@@ -1949,6 +1983,11 @@ impl Gen {
     /// The timings so far.
     pub(crate) fn timings(&self) -> &Timings {
         &self.tim
+    }
+
+    /// The draft's counts by depth so far, depth `d` at index `d - 1`.
+    pub(crate) fn draft_depths(&self) -> &[Depth] {
+        &self.depths
     }
 
     /// The buffer a pass's kept tokens go to.
@@ -2603,6 +2642,7 @@ impl Gen {
     /// its first kept token is always there for the taking.
     pub(crate) fn advanced(&mut self, d: Drafted) {
         self.tim.book(d);
+        book_depths(&mut self.depths, d);
         self.tim.n_past = self.n + self.generated.len() + self.kept.len() - 1;
         self.tok = Some(self.kept[0]);
         self.taken = 1;
@@ -2780,10 +2820,25 @@ pub(crate) fn generate_in_quanta(
 
 #[cfg(test)]
 mod tests {
-    use super::{partial_path, prompt_tail};
+    use super::{Depth, book_depths, partial_path, prompt_tail};
+    use crate::engine::Drafted;
     use crate::media::{Held, ImageKey, MediaSpan};
     use crate::slotfile;
     use std::path::Path;
+
+    /// A pass's draft counts land at their depths, a kept prefix's: three
+    /// proposed and one kept, then two proposed and both kept, then a pass
+    /// that proposed none, leave depths 1 to 3 at proposed 2, 2, 1 and kept
+    /// 2, 1, 0.
+    #[test]
+    fn a_pass_books_its_draft_at_each_depth() {
+        let mut depths = Vec::new();
+        for (proposed, accepted) in [(3, 1), (2, 2), (0, 0)] {
+            book_depths(&mut depths, Drafted { proposed, accepted });
+        }
+        let at = |proposed, accepted| Depth { proposed, accepted };
+        assert_eq!(depths, vec![at(2, 2), at(2, 1), at(1, 0)]);
+    }
 
     /// The penalties' prompt tail leaves an image span's positions out and
     /// keeps the last `n` of the rest, in order.

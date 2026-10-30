@@ -107,6 +107,7 @@ pub(crate) mod tensor;
 pub mod token_major;
 pub(crate) mod upload;
 pub(crate) mod view;
+pub mod waits;
 pub(crate) mod watchdog;
 pub mod weights;
 

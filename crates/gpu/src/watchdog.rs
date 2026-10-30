@@ -226,10 +226,14 @@ impl Drop for Busy {
     }
 }
 
-/// A wait on the card finished (`host::await_within` returning `Ok`): the
-/// engine thread is moving. Nothing outside a guarded call.
-pub(crate) fn wait_done() {
-    guarded(|w| w.progress.fetch_add(1, Ordering::Relaxed));
+/// A wait on the card of `waited` finished (`host::await_within` returning
+/// `Ok`): the engine thread is moving, and the wait is the engine's
+/// ([`crate::waits`]). Nothing outside a guarded call.
+pub(crate) fn wait_done(waited: Duration) {
+    guarded(|w| {
+        w.progress.fetch_add(1, Ordering::Relaxed);
+        crate::waits::card(waited);
+    });
 }
 
 /// One token's pass inside a guarded call finished: a prompt run as steps
@@ -398,7 +402,12 @@ mod tests {
             assert_ne!(w.busy_since.load(Ordering::Relaxed), 0);
             assert_eq!(w.reads.load(Ordering::Relaxed), 3);
             let p0 = w.progress.load(Ordering::Relaxed);
-            wait_done();
+            let waited = crate::waits::card_waited();
+            wait_done(Duration::from_millis(2));
+            assert!(
+                crate::waits::card_waited() >= waited + Duration::from_millis(2),
+                "a guarded wait is the engine's card wait"
+            );
             boundary_landed(5);
             assert_eq!(w.progress.load(Ordering::Relaxed), p0 + 2);
             assert_eq!(w.boundary.load(Ordering::Relaxed), 5);
@@ -408,7 +417,7 @@ mod tests {
         }
         assert_eq!(w.busy_since.load(Ordering::Relaxed), 0);
         let p1 = w.progress.load(Ordering::Relaxed);
-        wait_done();
+        wait_done(Duration::from_millis(2));
         assert_eq!(w.progress.load(Ordering::Relaxed), p1, "no watch guarded");
     }
 

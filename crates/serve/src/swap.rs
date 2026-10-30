@@ -42,7 +42,7 @@ use std::sync::Arc;
 use crate::api::ServeError;
 use crate::engine::{
     CacheNote, Drafted, Engine, EngineError, EngineProps, ResidencyReset, Saved, SavedState,
-    SlotRow, StateError, Tokenizer,
+    SlotRow, StateError, Tokenizer, Waits,
 };
 use crate::media::MediaFeed;
 
@@ -204,6 +204,9 @@ impl Engine for SwapEngine {
     }
     fn note(&self, note: &CacheNote) {
         self.inner.note(note);
+    }
+    fn waits(&self) -> Waits {
+        self.inner.waits()
     }
 }
 

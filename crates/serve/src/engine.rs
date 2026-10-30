@@ -71,6 +71,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::media::{MediaFeed, SharedMediaModel};
 use crate::swap::Park;
@@ -613,6 +614,50 @@ pub trait Engine: Send {
     /// default writes one plain line to stderr.
     fn note(&self, note: &CacheNote) {
         eprintln!("bloomery-serve: {note}");
+    }
+    /// What the engine has waited for ([`Waits`]), each total only growing
+    /// from a start the engine fixes (its open, or its process's start): the
+    /// server counts from its first reading and reads it around every decode
+    /// round. The default, for an engine that counts no waits, is zero.
+    fn waits(&self) -> Waits {
+        Waits::default()
+    }
+}
+
+/// The time an engine's calls spent waiting, summed ([`Engine::waits`]):
+/// `/metrics`' card and PLE wait counters, and each decode round's share by
+/// its width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Waits {
+    /// On the card's work to finish.
+    pub card: Duration,
+    /// On the rows of a PLE table (a per-layer embedding) read from storage
+    /// for a call that needs them.
+    pub ple: Duration,
+}
+
+impl Waits {
+    /// What was waited since `before`, an earlier reading of the same
+    /// engine. Both totals must only grow; equal readings give zero.
+    /// Panics naming the counter if either total decreased.
+    pub(crate) fn since(self, before: Waits) -> Waits {
+        Waits {
+            card: self
+                .card
+                .checked_sub(before.card)
+                .expect("Engine::waits card total must only grow"),
+            ple: self
+                .ple
+                .checked_sub(before.ple)
+                .expect("Engine::waits PLE total must only grow"),
+        }
+    }
+}
+
+impl std::ops::AddAssign for Waits {
+    fn add_assign(&mut self, w: Waits) {
+        self.card += w.card;
+        self.ple += w.ple;
     }
 }
 
@@ -1176,3 +1221,48 @@ pub struct SamplerRefused(pub String);
 /// so it runs without it.
 pub type SamplerFactory =
     Arc<dyn Fn(&SamplingParams) -> Result<Sampler, SamplerRefused> + Send + Sync>;
+
+#[cfg(test)]
+mod tests {
+    use super::Waits;
+    use std::time::Duration;
+
+    #[test]
+    fn wait_deltas_require_monotonic_totals() {
+        let before = Waits {
+            card: Duration::from_millis(10),
+            ple: Duration::from_millis(20),
+        };
+        assert_eq!(before.since(before), Waits::default());
+        let growth = Waits {
+            card: Duration::from_millis(3),
+            ple: Duration::from_millis(7),
+        };
+        let mut after = before;
+        after += growth;
+        assert_eq!(after.since(before), growth);
+        for (reading, name) in [
+            (
+                Waits {
+                    card: Duration::from_millis(2),
+                    ..after
+                },
+                "card",
+            ),
+            (
+                Waits {
+                    ple: Duration::from_millis(2),
+                    ..after
+                },
+                "PLE",
+            ),
+        ] {
+            let panic = std::panic::catch_unwind(|| reading.since(before))
+                .expect_err("a decreasing wait total must panic");
+            assert_eq!(
+                crate::api::panic_text(&*panic),
+                format!("Engine::waits {name} total must only grow")
+            );
+        }
+    }
+}
