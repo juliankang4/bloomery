@@ -43,6 +43,24 @@ impl Request {
             .iter()
             .find_map(|(k, v)| (k == key).then_some(v.as_str()))
     }
+
+    /// The 404's message for a request no route of the server answers: its method and path.
+    pub(crate) fn not_found(&self) -> String {
+        format!("File Not Found: {} {}", self.method, self.path)
+    }
+}
+
+/// What a path names below `/v1/<collection>/` (or `/<collection>/`), as sent; `None` for
+/// another path or an empty rest.
+pub(crate) fn below<'a>(path: &'a str, collection: &str) -> Option<&'a str> {
+    let path = path
+        .strip_prefix("/v1")
+        .filter(|p| p.starts_with('/'))
+        .unwrap_or(path);
+    path.strip_prefix('/')?
+        .strip_prefix(collection)?
+        .strip_prefix('/')
+        .filter(|rest| !rest.is_empty())
 }
 
 /// The pairs of a query string, each side percent-decoded as a form field
@@ -59,8 +77,9 @@ fn parse_query(query: &str) -> io::Result<Vec<(String, String)>> {
         .collect()
 }
 
-/// One side of a query pair, decoded ([`parse_query`]).
-fn percent_decode(s: &str) -> io::Result<String> {
+/// One side of a query pair, decoded ([`parse_query`]); also a model name a path carries
+/// ([`crate::models::named`], which escapes a `+` first: in a path it is a `+`).
+pub(crate) fn percent_decode(s: &str) -> io::Result<String> {
     let hex = |b: u8| char::from(b).to_digit(16);
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

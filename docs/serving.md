@@ -10,6 +10,16 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **The API**: `/v1/chat/completions`, `/completion`, streaming, tool calls, `reasoning_content`,
   `cache_prompt`, `/apply-template`, `/tokenize`, `/detokenize`, `/slots`, `/metrics`, `/v1/models`, `/props`. OpenAI SDKs, curl,
   and llama-server tutorials apply as they are.
+- **Model lookup**: `GET /v1/models/{model}` (and `/models/{model}`) answers the one `/v1/models` entry of that name.
+  URL names are percent-decoded once with literal `+` preserved; invalid encoding is a 400 `invalid_request_error`.
+  JSON names in `/api/show` are matched literally.
+  A name the server does not serve is a 404 `not_found_error` naming the models it does, and a route it does not have
+  a 404 that starts with the method and path (`File Not Found: GET /path`). For Ollama clients, `GET /api/tags`
+  answers the `/v1/models` list (its `models` array is Ollama's shape) and `POST /api/show` with `{"model": NAME}`
+  answers the chat model's template, its file's format, architecture and quant (`details`), the served context as
+  `<arch>.context_length` (`model_info`) and its `capabilities`: `completion`, `tools` when the template's tool-call
+  markup is one the server parses, `vision` with an image encoder; the embedding model answers `embedding`. A decision
+  model's server answers `/api/tags` and the lookup but not `/api/show`. Ollama's other routes are not served.
 - **The Anthropic Messages API**: `POST /v1/messages` and `/v1/messages/count_tokens`, as llama-server serves
   them. Point Claude Code or the Anthropic SDK at `ANTHROPIC_BASE_URL=http://localhost:8080`.
 - **The OpenAI text completion API**: `POST /v1/completions` runs the `/completion` path under OpenAI's shape —

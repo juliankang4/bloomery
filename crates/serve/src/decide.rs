@@ -3,8 +3,9 @@
 //!
 //! Routes: `POST` on each of the row's routes (the request body to [`Decide::decide`]; the answer
 //! with a `timings` object appended as its last key), `GET /props` ([`Decide::props`], read once at
-//! bind, with the `engine` object the generative server gives), `GET /v1/models` and `/models` (the
-//! seated model's listing, as the generative server's), `GET /health`, `OPTIONS` on any path (the
+//! bind, with the `engine` object the generative server gives), `GET /v1/models`, `/models` and
+//! `/api/tags` (the seated model's listing, as the generative server's), `GET /v1/models/{model}`
+//! (its entry, or a 404 naming it), `GET /health`, `OPTIONS` on any path (the
 //! CORS answer [`crate::Server`] gives), and a 404 error object naming the routes for anything
 //! else ([`not_found`]: a chat client finds what to post instead). A refused request
 //! is a 400 carrying the decider's message, a request the engine cannot answer (an image) a 501
@@ -556,7 +557,14 @@ fn reply(s: &Shared, req: &Request) -> Reply {
             None => Reply::json(200, &json!({ "status": "ok" })),
         },
         ("GET", "/props") => Reply::json(200, &s.fixed.props),
-        ("GET", "/v1/models" | "/models") => Reply::json(200, &s.fixed.models),
+        ("GET", "/v1/models" | "/models" | "/api/tags") => Reply::json(200, &s.fixed.models),
+        ("GET", p) if let Some(id) = crate::models::named(p) => match id {
+            Ok(id) => match crate::models::lookup(&s.fixed.models, &id) {
+                Ok(entry) => Reply::json(200, &entry),
+                Err(message) => Reply::error(404, "not_found_error", &message),
+            },
+            Err(message) => Reply::error(400, "invalid_request_error", &message),
+        },
         ("OPTIONS", _) => Reply {
             status: 204,
             ctype: "text/plain",
@@ -573,15 +581,16 @@ fn reply(s: &Shared, req: &Request) -> Reply {
             };
             decide(s, body)
         }
-        _ => Reply::error(404, "not_found_error", &not_found(s.fixed.routes)),
+        _ => Reply::error(404, "not_found_error", &not_found(req, s.fixed.routes)),
     }
 }
 
-/// The 404's message: what this server answers instead, its decider's `routes`.
-fn not_found(routes: &[&str]) -> String {
+/// The 404's message: the request, and what this server answers instead, its decider's `routes`.
+fn not_found(req: &Request, routes: &[&str]) -> String {
     format!(
-        "File Not Found: this server seats a decision model, which answers POST {} and no \
-         chat or completion route",
+        "{}; this server seats a decision model, which answers POST {} and no chat or \
+         completion route",
+        req.not_found(),
         routes.join(", POST ")
     )
 }
@@ -891,19 +900,21 @@ mod tests {
             (
                 404,
                 &json!(
-                    "File Not Found: this server seats a decision model, which answers POST \
-                     /v1/rerank, POST /rerank and no chat or completion route"
+                    "File Not Found: POST /v1/chat/completions; this server seats a decision \
+                     model, which answers POST /v1/rerank, POST /rerank and no chat or \
+                     completion route"
                 )
             )
         );
         assert_eq!(reply(&s, &post("/v1/systemone")).status, 404);
-        assert!(not_found(&["/v1/systemone"]).contains("POST /v1/systemone and"));
+        assert!(not_found(&post("/x"), &["/v1/systemone"]).contains("POST /v1/systemone and"));
         assert!(check_routes(&[]).unwrap_err().contains("no route"));
         assert!(check_routes(&["v1/x"]).is_err() && check_routes(&["/props"]).is_err());
         assert!(check_routes(routes).is_ok());
     }
 
-    /// A request the engine cannot answer is llama.cpp's 501; the model list is the seated one's.
+    /// A request the engine cannot answer is llama.cpp's 501; the model list is the seated one's,
+    /// on Ollama's `/api/tags` too, and a lookup by name answers its entry or the 404.
     #[test]
     fn not_supported_is_501_and_the_models_are_listed() {
         let s = shared();
@@ -915,7 +926,7 @@ mod tests {
             (r.status, &body["error"]["type"]),
             (501, &json!("not_supported_error"))
         );
-        for path in ["/v1/models", "/models"] {
+        let get = |path: &str| {
             let r = reply(
                 &s,
                 &Request {
@@ -923,13 +934,44 @@ mod tests {
                     ..post(path)
                 },
             );
-            let v: Value = serde_json::from_slice(&r.body).unwrap();
+            (r.status, serde_json::from_slice::<Value>(&r.body).unwrap())
+        };
+        for path in ["/v1/models", "/models", "/api/tags"] {
+            let (status, v) = get(path);
             assert_eq!(
-                (r.status, &v["data"][0]["id"]),
+                (status, &v["data"][0]["id"]),
                 (200, &json!("m.gguf")),
                 "{path}"
             );
         }
+        let (status, v) = get("/v1/models/m.gguf");
+        assert_eq!((status, &v["id"]), (200, &json!("m.gguf")));
+        for prefix in ["/v1/models/", "/models/"] {
+            let (status, v) = get(&format!("{prefix}m%2Egguf"));
+            assert_eq!((status, &v["id"]), (200, &json!("m.gguf")));
+            for id in ["%", "%2", "%GG", "%FF"] {
+                let (status, v) = get(&format!("{prefix}{id}"));
+                assert_eq!(
+                    (status, &v["error"]),
+                    (
+                        400,
+                        &json!({
+                            "code": 400,
+                            "type": "invalid_request_error",
+                            "message": format!("invalid percent-encoded model name: {id:?}"),
+                        })
+                    )
+                );
+            }
+        }
+        let (status, v) = get("/models/other");
+        assert_eq!(
+            (status, &v["error"]["message"]),
+            (
+                404,
+                &json!("model \"other\" not found: this server serves m.gguf")
+            )
+        );
     }
 
     /// The decide seat's side of a backbone worker thread that has ended (it panicked): its job

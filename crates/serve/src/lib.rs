@@ -7,7 +7,8 @@
 //! and `POST /v1/chat/completions/input_tokens` (the chat prompt's id count),
 //! `POST /tokenize`,
 //! `POST /detokenize`, `POST /apply-template`, `POST /v1/embeddings`, `POST /embeddings` and
-//! `POST /embedding` (an [`embed::Embed`] beside the engine), `GET /v1/models`, `GET /health`,
+//! `POST /embedding` (an [`embed::Embed`] beside the engine), `GET /v1/models`,
+//! `GET /v1/models/{model}`, Ollama's `GET /api/tags` and `POST /api/show`, `GET /health`,
 //! `GET /props`, `GET /slots`, `POST /slots/{id}?action=save|restore|erase`,
 //! `GET /metrics`, `POST /residency/reset` and `POST /shutdown` (bloomery's
 //! own; the shutdown is the orderly stop, accepted from a loopback peer

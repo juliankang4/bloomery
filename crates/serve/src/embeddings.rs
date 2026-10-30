@@ -749,7 +749,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::super::testserve::{mock_config, roundtrip};
+    use super::super::testserve::{TEMPLATE, mock_config, roundtrip};
     use super::*;
     use crate::api::{End, relock};
     use crate::mock::{MockEmbed, MockFail, MockTokenizer, Passes};
@@ -979,7 +979,9 @@ mod tests {
         assert_eq!(status, 400, "{v}");
     }
 
-    /// Discovery lists every seated model and reports the side model's file only when present.
+    /// Discovery lists every seated model (on Ollama's `/api/tags` too), looks one up by name
+    /// (`/v1/models/{model}`, Ollama's `/api/show`), and reports the side model's file only when
+    /// present; a model or a path the server does not have is a 404 naming it.
     #[test]
     fn discovery_names_the_seated_models() {
         for side in [None, Some(MockEmbed::new(32))] {
@@ -1005,14 +1007,113 @@ mod tests {
                 }));
                 names.push(json!({ "name": "mock-embd", "model": "mock-embd" }));
             }
-            for path in ["/v1/models", "/models"] {
+            let get = |path: &str| {
                 let (status, body) = roundtrip(addr, "GET", path, &[], "");
-                assert_eq!(status, 200, "{path}: {body}");
-                let v: Value = serde_json::from_str(&body).expect("models JSON");
+                (status, serde_json::from_str::<Value>(&body).expect("JSON"))
+            };
+            for path in ["/v1/models", "/models", "/api/tags"] {
+                let (status, v) = get(path);
+                assert_eq!(status, 200, "{path}: {v}");
                 assert_eq!(
                     v,
                     json!({ "object": "list", "data": data, "models": names })
                 );
+            }
+            for entry in &data {
+                let id = entry["id"].as_str().expect("an id");
+                assert_eq!(get(&format!("/v1/models/{id}")), (200, entry.clone()));
+                assert_eq!(get(&format!("/models/{id}")), (200, entry.clone()));
+            }
+            let served = if has_side { "mock, mock-embd" } else { "mock" };
+            for field in ["model", "name"] {
+                for id in ["%6dock", "%"] {
+                    let (status, v) = post(addr, "/api/show", &json!({ field: id }));
+                    assert_eq!(
+                        (status, &v["error"]["message"]),
+                        (
+                            404,
+                            &json!(format!(
+                                "model {id:?} not found: this server serves {served}"
+                            ))
+                        )
+                    );
+                }
+            }
+            for prefix in ["/v1/models/", "/models/"] {
+                assert_eq!(get(&format!("{prefix}%6dock")), (200, data[0].clone()));
+                for id in ["%", "%2", "%GG", "%FF"] {
+                    let (status, v) = get(&format!("{prefix}{id}"));
+                    assert_eq!(
+                        (status, &v["error"]),
+                        (
+                            400,
+                            &json!({
+                                "code": 400,
+                                "type": "invalid_request_error",
+                                "message": format!("invalid percent-encoded model name: {id:?}"),
+                            })
+                        )
+                    );
+                }
+            }
+            let unknown = |v: &Value| {
+                assert_eq!(
+                    v["error"],
+                    json!({
+                        "code": 404,
+                        "type": "not_found_error",
+                        "message": format!("model \"nope\" not found: this server serves {served}"),
+                    })
+                );
+            };
+            let (status, v) = get("/v1/models/nope");
+            assert_eq!(status, 404);
+            unknown(&v);
+            let (status, v) = get("/api/nope");
+            assert_eq!(
+                (status, &v["error"]["message"]),
+                (
+                    404,
+                    &json!(
+                        "File Not Found: GET /api/nope; POST /v1/systemone answers a SystemOne \
+                         decision request"
+                    )
+                )
+            );
+            let (status, v) = post(addr, "/api/show", &json!({ "model": "nope" }));
+            assert_eq!(status, 404);
+            unknown(&v);
+            let show = json!({
+                "template": TEMPLATE,
+                "details": {},
+                "model_info": {},
+                "capabilities": ["completion"],
+            });
+            for body in [json!({ "model": "mock" }), json!({ "name": "mock" })] {
+                assert_eq!(
+                    post(addr, "/api/show", &body),
+                    (200, show.clone()),
+                    "{body}"
+                );
+            }
+            if has_side {
+                assert_eq!(
+                    post(addr, "/api/show", &json!({ "model": "mock-embd" })),
+                    (
+                        200,
+                        json!({ "details": {}, "model_info": {}, "capabilities": ["embedding"] })
+                    )
+                );
+            }
+            for (body, message) in [
+                (json!({}), "model is required: a name /api/tags lists"),
+                (
+                    json!({ "model": 7 }),
+                    "model must be a string, not a number",
+                ),
+            ] {
+                let (status, v) = post(addr, "/api/show", &body);
+                assert_eq!((status, &v["error"]["message"]), (400, &json!(message)));
             }
             let (status, body) = roundtrip(addr, "GET", "/props", &[], "");
             assert_eq!(status, 200, "{body}");

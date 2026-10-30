@@ -1524,6 +1524,16 @@ fn invalid(message: impl Into<String>) -> ApiError {
     }
 }
 
+/// The 404 of a route, model or stored response the server does not have.
+fn not_found(message: impl Into<String>) -> ApiError {
+    ApiError {
+        retry_after: false,
+        code: 404,
+        kind: "not_found_error",
+        message: message.into(),
+    }
+}
+
 pub(crate) fn error_body(code: u16, kind: &str, message: &str) -> Value {
     json!({ "error": { "code": code, "message": message, "type": kind } })
 }
@@ -1628,7 +1638,11 @@ pub(crate) const LISTED: [(&str, &str); 13] = [
 fn route(state: &Arc<State>, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let r = match (req.method.as_str(), req.path.as_str()) {
         ("GET", path::HEALTH | "/v1/health") => return health(state, req, w),
-        ("GET", path::MODELS | "/models") => Ok(models(state)),
+        ("GET", path::MODELS | "/models" | "/api/tags") => Ok(models(state)),
+        ("GET", p) if let Some(id) = crate::models::named(p) => id
+            .map_err(invalid)
+            .and_then(|id| crate::models::lookup(&models(state), &id).map_err(not_found)),
+        ("POST", "/api/show") => body(req).and_then(|b| show(state, &b)),
         ("GET", path::PROPS) => Ok(props(state)),
         ("GET", path::SLOTS) => Ok(slots(state)),
         ("GET", path::METRICS) => return metrics(state, req, w),
@@ -1662,15 +1676,11 @@ fn route(state: &Arc<State>, req: &Request, w: &mut TcpStream) -> io::Result<boo
             http::respond(w, req, 204, "text/plain", &cors_preflight(), b"")?;
             return Ok(true);
         }
-        _ => Err(ApiError {
-            retry_after: false,
-            code: 404,
-            kind: "not_found_error",
-            message: format!(
-                "File Not Found: POST {} answers a SystemOne decision request",
-                systemone::ROUTES.join(", POST ")
-            ),
-        }),
+        _ => Err(not_found(format!(
+            "{}; POST {} answers a SystemOne decision request",
+            req.not_found(),
+            systemone::ROUTES.join(", POST ")
+        ))),
     };
     match r {
         Ok(v) => send_json(w, req, 200, &v),
@@ -2378,6 +2388,48 @@ fn models(state: &State) -> Value {
         });
     }
     crate::models::listing(models, state.start_unix)
+}
+
+/// Ollama's `POST /api/show` of a model [`models`] lists, named by `model` (or Ollama's older
+/// `name`); another name is the lookup's 404. The engine's model answers its chat template,
+/// what the file states of its format, architecture and quant, the served context as
+/// `<arch>.context_length`, and its `capabilities`: `completion`, `tools` when the template
+/// teaches a tool-call markup the server parses, `vision` with an image input. The side model
+/// answers `embedding` alone.
+fn show(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
+    let field = |k| b.get(k).filter(|v| !v.is_null());
+    let id = match field("model").or_else(|| field("name")) {
+        Some(Value::String(s)) => s,
+        Some(v) => return Err(wrong_type("model", "a string", v)),
+        None => return Err(invalid("model is required: a name /api/tags lists")),
+    };
+    let entry = crate::models::lookup(&models(state), id).map_err(not_found)?;
+    if entry["id"] != state.alias.as_str() {
+        return Ok(json!({ "details": {}, "model_info": {}, "capabilities": ["embedding"] }));
+    }
+    let file = &state.engine_props["model"];
+    let (mut details, mut info) = (Map::new(), Map::new());
+    put(&mut details, "format", file["format"].as_str());
+    put(&mut details, "quantization_level", file["quant"].as_str());
+    if let Some(arch) = file["arch"].as_str() {
+        details.insert("family".into(), json!(arch));
+        details.insert("families".into(), json!([arch]));
+        info.insert(gguf::GENERAL_ARCHITECTURE.into(), json!(arch));
+        info.insert(format!("{arch}.context_length"), json!(state.info.ctx_max));
+    }
+    let mut capabilities = vec!["completion"];
+    if !matches!(state.tool_format, ToolFormat::Unparsed) {
+        capabilities.push("tools");
+    }
+    if state.media.is_some() {
+        capabilities.push("vision");
+    }
+    Ok(json!({
+        "template": state.template.source(),
+        "details": details,
+        "model_info": info,
+        "capabilities": capabilities,
+    }))
 }
 
 fn props(state: &State) -> Value {
@@ -4962,6 +5014,76 @@ mod tests {
         ] {
             assert!(!carries_media(&v), "{v}");
         }
+    }
+
+    /// Ollama's `/api/show` of the chat model: its template, what the file
+    /// states (format, arch, quant), the served context under the arch, and
+    /// `tools` and `vision` for a template whose tool markup the server parses
+    /// and an engine that takes images.
+    #[test]
+    fn show_names_the_files_facts_and_capabilities() {
+        struct Filed(crate::MockEngine);
+        impl Engine for Filed {
+            fn tokenizer(&self) -> Arc<dyn crate::Tokenizer> {
+                self.0.tokenizer()
+            }
+            fn media_model(&self) -> Option<crate::media::SharedMediaModel> {
+                self.0.media_model()
+            }
+            fn prefill(&mut self, ids: &[u32]) -> Result<(), crate::EngineError> {
+                self.0.prefill(ids)
+            }
+            fn next(
+                &mut self,
+                last: u32,
+                out: Option<&mut [f32]>,
+            ) -> Result<u32, crate::EngineError> {
+                self.0.next(last, out)
+            }
+            fn reset(&mut self) -> Result<(), crate::EngineError> {
+                self.0.reset()
+            }
+            fn ctx_max(&self) -> usize {
+                self.0.ctx_max()
+            }
+            fn describe(&self) -> String {
+                self.0.describe()
+            }
+            fn props_engine(&self) -> EngineProps {
+                let model = crate::ModelProps {
+                    format: Some("gguf".to_owned()),
+                    arch: Some("qwen38".to_owned()),
+                    quant: Some("q4_0".to_owned()),
+                    ..crate::ModelProps::default()
+                };
+                EngineProps {
+                    model: Some(model),
+                    ..EngineProps::default()
+                }
+            }
+        }
+        let mut config = super::testserve::mock_config();
+        config.chat_template = format!("{}{{#- to=commentary <|eom|> #}}", config.chat_template);
+        let template = config.chat_template.clone();
+        let engine = Filed(crate::MockEngine::new(64).with_media().0);
+        let (addr, _state, _end) = super::testserve::spawn(Box::new(engine), config);
+        let (status, body) =
+            super::testserve::roundtrip(addr, "POST", "/api/show", &[], r#"{"model":"mock"}"#);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({
+                "template": template,
+                "details": {
+                    "format": "gguf",
+                    "family": "qwen38",
+                    "families": ["qwen38"],
+                    "quantization_level": "q4_0",
+                },
+                "model_info": { (gguf::GENERAL_ARCHITECTURE): "qwen38", "qwen38.context_length": 64 },
+                "capabilities": ["completion", "tools", "vision"],
+            })
+        );
     }
 
     /// `engine.ctx_verified` is the engine's verified context when it
