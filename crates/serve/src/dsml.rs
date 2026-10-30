@@ -687,7 +687,7 @@ pub struct ChatParser {
     /// writes back around the reasoning.
     tags: ThinkTags,
     /// `None` when neither a split nor a scan is asked for.
-    think: Option<ThinkSplit>,
+    pub(crate) think: Option<ThinkSplit>,
     scan: Option<Scan>,
     /// `Some` for a stream that sends a call as it is read
     /// ([`ChatParser::streaming_calls`]).

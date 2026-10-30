@@ -42,9 +42,9 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **The Anthropic Messages API**: `POST /v1/messages` and `/v1/messages/count_tokens`, as llama-server serves
   them. Point Claude Code or the Anthropic SDK at `ANTHROPIC_BASE_URL=http://localhost:8080`.
 - **The OpenAI text completion API**: `POST /v1/completions` runs the `/completion` path under OpenAI's shape —
-  `object: "text_completion"`, `choices` with `finish_reason` `stop`/`length`, `usage`, and a stream of chunks ending
-  in `data: [DONE]`. One prompt a request: a `prompt` array of several prompts, `echo`, a non-empty `suffix` and
-  `best_of > 1` are refused by name, as is `logprobs`.
+  `object: "text_completion"`, `choices` with `finish_reason` `stop`/`length` (or `reasoning_loop`, below), `usage`,
+  and a stream of chunks ending in `data: [DONE]`. One prompt a request: a `prompt` array of several prompts, `echo`,
+  a non-empty `suffix` and `best_of > 1` are refused by name, as is `logprobs`.
 - **Several choices**: `n` on `/v1/chat/completions` and `/v1/completions` asks for that many choices of the one
   prompt, each answered with its `index`, in a stream too. Choice `i` samples with the request's `seed` plus `i`, so
   choice 0 is the answer `n` 1 gives and a seeded request repeats; a greedy request answers the same text `n` times.
@@ -156,6 +156,19 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **`reasoning_budget`**, per request on `/v1/chat/completions` and `/completion`: llama-server's
   `--reasoning-budget` — the think span's budget in generated ids taken while the span is open, `0` closing it at
   once, `-1` or absent unrestricted, and silently ignored when the template already closed the span.
+  A Qwen3-Coder `<tool_call>` ends the span too, so the budget never forces a close inside its arguments.
+- **`reasoning_loop`**, per request on every generating route (`/completion`, `/v1/completions`,
+  `/v1/chat/completions`, `/v1/responses`, `/v1/messages`): `true` ends a generation whose open think span
+  repeats itself. The span's last ids repeat a cycle of up to 1,024 ids when each of them equals the id one cycle
+  before it, over at least 256 ids and one whole cycle (so two copies of the cycle stand). The generation then ends
+  with the reasoning so far and no answer: `finish_reason` `reasoning_loop` (`stop_reason` on `/v1/messages`,
+  `stop_type` on `/completion`), and on `/v1/responses` `status` `incomplete` with `incomplete_details.reason`
+  `reasoning_loop`. Absent, `null` or `false` turns it off; any other type is a 400 naming the field. Text after
+  the span closes is never read, and like `reasoning_budget` the field is ignored when the template already
+  closed the span. On `/completion`, read `stop_type` for the cause: a reasoning loop leaves
+  `stopped_eos`, `stopped_word` and `stopped_limit` all `false`. Structured output may enable the guard too;
+  its program closes an open think span before generating the document. One id costs one compare per cycle
+  length, at most 1,024.
 - **`developer` messages** reach the chat template as `system`, the mapping llama-server applies before it — every
   template but GPT-OSS's, whose `<|channel|>` marker in the template source keeps the role. A template with no
   branch for the role would drop the message, and OpenAI clients send one every turn.

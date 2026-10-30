@@ -13,7 +13,7 @@ pub(crate) const KEPT: usize = 64;
 /// How a request ended, by the distinctions the server already makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Ending {
-    /// It finished: its `finish_reason` (`stop` or `length`).
+    /// It finished: its `finish_reason` (`stop`, `length` or `reasoning_loop`).
     Done(&'static str),
     /// Its client went away.
     ClientClosed,
