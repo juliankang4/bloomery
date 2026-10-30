@@ -28,6 +28,19 @@ pub enum PlacementError {
         ty: GgmlType,
         role: Role,
     },
+    /// A routed stack with experts on the host, of a type or width no host kernel runs
+    /// ([`crate::kernels::host_stack`]): the host would hold the bytes and compute nothing.
+    #[error(
+        "tensor {name}: experts {experts} on the host, where no host kernel runs {ty} rows of {k} \
+         values ({why})"
+    )]
+    NoHostKernel {
+        name: String,
+        ty: GgmlType,
+        k: usize,
+        experts: String,
+        why: qdot::QdotError,
+    },
     /// The cards' layer ranges do not cover the model once, in order, with one head.
     #[error("stage map: {0}")]
     Stages(String),

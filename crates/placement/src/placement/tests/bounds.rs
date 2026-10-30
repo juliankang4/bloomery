@@ -328,6 +328,87 @@ fn an_nvfp4_stack_holds_a_scale_an_expert_and_is_not_split() {
     assert_eq!(seg.experts.as_ref().map(ExpertList::len), Some(8));
 }
 
+/// The host holds a routed stack's experts only where a host kernel runs them
+/// ([`crate::kernels::host_stack`]): a BF16 or F16 stack, which no host kernel
+/// reads, and NVFP4 rows 48 values wide, whole 16-value groups the host's
+/// 32-value rows do not cut, are refused by name with the experts the host
+/// would hold, by the same rule whether a split or the planner put them there;
+/// NVFP4, MXFP4 and Q4_K stacks at whole rows go to the host. Mutant, the
+/// rule before: a host segment was the stack's file bytes whatever the host
+/// ran.
+#[test]
+fn the_host_holds_experts_only_where_a_host_kernel_runs_them() {
+    let stack = |ty: GgmlType, k: u64| {
+        let mut model = legged(&[[GgmlType::Q4_K; 3]]);
+        let i = model
+            .tensors
+            .iter()
+            .position(|t| t.role == Role::RoutedExperts)
+            .expect("a stack");
+        let blocks = k / ty.blck_size().expect("a sized type");
+        let t = &mut model.tensors[i];
+        (t.ty, t.dims[0]) = (ty, k);
+        t.file_bytes = ty.type_size().expect("a sized type") * blocks * 32;
+        (model, i)
+    };
+    let list = |ids: &[u32]| ExpertList::new(ids.to_vec(), 8).expect("a list");
+    for (ty, k) in [
+        (GgmlType::BF16, 256),
+        (GgmlType::F16, 256),
+        (GgmlType::NVFP4_ROWS, 48),
+    ] {
+        let (model, i) = stack(ty, k);
+        let t = &model.tensors[i];
+        // The card's planes take no 48-value row, so those rows stay whole on the host.
+        let splits = if ty == GgmlType::NVFP4_ROWS { 1 } else { 2 };
+        for on_card in [Vec::new(), vec![(0, list(&[0, 1]))]]
+            .into_iter()
+            .take(splits)
+        {
+            match routed_row_on(i, t, 0, on_card, &model) {
+                Err(e @ PlacementError::NoHostKernel { .. }) => {
+                    let e = e.to_string();
+                    assert!(
+                        e.contains(&t.name) && e.contains(&format!("{ty} rows of {k} values")),
+                        "{e}"
+                    );
+                }
+                other => panic!("{ty} at {k}: {other:?}, not the host kernel refusal"),
+            }
+        }
+    }
+    for ty in [GgmlType::NVFP4, GgmlType::MXFP4, GgmlType::Q4_K] {
+        let (model, i) = stack(ty, 256);
+        let row = routed_row_on(i, &model.tensors[i], 0, Vec::new(), &model)
+            .unwrap_or_else(|e| panic!("{ty} on the host: {e}"));
+        assert_eq!(row.segments[0].device, Device::Host, "{ty}");
+    }
+    let mut bf16 = legged(&[[GgmlType::Q4_K; 3], [GgmlType::BF16; 3]]);
+    bf16.bf16_words = |_| false;
+    let machine = Machine {
+        cards: vec![bytes_card("stage", HEAD + 64 * EXPERT, 0..2)],
+        tiers: Vec::new(),
+        nodes: vec![Node {
+            host: host(),
+            unified: None,
+        }],
+    };
+    let leg = RoutedRule::Leg {
+        gate_up: |ty| (ty == GgmlType::Q4_K).then_some(CardFormat::KQuant),
+        down: |ty| (ty == GgmlType::Q4_K).then_some(CardFormat::KQuant),
+        pair: None,
+    };
+    match plan_routed(&bf16, &machine, 4096, &NoKv, &PlanLevers::default(), leg) {
+        Err(PlacementError::NoHostKernel { ty, experts, .. }) => {
+            assert_eq!((ty, experts.as_str()), (GgmlType::BF16, "0..8"));
+        }
+        other => panic!(
+            "a BF16 layer the card leg leaves to the host: {:?}",
+            other.err()
+        ),
+    }
+}
+
 /// A card leg judges a layer by its parts: Qwen3-30B's leg (a Q4_K or
 /// Q5_K gate·up, a Q4_K, Q5_K or Q6_K down) cards a Q4_K gate and up over
 /// a Q6_K down, and keeps on the host a Q6_K gate and up (a type only its

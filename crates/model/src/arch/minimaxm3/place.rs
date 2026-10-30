@@ -222,7 +222,7 @@ mod tests {
     use super::super::hparams::{Attn, FfnKind, Kind};
     use super::{PROMPT_ROWS, PlaceError, PlanInputs, TIER_CHUNK, stream_bytes, tier_batch};
     use crate::arch::place_hybrid::ring_pass_bytes;
-    use crate::arch::synthetic::{V, header_shaped};
+    use crate::arch::synthetic::{V, header_shaped, host_run_experts};
     use crate::placement::{PlacementError, PlanLevers, workstation};
 
     /// The small header's global keys: the pre-tokenizer and a template the description reads.
@@ -245,6 +245,14 @@ mod tests {
         let split = Split::open(&path).expect("the synthetic header opens");
         let inputs = PlanInputs::describe(&split).expect("the synthetic header describes");
         let _ = std::fs::remove_file(&path);
+        inputs
+    }
+
+    /// [`described`], its routed stacks rows a host kernel runs ([`host_run_experts`]): a header
+    /// a plan places.
+    fn runnable(name: &str) -> PlanInputs {
+        let mut inputs = described(name);
+        host_run_experts(&mut inputs.model);
         inputs
     }
 
@@ -335,17 +343,18 @@ mod tests {
     /// ring once from the file it read and plans `streaming` of those bytes; the open describes the
     /// file again and plans `streaming` of the run's bytes. Both take the plain plan's batch bytes
     /// plus the ring's [derived from the header's widths, apart from the formula]: two halves of 32
-    /// slots, 1,179,648 B, and the pass's buffers, 162,120 B, 1,341,768 B, and they plan the same
-    /// context and expert counts. Mutant: `streaming` leaves the reserve as it was (both equal the
+    /// slots, a slot an expert's three Q8_0 stacks ([`runnable`]: the gate and up 24 rows of 64
+    /// values, 1,632 B each, the down 64 rows of 32, 2,176 B), 348,160 B, and the pass's buffers,
+    /// 162,120 B, 510,280 B, and they plan the same context and expert counts. Mutant: `streaming` leaves the reserve as it was (both equal the
     /// plain plan's, the clause naming the ring's bytes reddens).
     #[test]
     fn the_probe_and_the_open_keep_the_same_stream_room() {
         let machine = workstation::plan_gate(LAYERS);
-        let plain = described("mm3-place-plain");
+        let plain = runnable("mm3-place-plain");
         let ring = stream_bytes(&plain).expect("the routed stacks");
-        assert_eq!(ring, 1_179_648 + 162_120);
-        let probe = described("mm3-place-probe").streaming(ring);
-        let open = described("mm3-place-open").streaming(ring);
+        assert_eq!(ring, 348_160 + 162_120);
+        let probe = runnable("mm3-place-probe").streaming(ring);
+        let open = runnable("mm3-place-open").streaming(ring);
         let room = |inputs: &PlanInputs| {
             inputs
                 .prompt_batch_bytes(&machine)
@@ -375,7 +384,7 @@ mod tests {
     /// layout (the card holds 40,960 B), or the stage rows counted a slot.
     #[test]
     fn the_cards_kv_class_is_the_layers_stores() {
-        let inputs = described("mm3-place-kv");
+        let inputs = runnable("mm3-place-kv");
         assert_eq!(inputs.kv.bytes(0..LAYERS, 64), 47_104);
         let machine = workstation::plan_gate(LAYERS);
         let levers = PlanLevers::default();
@@ -443,7 +452,8 @@ mod tests {
             &tensors_shaped(LAYERS, LEAD, Some(&flags)),
         );
         let split = Split::open(&path).expect("the synthetic header opens");
-        let inputs = PlanInputs::describe(&split).expect("the split header describes");
+        let mut inputs = PlanInputs::describe(&split).expect("the split header describes");
+        host_run_experts(&mut inputs.model);
         let _ = std::fs::remove_file(&path);
         let row = 2 * (16 + 16) * 2;
         let index = IDX_D * 2;
@@ -458,7 +468,7 @@ mod tests {
             );
             !routed || t.layer.is_some_and(|l| l >= LEAD)
         }));
-        let coupled = described("mm3-place-coupled");
+        let coupled = runnable("mm3-place-coupled");
         let machine = workstation::plan_gate(LAYERS);
         let levers = PlanLevers::default();
         let slots = NonZeroUsize::new(1).expect("a slot");

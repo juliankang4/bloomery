@@ -412,7 +412,9 @@ fn case_of(cell: Cell) -> &'static Case {
 const RULER: u64 = super::workstation::RULER;
 
 /// A one-layer model of `experts` ids of `bytes` each, `used` a token,
-/// beside a head of `4 × bytes`: F32 rows of one value.
+/// beside a head of `4 × bytes` (F32 rows of one value): MXFP4 stacks of
+/// `bytes` rows of one block, a byte a row, which no card rule here reads
+/// and the host runs.
 fn tiny(experts: u64, used: u64, bytes: u64) -> ModelTensors {
     let tensor = |name: &str, layer, role, ty, dims: Vec<u64>, file_bytes| ModelTensor {
         name: name.into(),
@@ -438,8 +440,8 @@ fn tiny(experts: u64, used: u64, bytes: u64) -> ModelTensors {
                 "experts 0",
                 Some(0),
                 Role::RoutedExperts,
-                GgmlType::I8,
-                vec![1, bytes, experts],
+                GgmlType::MXFP4,
+                vec![32, bytes, experts],
                 experts * bytes,
             ),
         ],

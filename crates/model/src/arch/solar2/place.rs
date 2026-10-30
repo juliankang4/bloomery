@@ -178,7 +178,7 @@ mod tests {
 
     use super::super::hparams::tests::{LAYERS, keys, tensors};
     use super::{PROMPT_ROWS, PlaceError, PlanInputs, prompt_reserve_bytes, tier_batch};
-    use crate::arch::synthetic::{Ty, V, header_shaped, header_typed};
+    use crate::arch::synthetic::{Ty, V, header_shaped, header_typed, host_run_experts};
     use crate::placement::{Device, PlacementError, PlanLevers, workstation};
 
     /// The small header's file, described; each test names its own file (the tests run in
@@ -190,8 +190,9 @@ mod tests {
         ];
         let path = header_shaped(name, "solar-open2", &keys(), &global, &tensors());
         let split = Split::open(&path).expect("the synthetic header opens");
-        let inputs = PlanInputs::describe(&split).expect("the synthetic header describes");
+        let mut inputs = PlanInputs::describe(&split).expect("the synthetic header describes");
         let _ = std::fs::remove_file(&path);
+        host_run_experts(&mut inputs.model);
         inputs
     }
 
