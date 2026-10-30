@@ -2349,7 +2349,8 @@ fn integrated_room(what: &'static str) -> Result<u64, GpuError> {
 /// without a context but its free bytes, which the primary context answers:
 /// ordinal, name, `cuDeviceTotalMem`, free bytes (on a device that allocates
 /// from host memory, the host's room: [`raw_device_free_bytes`]), whether it
-/// does, compute capability, UUID and PCI bus id — the census a plan resolves
+/// does, compute capability, allocation granule ([`allocation_granularity`]),
+/// UUID and PCI bus id — the census a plan resolves
 /// its cards against
 /// ([`::model::placement::workstation::resolve`]) and an open checks them
 /// against ([`Gpu::open_card`]). No device is an empty census, not an error.
@@ -2409,6 +2410,12 @@ pub(crate) fn device_info(
         free_bytes: raw_device_free_bytes(dev, integrated)?,
         integrated,
         compute_capability: Some(raw_device_compute_capability(dev)?),
+        granule_bytes: Some(
+            u64::try_from(allocation_granularity(ordinal)?)
+                .ok()
+                .and_then(std::num::NonZeroU64::new)
+                .ok_or_else(|| GpuError::shape("census", "an allocation granule of no byte"))?,
+        ),
         uuid: raw_device_uuid(dev)?,
         pci_bus: String::from_utf8_lossy(&bus).into_owned(),
         held_by: None,

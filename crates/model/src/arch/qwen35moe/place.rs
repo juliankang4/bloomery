@@ -1719,7 +1719,9 @@ const fn tier_batch_of(n_embd: u64, n_used: u64, ubatch: u64) -> TierBatchBytes 
 ///
 /// The per-card counts at 4,096 positions and their derivation are pinned in
 /// `crates/model/tests/qwen4exp_meta.rs` (plain) and
-/// `crates/model/tests/qwen4exp_mtp_meta.rs` (with the draft).
+/// `crates/model/tests/qwen4exp_mtp_meta.rs` (with the draft). The machine is
+/// the named reproduction of the maintainer's two cards; a load lays out
+/// [`machine_bp_on`] over the cards its placement resolved on the census.
 #[must_use]
 pub fn machine_bp(
     layers: usize,

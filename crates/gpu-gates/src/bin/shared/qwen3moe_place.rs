@@ -28,6 +28,7 @@
 //! counts their stores and checkpoints. [`census_reads`] counts census
 //! readings; [`serve_choice`] returns each choice's probe count.
 
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bloomery_gpu::arch::qwen3moe::{
@@ -53,7 +54,7 @@ use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::place as q35;
 use model::placement::accepts::{Program, routed_rule};
 use model::placement::ctx_ask::{Chosen, Probe};
-use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE};
+use model::placement::workstation::{self, CardSpec, DeviceInfo};
 use model::placement::{
     self, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
     WholeLoad, WholeNeed,
@@ -576,16 +577,17 @@ impl PlaceQ3 {
         load: Result<WholeLoad, String>,
     ) -> Result<Whole, GateError> {
         let layers = 0..self.layers();
+        let card = self.place.card_specs()?[0];
         let kv = kv_bytes(
             &layers,
             &self.inputs,
             (self.kv, self.media),
-            self.lanes,
+            (self.lanes, card.granule_bytes),
             slots,
             ctx,
         );
         whole_on(
-            self.place.card_specs()?[0],
+            card,
             inputs_model(&self.inputs),
             layers.end,
             kv,
@@ -699,7 +701,7 @@ fn kv_bytes(
     layers: &std::ops::Range<usize>,
     inputs: &Inputs,
     (kv, media): (KvQ8, Media),
-    lanes: usize,
+    (lanes, granule): (usize, NonZeroU64),
     slots: usize,
     ctx: u64,
 ) -> u64 {
@@ -755,7 +757,7 @@ fn kv_bytes(
             planes.push(rows * image_plan::table_bytes_per_position(width));
         }
     }
-    placement::allocator_bytes(GRANULE, planes)
+    placement::allocator_bytes(granule, planes)
 }
 
 /// The plane bytes a delta layer of `shape` holds at `lanes` lanes onto
@@ -2127,6 +2129,7 @@ pub(super) mod tests {
             pci_bus: "0000:41:00.0".to_owned(),
             held_by: None,
             compute_capability: Some((8, 6)),
+            granule_bytes: None,
             integrated: false,
         }];
         let place = Place::parse("cuda0").expect("a card word");
@@ -2141,6 +2144,21 @@ pub(super) mod tests {
         assert_eq!(workstation::counted_arena_bytes(&q.machine.cards[0]), arena);
         q.plan(o.ctx, &PlanLevers::default())
             .unwrap_or_else(|e| panic!("the dense plan at {}: {e}", o.ctx));
+        // The whole load counts the cache in the census card's granule.
+        let cache = |granule| {
+            let mut fine = census.clone();
+            fine[0].granule_bytes = granule;
+            let place = Place::parse("cuda0").expect("a card word");
+            let q = PlaceQ3::qwen35_on(&split, place, &fine, o, Seqs::ONE, Beside::default())
+                .unwrap_or_else(|e| panic!("a dense file plans: {e}"));
+            let load = Qwen35moeModel::whole_load(&split, o).map_err(|e| e.to_string());
+            match q.whole_at(4096, 1, load).expect("a whole verdict") {
+                Whole::Fits(need) | Whole::Short(need) => need.kv,
+                Whole::Refused(why) => panic!("the whole load refused: {why}"),
+            }
+        };
+        let (fine, coarse) = (cache(NonZeroU64::new(64 << 10)), cache(None));
+        assert!(fine < coarse, "{fine} B at 64 KiB, {coarse} B at 2 MiB");
         let tier = DeviceInfo {
             ordinal: 1,
             name: "NVIDIA RTX 3090".to_owned(),
@@ -2150,6 +2168,7 @@ pub(super) mod tests {
             pci_bus: "0000:81:00.0".to_owned(),
             held_by: None,
             compute_capability: Some((8, 6)),
+            granule_bytes: None,
             integrated: false,
         };
         let census = [census.into_iter().next().expect("the stage card"), tier];

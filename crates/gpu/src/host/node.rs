@@ -34,6 +34,7 @@
 pub mod wire;
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -151,6 +152,7 @@ impl NodeCensus {
                 .u64(d.total_bytes)
                 .u64(d.free_bytes)
                 .u8(u8::from(d.integrated))
+                .u64(d.granule_bytes.map_or(0, NonZeroU64::get))
                 .bytes(&d.uuid)
                 .str(&d.pci_bus)
                 .str(d.held_by.as_deref().unwrap_or(""));
@@ -196,6 +198,7 @@ impl NodeCensus {
             let total_bytes = i.u64("total bytes")?;
             let free_bytes = i.u64("free bytes")?;
             let integrated = i.flag("integrated")?;
+            let granule_bytes = NonZeroU64::new(i.u64("allocation granule")?);
             let uuid = <[u8; 16]>::try_from(i.bytes("uuid")?)
                 .map_err(|_| "a uuid of other than 16 bytes".to_string())?;
             let pci_bus = i.str("pci bus")?;
@@ -218,6 +221,7 @@ impl NodeCensus {
                 pci_bus,
                 held_by: (!held.is_empty()).then_some(held),
                 compute_capability: None,
+                granule_bytes,
             });
         }
         Ok(NodeCensus {
@@ -2122,6 +2126,7 @@ pub(super) mod tests {
             pci_bus: "000F:01:00.0".into(),
             held_by: None,
             compute_capability: None,
+            granule_bytes: std::num::NonZeroU64::new(2 << 20),
         }
     }
 

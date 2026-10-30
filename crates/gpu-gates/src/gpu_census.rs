@@ -161,6 +161,7 @@ mod tests {
             pci_bus: String::new(),
             held_by: None,
             compute_capability: None,
+            granule_bytes: None,
             integrated: false,
         };
         let a6000 = [

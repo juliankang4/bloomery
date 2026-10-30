@@ -12,9 +12,10 @@
 //! census again.
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::sync::{Mutex, PoisonError};
 
-use super::workstation::{A6000, CARDS, CardSpec, MIB, RTX_3090};
+use super::workstation::{A6000, CARDS, CardSpec, GRANULE, MIB, RTX_3090};
 
 /// One visible CUDA device as this process's driver enumerates it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +39,11 @@ pub struct DeviceInfo {
     /// `CU_DEVICE_ATTRIBUTE_INTEGRATED`: the device allocates from host
     /// memory (GB10), one pool with the host.
     pub integrated: bool,
+    /// The device's allocation granule (`cuMemGetAllocationGranularity`,
+    /// its minimum), read without a context: the unit a plan's card
+    /// allocator counts in ([`CardSpec::granule_bytes`]). `None` on a
+    /// backend that reads none (Metal, the mock).
+    pub granule_bytes: Option<NonZeroU64>,
     /// The device's CUDA compute capability, `(major, minor)`
     /// (`CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR` and `_MINOR`), read
     /// without a context; `None` on a backend that has none (Metal, the
@@ -121,57 +127,36 @@ impl fmt::Display for DeviceId {
     }
 }
 
-/// The driver names of the cards whose figures were measured, and those
-/// figures.
-const KNOWN: [(&str, CardSpec); 2] = [
-    ("NVIDIA RTX A6000", A6000),
-    ("NVIDIA GeForce RTX 3090", RTX_3090),
-];
-
 /// The usable bytes the census gives a device of `total_bytes`
 /// (`cuDeviceTotalMem`): the total rounded down to a whole MiB. The driver's
 /// reservation (`nvidia-smi`'s `reserved`) is already outside
-/// `cuDeviceTotalMem`, so what is left is a tail under one MiB; on both
-/// measured cards this rule gives exactly their usable bytes.
+/// `cuDeviceTotalMem`, so what is left is a tail under one MiB; on both of
+/// the workstation's cards this rule gives exactly their measured usable
+/// bytes.
 #[must_use]
 pub const fn census_usable(total_bytes: u64) -> u64 {
     total_bytes / MIB * MIB
 }
 
-/// The card spec device `d` gives a plan, naming `d`: the device's free
-/// reading and its holders ride along ([`CardSpec::free_bytes`],
-/// [`CardSpec::held_by`]) for the plan's budget term and its refusals, and
-/// whether it shares the host's memory ([`CardSpec::integrated`]). A
-/// device of a known card's driver name whose total gives that card's
-/// usable bytes takes the card's measured figures; any other device takes
-/// its census total with [`census_usable`]'s tail as the reserve, under a
-/// label from its driver name ([`label`]).
+/// The card spec device `d` gives a plan, naming `d`, every figure the
+/// census's: its total with [`census_usable`]'s tail as the reserve, under a
+/// label from its driver name ([`label`]); its free reading and its holders
+/// for the plan's budget term and its refusals ([`CardSpec::free_bytes`],
+/// [`CardSpec::held_by`]); whether it shares the host's memory
+/// ([`CardSpec::integrated`]); and its allocation granule, or [`GRANULE`]
+/// where the backend reads none.
 #[must_use]
 pub fn spec_of_device(d: &DeviceInfo) -> CardSpec {
-    let device = Some(d.device());
-    let free = Some(d.free_bytes);
-    let held_by = held_word(&d.held_by);
-    let known = KNOWN
-        .iter()
-        .find(|(name, k)| *name == d.name && k.usable_bytes() == census_usable(d.total_bytes));
-    if let Some((_, k)) = known {
-        return CardSpec {
-            device,
-            free_bytes: free,
-            held_by,
-            integrated: d.integrated,
-            ..*k
-        };
-    }
     CardSpec {
         name: label(&d.name),
         total_bytes: d.total_bytes,
         driver_reserve_bytes: d.total_bytes - census_usable(d.total_bytes),
-        device,
-        free_bytes: free,
-        held_by,
+        device: Some(d.device()),
+        free_bytes: Some(d.free_bytes),
+        held_by: held_word(&d.held_by),
         integrated: d.integrated,
         margin_bytes: None,
+        granule_bytes: d.granule_bytes.unwrap_or(GRANULE),
     }
 }
 
@@ -291,7 +276,10 @@ pub const ALIASES: [(&str, &[Pick]); 3] = [
 /// What `pick` is on this workstation with no census, by name: a rank is
 /// [`CARDS`] in its order (the most usable bytes first), a name that card, a
 /// room its own card; an ordinal has no meaning without the census of the
-/// process that numbers it.
+/// process that numbers it. It is the named reproduction of the maintainer's
+/// workstation a gate plans with no census; a placement of the cards a
+/// process holds resolves its picks against the census instead
+/// ([`resolve`]).
 #[must_use]
 pub const fn workstation_spec(pick: Pick) -> Option<CardSpec> {
     match pick {
@@ -727,8 +715,11 @@ mod tests {
         census_usable, device_on_host, listed_index, resolve, spec_of_device, visible, word_picks,
         workstation_spec,
     };
+    use std::num::NonZeroU64;
+
     use crate::placement::workstation::{
-        A6000, CardSpec, MIB, RTX_3090, plan_a, plan_bp, plan_on, plan_tiers, tier_batch_bytes,
+        A6000, CardSpec, GRANULE, MIB, RTX_3090, plan_a, plan_bp, plan_on, plan_tiers,
+        tier_batch_bytes,
     };
     use crate::placement::{PlacementError, UnifiedPool};
 
@@ -765,6 +756,7 @@ mod tests {
                 held_by: None,
                 integrated: false,
                 compute_capability: None,
+                granule_bytes: None,
             })
             .collect()
     }
@@ -790,39 +782,33 @@ mod tests {
             .collect())
     }
 
-    /// The census gives this workstation's two cards exactly their measured
-    /// usable bytes: the reserve rule reproduces both known pairs.
+    /// Every device plans the census's own figures: its total, the sub-MiB
+    /// tail its reserve, its label from the driver name and its allocation
+    /// granule, the workstation's own two cards among them, whose usable
+    /// bytes the rule gives exactly as measured. A backend that reads no
+    /// granule plans [`GRANULE`].
     #[test]
-    fn the_reserve_rule_reproduces_both_cards() {
-        assert_eq!(census_usable(TOTAL_3090), RTX_3090.usable_bytes());
-        assert_eq!(census_usable(TOTAL_A6000), A6000.usable_bytes());
-        let c = census(&[(NAME_3090, TOTAL_3090), (NAME_A6000, TOTAL_A6000)]);
+    fn every_device_plans_the_census_figures() {
+        let mut c = census(&[(NAME_3090, TOTAL_3090), (NAME_A6000, TOTAL_A6000)]);
+        let granule = NonZeroU64::new(64 << 10).expect("not zero");
+        c[1].granule_bytes = Some(granule);
         let (t, a) = (spec_of_device(&c[0]), spec_of_device(&c[1]));
         assert_eq!(
-            (t, a),
-            (
-                CardSpec {
-                    device: Some(c[0].device()),
-                    free_bytes: Some(census_usable(TOTAL_3090)),
-                    ..RTX_3090
-                },
-                CardSpec {
-                    device: Some(c[1].device()),
-                    free_bytes: Some(census_usable(TOTAL_A6000)),
-                    ..A6000
-                }
-            )
+            (t.name, t.usable_bytes(), t.granule_bytes),
+            (RTX_3090.name, RTX_3090.usable_bytes(), GRANULE)
         );
-        // Another device: its census total, the sub-MiB tail its reserve,
-        // its label from the driver name.
+        assert_eq!(
+            (a.name, a.total_bytes, a.usable_bytes(), a.granule_bytes),
+            (A6000.name, TOTAL_A6000, A6000.usable_bytes(), granule)
+        );
+        assert_eq!(plan_on(a, 43).cards[0].granule_bytes, granule);
         let other = census(&[(NAME_4090, TOTAL_4090 + 77)]);
         let s = spec_of_device(&other[0]);
         assert_eq!(
             (s.name, s.total_bytes, s.usable_bytes()),
             ("GeForce_RTX_4090", TOTAL_4090 + 77, TOTAL_4090)
         );
-        // A known name whose total gives other bytes (ECC on, say) takes the
-        // census rule, not the measured constant.
+        // A workstation card's name with other bytes (ECC on, say).
         let short = census(&[(NAME_A6000, TOTAL_A6000 - 2048 * MIB)]);
         let s = spec_of_device(&short[0]);
         assert_eq!(
@@ -1101,8 +1087,9 @@ mod tests {
     /// `gate` plans the 3090's bytes on the card it picks: the device, its
     /// name, free reading, holders and whether it is integrated are the
     /// census's, the total and the driver reserve the 3090's. On the box's
-    /// 3090 that is the 3090's own spec. On a GB10 the card plans the 3090's
-    /// usable bytes and the pool is the census's reading, the host's room.
+    /// 3090 that is the 3090's own device, usable bytes and granule. On a
+    /// GB10 the card plans the 3090's usable bytes and the pool is the
+    /// census's reading, the host's room.
     #[test]
     fn gate_plans_the_3090s_bytes_on_its_card() {
         let gate = |c: &[DeviceInfo]| resolve(alias("gate"), c).expect("gate")[0];
@@ -1119,8 +1106,14 @@ mod tests {
                 ..RTX_3090
             }
         );
-        let box_3090 = census(&[(NAME_A6000, TOTAL_A6000), (NAME_3090, TOTAL_3090)]);
-        assert_eq!(gate(&box_3090), spec_of_device(&box_3090[1]));
+        let mut box_3090 = census(&[(NAME_A6000, TOTAL_A6000), (NAME_3090, TOTAL_3090)]);
+        box_3090[1].granule_bytes = NonZeroU64::new(64 << 10);
+        let (on_box, own) = (gate(&box_3090), spec_of_device(&box_3090[1]));
+        assert_eq!(
+            (on_box.device, on_box.usable_bytes(), on_box.granule_bytes),
+            (own.device, own.usable_bytes(), own.granule_bytes)
+        );
+        assert_eq!(on_box.granule_bytes.get(), 64 << 10);
         let room = 110_000 * MIB;
         let mut gb10 = census(&[(NAME_GB10, TOTAL_GB10)]);
         gb10[0].integrated = true;

@@ -11,11 +11,12 @@ use super::table::{CardTotals, HostTotals, Plan, Row, Segment};
 use super::workstation;
 
 /// The rounds [`plan_in_pool`] lowers the card budget before it refuses by
-/// name. A round lowers the budget by at least a [`workstation::GRANULE`],
-/// and a shortfall under one expert's card bytes takes a round a granule
-/// until an expert leaves the card, so the rounds cover an expert of 128 MiB;
-/// a plan still short past them meets a floor that falls too slowly for a
-/// load to wait on.
+/// name. A round lowers the budget by at least a [`workstation::GRANULE`], or
+/// the card's granule where it is larger ([`Card::granule_bytes`]), and a
+/// shortfall under one expert's card bytes takes a round that step until an
+/// expert leaves the card, so the rounds cover an expert of 128 MiB on any
+/// card; a plan still short past them meets a floor that falls too slowly for
+/// a load to wait on.
 pub(super) const POOL_ROUNDS: u32 = 64;
 
 /// The plan `make` builds under `levers` (the placement, then the NVMe
@@ -26,9 +27,9 @@ pub(super) const POOL_ROUNDS: u32 = 64;
 /// cards and the host read one pool, and the cards' share is a host term of
 /// the floor ([`HostTotals::pool_card_bytes`]); the experts the cards give
 /// up are the host's, so the floor falls by less than the budget does. Each
-/// round lowers the budget by the shortfall its refusal names, at least a
-/// [`workstation::GRANULE`]. The card keeps each layer's id prefix, as under
-/// any budget.
+/// round lowers the budget by the shortfall its refusal names, at least the
+/// step [`POOL_ROUNDS`] names. The card keeps each layer's id prefix, as
+/// under any budget.
 ///
 /// A first plan that is not refused for the floor, a plan under a given
 /// budget (`BLOOMERY_CARD_BUDGET`), a plan of a machine whose cards have
@@ -54,10 +55,11 @@ pub fn plan_in_pool<'a>(
     ) else {
         return first;
     };
+    let step = card.granule_bytes.get().max(workstation::GRANULE.get());
     let mut budget = capped(card, None);
     let mut last = None;
     for round in 1..=POOL_ROUNDS {
-        let Some(lower) = budget.checked_sub(short.max(workstation::GRANULE.get())) else {
+        let Some(lower) = budget.checked_sub(short.max(step)) else {
             break;
         };
         budget = lower;

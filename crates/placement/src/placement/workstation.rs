@@ -25,10 +25,11 @@ use crate::kernels::{
 
 pub const MIB: u64 = 1 << 20;
 
-/// One card as `nvidia-smi` reports it with no process on it [measured], or
-/// as the census gives a device ([`spec_of_device`]): its memory, the part
-/// the driver keeps, and the device it is when it was resolved against this
-/// process's devices.
+/// One card as the census gives a device ([`spec_of_device`]), or a card of
+/// this workstation by name as `nvidia-smi` reports it with no process on it
+/// [measured] ([`A6000`], [`RTX_3090`]): its memory, the part the driver
+/// keeps, its allocation granule, and the device it is when it was resolved
+/// against this process's devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CardSpec {
     /// The name a plan and its records give the card; a known card's driver
@@ -56,6 +57,10 @@ pub struct CardSpec {
     /// keeps [`MARGIN`]. A plan's [`Card::margin_bytes`] takes it from
     /// [`CardSpec::margin`].
     pub margin_bytes: Option<u64>,
+    /// The device allocator's granule ([`Card::granule_bytes`]): the
+    /// census's reading of the device ([`DeviceInfo::granule_bytes`]), or a
+    /// card by name's measured one ([`GRANULE`]).
+    pub granule_bytes: NonZeroU64,
 }
 
 impl CardSpec {
@@ -85,7 +90,9 @@ impl CardSpec {
     }
 }
 
-/// The RTX A6000 [measured, `nvidia-smi`].
+/// The maintainer workstation's RTX A6000 [measured, `nvidia-smi`]: a card
+/// by name, the named plans' (plan (a), plan (b′)'s stage, `--place a6000`).
+/// A census device of any name plans its own figures ([`spec_of_device`]).
 pub const A6000: CardSpec = CardSpec {
     name: "A6000",
     total_bytes: 49_140 * MIB,
@@ -95,9 +102,12 @@ pub const A6000: CardSpec = CardSpec {
     held_by: None,
     integrated: false,
     margin_bytes: None,
+    granule_bytes: GRANULE,
 };
 
-/// The RTX 3090 [measured, `nvidia-smi`].
+/// The maintainer workstation's RTX 3090 [measured, `nvidia-smi`]: a card by
+/// name, the gate plan's bytes ([`plan_gate`], `--place gate` on any card
+/// with the room) and plan (b′)'s tier.
 pub const RTX_3090: CardSpec = CardSpec {
     name: "3090",
     total_bytes: 24_576 * MIB,
@@ -107,33 +117,45 @@ pub const RTX_3090: CardSpec = CardSpec {
     held_by: None,
     integrated: false,
     margin_bytes: None,
+    granule_bytes: GRANULE,
 };
 
 /// Every card a plan names by name, the most usable bytes first: the names
-/// a `--place` word takes ([`word_picks`]), and this workstation's cards by
-/// size ([`Pick::Rank`] on a census-free plan).
+/// a `--place` word takes ([`word_picks`]), and the workstation's cards by
+/// size an alias names with no census ([`workstation_spec`]), the gates'
+/// reproduction of this workstation.
 pub const CARDS: [CardSpec; 2] = [A6000, RTX_3090];
 
 const _: () = assert!(A6000.usable_bytes() > RTX_3090.usable_bytes());
 
-/// Per card: the CUDA context and the m = 1 scratch [assumed], and the margin
-/// the expert rule leaves free. The context term covers the primary context's
-/// own creation ([`CONTEXT_SELF`]) and what a load takes from the device past
-/// a census reading that no other plan term counts: the bundles' module
-/// images, the kernels' local-memory growth, a capture's graph.
+/// The CUDA context term every card sets aside, a card of the census or by
+/// name [assumed]: the program's figure, not a reading of the card. It covers
+/// the primary context's own creation ([`CONTEXT_SELF`]) and what a load takes
+/// from the device past a census reading that no other plan term counts: the
+/// bundles' module images, the kernels' local-memory growth, a capture's graph.
 pub const CONTEXT: u64 = 512 * MIB;
-/// The primary context's own creation cost [measured: an idle A6000's census
-/// reading sits this far below its usable bytes; an idle 3090's sits less far
-/// below, a `Gpu` and its module included]. A census reads free bytes on that
-/// context, so the reading is already net of it; a plan's cap adds it back
-/// (placement's `capped`) and counts the context once, in [`CONTEXT`].
+/// The part of [`CONTEXT`] a census reading already carries, the primary
+/// context's own creation cost [measured on the workstation: an idle A6000's
+/// census reading sits this far below its usable bytes; an idle 3090's sits
+/// less far below, a `Gpu` and its module included]. A census reads free bytes
+/// on that context, so the reading is already net of it; a plan's cap adds it
+/// back (placement's `capped`) and counts the context once, in [`CONTEXT`]. The
+/// census prices no context of its own, so every card's cap adds this figure:
+/// where a card's context costs more, the reading binds the cap; where it
+/// costs less, the usable bytes do.
 pub const CONTEXT_SELF: u64 = 271 * MIB;
+/// The m = 1 scratch every card's stage sets aside [assumed]: the program's
+/// figure, not the card's.
 pub const SCRATCH: u64 = 64 * MIB;
+/// What the expert rule leaves free on a card that `BLOOMERY_CARD_MARGIN`
+/// gives no margin of its own ([`CardSpec::margin`]): a policy, not a reading.
 pub const MARGIN: u64 = 1 << 30;
 
-/// Both cards' allocation granule [measured: what a load takes from
-/// `cuMemGetInfo` is a whole number of them, and
-/// `cuMemGetAllocationGranularity` reports the same size].
+/// The workstation cards' allocation granule [measured: what a load takes
+/// from `cuMemGetInfo` is a whole number of them, and
+/// `cuMemGetAllocationGranularity` reports the same size]: a card by name's,
+/// and a census device's on a backend that reads none. A census device's own
+/// is its reading ([`DeviceInfo::granule_bytes`]).
 pub const GRANULE: NonZeroU64 = NonZeroU64::new(2 * MIB).expect("2 MiB is not zero");
 
 /// The host's usable bytes and the OS and everything else [measured,
@@ -178,9 +200,10 @@ pub fn model_v41() -> String {
     gguf::v41::model()
 }
 
-/// `spec` running `layers`, with this machine's context, scratch and margin.
-/// The spec's free reading and its holders ride on the card for the plan's
-/// budget term and its refusals ([`Card::free_bytes`], [`Card::held_by`]).
+/// `spec` running `layers`, with the program's context and scratch, the
+/// spec's margin and its allocation granule. The spec's free reading and its
+/// holders ride on the card for the plan's budget term and its refusals
+/// ([`Card::free_bytes`], [`Card::held_by`]).
 fn card(spec: CardSpec, layers: Range<usize>, head: bool) -> Card {
     Card {
         name: spec.name.to_string(),
@@ -190,7 +213,7 @@ fn card(spec: CardSpec, layers: Range<usize>, head: bool) -> Card {
         context_bytes: CONTEXT,
         scratch_bytes: SCRATCH,
         margin_bytes: spec.margin(),
-        granule_bytes: GRANULE,
+        granule_bytes: spec.granule_bytes,
         layers,
         head,
         token_embedding: false,
@@ -925,6 +948,7 @@ pub(crate) fn gb10(free: u64) -> CardSpec {
         pci_bus: "000f:01:00.0".to_string(),
         held_by: None,
         compute_capability: Some((12, 1)),
+        granule_bytes: None,
         integrated: true,
     })
 }
@@ -2241,6 +2265,7 @@ mod tests {
             pci_bus: "000f:01:00.0".to_string(),
             held_by: None,
             compute_capability: Some((12, 1)),
+            granule_bytes: None,
         };
         let pinned = ("pinned".to_string(), 1 << 30);
         for integrated in [true, false] {

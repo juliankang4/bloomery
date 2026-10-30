@@ -12,8 +12,12 @@
 //! two cards, the card a run with `--place` unset loads on — whole or placed
 //! (`q3place::PlaceQ3::unplaced_on`) — is the A6000 at its own ordinal with
 //! the 3090 at device 0 and with it at device 1, a lone 3090 is itself, and
-//! a census of no device is `a`'s refusal by name. FAIL-first: a card that
-//! is the census's first device turns the 3090-first census red.
+//! a census of no device is `a`'s refusal by name; that card's allocation
+//! granule is the census's, the unit the seat counts its cache planes in.
+//! FAIL-first: a card that is the census's first device turns the
+//! 3090-first census red, and the workstation's 2 MiB granule a 64 KiB one.
+//! Then it reads this process's census once, before any server holds the
+//! card, for the granule the cache clauses below count in.
 //!
 //! For each file it starts `bloomery-serve --model qwen3 -m <file> --port 0
 //! --parallel 1` (beside this binary, `BLOOMERY_REF_MODEL` removed from its
@@ -297,16 +301,17 @@
 //! - `ctx_flag_wins`, the whole-fit clause's server: `/props`' `n_ctx` is
 //!   the flagged context, not the seat's default.
 //! - `whole_fit_counts_the_planes_granules`: a server at a flagged `--ctx`
-//!   (an odd multiple of 1024, so the rounding binds) and `--parallel 1`
+//!   (one row past an odd multiple of 1024, so the rounding binds on any
+//!   card's granule) and `--parallel 1`
 //!   prints the seat's one whole-fit line before any load — fits or not,
 //!   the term prints either way — and its cache term equals the
-//!   allocator's bytes of the file's own planes at the card's 2 MiB
-//!   granule: f16's `k` and `v` a plain-attention layer, a qwen35moe
+//!   allocator's bytes of the file's own planes at the card's granule:
+//!   f16's `k` and `v` a plain-attention layer, a qwen35moe
 //!   file's recurrent layers' `state` and `ring` (the layers its
 //!   `attn_qkv` tensor marks). FAIL-first: the raw sum the verdict
-//!   counted before the planes went through the allocator is 96 MiB short
-//!   at that ctx on the Qwen3-30B file (every plane half a granule past a
-//!   whole one) and 21.7 MiB on the Qwen3.6 one.
+//!   counted before the planes went through the allocator is 95.9 MiB short
+//!   at that ctx on the Qwen3-30B file at a 2 MiB granule (every plane 1023
+//!   KiB under the granules it takes) and about 21.7 MiB on the Qwen3.6 one.
 //! - `ctx_never_passes_the_trained_context`, `default_load_names_f16` and
 //!   `unset_place_is_the_rule`, the main server's default arm: `/props`'
 //!   `n_ctx` is at most the file's trained context, the load record names
@@ -524,9 +529,10 @@ mod q3place;
 #[cfg(feature = "deepseek41")]
 mod gate {
     use std::collections::BTreeMap;
+    use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::mpsc;
+    use std::sync::{OnceLock, mpsc};
     use std::thread::JoinHandle;
     use std::time::Duration;
 
@@ -554,7 +560,7 @@ mod gate {
     use model::arch::models::Mixer;
     use model::arch::qwen35moe::mtp::{InFile, in_file};
     use model::placement::WholeLoad;
-    use model::placement::workstation::{A6000, DeviceInfo, GRANULE, RTX_3090};
+    use model::placement::workstation::{A6000, DeviceInfo, RTX_3090};
     use refset::arch::qwen35moe::vis::{self, CHATIDS, DECODE};
     use refset::clefvis::{ClefvisSet, Span};
     use refset::family::Family;
@@ -742,14 +748,35 @@ mod gate {
                     pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
                     held_by: None,
                     compute_capability: Some((8, 6)),
+                    granule_bytes: None,
                     integrated: false,
                 }
             })
             .collect()
     }
 
+    /// The allocation granule of the card a run with `--place` unset loads
+    /// on, as `census` reads it: the unit the seat counts its cache planes
+    /// in (`q3place::kv_bytes`).
+    fn granule_on(census: &[DeviceInfo]) -> Result<NonZeroU64, GateError> {
+        Ok(q3place::PlaceQ3::unplaced_on(census)?.card_specs()?[0].granule_bytes)
+    }
+
+    /// [`granule_on`] this process's census, read once: [`run`] reads it
+    /// before any server holds the card, so the census's context never sits
+    /// beside a load.
+    fn serve_granule() -> Result<NonZeroU64, GateError> {
+        static READ: OnceLock<NonZeroU64> = OnceLock::new();
+        if let Some(g) = READ.get() {
+            return Ok(*g);
+        }
+        let g = granule_on(&bloomery_gpu::census()?)?;
+        Ok(*READ.get_or_init(|| g))
+    }
+
     /// `unplaced_card_is_the_largest` (module doc): the card the unset
-    /// default loads on, by name and ordinal, on each fake census.
+    /// default loads on, by name and ordinal, on each fake census, and its
+    /// granule.
     fn unplaced_card_is_the_largest(ok: &mut bool) {
         let card = |census: &[DeviceInfo]| {
             q3place::PlaceQ3::unplaced_on(census)
@@ -766,6 +793,13 @@ mod gate {
         let lone = card(&fake_census(&["3090"]));
         println!("unplaced card on [\"3090\"]: {lone:?}");
         pass &= lone == Ok((RTX_3090.name, Some(0)));
+        let mut fine = fake_census(&["3090", "A6000"]);
+        fine[1].granule_bytes = NonZeroU64::new(64 << 10);
+        let granule = granule_on(&fine)
+            .map(NonZeroU64::get)
+            .map_err(|e| e.to_string());
+        println!("unplaced card's granule on [\"3090\", \"A6000\" at 64 KiB]: {granule:?}");
+        pass &= granule == Ok(64 << 10);
         let none = card(&[]);
         println!("unplaced card on []: {none:?}");
         pass &= none.is_err_and(|e| {
@@ -1329,7 +1363,7 @@ mod gate {
         // the K or V values of a layer (kv_heads x n x head_dim). The default context became
         // a 1024-step (cd84d529f); at 226304 on Qwen3-30B the clause was red at 153 MiB under
         // the ceiling, which this term equals.
-        let g = GRANULE.get();
+        let g = serve_granule()?.get();
         let b = kv_heads * same_n * head_dim;
         let granule_drop = layers
             * (2 * (2 * b).next_multiple_of(g)
@@ -1485,9 +1519,10 @@ mod gate {
             ..
         } = whole_terms(line)?;
         // The whole load's need at `ctx` positions, the line's other terms kept.
+        let granule = serve_granule()?;
         let need_at = |ctx: u64| -> Result<u64, GateError> {
             let planes = cache_planes(model, split, ctx, default_lanes(split))?;
-            rest.checked_add(model::placement::allocator_bytes(GRANULE, planes))
+            rest.checked_add(model::placement::allocator_bytes(granule, planes))
                 .ok_or_else(|| format!("the whole load's need at {ctx} passes u64 bytes").into())
         };
         let target = target_of(trained);
@@ -1576,11 +1611,12 @@ mod gate {
         Ok(())
     }
 
-    /// The ctx [`whole_fit_counts_the_planes_granules`] runs at: an odd
-    /// multiple of 1024 over the seat's floor, so a qwen3moe file's every
-    /// f16 plane is half a granule past a whole one and the allocator's
-    /// rounding moves the verdict's cache term off the raw sum.
-    const GRANULE_CTX: usize = 5 * 1024;
+    /// The ctx [`whole_fit_counts_the_planes_granules`] runs at: one row
+    /// past an odd multiple of 1024, over the seat's floor, so a qwen3moe
+    /// file's f16 plane (1 KiB a row) is no whole number of granules of any
+    /// power-of-two size past 1 KiB, and the allocator's rounding moves the
+    /// verdict's cache term off the raw sum on any card.
+    const GRANULE_CTX: usize = 5 * 1024 + 1;
 
     /// `whole_fit_counts_the_planes_granules`: the whole-fit verdict's cache
     /// term is the allocator's bytes of the planes the body allocates, one
@@ -1588,14 +1624,15 @@ mod gate {
     /// its one whole-fit line before any load — fits or not, the term prints
     /// either way — and the clause reads the line's cache bytes and holds
     /// them equal to `allocator_bytes` over the file's own planes at the
-    /// card's 2 MiB granule: f16's `k` and `v` a plain-attention layer, a
+    /// card's granule: f16's `k` and `v` a plain-attention layer, a
     /// qwen35moe file's recurrent layers' `state` and `ring`
     /// (`LinearShape`'s lengths, one lane as `Body35` allocates them).
     /// FAIL-first: the raw sum the verdict counted before the planes went
-    /// through the allocator is 96 MiB short at this ctx on the Qwen3-30B
-    /// file (every plane half a granule past a whole one) and 21.7 MiB on
-    /// the Qwen3.6 one (its GQA planes 2.5 granules each, its delta rings
-    /// sharing granules), so the clause is red on it.
+    /// through the allocator is 95.9 MiB short at this ctx on the Qwen3-30B
+    /// file at a 2 MiB granule (every plane 1023 KiB under the granules it
+    /// takes) and about 21.7 MiB on the Qwen3.6 one (its GQA planes just past
+    /// 2.5 granules each, its delta rings sharing granules), so the clause is
+    /// red on it.
     fn whole_fit_counts_the_planes_granules(
         model: &Path,
         dir: &Path,
@@ -1603,7 +1640,7 @@ mod gate {
     ) -> Result<(), GateError> {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
         let planes = cache_planes(model, &split, GRANULE_CTX as u64, default_lanes(&split))?;
-        let expected = model::placement::allocator_bytes(GRANULE, planes.iter().copied());
+        let expected = model::placement::allocator_bytes(serve_granule()?, planes.iter().copied());
         let raw: u64 = planes.iter().sum();
         let d = dir.join("ctx-granule");
         std::fs::create_dir_all(&d)?;
@@ -2365,11 +2402,12 @@ mod gate {
         // The two-slot whole load's need at a total `x`: the line's other
         // terms plus two slots' planes, each slot one slot's list at half
         // the total, as the allocator rounds them.
+        let granule = serve_granule()?;
         let need2 = |x: u64| -> Result<u64, GateError> {
             let rows = x / 2;
             let mut planes = cache_planes(model, &split, rows, 1)?;
             planes.extend(cache_planes(model, &split, rows, 1)?);
-            rest.checked_add(model::placement::allocator_bytes(GRANULE, planes))
+            rest.checked_add(model::placement::allocator_bytes(granule, planes))
                 .ok_or_else(|| {
                     format!("the two-slot whole load's need at {x} passes u64 bytes").into()
                 })
@@ -4175,7 +4213,7 @@ mod gate {
             planes.extend(cache_planes(model, &split, rows, 1)?);
             planes.push(rows * rope * 4);
         }
-        let want = model::placement::allocator_bytes(GRANULE, planes);
+        let want = model::placement::allocator_bytes(serve_granule()?, planes);
         println!(
             "tables: {slots} slots of {rows} rows, the line's cache {said} B, the allocator's \
              bytes of the planes and the {rope}-wide tables {want} B"
@@ -4593,6 +4631,7 @@ mod gate {
         let a = parse_args()?;
         let mut ok = true;
         unplaced_card_is_the_largest(&mut ok);
+        println!("serve granule: {} B, the unplaced card's", serve_granule()?);
         for (i, model) in a.models.iter().enumerate() {
             let dir = a.dir.join(i.to_string());
             std::fs::create_dir_all(&dir)?;

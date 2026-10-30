@@ -114,8 +114,9 @@ fn a_lane_holds_its_open_reads_and_its_victim_claim() {
 /// [`plan_in_pool`] on a planner whose floor passes the room by
 /// `short(budget)` B: on a unified machine with no given budget each
 /// round lowers the budget by the shortfall the last refusal named, at
-/// least a granule, and the plan that fits is marked as the pool's, so
-/// the host's refusal does not name a lever no one set. A refusal other
+/// least the card's granule or a workstation granule, whichever is larger,
+/// and the plan that fits is marked as the pool's, so the host's refusal
+/// does not name a lever no one set. A refusal other
 /// than the floor (on a machine with no node too), a discrete card, a
 /// given budget and a shortfall past the card's whole budget are the
 /// first plan's result; a lowered budget refused for another reason, a
@@ -125,7 +126,8 @@ fn a_lane_holds_its_open_reads_and_its_victim_claim() {
 fn a_unified_pool_lowers_the_card_budget_to_the_tiers_floor() {
     const ROOM: u64 = 100 << 30;
     const POOL: u64 = 64 << 30;
-    let granule = workstation::GRANULE.get();
+    // The card's own granule, not the workstation's.
+    let granule = 4 << 20;
     let model = ModelTensors {
         tensors: Vec::new(),
         layers: 1,
@@ -137,6 +139,7 @@ fn a_unified_pool_lowers_the_card_budget_to_the_tiers_floor() {
         let mut c = card("GB10", 0..1, true, true);
         c.usable_bytes = 120 << 30;
         c.free_bytes = Some(POOL);
+        c.granule_bytes = NonZeroU64::new(granule).expect("not zero");
         Machine {
             cards: vec![c],
             tiers: Vec::new(),
@@ -205,6 +208,19 @@ fn a_unified_pool_lowers_the_card_budget_to_the_tiers_floor() {
         workstation::HostNeed::of(&p, 0).card_budget
     };
     assert!(!need(true) && need(false));
+
+    // A card granule under the workstation's still lowers a workstation
+    // granule a round, so the rounds reach an expert of 128 MiB: a 1 B
+    // shortfall that holds until 16 MiB leave the card.
+    let mut fine = pool(true);
+    fine.cards[0].granule_bytes = NonZeroU64::new(64 << 10).expect("not zero");
+    let step = workstation::GRANULE.get();
+    let (got, calls) = run(&fine, &unset, &|b| u64::from(b + (16 << 20) > full), 0);
+    assert_eq!(calls.len(), 1 + ((16 << 20) / step) as usize);
+    assert_eq!(
+        got.expect("the lowered plan"),
+        (Some(full - (16 << 20)), true)
+    );
 
     // The first plan's result: a discrete card, a given budget, a
     // shortfall past the card's whole budget.
