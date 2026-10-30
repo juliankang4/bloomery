@@ -9,6 +9,9 @@ use crate::{Norm, encode_base64, normalize};
 pub enum Error {
     #[error("{0}")]
     Invalid(String),
+    /// A field of the request that is malformed, named by `field`.
+    #[error("{message}")]
+    Field { field: String, message: String },
     #[error("input ({tokens} tokens) is larger than the max context size ({ctx} tokens)")]
     Context { tokens: usize, ctx: usize },
 }
@@ -38,20 +41,19 @@ impl<'a> Request<'a> {
         if oai && let Some(name) = b.get("model").filter(|v| !v.is_null()) {
             let name = name
                 .as_str()
-                .ok_or_else(|| Error::Invalid("model must be a string".into()))?;
+                .ok_or_else(|| field("model", "model must be a string"))?;
             if name != model {
-                return Err(Error::Invalid(format!(
-                    "model {name:?}: embeddings are served by {model:?}"
-                )));
+                return Err(field(
+                    "model",
+                    format!("model {name:?}: embeddings are served by {model:?}"),
+                ));
             }
         }
         let (key, prompt, oai) = match (b.get("input"), b.get("content")) {
             (Some(v), _) => ("input", v, oai),
             (None, Some(v)) => ("content", v, false),
             (None, None) => {
-                return Err(Error::Invalid(
-                    "\"input\" or \"content\" must be provided".into(),
-                ));
+                return Err(field("input", "\"input\" or \"content\" must be provided"));
             }
         };
         let base64 = match b.get("encoding_format") {
@@ -59,8 +61,9 @@ impl<'a> Request<'a> {
             Some(Value::String(f)) if f == "float" => false,
             Some(Value::String(f)) if f == "base64" => true,
             Some(Value::String(_)) => {
-                return Err(Error::Invalid(
-                    "The format to return the embeddings in. Can be either float or base64".into(),
+                return Err(field(
+                    "encoding_format",
+                    "The format to return the embeddings in. Can be either float or base64",
                 ));
             }
             Some(v) => return Err(wrong_type("encoding_format", "a string", v)),
@@ -70,7 +73,7 @@ impl<'a> Request<'a> {
             Some(p) => i32::try_from(p)
                 .map_err(|e| e.to_string())
                 .and_then(Norm::of)
-                .map_err(|e| Error::Invalid(format!("embd_normalize {p}: {e}")))?,
+                .map_err(|e| field("embd_normalize", format!("embd_normalize {p}: {e}")))?,
         };
         let width = match integer(b, "dimensions")? {
             None => *dims
@@ -82,17 +85,20 @@ impl<'a> Request<'a> {
                 .find(|&d| i64::try_from(d).is_ok_and(|d| d == k))
                 .ok_or_else(|| {
                     let widths: Vec<String> = dims.iter().map(ToString::to_string).collect();
-                    Error::Invalid(format!(
-                        "dimensions {k}: {model} cuts its vectors to {}",
-                        widths.join(", ")
-                    ))
+                    field(
+                        "dimensions",
+                        format!(
+                            "dimensions {k}: {model} cuts its vectors to {}",
+                            widths.join(", ")
+                        ),
+                    )
                 })?,
         };
         let prompt_name = b
             .get("prompt_name")
             .map(|v| {
                 v.as_str()
-                    .ok_or_else(|| Error::Invalid("prompt_name must be a string".into()))
+                    .ok_or_else(|| field("prompt_name", "prompt_name must be a string"))
             })
             .transpose()?;
         let inputs = match prompt {
@@ -100,7 +106,7 @@ impl<'a> Request<'a> {
             v => vec![v],
         };
         if inputs.is_empty() {
-            return Err(Error::Invalid("\"input\" must not be empty".into()));
+            return Err(field(key, "\"input\" must not be empty"));
         }
         Ok(Self {
             key,
@@ -194,13 +200,21 @@ pub fn integer(o: &Map<String, Value>, k: &str) -> Result<Option<i64>, Error> {
         Some(f) if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 => {
             Ok(Some(f as i64))
         }
-        _ => Err(Error::Invalid(format!("{k} must be an integer, not {v}"))),
+        _ => Err(field(k, format!("{k} must be an integer, not {v}"))),
     }
 }
 
 /// A field's refusal naming the type it takes and the type it got.
 pub fn wrong_type(k: &str, takes: &str, v: &Value) -> Error {
-    Error::Invalid(format!("{k} must be {takes}, not {}", json_type(v)))
+    field(k, format!("{k} must be {takes}, not {}", json_type(v)))
+}
+
+/// The refusal of the request field `k`.
+fn field(k: &str, message: impl Into<String>) -> Error {
+    Error::Field {
+        field: k.to_owned(),
+        message: message.into(),
+    }
 }
 
 /// A JSON value's type in a field's refusal.

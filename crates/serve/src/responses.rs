@@ -144,7 +144,8 @@
 //! `input_image` by `file_id`, and an assistant's `refusal` part; a tool that
 //! is neither a function nor a web search; an item, a part or a role the
 //! conversion does not know; and a field of the wrong type. An error is the
-//! chat path's OpenAI error object; inside a stream that has started, a
+//! chat path's OpenAI error object, its `param` this request's own field
+//! (`input` for the chat path's `messages`); inside a stream that has started, a
 //! `data: {"error": …}` frame with no `event:` line, as llama-server sends it.
 //!
 //! # Where this differs from llama-server
@@ -182,8 +183,8 @@ use serde_json::{Map, Value, json};
 use super::response_store::Refusal;
 use super::{
     ApiError, ChatPlan, Client, State, body, chat_input, chat_plan, check_effort, engine_error,
-    error_body, finish_stream, gen_body, get_b, get_i, get_i_in, invalid, json_type, not_found,
-    progress, run_gen, run_whole, send_error, send_json, sse, tool_markup_error, unix_now,
+    finish_stream, gen_body, get_b, get_i, get_i_in, invalid, json_type, not_found, progress,
+    run_gen, run_whole, send_error, send_json, sse, tool_markup_error, unix_now,
 };
 use crate::dsml::{ChatParser, Message, ToolCall};
 use crate::genloop::{Event, GenError, Outcome, StopKind, Timings};
@@ -206,7 +207,8 @@ const INCLUDE_LOGPROBS: &str = "message.output_text.logprobs";
 pub(super) fn create(state: &Arc<State>, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let parsed = gen_body(req).and_then(|b| {
         let r = request(state, &b)?;
-        let plan = chat_plan(state, &r.chat, r.chat.get("reasoning_format"))?;
+        let plan = chat_plan(state, &r.chat, r.chat.get("reasoning_format"))
+            .map_err(|e| named_in(&b, e))?;
         Ok((Ids::new(state, &b, r.keep), r.conversation, plan))
     });
     let (ids, conversation, plan) = match parsed {
@@ -227,9 +229,10 @@ pub(super) fn create(state: &Arc<State>, req: &Request, w: &mut TcpStream) -> io
 /// prompt the same request renders, by the template and the tokenizer the
 /// generation uses.
 pub(super) fn input_tokens(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    let counted = body(req)
-        .and_then(|b| request(state, &b))
-        .and_then(|r| chat_input(state, &r.chat));
+    let counted = body(req).and_then(|b| {
+        let r = request(state, &b)?;
+        chat_input(state, &r.chat).map_err(|e| named_in(&b, e))
+    });
     match counted {
         Ok((_, prompt)) => send_json(
             w,
@@ -242,6 +245,28 @@ pub(super) fn input_tokens(state: &State, req: &Request, w: &mut TcpStream) -> i
 }
 
 // ---------------------------------------------------------------- the request
+
+/// A refusal of the chat body `b` converts to, its `param` named as `b` names
+/// it: the chat path's `messages` is the `input`, and a `response_format` that
+/// `text.format` wrote ([`text_format`]) is the `text`.
+fn named_in(b: &Map<String, Value>, mut e: ApiError) -> ApiError {
+    e.param = e.param.map(|p| match p.as_str() {
+        "messages" => "input".to_owned(),
+        "response_format" if text_format(b).is_some() => "text".to_owned(),
+        _ => p,
+    });
+    e
+}
+
+/// `text.format` and its type when the type is one the chat path's
+/// `response_format` takes, `json_schema` or `json_object`.
+fn text_format(b: &Map<String, Value>) -> Option<(&Value, &str)> {
+    let format = set(b, "text")?.get("format")?;
+    match format.get("type")?.as_str()? {
+        kind @ ("json_schema" | "json_object") => Some((format, kind)),
+        _ => None,
+    }
+}
 
 /// A field that is present and not `null`.
 fn set<'a>(o: &'a Map<String, Value>, k: &str) -> Option<&'a Value> {
@@ -279,20 +304,23 @@ impl Keep {
                 return Err(invalid(format!(
                     "previous_response_id must be a string, not {}",
                     json_type(v)
-                )));
+                ))
+                .at("previous_response_id"));
             }
         };
         if background && !store {
             return Err(invalid(
                 "background: true needs store: true: a background response is read back from the \
                  store",
-            ));
+            )
+            .at("background"));
         }
         if background && get_b(b, "stream")? == Some(true) {
             return Err(invalid(
                 "background: true with stream: true is not supported by this server: poll GET \
                  /v1/responses/{id} for the response",
-            ));
+            )
+            .at("background"));
         }
         Ok(Keep {
             store,
@@ -318,15 +346,18 @@ fn request(state: &State, b: &Map<String, Value>) -> Result<Converted, ApiError>
     let keep = Keep::of(b)?;
     let mut items = match &keep.previous {
         None => Vec::new(),
-        Some(id) => state.responses.conversation(id).map_err(|r| match r {
-            Refusal::Missing => invalid(format!(
-                "previous_response_id {id} names no stored response: it was not stored, was \
-                 deleted, or the store dropped it as the oldest"
-            )),
-            Refusal::Status(s) => invalid(format!(
-                "previous_response_id {id} is {s}: only a completed or incomplete response \
-                 can be continued"
-            )),
+        Some(id) => state.responses.conversation(id).map_err(|r| {
+            match r {
+                Refusal::Missing => invalid(format!(
+                    "previous_response_id {id} names no stored response: it was not stored, was \
+                     deleted, or the store dropped it as the oldest"
+                )),
+                Refusal::Status(s) => invalid(format!(
+                    "previous_response_id {id} is {s}: only a completed or incomplete response \
+                     can be continued"
+                )),
+            }
+            .at("previous_response_id")
         })?,
     };
     match set(b, "input") {
@@ -336,9 +367,10 @@ fn request(state: &State, b: &Map<String, Value>) -> Result<Converted, ApiError>
             return Err(invalid(format!(
                 "input must be a string or an array of items, not {}",
                 json_type(v)
-            )));
+            ))
+            .at("input"));
         }
-        None => return Err(invalid("input is required")),
+        None => return Err(invalid("input is required").at("input")),
     }
     let chat = to_chat(b, &items)?;
     Ok(Converted {
@@ -357,12 +389,13 @@ fn to_chat(b: &Map<String, Value>, items: &[Value]) -> Result<Map<String, Value>
             return Err(invalid(format!(
                 "instructions must be a string, not {}",
                 json_type(v)
-            )));
+            ))
+            .at("instructions"));
         };
         messages.push(json!({ "role": "system", "content": s }));
     }
     for it in items {
-        item(it, &mut messages)?;
+        item(it, &mut messages).map_err(|e| e.at("input"))?;
     }
     let mut chat: Map<String, Value> = b
         .iter()
@@ -371,7 +404,7 @@ fn to_chat(b: &Map<String, Value>, items: &[Value]) -> Result<Map<String, Value>
         .collect();
     chat.insert("messages".into(), Value::Array(messages));
     if let Some(t) = set(b, "tools") {
-        let tools = tools(t)?;
+        let tools = tools(t).map_err(|e| e.at("tools"))?;
         if !tools.is_empty() {
             chat.insert("tools".into(), Value::Array(tools));
         }
@@ -382,15 +415,13 @@ fn to_chat(b: &Map<String, Value>, items: &[Value]) -> Result<Map<String, Value>
     if let Some(n) = b.get("max_output_tokens") {
         chat.insert("max_tokens".into(), n.clone());
     }
-    if let Some(effort) = reasoning_effort(set(b, "reasoning"))? {
+    if let Some(effort) = reasoning_effort(set(b, "reasoning")).map_err(|e| e.at("reasoning"))? {
         chat.insert("reasoning_effort".into(), effort.clone());
     }
     // A JSON schema or a JSON object is the chat path's `response_format` of
     // that type.
-    let format = set(b, "text").and_then(|t| t.get("format"));
-    match format.and_then(|f| f.get("type")).and_then(Value::as_str) {
-        Some("json_schema") => {
-            let f = format.unwrap_or(&Value::Null);
+    match text_format(b) {
+        Some((f, "json_schema")) => {
             chat.insert(
                 "response_format".into(),
                 json!({ "type": "json_schema", "json_schema": {
@@ -400,10 +431,10 @@ fn to_chat(b: &Map<String, Value>, items: &[Value]) -> Result<Map<String, Value>
                 } }),
             );
         }
-        Some("json_object") => {
+        Some(_) => {
             chat.insert("response_format".into(), json!({ "type": "json_object" }));
         }
-        _ => {}
+        None => {}
     }
     Ok(chat)
 }
@@ -438,9 +469,7 @@ fn unserved(b: &Map<String, Value>) -> Result<(), ApiError> {
         ),
     ];
     if let Some((field, _, why)) = refused.iter().find(|(_, hit, _)| *hit) {
-        return Err(invalid(format!(
-            "{field} is not supported by this server: {why}"
-        )));
+        return Err(invalid(format!("{field} is not supported by this server: {why}")).at(field));
     }
     match set(b, "include") {
         None => {}
@@ -451,10 +480,15 @@ fn unserved(b: &Map<String, Value>) -> Result<(), ApiError> {
                         return Err(invalid(format!(
                             "include {INCLUDE_LOGPROBS} is not supported by this server: the \
                              answer carries no probabilities"
-                        )));
+                        ))
+                        .at("include"));
                     }
                     Some(_) => {}
-                    None => return Err(invalid(format!("include must hold strings, not {x}"))),
+                    None => {
+                        return Err(
+                            invalid(format!("include must hold strings, not {x}")).at("include")
+                        );
+                    }
                 }
             }
         }
@@ -462,10 +496,11 @@ fn unserved(b: &Map<String, Value>) -> Result<(), ApiError> {
             return Err(invalid(format!(
                 "include must be an array of strings, not {}",
                 json_type(v)
-            )));
+            ))
+            .at("include"));
         }
     }
-    match set(b, "text") {
+    let text = match set(b, "text") {
         None => Ok(()),
         Some(Value::Object(t)) => match set(t, "format") {
             None => Ok(()),
@@ -488,7 +523,8 @@ fn unserved(b: &Map<String, Value>) -> Result<(), ApiError> {
             "text must be an object, not {}",
             json_type(v)
         ))),
-    }
+    };
+    text.map_err(|e| e.at("text"))
 }
 
 /// `reasoning.effort`, a string, which the chat path hands the template as
@@ -1173,6 +1209,7 @@ fn background(
     {
         let e = ApiError {
             retry_after: true,
+            param: None,
             code: 503,
             kind: "unavailable_error",
             message: "the running background responses fill the response store".to_owned(),
@@ -1390,10 +1427,7 @@ fn stream(
             Err(e) => {
                 frames.send(s, events)?;
                 let e = tool_markup_error(&e);
-                return sse(
-                    s,
-                    &json!({ "error": error_body(e.code, e.kind, &e.message)["error"] }),
-                );
+                return sse(s, &e.body());
             }
         }
         let output = items.finish(&mut events);
@@ -1552,13 +1586,13 @@ mod tests {
         frames.iter().filter(|f| f["type"] == kind).collect()
     }
 
-    /// Asserts a refusal: a 400 carrying exactly the chat path's error object,
-    /// its message holding `part`.
+    /// Asserts a refusal: a 400 carrying exactly the chat path's error object
+    /// (a `param` when it names a field), its message holding `part`.
     fn assert_refused(addr: SocketAddr, path: &str, body: &Value, part: &str) {
         let (status, v) = post(addr, path, body);
         assert_eq!(status, 400, "{body} -> {v}");
         let e = v["error"].as_object().unwrap_or_else(|| panic!("{v}"));
-        let mut keys: Vec<&String> = e.keys().collect();
+        let mut keys: Vec<&String> = e.keys().filter(|k| *k != "param").collect();
         keys.sort();
         assert_eq!(keys, ["code", "message", "type"], "{v}");
         assert_eq!(v.as_object().map(|o| o.len()), Some(1), "{v}");
@@ -2418,7 +2452,8 @@ mod tests {
     }
 
     /// An `input_image` is the chat path's `image_url` part, so a text-only
-    /// engine answers it as `/v1/chat/completions` answers that part; an
+    /// engine answers it as `/v1/chat/completions` answers that part, about
+    /// the `input` where the chat path's is about its `messages`; an
     /// `input_image` by `file_id` and an `input_file`, in a message or in a
     /// call's output, are refused by name.
     #[test]
@@ -2429,8 +2464,12 @@ mod tests {
         let chat = json!({"messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
         ]}]});
-        let (status, v) = post(addr, "/v1/responses", &responses);
-        let (chat_status, chat_v) = post(addr, "/v1/chat/completions", &chat);
+        let (status, mut v) = post(addr, "/v1/responses", &responses);
+        let (chat_status, mut chat_v) = post(addr, "/v1/chat/completions", &chat);
+        assert_eq!(v["error"]["param"], "input", "{v}");
+        assert_eq!(chat_v["error"]["param"], "messages", "{chat_v}");
+        v["error"]["param"].take();
+        chat_v["error"]["param"].take();
         assert_eq!((status, &v), (chat_status, &chat_v));
         assert_eq!(status, 400, "{v}");
         let by_file = json!({"type": "input_image", "file_id": "file_1"});

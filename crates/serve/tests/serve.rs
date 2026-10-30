@@ -199,43 +199,138 @@ fn hw_chat_stop_string_is_cut() {
 #[ignore = "gate: just gate-serve"]
 fn hw_errors_are_openai_objects() {
     let addr = start(64);
-    let check = |r: common::Reply, code: u16, kind: &str| {
+    // `param` is the top-level request field the error is about, absent when it is about none.
+    let check = |r: common::Reply, code: u16, kind: &str, param: Option<&str>| {
         assert_eq!(r.status, code, "{}", r.body);
         let e = &r.json()["error"];
         assert_eq!(e["code"], code, "{e}");
         assert_eq!(e["type"], kind, "{e}");
         assert!(e["message"].as_str().is_some_and(|m| !m.is_empty()), "{e}");
+        assert_eq!(
+            e.get("param").map(|p| p.as_str().expect("a string")),
+            param,
+            "{e}"
+        );
     };
+    let bad = "invalid_request_error";
     check(
         call(addr, "POST", "/v1/chat/completions", Some("{not json")),
         400,
-        "invalid_request_error",
+        bad,
+        None,
     );
     check(
         post(addr, "/v1/chat/completions", &json!({"model": "m"})),
         400,
-        "invalid_request_error",
+        bad,
+        Some("messages"),
     );
-    check(
-        post(
-            addr,
-            "/completion",
-            &json!({"prompt": "ab", "n_probs": 101}),
+    let (chat, responses) = ("/v1/chat/completions", "/v1/responses");
+    let unknown = json!({"type": "object", "properties": {"a": {"type": "date"}}});
+    let schema = json!({"type": "json_schema", "json_schema": {"schema": unknown}});
+    let text = json!({"format": {"type": "json_schema", "name": "r", "schema": unknown}});
+    let costly = json!({"type": "object", "properties": {
+        ("k".repeat(10_000)): {"anyOf": vec![json!({"type": "null"}); 1000]}}});
+    let compile_error = "its program tokenises more than 16777216 bytes";
+    let message = |content: Value| json!([{"type": "message", "role": "user", "content": content}]);
+    let image = json!([{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]);
+    // Each body adds its fields to a request its route serves. The Responses API names its own
+    // fields where the chat request it runs as names others.
+    for (path, extra, param, needle) in [
+        (chat, json!({"temperature": "hot"}), "temperature"),
+        (chat, json!({"top_k": 2.5}), "top_k"),
+        (chat, json!({"logit_bias": {"x": 1}}), "logit_bias"),
+        (chat, json!({"reasoning_format": 5}), "reasoning_format"),
+        (
+            chat,
+            json!({"messages": [{"role": "user", "content": 5}]}),
+            "messages",
         ),
-        400,
-        "invalid_request_error",
-    );
-    check(
-        post(addr, "/completion", &json!({"prompt": 7})),
-        400,
-        "invalid_request_error",
-    );
+        (chat, json!({"response_format": schema}), "response_format"),
+        ("/completion", json!({"n_probs": 101}), "n_probs"),
+        ("/completion", json!({"prompt": 7}), "prompt"),
+        ("/completion", json!({"prompt": []}), "prompt"),
+        ("/completion", json!({"prompt": ""}), "prompt"),
+        ("/v1/completions", json!({"prompt": []}), "prompt"),
+        ("/v1/completions", json!({"prompt": ""}), "prompt"),
+        (responses, json!({"input": 5}), "input"),
+        (responses, json!({"input": message(json!(5))}), "input"),
+        (responses, json!({"input": message(image)}), "input"),
+        (responses, json!({"text": text}), "text"),
+        (
+            responses,
+            json!({"response_format": null, "text": text}),
+            "text",
+        ),
+        (
+            responses,
+            json!({"previous_response_id": 5}),
+            "previous_response_id",
+        ),
+        (responses, json!({"tools": [{"type": "computer"}]}), "tools"),
+        (responses, json!({"temperature": "hot"}), "temperature"),
+        (responses, json!({"reasoning": 5}), "reasoning"),
+        (responses, json!({"reasoning": {"effort": 5}}), "reasoning"),
+        (responses, json!({"text": 5}), "text"),
+        (responses, json!({"include": 5}), "include"),
+        (responses, json!({"instructions": 5}), "instructions"),
+        (responses, json!({"background": true}), "background"),
+    ]
+    .into_iter()
+    .map(|(path, extra, param)| (path, extra, param, ""))
+    .chain([
+        (
+            chat,
+            json!({"response_format": {"type": "json_schema", "json_schema": {"schema": costly}}}),
+            "response_format",
+            compile_error,
+        ),
+        (
+            responses,
+            json!({"text": {"format": {"type": "json_schema", "name": "r", "schema": costly}}}),
+            "text",
+            compile_error,
+        ),
+        (
+            chat,
+            json!({"tool_choice": "required", "tools": [{"type": "function", "function": {
+                "name": "f", "parameters": costly}}]}),
+            "tools",
+            compile_error,
+        ),
+        (
+            responses,
+            json!({"tool_choice": "required", "tools": [{"type": "function",
+                "name": "f", "parameters": costly}]}),
+            "tools",
+            compile_error,
+        ),
+    ]) {
+        let mut b = match path {
+            "/completion" | "/v1/completions" => json!({"prompt": "ab"}),
+            "/v1/responses" => json!({"model": "m", "input": "hi", "store": false}),
+            _ => chat_body(json!({})),
+        };
+        b.as_object_mut()
+            .expect("an object")
+            .extend(extra.as_object().expect("an object").clone());
+        let r = post(addr, path, &b);
+        assert!(
+            r.json()["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(needle)),
+            "{}",
+            r.body
+        );
+        check(r, 400, bad, Some(param));
+    }
     check(
         post(addr, "/completion", &json!({"prompt": "x".repeat(64)})),
         400,
         "exceed_context_size_error",
+        None,
     );
-    check(get(addr, "/nope"), 404, "not_found_error");
+    check(get(addr, "/nope"), 404, "not_found_error", None);
 }
 
 #[test]

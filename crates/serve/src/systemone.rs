@@ -111,6 +111,7 @@ fn refusal(e: decision::Error) -> ApiError {
     match e {
         decision::Error::NotSupported(m) => ApiError {
             retry_after: false,
+            param: None,
             code: 501,
             kind: "not_supported_error",
             message: m,

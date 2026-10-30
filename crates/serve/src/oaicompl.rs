@@ -173,16 +173,17 @@ fn openai_fields(b: &Map<String, Value>) -> Result<(), ApiError> {
         return Err(invalid(format!(
             "'prompt' holds {} prompts: this server takes one prompt a request",
             a.len()
-        )));
+        ))
+        .at("prompt"));
     }
     if set("echo").is_some_and(|v| v.as_bool() != Some(false)) {
-        return Err(invalid("echo is not supported by this server"));
+        return Err(invalid("echo is not supported by this server").at("echo"));
     }
     if set("suffix").is_some_and(|v| v.as_str() != Some("")) {
-        return Err(invalid("suffix is not supported by this server"));
+        return Err(invalid("suffix is not supported by this server").at("suffix"));
     }
     if get_i(b, "best_of")?.is_some_and(|n| n > 1) {
-        return Err(invalid("best_of is not supported by this server"));
+        return Err(invalid("best_of is not supported by this server").at("best_of"));
     }
     Ok(())
 }

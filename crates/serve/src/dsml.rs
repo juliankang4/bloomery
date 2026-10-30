@@ -1024,6 +1024,7 @@ impl ToolFormat {
                           send the request without tool_choice \"required\" or a named function"
                     .to_owned(),
                 unsupported: true,
+                field: None,
             }),
         }
     }

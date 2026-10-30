@@ -39,8 +39,9 @@
 //! `message_stop`; every frame is `event: <type>` and `data: <json>`.
 //!
 //! An error is Anthropic's envelope around the OpenAI path's error object, its
-//! status and `type` unchanged: `{"type":"error","error":{"code","message","type"}}`,
-//! and inside a stream that has started, an `error` event carrying the same.
+//! status and `type` unchanged: `{"type":"error","error":{"code","message","type"}}`
+//! without the OpenAI path's `param`, and inside a stream that has started, an
+//! `error` event carrying the same.
 
 use std::io;
 use std::net::TcpStream;

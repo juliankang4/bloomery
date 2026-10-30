@@ -117,6 +117,7 @@ fn answer(state: &State, req: &Request, oai: bool) -> Result<Value, ApiError> {
     let Some(side) = &state.side else {
         return Err(ApiError {
             retry_after: false,
+            param: None,
             code: 501,
             kind: "not_supported_error",
             message: NOT_SERVED.to_owned(),
@@ -528,10 +529,12 @@ fn prepare(
                     "unknown prompt_name {name:?}; available names: {:?}",
                     side.prompts.keys().collect::<Vec<_>>()
                 ))
+                .at("prompt_name")
             })
         })
         .transpose()?;
-    let mut images = inline_images(side, request.inputs.iter().copied())?;
+    let mut images =
+        inline_images(side, request.inputs.iter().copied()).map_err(|e| e.at(request.key))?;
     let inputs = request
         .inputs
         .iter()
@@ -551,9 +554,13 @@ fn prepare(
                 input_with(side, video, request.key, v, &mut images)
             }
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.at(request.key))?;
     for input in &inputs {
-        request::check_tokens(input.ids.len(), side.ctx).map_err(ApiError::from)?;
+        request::check_tokens(input.ids.len(), side.ctx).map_err(|e| match e {
+            request::Error::Context { .. } => ApiError::from(e),
+            e => ApiError::from(e).at(request.key),
+        })?;
     }
     Ok(inputs)
 }
@@ -729,6 +736,7 @@ fn fail(state: &State, side: &Side, error: String) -> ApiError {
     state.shared.end_on(adopted);
     ApiError {
         retry_after: false,
+        param: None,
         code: 500,
         kind: "server_error",
         message: error,
@@ -1167,7 +1175,7 @@ mod tests {
 
     /// Which inputs a request holds and the ids each passes, as llama-server splits and
     /// tokenizes them, and the refusals of an input with nothing in it, an object input, and one
-    /// of more ids than the context.
+    /// of more ids than the context; each names `input` as its `param` but the context's.
     #[test]
     fn inputs_split_and_tokenize_as_llama_server() {
         let (addr, _, calls, _) = serve(Some(MockEmbed::new(4)));
@@ -1193,27 +1201,40 @@ mod tests {
             assert_eq!(*calls.lock().expect("calls"), want, "{input}");
         }
         calls.lock().expect("calls").clear();
-        for (body, message) in [
-            (json!({ "input": [] }), "\"input\" must not be empty"),
-            (json!({ "input": [[]] }), "Input content cannot be empty"),
-            (json!({}), "\"input\" or \"content\" must be provided"),
+        let input = Some("input");
+        for (body, message, param) in [
+            (json!({ "input": [] }), "\"input\" must not be empty", input),
+            (
+                json!({ "input": [[]] }),
+                "Input content cannot be empty",
+                input,
+            ),
+            (
+                json!({}),
+                "\"input\" or \"content\" must be provided",
+                input,
+            ),
             (
                 json!({ "input": { "prompt_string": "a" } }),
                 "input must be a string or an array of strings and token ids, not an object",
+                input,
             ),
             (
                 json!({ "input": [1, 1_000_000] }),
                 "invalid token id 1000000",
+                input,
             ),
             (
                 json!({ "input": "abcd" }),
                 "input (6 tokens) is larger than the max context size (4 tokens)",
+                None,
             ),
         ] {
             let (status, v) = post(addr, "/v1/embeddings", &body);
             assert_eq!(status, 400, "{body}: {v}");
             let got = v["error"]["message"].as_str().expect("a message");
             assert!(got.starts_with(message), "{body}: {got}");
+            assert_eq!(v["error"]["param"].as_str(), param, "{body}: {v}");
         }
         assert!(calls.lock().expect("calls").is_empty(), "no refusal passes");
     }
