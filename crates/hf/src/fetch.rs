@@ -1,14 +1,14 @@
 //! The network part: `curl` for the listing and for each file, then the
 //! checks of what it wrote. curl because it is on every machine that runs
 //! the server and keeps a TLS stack out of the build; it is asked for
-//! `--fail --location --continue-at -`, so an HTTP error is an exit code and
-//! a partial file resumes where it stopped.
+//! `--fail --location`, so an HTTP error is an exit code.
 //!
 //! A file lands at its cache path ([`crate::cache_path`]) — the MTP draft
 //! beside the set's first shard instead — only after its size and its
-//! digest ([`crate::Check`]) match the listing's: curl writes
-//! `<file>.part`, the check reads it whole, and the rename makes it the
-//! file. Beside it, `<file>.verified` holds the digest it was checked
+//! digest ([`crate::Check`]) match the listing's: curl transfers write
+//! `<file>.part` by ranges, several at once, each resumed where it stopped
+//! (`ranges`), the digest is read in order behind them, and the rename makes
+//! it the file. Beside it, `<file>.verified` holds the digest it was checked
 //! against, so a later start trusts a file of the right size whose marker
 //! names the listing's digest without reading it again. A file of the
 //! right size with no such marker is read and checked once; one whose
@@ -50,14 +50,18 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sha1::Digest as _;
 
 use crate::{Check, Entry, GgufSet, HfError, RepoRef, cache_path, exact, gguf_sets, listing};
+
+mod ranges;
+
+use ranges::{Ranges, Split};
 
 /// How often a running download prints its progress.
 const PROGRESS_EVERY: Duration = Duration::from_secs(5);
@@ -76,7 +80,7 @@ pub enum State {
     Cached,
     /// Not there: fetched from byte 0.
     Fetch,
-    /// A partial file: fetched from its end.
+    /// A partial file: each of its ranges fetched from where it stopped.
     Resume,
     /// In the cache with content that is not the listing's: removed and
     /// fetched again.
@@ -111,15 +115,15 @@ pub enum Event<'a> {
         files: usize,
         bytes: u64,
     },
-    /// A file before its fetch: its size, its state, and the byte the
-    /// fetch starts at (its size when cached).
+    /// A file before its fetch: its size, its state, and the bytes of it
+    /// already on disk that the fetch keeps (its size when cached).
     File {
         file: &'a str,
         bytes: u64,
         state: State,
         from: u64,
     },
-    /// A running download's bytes on disk.
+    /// A running download's bytes on disk, whichever ranges hold them.
     Progress { file: &'a str, have: u64, of: u64 },
     /// No listing — the network or the hub refused it, or `HF_HUB_OFFLINE`
     /// asked for none — and the cache stands in: why.
@@ -295,24 +299,45 @@ impl Client {
         })
     }
 
-    /// A curl command with the token on its standard input (none when
-    /// there is no token) and `args`; its stdout and stderr captured.
-    fn curl(&self, what: &str, args: &[&std::ffi::OsStr]) -> Result<Vec<u8>, HfError> {
+    /// curl with the flags every call takes, reading the token's config line
+    /// from its standard input when there is a token; its stderr captured.
+    fn command(&self) -> Command {
         let mut cmd = Command::new(&self.curl);
         cmd.args(["--fail", "--location", "--silent", "--show-error"]);
         cmd.args(["--connect-timeout", CONNECT_TIMEOUT]);
         if self.token.is_some() {
             cmd.args(["--config", "-"]);
         }
-        cmd.args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
+        cmd
+    }
+
+    /// `cmd`, a [`Client::command`], started and given the token.
+    fn spawn(&self, mut cmd: Command, what: &str) -> Result<Child, HfError> {
         let mut child = cmd.spawn().map_err(|e| HfError::Curl {
             what: what.to_owned(),
             why: format!("{e} (the fetch shells out to curl, which must be on PATH)"),
         })?;
         self.send_token(&mut child, what)?;
+        Ok(child)
+    }
+
+    /// A header file for curl's `--dump-header` under the cache root, its own
+    /// for each call: `kind` calls run at once in one process.
+    fn headers_file(&self, kind: &str) -> PathBuf {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        self.root.join(format!(
+            ".{kind}-{}-{}.headers",
+            std::process::id(),
+            CALLS.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// A [`Client::command`] with `args`; its stdout.
+    fn curl(&self, what: &str, args: &[&std::ffi::OsStr]) -> Result<Vec<u8>, HfError> {
+        let mut cmd = self.command();
+        cmd.args(args).stdout(Stdio::piped());
+        let child = self.spawn(cmd, what)?;
         let out = child.wait_with_output().map_err(|e| HfError::Curl {
             what: what.to_owned(),
             why: e.to_string(),
@@ -386,13 +411,7 @@ impl Client {
     /// [`Client::listing`] of `repo` at revision `rev` (a branch, a tag or a
     /// commit hash).
     pub fn listing_at(&self, repo: &str, rev: &str) -> Result<Vec<Entry>, HfError> {
-        // One header file per call: listings run at once in one process.
-        static CALLS: AtomicUsize = AtomicUsize::new(0);
-        let headers = self.root.join(format!(
-            ".listing-{}-{}.headers",
-            std::process::id(),
-            CALLS.fetch_add(1, Ordering::Relaxed)
-        ));
+        let headers = self.headers_file("listing");
         fs::create_dir_all(&self.root).map_err(|e| HfError::io(&self.root, e))?;
         let mut url = format!("{}/api/models/{repo}/tree/{rev}?recursive=true", self.base);
         let mut out = Vec::new();
@@ -430,17 +449,18 @@ impl Client {
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<PathBuf, HfError> {
         let dest = cache_path(&self.root, repo, &entry.path)?;
-        self.fetch_to(repo, entry, &dest, events)
+        self.fetch_to(repo, entry, &dest, Split::HUB, events)
     }
 
     /// `entry` of `repo` fetched to `dest` — the MTP draft's `dest` is
-    /// beside the set's first shard, not its cache path — checked and marked
-    /// as the module says; `dest`.
+    /// beside the set's first shard, not its cache path — in ranges `split`
+    /// cuts, checked and marked as the module says; `dest`.
     fn fetch_to(
         &self,
         repo: &str,
         entry: &Entry,
         dest: &Path,
+        split: Split,
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<PathBuf, HfError> {
         let _lock = lock_file(dest)?;
@@ -489,16 +509,17 @@ impl Client {
                 remove(dest)?;
                 state = State::Stale;
             } else {
+                // The file's first bytes, whatever ranges an earlier part held.
+                ranges::forget(&part)?;
                 rename(dest, &part)?;
             }
             let _ = fs::remove_file(&marker);
         }
-        let mut from = size_of(&part)?.unwrap_or(0);
-        if from > entry.size {
-            remove(&part)?;
-            from = 0;
+        let (ranges, stale) = Ranges::open(entry, &part, split)?;
+        if stale {
             state = State::Stale;
         }
+        let from = ranges.held();
         if from > 0 && state == State::Fetch {
             state = State::Resume;
         }
@@ -508,20 +529,10 @@ impl Client {
             state,
             from,
         });
-        if from < entry.size {
-            self.download(repo, entry, &part, events)?;
-        }
-        let len = size_of(&part)?.unwrap_or(0);
-        if len != entry.size {
-            return Err(HfError::Size {
-                file: part.display().to_string(),
-                bytes: len,
-                want: entry.size,
-            });
-        }
-        let got = digest(&part, entry.check, entry.size)?;
+        let got = self.download(repo, entry, &part, ranges, split, events)?;
         if got != entry.digest {
             remove(&part)?;
+            ranges::forget(&part)?;
             return Err(HfError::Hash {
                 file: dest.display().to_string(),
                 check: entry.check,
@@ -529,6 +540,7 @@ impl Client {
                 want: entry.digest.clone(),
             });
         }
+        ranges::forget(&part)?;
         if size_of(&marker)?.is_some() {
             remove(&marker)?;
         }
@@ -585,73 +597,6 @@ impl Client {
             });
         }
         Ok(body)
-    }
-
-    /// curl from the end of `part` to the end of the file, a `Progress`
-    /// event every [`PROGRESS_EVERY`] while it runs.
-    fn download(
-        &self,
-        repo: &str,
-        entry: &Entry,
-        part: &Path,
-        events: &mut dyn FnMut(&Event<'_>),
-    ) -> Result<(), HfError> {
-        if let Some(dir) = part.parent() {
-            fs::create_dir_all(dir).map_err(|e| HfError::io(dir, e))?;
-        }
-        let (repo, rev) = self.hub_at(repo);
-        let url = format!("{}/{repo}/resolve/{rev}/{}", self.base, entry.path);
-        let what = format!("download {url}");
-        let mut cmd = Command::new(&self.curl);
-        cmd.args(["--fail", "--location", "--silent", "--show-error"]);
-        cmd.args(["--connect-timeout", CONNECT_TIMEOUT]);
-        if self.token.is_some() {
-            cmd.args(["--config", "-"]);
-        }
-        cmd.args(["--continue-at", "-", "--output"])
-            .arg(part)
-            .arg(&url)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| HfError::Curl {
-            what: what.clone(),
-            why: format!("{e} (the fetch shells out to curl, which must be on PATH)"),
-        })?;
-        self.send_token(&mut child, &what)?;
-        let mut last = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(s)) => break s,
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(HfError::Curl {
-                        what,
-                        why: e.to_string(),
-                    });
-                }
-            }
-            if last.elapsed() >= PROGRESS_EVERY {
-                last = Instant::now();
-                events(&Event::Progress {
-                    file: &entry.path,
-                    have: size_of(part)?.unwrap_or(0),
-                    of: entry.size,
-                });
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        };
-        if !status.success() {
-            let mut err = String::new();
-            if let Some(mut s) = child.stderr.take() {
-                let _ = s.read_to_string(&mut err);
-            }
-            return Err(HfError::Curl {
-                what,
-                why: curl_why(status.code(), &err),
-            });
-        }
-        Ok(())
     }
 
     /// The set `r` picks in its repo, every file fetched and checked; the
@@ -723,7 +668,7 @@ impl Client {
                     // it there.
                     Ok(()) => {
                         let dest = files[0].with_file_name(d.name);
-                        self.fetch_to(&id, e, &dest, events)?;
+                        self.fetch_to(&id, e, &dest, Split::HUB, events)?;
                     }
                     Err(why) => events(&Event::DraftSkip {
                         file: &e.path,
@@ -1008,6 +953,14 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// A bounded record name beside `path`, keyed by its basename. `suffix` ends in `.lock.lock`,
+/// which no listed file or listed file's lock can have (see [`lock_file`]).
+fn record_path(path: &Path, suffix: &str) -> PathBuf {
+    let name = path.file_name().expect("a cache record has a file name");
+    let key = gguf::digest::sha256_hex(name.as_encoded_bytes());
+    path.with_file_name(format!(".{key}{suffix}"))
+}
+
 /// The size of the file at `path`, `None` when there is none.
 fn size_of(path: &Path) -> Result<Option<u64>, HfError> {
     Ok(metadata_of(path)?.map(|m| m.len()))
@@ -1030,9 +983,23 @@ fn remove(path: &Path) -> Result<(), HfError> {
     fs::remove_file(path).map_err(|e| HfError::io(path, e))
 }
 
+fn remove_if_there(path: &Path) -> Result<(), HfError> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(HfError::io(path, e)),
+        _ => Ok(()),
+    }
+}
+
 fn write_marker(path: &Path, digest: &str) -> Result<(), HfError> {
-    let part = with_suffix(path, ".part");
-    fs::write(&part, format!("{digest}\n")).map_err(|e| HfError::io(&part, e))?;
+    write_text(path, &format!("{digest}\n"))
+}
+
+/// `text` at `path`, published by rename so a reader sees the old text or the new. The text is
+/// written beside it under a name ending in `.lock.lock`, which is no listed file's (see
+/// [`lock_file`]).
+fn write_text(path: &Path, text: &str) -> Result<(), HfError> {
+    let part = record_path(path, ".lock.lock");
+    fs::write(&part, text).map_err(|e| HfError::io(&part, e))?;
     rename(&part, path)
 }
 
@@ -1088,33 +1055,58 @@ fn range_limit(len: u64) -> u64 {
     len.saturating_add(REDIRECT_BODY)
 }
 
+/// A file's digest by its [`Check`], fed its bytes in order.
+enum Hasher {
+    Sha256(gguf::digest::Sha256),
+    GitSha1(sha1::Sha1),
+}
+
+impl Hasher {
+    /// For a Git blob, `size` is the header's size.
+    fn new(check: Check, size: u64) -> Hasher {
+        match check {
+            Check::Sha256 => Hasher::Sha256(gguf::digest::Sha256::new()),
+            Check::GitSha1 => {
+                let mut sha1 = sha1::Sha1::new();
+                // "blob ", at most 20 decimal digits for a u64, and NUL.
+                let mut header = [0u8; 26];
+                let mut remaining = &mut header[..];
+                write!(remaining, "blob {size}\0").expect("a u64 Git blob header fits");
+                let used = 26 - remaining.len();
+                sha1.update(&header[..used]);
+                Hasher::GitSha1(sha1)
+            }
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Hasher::Sha256(h) => h.update(bytes),
+            Hasher::GitSha1(h) => h.update(bytes),
+        }
+    }
+
+    /// The digest, lowercase hex.
+    fn finish(self) -> String {
+        match self {
+            Hasher::Sha256(h) => gguf::digest::hex(&h.finish()),
+            Hasher::GitSha1(h) => gguf::digest::hex(&h.finalize()),
+        }
+    }
+}
+
 /// The digest of the whole file at `path` by `check`, lowercase hex.
 /// For a Git blob, `size` supplies the header's size, not a read limit.
 pub fn digest(path: &Path, check: Check, size: u64) -> Result<String, HfError> {
-    match check {
-        Check::Sha256 => gguf::digest::sha256_file(path).map_err(|e| HfError::Io {
-            path: e.path.display().to_string(),
-            err: e.source,
-        }),
-        Check::GitSha1 => {
-            let mut f = fs::File::open(path).map_err(|e| HfError::io(path, e))?;
-            let mut sha1 = sha1::Sha1::new();
-            // "blob ", at most 20 decimal digits for a u64, and NUL.
-            let mut header = [0u8; 26];
-            let mut remaining = &mut header[..];
-            write!(remaining, "blob {size}\0").expect("a u64 Git blob header fits");
-            let used = 26 - remaining.len();
-            sha1.update(&header[..used]);
-            let mut buf = [0u8; 64 * 1024];
-            loop {
-                let n = f.read(&mut buf).map_err(|e| HfError::io(path, e))?;
-                if n == 0 {
-                    break;
-                }
-                sha1.update(&buf[..n]);
-            }
-            Ok(gguf::digest::hex(&sha1.finalize()))
+    let mut f = fs::File::open(path).map_err(|e| HfError::io(path, e))?;
+    let mut hasher = Hasher::new(check, size);
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| HfError::io(path, e))?;
+        if n == 0 {
+            return Ok(hasher.finish());
         }
+        hasher.update(&buf[..n]);
     }
 }
 
@@ -1132,13 +1124,13 @@ pub(crate) mod tests {
         d
     }
 
-    fn hex(b: &[u8]) -> String {
+    pub(super) fn hex(b: &[u8]) -> String {
         b.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// A served repo under `dir/hub` as `file://` resolves it, one file
     /// `path` of `content`, and a client caching under `dir/cache`.
-    fn served(dir: &Path, repo: &str, path: &str, content: &[u8]) -> (Client, Entry) {
+    pub(super) fn served(dir: &Path, repo: &str, path: &str, content: &[u8]) -> (Client, Entry) {
         let src = dir.join("hub").join(repo).join("resolve/main").join(path);
         fs::create_dir_all(src.parent().expect("parent")).expect("hub dir");
         fs::write(&src, content).expect("hub file");
@@ -1159,7 +1151,7 @@ pub(crate) mod tests {
         (client, entry)
     }
 
-    fn content() -> Vec<u8> {
+    pub(super) fn content() -> Vec<u8> {
         (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect()
     }
 
@@ -1223,8 +1215,25 @@ pub(crate) mod tests {
     }
 
     fn run(c: &Client, repo: &str, e: &Entry) -> (Result<PathBuf, HfError>, Vec<String>) {
+        recorded(|events| c.fetch(repo, e, events))
+    }
+
+    /// [`run`] in the ranges `split` cuts.
+    pub(super) fn run_split(
+        c: &Client,
+        e: &Entry,
+        split: Split,
+    ) -> (Result<PathBuf, HfError>, Vec<String>) {
+        let dest = cache_path(&c.root, "a/b", &e.path).expect("cache path");
+        recorded(|events| c.fetch_to("a/b", e, &dest, split, events))
+    }
+
+    /// What `fetch` gives, and each event it says as a line.
+    fn recorded(
+        fetch: impl FnOnce(&mut dyn FnMut(&Event<'_>)) -> Result<PathBuf, HfError>,
+    ) -> (Result<PathBuf, HfError>, Vec<String>) {
         let mut seen = Vec::new();
-        let r = c.fetch(repo, e, &mut |ev| {
+        let r = fetch(&mut |ev| {
             seen.push(match ev {
                 Event::File { state, from, .. } => format!("file {} {from}", state.name()),
                 Event::Done { fetched, .. } => format!("done {fetched}"),
@@ -1279,9 +1288,10 @@ pub(crate) mod tests {
             assert!(events.is_empty(), "{events:?}");
             assert_eq!(fs::read(&dest).unwrap(), b"");
             assert_eq!(held.metadata().unwrap().len(), 0);
-            for sidecar in [".lock", ".part", ".verified", ".verified.part"] {
+            for sidecar in [".lock", ".part", ".verified"] {
                 assert!(!with_suffix(&dest, sidecar).exists(), "{sidecar}");
             }
+            assert!(!record_path(&with_suffix(&dest, ".verified"), ".lock.lock").exists());
             let absent = d.join("absent").join(format!("x{suffix}"));
             assert!(lock_file(&absent).is_err());
             assert!(!absent.parent().unwrap().exists());
@@ -1335,13 +1345,63 @@ pub(crate) mod tests {
         assert!(!lock.exists());
     }
 
+    /// A listed file named like another one's part sidecar or marker temporary keeps its bytes:
+    /// the cache's own records take names no listed file and no listed file's lock can have.
+    #[test]
+    fn listed_files_named_like_another_files_records_keep_their_bytes() {
+        let d = scratch("record-names");
+        let names = [
+            "x.bin.part.ranges",
+            "x.bin.part.ranges.part",
+            "x.bin.verified.part",
+            "x.bin",
+        ];
+        let bodies: Vec<Vec<u8>> = names.iter().map(|n| n.repeat(3).into_bytes()).collect();
+        let files: Vec<_> = names
+            .iter()
+            .zip(&bodies)
+            .map(|(n, b)| (*n, &b[..]))
+            .collect();
+        let c = hub(&d, "a/b", &files);
+        let got = c
+            .resolve_exact("a/b", &names, &mut |_| {})
+            .expect("resolve");
+        for (path, body) in got.iter().zip(&bodies) {
+            assert_eq!(
+                fs::read(path).ok().as_ref(),
+                Some(body),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn long_file_names_leave_room_for_records_and_their_temporaries() {
+        let d = scratch("long-record-names");
+        for len in [224, 241] {
+            let name = format!("{}.gguf", "x".repeat(len - 5));
+            let (c, e) = served(&d, "a/b", &name, &content());
+            let (got, seen) = run(&c, "a/b", &e);
+            let path = got.expect("long-name fetch");
+            assert_eq!(fs::read(&path).unwrap(), content());
+            assert_eq!(seen, ["file fetch 0", "done 300000"]);
+            assert_eq!(
+                fs::read_to_string(with_suffix(&path, ".verified"))
+                    .unwrap()
+                    .trim(),
+                e.digest
+            );
+        }
+    }
+
     #[test]
     fn publishing_the_file_precedes_publishing_its_marker() {
         let d = scratch("publish-order");
         let (c, e) = served(&d, "a/b", "m.gguf", &content());
         let dest = cache_path(&c.root, "a/b", &e.path).unwrap();
         // A marker write fails after the verified bytes have taken their final name.
-        fs::create_dir_all(with_suffix(&dest, ".verified.part")).unwrap();
+        fs::create_dir_all(record_path(&with_suffix(&dest, ".verified"), ".lock.lock")).unwrap();
         run(&c, "a/b", &e).0.expect_err("marker publication fails");
         assert_eq!(digest(&dest, e.check, e.size).unwrap(), e.digest);
         assert!(!with_suffix(&dest, ".verified").exists());
@@ -1358,7 +1418,7 @@ pub(crate) mod tests {
         earlier.read_to_string(&mut old).unwrap();
         assert_eq!(old, "old\n");
         assert_eq!(fs::read_to_string(&marker).unwrap(), "new\n");
-        assert!(!with_suffix(&marker, ".part").exists());
+        assert!(!record_path(&marker, ".lock.lock").exists());
     }
 
     #[test]
@@ -2196,20 +2256,31 @@ pub(crate) mod tests {
 
     /// A hub on a local port that answers every request with `status` and `body`.
     fn answering_with(status: &'static str, body: &'static [u8], root: &Path) -> Client {
-        use std::io::Write as _;
+        hub_answering(root, move |_, _| {
+            let mut answer = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            answer.extend_from_slice(body);
+            answer
+        })
+    }
+
+    /// A hub on a local port that answers its `n`th request, of text `request`, with the bytes
+    /// `answer(n, request)` and closes the connection.
+    pub(super) fn hub_answering(
+        root: &Path,
+        answer: impl Fn(usize, &str) -> Vec<u8> + Send + 'static,
+    ) -> Client {
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = l.local_addr().expect("addr").port();
         std::thread::spawn(move || {
-            for c in l.incoming().flatten() {
+            for (n, c) in l.incoming().flatten().enumerate() {
                 let mut c = c;
                 let mut buf = [0u8; 4096];
-                let _ = c.read(&mut buf);
-                let _ = write!(
-                    c,
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = c.write_all(body);
+                let got = c.read(&mut buf).unwrap_or(0);
+                let _ = c.write_all(&answer(n, &String::from_utf8_lossy(&buf[..got])));
             }
         });
         Client {
