@@ -209,6 +209,7 @@ struct HeadMap {
 
 /// The MTP layer on the target's card. See the module comment.
 pub struct Mtp38 {
+    names: Names,
     /// The draft's own tensors, the widened injects and the joined router.
     w: Weights,
     store: Roomed<KvPlanes>,
@@ -387,6 +388,7 @@ impl Mtp38 {
         let store = KvPlanes::roomed(&gpu.stream_handle(), (geo::N_KV, ctx, geo::HEAD), kv)?;
         stream.synchronize()?;
         let body = Mtp38 {
+            names: Names::of(d.index, &w),
             w,
             store,
             head,
@@ -992,6 +994,71 @@ struct MtpKey {
     head: DraftHead,
 }
 
+/// One sequence's rows of a walk ([`Mtp38::walk_in`]): arena rows `at .. at
+/// + m`, their ids where [`IdsAt`] names them and their first position the
+/// inbox word `pos0`.
+#[derive(Clone, Copy, Debug)]
+struct WalkRows {
+    at: usize,
+    m: usize,
+    ids: IdsAt,
+    pos0: usize,
+}
+
+/// Where a walk's rows' ids sit on the card: inbox words from a word on,
+/// the own id the last walk copied beside the arena (one row), or one word
+/// of the readback of several sequences' chains, the id a sequence's walk
+/// before proposed (one row, [`Mtp38::chain_rows`]).
+#[derive(Clone, Copy, Debug)]
+enum IdsAt {
+    Inbox(usize),
+    Own,
+    Chains(usize),
+}
+
+/// One sequence's chain in a walk of several sequences' chains
+/// ([`Mtp38::stage_chain`]): the round's block `block`, its refresh's arena
+/// rows `at .. at + m` from position `pos0`, then `own` own walks, and the
+/// first of its readback pairs (one a walk: the id and the probability's
+/// bits).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ChainBlock {
+    block: usize,
+    at: usize,
+    m: usize,
+    pos0: u32,
+    own: usize,
+    pair: usize,
+}
+
+impl ChainBlock {
+    /// The refresh's rows.
+    pub(super) fn m(&self) -> usize {
+        self.m
+    }
+
+    /// Positions of the sequence its store holds after the chain: through
+    /// the refresh, as [`Mtp38::run_chain`] leaves them.
+    pub(super) fn end(&self) -> usize {
+        self.pos0 as usize + self.m
+    }
+
+    /// The pairs its walks fill: one a walk.
+    pub(super) fn pairs(&self) -> usize {
+        1 + self.own
+    }
+}
+
+/// The inbox's first word of the positions a walk of several sequences'
+/// chains reads: walk `j`'s block `i` at `CHAIN_POS + j·MTP_ROWS + i`, past
+/// the walk's ids.
+const CHAIN_POS: usize = IN_IDS + MTP_ROWS;
+
+/// The most readback pairs one walk of several sequences' chains fills, the
+/// store arena's position words less the fault word and its site mask
+/// ([`Mtp38::read_chains`]).
+pub(super) const CHAIN_PAIRS: usize = MTP_STORE_ROWS / 2 - 1;
+
 /// A walk's readback: each row's token and the draft's probability of it
 /// among the head's rows.
 #[derive(Clone, Debug, PartialEq)]
@@ -1123,6 +1190,10 @@ impl TapBufs {
 struct StoreArena {
     h: DeviceBuffer<f32>,
     emb: DeviceBuffer<f32>,
+    /// The rows' positions; between store walks, which write them before
+    /// any read, a round of several sequences' chains' readback
+    /// ([`Mtp38::chain_out`]: [`CHAIN_PAIRS`] pairs, then the fault word and
+    /// its site mask).
     pos: DeviceBuffer<u32>,
     n_keys: DeviceBuffer<u32>,
     pack: DeviceBuffer<f32>,
@@ -1373,7 +1444,7 @@ impl MtpArena {
     }
 }
 
-/// The draft layer's names, read once a walk.
+/// The draft layer's names, resolved once when its weights are loaded.
 struct Names {
     attn_site: HcSite,
     ffn_site: HcSite,
@@ -1481,7 +1552,7 @@ impl Mtp38 {
         // The walk's dense sites read the f32 rows or q8 planes: a K-quant
         // draft layer is not projected by name (the target's sites are,
         // `site::ByName`), and is refused here rather than at a walk.
-        let n = Names::of(self.index, &self.w);
+        let n = &self.names;
         for name in [
             &n.eh, &n.q, &n.k, &n.v, &n.out, &n.gate_sh, &n.up_sh, &n.down_sh,
         ] {
@@ -1922,29 +1993,9 @@ impl Mtp38 {
             ));
         };
         let (tokens, pos0) = (f.tokens, f.pos0);
-        if own >= MTP_GRAPH_ROWS {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "{own} own walks; a chain proposes at most {}",
-                    MTP_GRAPH_ROWS - 1
-                ),
-            ));
-        }
         // Every walk's positions, checked before the first moves anything:
         // the refresh's rows, then one own row at each position after them.
-        let (m, end) = (tokens.len(), pos0 as usize + tokens.len());
-        if end + own > self.ctx {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "a chain of {} rows from position {pos0}: its last own row runs past a store \
-                     of {}",
-                    m + own,
-                    self.ctx
-                ),
-            ));
-        }
+        let end = self.chain_end(pos0, tokens.len(), own)?;
         let feeds: Vec<DraftFeed<'_, TargetRows>> = std::iter::once(refresh)
             .chain((0..own).map(|i| {
                 DraftFeed::Own {
@@ -2027,20 +2078,264 @@ impl Mtp38 {
         })
     }
 
+    /// The end of a chain's refresh of `m` rows from `pos0`, its `own` own
+    /// walks checked to fit a chain ([`MTP_GRAPH_ROWS`]) and the store: one
+    /// own row at each position after the refresh. Refused by name past
+    /// either.
+    fn chain_end(&self, pos0: u32, m: usize, own: usize) -> Result<usize, GpuError> {
+        if own >= MTP_GRAPH_ROWS {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{own} own walks; a chain proposes at most {}",
+                    MTP_GRAPH_ROWS - 1
+                ),
+            ));
+        }
+        let end = pos0 as usize + m;
+        if end + own > self.ctx {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a chain of {} rows from position {pos0}: its last own row runs past a store \
+                     of {}",
+                    m + own,
+                    self.ctx
+                ),
+            ));
+        }
+        Ok(end)
+    }
+
+    /// One sequence's chain in a round of several sequences' chains, checked
+    /// and staged on this sequence, the live one, as the round's block
+    /// `block` at arena rows `at ..`, its readback pairs from `pair`:
+    /// `refresh`'s rows — the target's kept rows with its hidden rows, as
+    /// [`Mtp38::run_chain`] takes them — then `own` own walks into `head`.
+    /// Each walk of the round runs over every block it reaches
+    /// ([`Mtp38::chain_in`], [`Mtp38::attend`], [`Mtp38::chain_out`]),
+    /// launch by launch whatever `mode` names: its launches address every
+    /// block's store. Refused by name as `run_chain` refuses the chain, and
+    /// past the round's rows ([`MTP_ROWS`]) or pairs ([`CHAIN_PAIRS`]);
+    /// nothing but the arena's scratch and the inbox's host words moves, and
+    /// the store's pages are mapped through the chain's last own row.
+    pub(super) fn stage_chain(
+        &mut self,
+        stream: &CudaStream,
+        target: Option<Target38<'_>>,
+        refresh: Feed<'_, TargetRows>,
+        (own, head, mode): (usize, DraftHead, WalkMode),
+        (block, at, pair): (usize, usize, usize),
+    ) -> Result<ChainBlock, GpuError> {
+        refuse_store(
+            mode,
+            "a chain's walks with a head (WalkMode::Store writes the store alone)",
+        )?;
+        head.check_opened(WHAT, self.head.rows.is_some())?;
+        let w = self.checked(target, DraftFeed::Rows(refresh), mode)?;
+        let (m, pos0) = (w.m, w.pos0);
+        let end = self.chain_end(pos0, m, own)?;
+        if block >= MTP_ROWS || at + m > MTP_ROWS || pair + 1 + own > CHAIN_PAIRS {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "block {block}'s {m} rows from row {at} and {} pairs from pair {pair}: a \
+                     round of chains walks at most {MTP_ROWS} rows and reads back {CHAIN_PAIRS} \
+                     pairs",
+                    1 + own
+                ),
+            ));
+        }
+        self.store.fit(end + own)?;
+        self.store.own_from(pos0 as usize)?;
+        let a = self.arena()?;
+        let host = a.inbox.host_mut()?;
+        host[IN_IDS + at..IN_IDS + at + m].copy_from_slice(refresh.tokens);
+        host[CHAIN_POS + block] = pos0;
+        for j in 1..=own {
+            host[CHAIN_POS + j * MTP_ROWS + block] =
+                u32::try_from(end + j - 1).expect("a chain's positions lie below its store");
+        }
+        let mut h = WindowMut::<f32>::of_mut(&mut a.h_in, at * WIDE * size_of::<f32>(), m * WIDE)?;
+        copy_hidden(stream, &mut h, refresh.hidden, w.src)?;
+        Ok(ChainBlock {
+            block,
+            at,
+            m,
+            pos0,
+            own,
+            pair,
+        })
+    }
+
+    /// The round's inbox words, every block's ids and every walk's
+    /// positions ([`Mtp38::stage_chain`]), copied to the card ahead of its
+    /// walks.
+    pub(super) fn upload_chains(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        self.arena()?
+            .inbox
+            .upload(stream, CHAIN_POS + MTP_GRAPH_ROWS * MTP_ROWS)
+    }
+
+    /// Walk `j` of a round of `blocks`' chains up to its attention
+    /// ([`Mtp38::walk_in`]) over the blocks it reaches ([`chain_rows`]).
+    pub(super) fn chain_in(
+        &mut self,
+        c: &MtpCtx<'_>,
+        blocks: &[ChainBlock],
+        j: usize,
+    ) -> Result<(), GpuError> {
+        let rows: Vec<WalkRows> = chain_rows(blocks, j).map(|(_, r)| r).collect();
+        self.walk_in(c, &rows, false)
+    }
+
+    /// Walk `j` of a round of `blocks`' chains after its attention
+    /// ([`Mtp38::walk_out`]), then, for each block it reaches, the last
+    /// row's id and probability bits copied into the block's pair for the
+    /// walk, and, when the block's chain walks on, its streams into the row
+    /// the next walk reads them at; the round's last walk's fault word and
+    /// site mask close the readback ([`Mtp38::read_chains`]).
+    pub(super) fn chain_out(
+        &mut self,
+        c: &MtpCtx<'_>,
+        blocks: &[ChainBlock],
+        j: usize,
+        head: DraftHead,
+    ) -> Result<(), GpuError> {
+        let rows: Vec<(ChainBlock, WalkRows)> = chain_rows(blocks, j).collect();
+        let m = rows.last().map_or(0, |(_, r)| r.at + r.m);
+        self.walk_out(c, m, head)?;
+        let stream = c.gpu.stream();
+        let a = self.arena()?;
+        let word = size_of::<u32>();
+        let mut next = 0;
+        for (b, r) in &rows {
+            let last = r.at + r.m - 1;
+            let pair = 2 * (b.pair + j);
+            let w_id = Window::<u32>::of(&a.out, last * word, 1)?;
+            WindowMut::<u32>::of_mut(&mut a.st.pos, pair * word, 1)?
+                .copy_from_device_async(&w_id, stream)?;
+            let w_p = Window::<u32>::of(&a.out, (m + last) * word, 1)?;
+            WindowMut::<u32>::of_mut(&mut a.st.pos, (pair + 1) * word, 1)?
+                .copy_from_device_async(&w_p, stream)?;
+            if b.own > j {
+                let src = Window::<f32>::of(&a.res, last * WIDE * size_of::<f32>(), WIDE)?;
+                let mut dst =
+                    WindowMut::<f32>::of_mut(&mut a.h_in, next * WIDE * size_of::<f32>(), WIDE)?;
+                dst.copy_from_device_async(&src, stream)?;
+                next += 1;
+            }
+        }
+        if blocks.iter().any(|b| b.own > j) {
+            return Ok(());
+        }
+        // The round's last walk: its fault word is the card's own, so a fault
+        // any walk of the round raised is on it.
+        let w_word = Window::<u32>::of(&a.out, 2 * m * word, 1)?;
+        WindowMut::<u32>::of_mut(&mut a.st.pos, 2 * CHAIN_PAIRS * word, 1)?
+            .copy_from_device_async(&w_word, stream)?;
+        let w_sites = Window::<u32>::of(&a.out, (2 * m + 1) * word, 1)?;
+        WindowMut::<u32>::of_mut(&mut a.st.pos, (2 * CHAIN_PAIRS + 1) * word, 1)?
+            .copy_from_device_async(&w_sites, stream)?;
+        Ok(())
+    }
+
+    /// A round of several sequences' chains ended for `b`'s sequence, the
+    /// live one: its store holds the sequence through the refresh, as
+    /// [`Mtp38::run_chain`] leaves it. The arena's rows are the round's, so
+    /// no walk of the sequence is read back and an own row needs a Rows
+    /// refresh first.
+    pub(super) fn end_chain(&mut self, b: &ChainBlock) {
+        self.held = b.end();
+        self.last = None;
+        self.own_at = None;
+    }
+
+    /// A round of `blocks`' chains read back once ([`Mtp38::chain_out`]'s
+    /// pairs): each block's proposal, its 1 + own ids and their
+    /// probabilities, in `blocks`' order. A fault any walk of the round
+    /// raised is [`GpuError::Fault`]: the word is the card's own, which the
+    /// argmax copies after its launch.
+    pub(super) fn read_chains(
+        &self,
+        stream: &CudaStream,
+        blocks: &[ChainBlock],
+    ) -> Result<Vec<MtpDraft>, GpuError> {
+        let out = self.arena_ref()?.st.pos.to_host_vec(stream)?;
+        let (Some(&word), Some(&sites)) = (out.get(2 * CHAIN_PAIRS), out.get(2 * CHAIN_PAIRS + 1))
+        else {
+            return Err(GpuError::state(
+                WHAT,
+                "a round's readback of 2·CHAIN_PAIRS + 2 words",
+            ));
+        };
+        if let Some(fault) = Fault::from_words(word, sites) {
+            return Err(GpuError::fault(WHAT, fault));
+        }
+        blocks
+            .iter()
+            .map(|b| {
+                let w = out
+                    .get(2 * b.pair..2 * (b.pair + b.pairs()))
+                    .ok_or(GpuError::state(WHAT, "a block's pairs inside the readback"))?;
+                Ok(MtpDraft {
+                    tokens: w.iter().step_by(2).copied().collect(),
+                    p: w[1..]
+                        .iter()
+                        .step_by(2)
+                        .map(|&b| f32::from_bits(b))
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
     /// The walk itself: every launch of the module doc's list, enqueued on
-    /// the card's stream (what a capture records).
+    /// the card's stream (what a capture records): the rows' launches up to
+    /// k and v ([`Mtp38::walk_in`]), the attention over this sequence's
+    /// store ([`Mtp38::attend`]) and the rest through the argmax
+    /// ([`Mtp38::walk_out`]), then the last row's token and streams copied
+    /// beside the arena, where the next own walk reads them.
     fn walk(&mut self, c: &MtpCtx<'_>, key: MtpKey) -> Result<(), GpuError> {
         let MtpKey { m, own, head } = key;
-        let (embd, head_out) = self.borrowed(c.tw)?;
+        let rows = WalkRows {
+            at: 0,
+            m,
+            ids: if own {
+                IdsAt::Own
+            } else {
+                IdsAt::Inbox(IN_IDS)
+            },
+            pos0: IN_POS0,
+        };
+        self.walk_in(c, &[rows], own)?;
+        self.attend(c, 0, m)?;
+        self.walk_out(c, m, head)?;
+        let stream = c.gpu.stream();
+        let a = self.arena()?;
+        // SAFETY: word m − 1 of the readback's 2·MTP_ROWS + 2 and row m − 1
+        // of the streams' MTP_ROWS rows (1 <= m <= MTP_ROWS); the windows
+        // live for the two copies.
+        let (id, row) = unsafe {
+            (
+                param_view::<u32>(&a.out, m - 1, 1),
+                cells_view(&a.res, (m - 1) * WIDE, WIDE),
+            )
+        };
+        a.own_id.copy_from_device_async(&id, stream)?;
+        a.own_h.copy_from_device_async(&row, stream)?;
+        Ok(())
+    }
+
+    /// A walk's launches before its attention, over `rows`, arena rows
+    /// `0 ..` in order: each one's embedding at its own first position, then
+    /// over all of them the input pack — the hidden rows `own_h`'s, the
+    /// draft's own last row, or `h_in`'s — `eh_proj`, the attention site's
+    /// mix and q, k and v.
+    fn walk_in(&mut self, c: &MtpCtx<'_>, rows: &[WalkRows], own_h: bool) -> Result<(), GpuError> {
+        let (embd, _) = self.borrowed(c.tw)?;
         let Mtp38 {
-            w,
-            store,
-            head: hm,
-            index,
-            ctx,
-            a,
-            q6k_ids,
-            ..
+            w, index, ctx, a, ..
         } = self;
         let a = a
             .as_mut()
@@ -2048,7 +2343,7 @@ impl Mtp38 {
         let (gpu, k) = (c.gpu, c.k);
         let stream = gpu.stream();
         let sink = gpu.layer_sink(*index as usize)?;
-        let n = Names::of(*index, w);
+        let n = &self.names;
         let cx = Ctx38 {
             gpu,
             w,
@@ -2058,34 +2353,52 @@ impl Mtp38 {
             ctx: *ctx,
         };
         let capturing = crate::capturing(stream)?;
-        let (h, ff, used) = (geo::HIDDEN, geo::FF, geo::N_USED);
+        let h = geo::HIDDEN;
+        let m = rows.last().map_or(0, |r| r.at + r.m);
 
-        // The embedding rows and the input pack.
+        // The embedding rows, a sequence's at a time, and the input pack.
         let table = EmbedRows::of_weight(embd).ok_or_else(|| {
             GpuError::tensor(WHAT, "token_embd.weight", "Q8_0 planes or BF16 words")
         })?;
-        // SAFETY: words IN_IDS .. IN_IDS + m of the inbox's IN_IDS +
-        // MTP_STORE_ROWS words (m <= MTP_ROWS <= MTP_STORE_ROWS); the window
-        // lives for the embedding's enqueue.
-        let ids = unsafe { param_view::<u32>(a.inbox.dev(), IN_IDS, m) };
-        k.q38.enqueue_embed_rows(
-            stream,
-            EmbedArgs {
-                table,
-                ids: if own { &a.own_id } else { &ids },
-                pos0: &a.pos0,
-                first: 0,
-                fault: sink,
-                y: &mut a.emb,
-                pos: &mut a.pos,
-                n_keys: &mut a.n_keys,
-            },
-        )?;
+        let word = size_of::<u32>();
+        for r in rows {
+            // SAFETY: the rows' ids — words `at .. at + m` of the inbox's
+            // IN_IDS + MTP_STORE_ROWS, the own id's one word, or one word of
+            // the chains' readback — and their first position's inbox word,
+            // each inside its buffer ([`WalkRows`]); the windows live for the
+            // embedding's enqueue.
+            let (ids, pos0) = unsafe {
+                (
+                    match r.ids {
+                        IdsAt::Inbox(at) => param_view::<u32>(a.inbox.dev(), at, r.m),
+                        IdsAt::Own => param_view::<u32>(&a.own_id, 0, 1),
+                        IdsAt::Chains(at) => param_view::<u32>(&a.st.pos, at, 1),
+                    },
+                    param_view::<u32>(a.inbox.dev(), r.pos0, 1),
+                )
+            };
+            let mut y = WindowMut::<f32>::of_mut(&mut a.emb, r.at * h * size_of::<f32>(), r.m * h)?;
+            let mut pos = WindowMut::<u32>::of_mut(&mut a.pos, r.at * word, r.m)?;
+            let mut n_keys = WindowMut::<u32>::of_mut(&mut a.n_keys, r.at * word, r.m)?;
+            k.q38.enqueue_embed_rows(
+                stream,
+                EmbedArgs {
+                    table,
+                    ids: &ids,
+                    pos0: &pos0,
+                    first: 0,
+                    fault: sink,
+                    y: &mut y,
+                    pos: &mut pos,
+                    n_keys: &mut n_keys,
+                },
+            )?;
+        }
         k.mtp.enqueue_mtp_input(
             stream,
             MtpInputArgs {
                 e: &a.emb,
-                h: if own { &a.own_h } else { &a.h_in },
+                h: if own_h { &a.own_h } else { &a.h_in },
                 enorm: f32_gain(w, &n.enorm)?,
                 hnorm: f32_gain(w, &n.hnorm)?,
                 hidden: h,
@@ -2125,7 +2438,7 @@ impl Mtp38 {
             dst.copy_from_device_async(&src, stream)?;
         }
 
-        // The attention site.
+        // The attention site: its mix, then q, k and v.
         cx.mix(
             &n.attn_site,
             &mut a.res,
@@ -2141,20 +2454,51 @@ impl Mtp38 {
         cx.dense_gemv(&n.q, &a.mixed, m, &mut a.qg)?;
         cx.dense_gemv(&n.k, &a.mixed, m, &mut a.k)?;
         cx.dense_gemv(&n.v, &a.mixed, m, &mut a.v)?;
+        Ok(())
+    }
+
+    /// The attention of arena rows `at .. at + m`, one sequence's rows of
+    /// the walk [`Mtp38::walk_in`] enqueued, over this sequence's store (the
+    /// live one's): the q/k norm, turn and append at their positions, then
+    /// the flash over every stored position below each row's.
+    pub(super) fn attend(&mut self, c: &MtpCtx<'_>, at: usize, m: usize) -> Result<(), GpuError> {
+        let Mtp38 {
+            w,
+            store,
+            index,
+            ctx,
+            a,
+            ..
+        } = self;
+        let a = a
+            .as_mut()
+            .ok_or(GpuError::state(WHAT, "the program's arena (Mtp38::arm)"))?;
+        let (gpu, k) = (c.gpu, c.k);
+        let stream = gpu.stream();
+        let sink = gpu.layer_sink(*index as usize)?;
+        let n = &self.names;
+        let (f, word) = (size_of::<f32>(), size_of::<u32>());
+        let qg = Window::<f32>::of(&a.qg, at * geo::Q_ROWS * f, m * geo::Q_ROWS)?;
+        let mut q = WindowMut::<f32>::of_mut(&mut a.q, at * geo::ATTN * f, m * geo::ATTN)?;
+        let mut kw = WindowMut::<f32>::of_mut(&mut a.k, at * geo::KV * f, m * geo::KV)?;
+        let v = Window::<f32>::of(&a.v, at * geo::KV * f, m * geo::KV)?;
+        let pos = Window::<u32>::of(&a.pos, at * word, m)?;
+        let n_keys = Window::<u32>::of(&a.n_keys, at * word, m)?;
+        let mut y = WindowMut::<f32>::of_mut(&mut a.flash, at * geo::ATTN * f, m * geo::ATTN)?;
         // SAFETY: the per-sequence embedding supplies distinct cache-valid positions.
         unsafe {
             store.append_256(
                 &k.neox,
                 stream,
                 Append256 {
-                    qg: &a.qg,
-                    q: &mut a.q,
-                    k: &mut a.k,
-                    v: &a.v,
+                    qg: &qg,
+                    q: &mut q,
+                    k: &mut kw,
+                    v: &v,
                     gq: f32_gain(w, &n.q_norm)?,
                     gk: f32_gain(w, &n.k_norm)?,
                     table: c.table,
-                    pos: &a.pos,
+                    pos: &pos,
                     eps: c.eps,
                     n_head: geo::N_HEAD,
                     n_kv: geo::N_KV,
@@ -2168,8 +2512,8 @@ impl Mtp38 {
             &k.flash,
             stream,
             super::scratch::FlashPass {
-                q: &a.q,
-                n_keys: &a.n_keys,
+                q: &q,
+                n_keys: &n_keys,
                 scale: ATTN_SCALE_256,
                 n_kv: geo::N_KV,
                 ctx: *ctx,
@@ -2177,12 +2521,46 @@ impl Mtp38 {
                 part_v: &mut a.part_v,
                 part_ms: &mut a.part_ms,
                 fault: sink,
-                y: &mut a.flash,
+                y: &mut y,
             },
             geo::N_HEAD,
             super::plan::Flash::Quads,
             MMA,
-        )?;
+        )
+    }
+
+    /// A walk's launches after its attention, over its `m` rows: the gate
+    /// and the output projection, the feed-forward site, the head site's mix,
+    /// the projection into `head` and the argmax.
+    fn walk_out(&mut self, c: &MtpCtx<'_>, m: usize, head: DraftHead) -> Result<(), GpuError> {
+        let (_, head_out) = self.borrowed(c.tw)?;
+        let Mtp38 {
+            w,
+            head: hm,
+            index,
+            ctx,
+            a,
+            q6k_ids,
+            ..
+        } = self;
+        let a = a
+            .as_mut()
+            .ok_or(GpuError::state(WHAT, "the program's arena (Mtp38::arm)"))?;
+        let (gpu, k) = (c.gpu, c.k);
+        let stream = gpu.stream();
+        let sink = gpu.layer_sink(*index as usize)?;
+        let n = &self.names;
+        let cx = Ctx38 {
+            gpu,
+            w,
+            k,
+            eps: c.eps,
+            table: c.table,
+            ctx: *ctx,
+        };
+        let capturing = crate::capturing(stream)?;
+        let (h, ff, used) = (geo::HIDDEN, geo::FF, geo::N_USED);
+
         k.q38.enqueue_out_gate(
             stream,
             OutGateArgs {
@@ -2445,19 +2823,6 @@ impl Mtp38 {
                 done: &mut a.done,
             },
         )?;
-
-        // The last row, for the next own walk.
-        // SAFETY: word m − 1 of the readback's 2·MTP_ROWS + 2 and row m − 1
-        // of the streams' MTP_ROWS rows (1 <= m <= MTP_ROWS); the windows
-        // live for the two copies.
-        let (id, row) = unsafe {
-            (
-                param_view::<u32>(&a.out, m - 1, 1),
-                cells_view(&a.res, (m - 1) * WIDE, WIDE),
-            )
-        };
-        a.own_id.copy_from_device_async(&id, stream)?;
-        a.own_h.copy_from_device_async(&row, stream)?;
         Ok(())
     }
 
@@ -2487,7 +2852,7 @@ impl Mtp38 {
         let (gpu, k) = (c.gpu, c.k);
         let stream = gpu.stream();
         let sink = gpu.layer_sink(*index as usize)?;
-        let n = Names::of(*index, w);
+        let n = &self.names;
         let m = blocks.last().map_or(0, |b| b.at + b.m);
         if !own && ids.len() != m {
             return Err(GpuError::shape(
@@ -2643,7 +3008,7 @@ impl Mtp38 {
         let s = &mut a.st;
         let (gpu, k) = (c.gpu, c.k);
         let sink = gpu.layer_sink(*index as usize)?;
-        let n = Names::of(*index, w);
+        let n = &self.names;
         let (kv_at, kv_n) = (b.at * geo::KV * size_of::<f32>(), b.m * geo::KV);
         let mut kw = WindowMut::<f32>::of_mut(&mut s.k, kv_at, kv_n)?;
         let v = Window::<f32>::of(&s.v, kv_at, kv_n)?;
@@ -2743,6 +3108,51 @@ impl Mtp38 {
     }
 }
 
+/// The rows walk `j` of a round of `blocks`' chains runs, a block's at a
+/// time for every block whose chain reaches it, in `blocks`' order: walk 0
+/// each block's refresh at its own arena rows and inbox ids, a later walk
+/// each block's one own row at the next arena row, its id the one the
+/// block's walk before proposed ([`Mtp38::chain_out`]); each block's
+/// position the inbox word [`Mtp38::stage_chain`] wrote for it.
+fn chain_rows(
+    blocks: &[ChainBlock],
+    j: usize,
+) -> impl Iterator<Item = (ChainBlock, WalkRows)> + '_ {
+    blocks
+        .iter()
+        .filter(move |b| b.own >= j)
+        .enumerate()
+        .map(move |(next, &b)| {
+            let rows = if j == 0 {
+                WalkRows {
+                    at: b.at,
+                    m: b.m,
+                    ids: IdsAt::Inbox(IN_IDS + b.at),
+                    pos0: CHAIN_POS + b.block,
+                }
+            } else {
+                WalkRows {
+                    at: next,
+                    m: 1,
+                    ids: IdsAt::Chains(2 * (b.pair + j - 1)),
+                    pos0: CHAIN_POS + j * MTP_ROWS + b.block,
+                }
+            };
+            (b, rows)
+        })
+}
+
+/// The arena rows each block reached by walk `j` of a round of `blocks`'
+/// chains runs ([`chain_rows`]): its index in `blocks`, its first row and
+/// its rows, the span its own sequence's attention takes
+/// ([`Mtp38::attend`]).
+pub(super) fn chain_spans(
+    blocks: &[ChainBlock],
+    j: usize,
+) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+    chain_rows(blocks, j).map(|(b, r)| (b.block, r.at, r.m))
+}
+
 /// Refuse by name a store walk ([`WalkMode::Store`]) where the head's rows
 /// are read back, `why` naming the call.
 fn refuse_store(mode: WalkMode, why: &'static str) -> Result<(), GpuError> {
@@ -2836,6 +3246,8 @@ fn read_draft(a: &MtpArena, stream: &CudaStream, m: usize) -> Result<MtpDraft, G
 const _: () = assert!(
     MTP_ROWS <= 8 && MTP_GRAPH_ROWS <= MTP_ROWS && EH_COLS == 8 && MTP_ROWS <= MTP_STORE_ROWS
 );
+// A round of chains' positions fit the inbox beside its ids.
+const _: () = assert!(CHAIN_POS + MTP_GRAPH_ROWS * MTP_ROWS <= IN_IDS + MTP_STORE_ROWS);
 
 #[cfg(test)]
 mod tests {

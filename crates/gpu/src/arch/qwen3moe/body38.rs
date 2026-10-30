@@ -120,7 +120,8 @@ use super::image::{
     MediaCarrier, MediaRows, imrope_sections, media_call, section_order, window_spans,
 };
 use super::mtp38::{
-    DraftRows38, DraftSeq38, Mtp38, MtpCtx, MtpDraft, MtpTaps, Target38, TargetRows,
+    CHAIN_PAIRS, ChainBlock, DraftRows38, DraftSeq38, MTP_ROWS, Mtp38, MtpCtx, MtpDraft, MtpTaps,
+    Target38, TargetRows, chain_spans,
 };
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
@@ -164,8 +165,8 @@ use crate::linear::delta::{RecoveryStore, RecoveryTable, carry_fold_host};
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::slots::slot_twice;
 use crate::model::{
-    CardBytes, ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, SlotRange, SlotRowOrder,
-    SlotRows, Slots,
+    CardBytes, ChainBody, GpuModel, HostServed, MAX_PASS_ROWS, Rollback, RowHeads, Rows, SlotRange,
+    SlotRowOrder, SlotRows, Slots,
 };
 use crate::ple::PleKernels;
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
@@ -2603,6 +2604,70 @@ impl Body38 {
             head,
             mode,
         )
+    }
+
+    /// One round of several slots' chains ([`GpuModel::mtp_chain_slots`])
+    /// beside this body, the homes canonical: `chains`' `(slot, refresh,
+    /// own)`, each sequence the live one (`None`) or `parked`'s entry its
+    /// `seqs` index names. Each chain is checked and staged with its
+    /// sequence live ([`Mtp38::stage_chain`]), then each walk runs once over
+    /// every chain it reaches, each chain's attention with its sequence live
+    /// ([`on_seq`]), and the round is read back once ([`Mtp38::read_chains`]).
+    fn mtp_chain_round(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        parked: &mut [&mut Slot38],
+        (chains, seqs): (&[SlotChain38<'_>], &[Option<usize>]),
+        head: DraftHead,
+        mode: WalkMode,
+    ) -> Result<Vec<MtpDraft>, GpuError> {
+        let stream = gpu.stream();
+        let mut blocks: Vec<ChainBlock> = Vec::with_capacity(chains.len());
+        let (mut at, mut pair) = (0, 0);
+        for (block, (&(_, feed, own), &seq)) in chains.iter().zip(seqs).enumerate() {
+            let seq = seq.map(|i| &mut *parked[i]);
+            let b = on_seq(self, seq, |body| {
+                let Body38 {
+                    mtp,
+                    plans,
+                    s,
+                    a,
+                    wa,
+                    wrote,
+                    ..
+                } = body;
+                let d = mtp.as_mut().ok_or(GpuError::state(
+                    WHAT,
+                    "an MTP draft (Body38::open_placed_mtp)",
+                ))?;
+                let target = mtp_target(plans, [s, a, wa], wrote, DraftFeed::Rows(feed));
+                d.stage_chain(stream, target, feed, (own, head, mode), (block, at, pair))
+            })?;
+            at += b.m();
+            pair += b.pairs();
+            blocks.push(b);
+        }
+        self.draft_mut()?.upload_chains(stream)?;
+        let walks = blocks.iter().map(|b| b.pairs()).max().unwrap_or(0);
+        for j in 0..walks {
+            self.mtp_with(gpu, w, |d, c| d.chain_in(c, &blocks, j))?;
+            for (block, at, m) in chain_spans(&blocks, j) {
+                let seq = seqs[block].map(|i| &mut *parked[i]);
+                on_seq(self, seq, |body| {
+                    body.mtp_with(gpu, w, |d, c| d.attend(c, at, m))
+                })?;
+            }
+            self.mtp_with(gpu, w, |d, c| d.chain_out(c, &blocks, j, head))?;
+        }
+        for (b, &seq) in blocks.iter().zip(seqs) {
+            let seq = seq.map(|i| &mut *parked[i]);
+            on_seq(self, seq, |body| {
+                body.draft_mut()?.end_chain(b);
+                Ok(())
+            })?;
+        }
+        self.draft_ref()?.read_chains(stream, &blocks)
     }
 
     /// Tokens of the vocabulary.
@@ -5315,6 +5380,10 @@ fn mtp_ctx<'a>(
 pub type Prompt38Sink<'a> =
     dyn FnMut(&mut GpuModel<Body38>, TargetRows, u32, usize) -> Result<(), GpuError> + 'a;
 
+/// One slot's chain of a round of several slots' chains
+/// ([`GpuModel::mtp_chain_slots`]): the slot, the refresh, the own walks.
+pub type SlotChain38<'a> = (usize, Feed<'a, TargetRows>, usize);
+
 /// The MTP draft's calls ([`Mtp38::run`]); each is refused by name on a load
 /// without a draft.
 impl GpuModel<Body38> {
@@ -5466,6 +5535,79 @@ impl GpuModel<Body38> {
         // A fault a walk of the chain raised poisons the model as the
         // target's would.
         self.note_fault(WHAT_D, r)
+    }
+
+    /// Several slots' window chains of the draft at once, one readback a
+    /// round: each `(slot, refresh, own)` the chain [`GpuModel::mtp_chain`]
+    /// runs on that slot, the chains' walks of each depth run as one walk
+    /// over every slot's rows — its attention each slot's over its own
+    /// store — and each slot's proposal, probabilities and store come out
+    /// as its own chain leaves them, each launch computing a row from that
+    /// row's inputs alone. Chains past one walk's rows or readback run in
+    /// rounds of them, in order, and more chains than one call binds
+    /// ([`MAX_PASS_ROWS`]) in calls of that many. Every walk runs launch by
+    /// launch: one walk's launches address every slot's store. The model
+    /// stands with slot 0 selected (`GpuModel::on_slots`). Refused by name:
+    /// a slot named twice, a poisoned model, and as `mtp_chain` refuses each
+    /// chain, before its round's first walk. Earlier chains in the round may
+    /// already be staged, and rounds before it have run. A fault any walk
+    /// raised poisons every slot its call named.
+    pub fn mtp_chain_slots(
+        &mut self,
+        chains: &[SlotChain38<'_>],
+        head: DraftHead,
+        mode: WalkMode,
+    ) -> Result<Vec<MtpDraft>, GpuError> {
+        const WHAT_D: &str = "qwen4exp mtp_chain_slots";
+        self.refuse_if_poisoned(WHAT_D)?;
+        for (i, &(slot, ..)) in chains.iter().enumerate() {
+            if chains[..i].iter().any(|&(seen, ..)| seen == slot) {
+                return Err(slot_twice(WHAT_D, slot));
+            }
+        }
+        if chains.len() > MAX_PASS_ROWS {
+            let mut out = Vec::with_capacity(chains.len());
+            for part in chains.chunks(MAX_PASS_ROWS) {
+                out.extend(self.mtp_chain_slots(part, head, mode)?);
+            }
+            return Ok(out);
+        }
+        let slots: Vec<usize> = chains.iter().map(|&(slot, ..)| slot).collect();
+        self.on_slots(&slots, WHAT_D, |gpu, w, body, parked| {
+            let mut seqs = Vec::with_capacity(chains.len());
+            let mut next = 0..parked.len();
+            for &(slot, ..) in chains {
+                seqs.push(match slot {
+                    0 => None,
+                    _ => Some(next.next().ok_or(GpuError::state(
+                        WHAT_D,
+                        "a parked sequence for every slot but slot 0",
+                    ))?),
+                });
+            }
+            let mut out = Vec::with_capacity(chains.len());
+            let mut start = 0;
+            while start < chains.len() {
+                let (mut rows, mut pairs, mut end) = (0, 0, start);
+                while let Some((_, feed, own)) = chains.get(end) {
+                    let (r, p) = (feed.tokens.len(), 1 + own);
+                    if end > start && (rows + r > MTP_ROWS || pairs + p > CHAIN_PAIRS) {
+                        break;
+                    }
+                    (rows, pairs, end) = (rows + r, pairs + p, end + 1);
+                }
+                out.extend(body.mtp_chain_round(
+                    gpu,
+                    w,
+                    parked,
+                    (&chains[start..end], &seqs[start..end]),
+                    head,
+                    mode,
+                )?);
+                start = end;
+            }
+            Ok(out)
+        })
     }
 
     /// The last draft walk's taps ([`Mtp38::taps`]). Blocking.
