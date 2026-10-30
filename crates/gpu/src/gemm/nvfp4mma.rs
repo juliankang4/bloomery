@@ -423,16 +423,16 @@ impl TileColumns {
 /// The u32 word where 16-byte chunk `q` of a stage row starts, half `q / 2`'s
 /// chunk `q % 2`. The chunk number is XORed with bit 1 of the row index (onto
 /// its bit 1) and bit 2 (onto its bit 0), so neither the eight rows one
-/// `ldmatrix` phase reads at one chunk nor the four rows' two chunks of one
-/// half that eight threads copy at a time meet a bank twice.
+/// `ldmatrix` phase reads at one chunk nor the two rows' four chunks that
+/// eight threads copy at a time meet a bank twice.
 #[inline(always)]
 const fn chunk(row: usize, q: usize) -> usize {
     row * ROW_W + 4 * (q ^ ((row & 2) | ((row >> 2) & 1)))
 }
 // Every row's chunks are aligned, inside the row and distinct; the eight rows
-// one `ldmatrix` phase reads at one chunk, and the four rows' two chunks of
-// one half that eight threads (`sr = tid / 2`, `half = tid & 1`) copy at a
-// time, cover the 32 banks once.
+// one `ldmatrix` phase reads at one chunk, and the two rows' four chunks that
+// eight threads (row `tid / 4`, chunk `tid % 4`) copy at a time, cover the 32
+// banks once.
 const _: () = {
     use cuda_device::swizzle::{WARP_LANES, conflict_degree};
     let mut row = 0;
@@ -448,7 +448,7 @@ const _: () = {
             let mut i = 0;
             while i < WARP_LANES {
                 ldmatrix[i] = chunk(row / 8 * 8 + i / 4, q) + i % 4;
-                copy[i] = chunk(row / 4 * 4 + i / 8, q / 2 * 2 + i / 4 % 2) + i % 4;
+                copy[i] = chunk(row / 2 * 2 + i / 16, i / 4 % 4) + i % 4;
                 i += 1;
             }
             assert!(conflict_degree(&ldmatrix, 4) == 1 && conflict_degree(&copy, 4) == 1);
@@ -461,51 +461,66 @@ const _: () = {
 
 /// One thread's `cp.async` copies of step `$s` (64-value steps `HALVES * $s`
 /// on, below `$steps`) into stage `$st` (`$s % STAGES`) of `nvfp4_walk!`'s
-/// shared arrays `$wp`, `$bp`, `$sp` (its arguments): of each half, half
-/// `$half` of weight row `$wrow`'s codes and, for `$sr < $bc`, of activation
-/// column `$col`'s, into shared row `$sr`; and half `$half`'s scale words,
-/// the activation's for `$sr < 64`. One group, empty for a step past the
-/// last. `$full` (a literal) says every step
-/// below `$steps` has both halves, so only the step itself is checked.
+/// shared arrays `$wp`, `$bp`, `$sp` (its arguments): 16-byte chunk `$cq` of
+/// the step's codes of weight rows `$wr0` (of `$wq0`, into shared row `$cr`)
+/// and `$wr1` (of `$wq1`, into shared row `$cr + 64`) and, for `$cr < $bc`, of
+/// activation column `$acol` (into shared row `$cr`), so one copy of a warp
+/// reads eight rows' whole steps; and half `$half`'s scale words of weight
+/// row `$wrow` (shared row `$sr`) and, for `$sr < 64`, of activation column
+/// `$col`. One group, empty for a step past the last. `$full` (a literal)
+/// says every step below `$steps` has both halves, so only the step itself
+/// is checked.
 macro_rules! nvfp4_copy {
     (
         $full:literal,
         ($s:expr, $st:expr),
-        ($wq:ident, $we:ident, $wrow:ident),
-        ($aq:ident, $ae:ident, $col:ident),
+        (
+            ($wq0:ident, $wr0:ident),
+            ($wq1:ident, $wr1:ident),
+            ($aq:ident, $acol:ident),
+            $cr:ident,
+            $cq:ident
+        ),
+        (($we:ident, $wrow:ident), ($ae:ident, $col:ident)),
         ($steps:ident, $sr:ident, $half:ident, $bc:expr),
         ($wp:ident, $bp:ident, $sp:ident)
     ) => {{
         let s: usize = $s;
         let st: usize = $st;
         if HALVES * s < $steps {
-            for h in 0..HALVES {
-                ::cuda_device::thread::__unroll_config::<0>();
-                let k = HALVES * s + h;
-                if $full || k < $steps {
-                    let at = chunk($sr, 2 * h + $half);
-                    // SAFETY: the weight row's aligned half of 64-value step k is in the checked plane
-                    // (K divides 64); sr < TILE_ROWS, h < HALVES and half < 2 put at, this thread's
-                    // own aligned four-word chunk, inside row sr of stage st of W, read by no other
-                    // thread before the barrier after the wait that completes it.
+            if $full || HALVES * s + $cq / 2 < $steps {
+                // A row's plane holds its halves in K order, so chunk cq of step s starts 4 * cq
+                // words into the step's.
+                let at = HALVES * s * 8 + 4 * $cq;
+                // SAFETY: the weight row's aligned chunk of step s is in the checked plane (K divides
+                // 64, the chunk's half is below steps); cr < 64 and cq < 4 put the destination, this
+                // thread's own aligned four-word chunk, inside row cr of stage st of W, read by no
+                // other thread before the barrier after the wait that completes it.
+                unsafe {
+                    cuda_device::async_copy::cp_async_cg_16(
+                        $wp.add(st * W_STAGE + chunk($cr, $cq)),
+                        $wq0.as_ptr().add($wr0 * $steps * 8 + at),
+                    )
+                };
+                // SAFETY: wr1's aligned chunk is within its checked plane; st < STAGES, cr < 64 and
+                // cq < 4 select unique words in row cr + 64, read only after the copy wait and barrier.
+                unsafe {
+                    cuda_device::async_copy::cp_async_cg_16(
+                        $wp.add(st * W_STAGE + chunk($cr + 64, $cq)),
+                        $wq1.as_ptr().add($wr1 * $steps * 8 + at),
+                    )
+                };
+                if $cr < $bc {
+                    // SAFETY: acol is a live column whose aligned chunk of step s is in the plane;
+                    // cr < bc <= 64 and cq < 4 put the destination, this thread's own aligned
+                    // four-word chunk, inside row cr of stage st of B, read by no other thread
+                    // before the barrier after the wait that completes it.
                     unsafe {
                         cuda_device::async_copy::cp_async_cg_16(
-                            $wp.add(st * W_STAGE + at),
-                            $wq.as_ptr().add(($wrow * $steps + k) * 8 + 4 * $half),
+                            $bp.add(st * B_STAGE + chunk($cr, $cq)),
+                            $aq.as_ptr().add($acol * $steps * 8 + at),
                         )
                     };
-                    if $sr < $bc {
-                        // SAFETY: col is a live column whose aligned half of step k is in the plane;
-                        // sr < bc <= 64, h < HALVES and half < 2 put at, this thread's own aligned four-word
-                        // chunk, inside row sr of stage st of B, read by no other thread before the
-                        // barrier after the wait that completes it.
-                        unsafe {
-                            cuda_device::async_copy::cp_async_cg_16(
-                                $bp.add(st * B_STAGE + at),
-                                $aq.as_ptr().add(($col * $steps + k) * 8 + 4 * $half),
-                            )
-                        };
-                    }
                 }
             }
             let k = HALVES * s + $half;
@@ -537,11 +552,9 @@ macro_rules! nvfp4_copy {
 
 /// The K walk both native kernels share, over [`STAGES`] shared stages of
 /// [`TILE_ROWS`] weight rows and 64 activation rows, [`HALVES`] 64-value
-/// halves a step: each thread copies half `$half` of shared row `$sr` from
-/// weight row `$wrow` (`$wq` codes, `$we` scales) and, for `$sr < 64`, from
-/// activation column `$col` (`$aq`, `$ae`) two steps ahead
-/// ([`nvfp4_copy`]), the activation codes of its first `$bc <= 64` rows
-/// alone. The MMA reads both operands' codes as stored: a weight keeps values
+/// halves a step: each thread copies its code chunks `$codes` and scale words
+/// `$scales` two steps ahead ([`nvfp4_copy`]), the activation codes of the
+/// first `$bc <= 64` rows alone. The MMA reads both operands' codes as stored: a weight keeps values
 /// `i` and `i + 8` of a 16-value block in byte `i`, and the activation planes
 /// hold theirs in the same order ([`nvfp4_pack_q8`]), so each block's products
 /// pair the same values under one scale pair. Then `$body`
@@ -553,8 +566,8 @@ macro_rules! nvfp4_copy {
 macro_rules! nvfp4_walk {
     (
         $full:literal,
-        ($wq:ident, $we:ident, $wrow:ident),
-        ($aq:ident, $ae:ident, $col:ident),
+        $codes:tt,
+        $scales:tt,
         ($steps:ident, $sr:ident, $half:ident, $bc:expr),
         ($wp:ident, $bp:ident, $sp:ident, $h:ident),
         $body:block
@@ -562,16 +575,16 @@ macro_rules! nvfp4_walk {
         nvfp4_copy!(
             $full,
             (0, 0),
-            ($wq, $we, $wrow),
-            ($aq, $ae, $col),
+            $codes,
+            $scales,
             ($steps, $sr, $half, $bc),
             ($wp, $bp, $sp)
         );
         nvfp4_copy!(
             $full,
             (1, 1),
-            ($wq, $we, $wrow),
-            ($aq, $ae, $col),
+            $codes,
+            $scales,
             ($steps, $sr, $half, $bc),
             ($wp, $bp, $sp)
         );
@@ -599,8 +612,8 @@ macro_rules! nvfp4_walk {
             nvfp4_copy!(
                 $full,
                 (step + 2, fill),
-                ($wq, $we, $wrow),
-                ($aq, $ae, $col),
+                $codes,
+                $scales,
                 ($steps, $sr, $half, $bc),
                 ($wp, $bp, $sp)
             );
@@ -626,6 +639,25 @@ macro_rules! nvfp4_walk {
 #[inline(always)]
 const fn live_rows(live: usize) -> usize {
     16 * live.div_ceil(2)
+}
+
+/// Column `c` of the route tile at `cols[start..start + len]`, clamped to its
+/// last live column: the column's slot and the activation column it reads
+/// (the slot over `slot_div`).
+#[inline(always)]
+fn tile_column(
+    cols: &[u32],
+    (start, len): (usize, usize),
+    slot_div: u32,
+    c: usize,
+) -> (usize, usize) {
+    let source = cols[start + c.min(len - 1)] as usize;
+    let col = if slot_div == 1 {
+        source
+    } else {
+        source / slot_div as usize
+    };
+    (source, col)
 }
 
 /// A local `$walk!(true, live)` over a route tile of `$len` columns: its first
@@ -1335,14 +1367,14 @@ mod native {
         let sr = tid / 2;
         let half = tid & 1;
         let wr = expert * rows + (rt * TILE_ROWS + sr).min(rows - 1);
-        let source = cols[start + sr.min(len - 1)] as usize;
-        let col = if slot_div == 1 {
-            source
-        } else {
-            source / slot_div as usize
-        };
+        let (source, col) = tile_column(cols, (start, len), slot_div, sr);
         // SAFETY: the block's column words, before the walk.
         unsafe { columns.put((sr, half), source, ag, col) };
+        // The thread's code chunks: chunk cq of tile rows cr and cr + 64 and of column cr.
+        let (cr, cq) = (tid / 4, tid % 4);
+        let wr0 = expert * rows + (rt * TILE_ROWS + cr).min(rows - 1);
+        let wr1 = expert * rows + (rt * TILE_ROWS + cr + 64).min(rows - 1);
+        let acol = tile_column(cols, (start, len), slot_div, cr).1;
         let mut acc = [0.0f32; 32];
         // An even K walk over whole row tiles runs without the walk's and the
         // fragments' checks, over the tile's first `$live` fragments
@@ -1352,8 +1384,8 @@ mod native {
             ($full:literal, $live:literal) => {
                 nvfp4_walk!(
                     $full,
-                    (wq, we, wr),
-                    (aq, ae, col),
+                    ((wq, wr0), (wq, wr1), (aq, acol), cr, cq),
+                    ((we, wr), (ae, col)),
                     (steps, sr, half, live_rows($live)),
                     (wp, bp, sp, h),
                     {
@@ -1523,16 +1555,16 @@ mod native {
         // Shared rows 0..PAIR_ROWS hold the gate's rows, the next PAIR_ROWS the up's.
         let sr = tid / 2;
         let half = tid & 1;
-        let (wq, we) = if sr < PAIR_ROWS { (gq, ge) } else { (uq, ue) };
+        let we = if sr < PAIR_ROWS { ge } else { ue };
         let wrow = expert * rows + rt * PAIR_ROWS + sr % PAIR_ROWS;
-        let source = cols[start + sr.min(len - 1)] as usize;
-        let col = if slot_div == 1 {
-            source
-        } else {
-            source / slot_div as usize
-        };
+        let (source, col) = tile_column(cols, (start, len), slot_div, sr);
         // SAFETY: the block's column words, before the walk.
         unsafe { columns.put((sr, half), source, ag, col) };
+        // The thread's code chunks: chunk cq of gate and up row cr (shared rows
+        // cr and PAIR_ROWS + cr) and of column cr.
+        let (cr, cq) = (tid / 4, tid % 4);
+        let crow = expert * rows + rt * PAIR_ROWS + cr;
+        let acol = tile_column(cols, (start, len), slot_div, cr).1;
         let (gate_scale, up_scale) = (gw[expert], uw[expert]);
         let mut gacc = [0.0f32; 16];
         let mut uacc = [0.0f32; 16];
@@ -1545,8 +1577,8 @@ mod native {
             ($full:literal, $live:literal) => {
                 nvfp4_walk!(
                     $full,
-                    (wq, we, wrow),
-                    (aq, ae, col),
+                    ((gq, crow), (uq, crow), (aq, acol), cr, cq),
+                    ((we, wrow), (ae, col)),
                     (steps, sr, half, live_rows($live)),
                     (wp, bp, sp, h),
                     {
