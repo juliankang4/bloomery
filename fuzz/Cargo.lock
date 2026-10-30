@@ -84,18 +84,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-levers"
+version = "0.1.0"
+
+[[package]]
+name = "bloomery-models"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "thiserror",
+]
+
+[[package]]
+name = "bloomery-os"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "bloomery-sampler"
+version = "0.1.0"
+
+[[package]]
 name = "bloomery-serve"
-version = "0.3.6"
+version = "0.3.11"
 dependencies = [
  "bloomery-decision",
  "bloomery-embed",
  "bloomery-gguf",
  "bloomery-jinja",
+ "bloomery-models",
+ "bloomery-sampler",
+ "bloomery-threads",
+ "bloomery-tokenizer",
  "bloomery-vision",
  "libc",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "bloomery-threads"
+version = "0.1.0"
+dependencies = [
+ "bloomery-levers",
+ "bloomery-os",
+ "libc",
 ]
 
 [[package]]
@@ -416,6 +453,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
