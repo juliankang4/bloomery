@@ -62,7 +62,7 @@
 #   one `# jit-cc: <M.m>` line of its header. A table with no such line, with two, or with one whose value is not one
 #   arch or capability, and two tables of one arch and capability, are refused. Each binary is read against the table
 #   of its own scan's banner, `arch=` and `jit-cc=`; a scan with no such table fails by name. An arch no table pins
-#   (BLOOMERY_ARCH, sm_86 unset: tools/arch.sh) ends the script before any scan, so a scan is never read against
+#   (BLOOMERY_ARCH, unset: tools/arch.sh's selection) ends the script before any scan, so a scan is never read against
 #   another arch's pins.
 #   Every table is read once, into a copy every binary reads: a table given as a pipe or a process
 #   substitution (`<(grep … tools/ref/ptx-shapes.tsv)`) is empty on a second read.

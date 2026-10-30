@@ -17,9 +17,11 @@
 #   3. Both calls are box.sh calls of this environment: with BLOOMERY_BOX_QUEUE=1 they are queued jobs, and a gate-batch item
 #      (`'ptx-compare:BASE generate_ds41 --features gpu,deepseek41'`) carries its lane's card in BLOOMERY_BOX_ENV into both. The JIT
 #      runs under tools/gpu-gate.sh as the ptx-scan recipe's does. Both sides are scanned in this order, base first.
+#   4. Both sides build at one arch, tools/arch.sh's (BLOOMERY_ARCH, unset: the selection from this machine's cards); a value that is
+#      no arch is refused (64) before any build.
 #
 # The base side's cache. A scan of BASE is the same whenever its inputs are: the BASE sha, BIN, the features, the arch and the md5 of
-# this tree's tools/ptx-scan.sh. A run whose key has target/ptx-compare/<base12>-<bin>-<features>-<scanner8>/base.scan prints `ptx-compare:
+# this tree's tools/ptx-scan.sh. A run whose key has target/ptx-compare/<base12>-<bin>-<features>-<arch>-<scanner8>/base.scan prints `ptx-compare:
 # base <sha> from cache <file>` and makes no box call for the base side. The file is written whole (a temp file and a rename) only after
 # the side ended rc 0 and the log reads as a full scan (tools/recipes.py ptx-compare of the log against itself). The toolkit on the box is
 # not in the key: a ptxas or driver move shows as moved rows against the cached base, so after one run with --no-cache (the run's result
@@ -37,7 +39,6 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PKG=bloomery-gpu-gates # the package the ptx-scan recipe builds
-ARCH=sm_86 # the comparison builds at sm_86; a different exported BLOOMERY_ARCH is refused below, before any build
 USAGE="usage: ptx-compare.sh BASE BIN [--features F] [--base-only] [--no-cache] | --self-test"
 
 die() { # die <rc> <message>
@@ -47,6 +48,8 @@ die() { # die <rc> <message>
 
 # shellcheck source=tools/nightly/units.sh
 source "$ROOT/tools/nightly/units.sh" # tree_commit labels the head side, archive_tree reads the base commit
+# shellcheck source=tools/arch.sh
+source "$ROOT/tools/arch.sh" # bloomery_arch sets ARCH, the arch both sides build at
 
 md5_of() { # md5_of <file>: the Mac has md5, the box md5sum
   if command -v md5sum > /dev/null; then md5sum "$1" | cut -d' ' -f1; else md5 -q "$1"; fi
@@ -97,7 +100,7 @@ run_compare() {
   case $bin in '' | *[!A-Za-z0-9_-]* | -*) die 64 "'$bin' is no binary name" ;; esac
   case $feats in '' | *[!A-Za-z0-9_,/-]*) die 64 "--features '$feats' is no cargo feature list" ;; esac
   scanner=$(md5_of "$ROOT/tools/ptx-scan.sh" | cut -c1-8)
-  key=${sha:0:12}-$bin-${feats//[,\/]/+}-$scanner
+  key=${sha:0:12}-$bin-${feats//[,\/]/+}-$ARCH-$scanner
   dir=$ROOT/target/ptx-compare/$key
   mkdir -p "$dir" || die 70 "cannot make $dir"
   track=$(basename "$ROOT")
@@ -165,7 +168,8 @@ run_compare() {
 # --- the self-test: both sides on stub box.sh and ptx-scan.sh in a temp git repo, the table through the real recipes.py
 self_test() {
   local t n=0 bad=0 rc out base_sha cases
-  unset BLOOMERY_ARCH
+  export BLOOMERY_ARCH=sm_86 # the fixture arch, whatever cards this machine has
+  ARCH=$BLOOMERY_ARCH
   t=$(mktemp -d "${TMPDIR:-/tmp}/ptx-compare-test.XXXXXX") || die 70 "self-test: no temporary directory"
   # shellcheck disable=SC2064 # the path is fixed now
   trap "rm -rf '$t'" EXIT
@@ -192,6 +196,7 @@ self_test() {
   cp "$ROOT/tools/bloomery/fixture_dirs.py" "$t/repo/tools/bloomery/fixture_dirs.py" # the table reader recipes.py imports
   mkdir -p "$t/repo/tools/nightly"
   cp "$ROOT/tools/nightly/units.sh" "$t/repo/tools/nightly/units.sh"
+  cp "$ROOT/tools/arch.sh" "$t/repo/tools/arch.sh"
   cp "$ROOT/tools/ref/ptx-canon.py" "$t/repo/tools/ref/ptx-canon.py"
   [ ! -d "$ROOT/tools/bloomery" ] || cp -R "$ROOT/tools/bloomery" "$t/repo/tools/bloomery"
   printf '%s\n' '#!/usr/bin/env bash' 'echo "scanner v1"' > "$t/repo/tools/ptx-scan.sh"
@@ -245,7 +250,7 @@ STUB
   [ "$(md5_of "$t/repo/tools/ptx-scan.sh" | cut -c1-8)" = "$(grep '^base' "$t/stub/box.log" | sed -n 's/.*scanner=\([0-9a-f]*\).*/\1/p')" ]; ok "cold run: the base side runs this tree's tools/ptx-scan.sh" $?
   grep -q -- "cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gx --bin oxart_jit >&2 && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx >&2 && bash tools/ptx-scan.sh gx 2>&1" "$t/stub/box.log"; ok "cold run: the box command builds the bin and oxart_jit (the JIT is run) and scans it" $?
   ! grep -q -- '--no-jit' "$t/stub/box.log"; ok "cold run: no --no-jit anywhere" $?
-  [ -s "$t/repo/target/ptx-compare/${base_sha:0:12}-gx-gpu-$(md5_of "$t/repo/tools/ptx-scan.sh" | cut -c1-8)/base.scan" ]; ok "cold run: the base scan is cached under target/ptx-compare/<key>/" $?
+  [ -s "$t/repo/target/ptx-compare/${base_sha:0:12}-gx-gpu-sm_86-$(md5_of "$t/repo/tools/ptx-scan.sh" | cut -c1-8)/base.scan" ]; ok "cold run: the base scan is cached under target/ptx-compare/<key>/" $?
   # 2. the same run again: the base from the cache, one call (the head)
   run -- "$base_sha" gx --features gpu
   [ "$rc" = 0 ] && has "from cache" && [ "$(calls base)" = 0 ] && [ "$(calls head)" = 1 ]; ok "second run: the base from cache, one box call (the head)" $?
@@ -293,7 +298,7 @@ STUB
   rm -rf "$t/repo/target"
   run STUB_RC_BASE=75 -- "$base_sha" gx --features gpu
   [ "$rc" = 75 ] && has 'rc 75: the box is held' && [ "$(calls head)" = 0 ]; ok "base side rc 75: contention, passed on, the head side not run" $?
-  [ ! -e "$t/repo/target/ptx-compare/${base_sha:0:12}-gx-gpu-$(md5_of "$t/repo/tools/ptx-scan.sh" | cut -c1-8)/base.scan" ]; ok "base side failed: nothing cached" $?
+  [ ! -e "$t/repo/target/ptx-compare/${base_sha:0:12}-gx-gpu-sm_86-$(md5_of "$t/repo/tools/ptx-scan.sh" | cut -c1-8)/base.scan" ]; ok "base side failed: nothing cached" $?
   run STUB_RC_BASE=101 -- "$base_sha" gx --features gpu
   [ "$rc" = 1 ] && has 'the box command ended rc 101'; ok "base side rc 101: named, rc 1" $?
   run STUB_RC_HEAD=70 -- "$base_sha" gx --features gpu
@@ -326,10 +331,13 @@ STUB
   [ "$rc" = 64 ] && has "is no cargo feature list"; ok "a feature list that is none: 64" $?
   run -- "$base_sha"
   [ "$rc" = 64 ] && has "usage:"; ok "a missing bin: usage, 64" $?
-  run BLOOMERY_ARCH=sm_121a -- "$base_sha" gx --features gpu
-  [ "$rc" = 64 ] && has "BLOOMERY_ARCH is 'sm_121a': comparisons build at sm_86" && [ "$(calls base)$(calls head)" = 00 ]; ok "an exported BLOOMERY_ARCH other than the build's: refused by name (64), nothing ran" $?
-  run BLOOMERY_ARCH=sm_86 -- "$base_sha" gx --features gpu
-  [ "$rc" = 0 ]; ok "BLOOMERY_ARCH=sm_86: accepted" $?
+  # the arch: both sides build at tools/arch.sh's, and it is part of the base cache's key
+  run BLOOMERY_ARCH=sm_120a -- "$base_sha" gx --features gpu
+  [ "$rc" = 0 ] && [ "$(calls base)" = 1 ] && [ "$(grep -c -- '--arch sm_120a -- ' "$t/stub/box.log")" = 2 ] && ! grep -q -- '--arch sm_86' "$t/stub/box.log" \
+    && [ -s "$t/repo/target/ptx-compare/${base_sha:0:12}-gx-gpu-sm_120a-$(md5_of "$t/repo/tools/ptx-scan.sh" | cut -c1-8)/base.scan" ]
+  ok "BLOOMERY_ARCH=sm_120a: both sides build at it, and the base cache misses the sm_86 entry and keys on it" $?
+  run BLOOMERY_ARCH=sm121 -- "$base_sha" gx --features gpu
+  [ "$rc" = 64 ] && has "BLOOMERY_ARCH is a CUDA arch" && [ "$(calls base)$(calls head)" = 00 ]; ok "a BLOOMERY_ARCH that is no arch: refused by name (64), nothing ran" $?
   # 9. the build lines are the ptx-scan recipe's (a drift here means the head side scans something the recipe does not)
   recipe=$(awk '/^ptx-scan /{f=1; next} f && /^[^ ]/{exit} f' "$ROOT/justfile")
   case $recipe in
@@ -347,8 +355,7 @@ STUB
 case ${1:-} in
   --self-test) self_test; exit ;;
 esac
-[ "${BLOOMERY_ARCH-$ARCH}" = "$ARCH" ] ||
-  die 64 "BLOOMERY_ARCH is '${BLOOMERY_ARCH-}': comparisons build at $ARCH; set BLOOMERY_ARCH=$ARCH explicitly"
+bloomery_arch ptx-compare.sh || exit $?
 [ $# -ge 2 ] || die 64 "$USAGE"
 REV=$1 BIN=$2
 shift 2

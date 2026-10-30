@@ -2013,9 +2013,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "BLOOMERY_ARCH",
         Some("arch.sh"),
         "The CUDA arch the device builds target: `sm_` and the capability's digits, with an \
-         optional `a` or `f` (`sm_86`, `sm_121`, `sm_121a`); unset is `sm_86`. The justfile's \
-         `arch` variable reads it for every `--arch`, `tools/arch.sh` parses it for the tools \
-         that run on the box, and `tools/box.sh` forwards it there.",
+         optional `a` or `f` (`sm_86`, `sm_121`, `sm_121a`). Unset, `tools/arch.sh` picks it \
+         from the visible cards: `sm_120a` when every one is compute capability 12.0, `sm_121a` \
+         when every one is 12.1, else `sm_86`. The justfile's `arch` variable reads it for every \
+         `--arch`, `tools/arch.sh` parses it for the tools that run on the box, and \
+         `tools/box.sh` forwards it there.",
     ),
     runner(
         "BLOOMERY_ARM_BOUND",

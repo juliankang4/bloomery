@@ -2,7 +2,7 @@
 # 게이트 러너 — 박스에서, box.sh가 들어간 원격 디렉터리에서 돈다. 인자는 `cargo test` 뒤에 그대로 붙는다.
 #   ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test mt -- --ignored --nocapture'
 # --oxide는 디바이스 크레이트용으로 `cargo oxide test --arch $BLOOMERY_ARCH --` 뒤에 인자를 붙인다(arch는
-# tools/arch.sh가 읽는다, 설정이 없으면 sm_86. plain cargo는 디바이스 크레이트를 빌드하지 못한다 — AGENTS.md 「Never」).
+# tools/arch.sh가 읽는다, 설정이 없으면 보이는 카드에서 고른다. plain cargo는 디바이스 크레이트를 빌드하지 못한다 — AGENTS.md 「Never」).
 #   ./tools/box.sh 'bash tools/gate.sh --gpu --oxide -p bloomery-gpu --release --lib'
 #
 # 막는 실패 둘:

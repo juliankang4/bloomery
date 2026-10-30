@@ -15,7 +15,7 @@ The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remot
 | Clang | 21 with its resource headers (`clang-21` or `libclang-common-21-dev` on Ubuntu), for bindgen | on `PATH` |
 | CUDA toolkit | 13.3, with the cuRAND headers (`libcurand-dev` on Ubuntu) | `CUDA_TOOLKIT_PATH` |
 | NVIDIA driver | 615.71.09 on the development machine | — |
-| GPU | sm_86: RTX A6000, RTX 3090; `sm_121a` on a DGX Spark's GB10 ([`contrib/dgx-spark.md`](contrib/dgx-spark.md#21-build), section 2.1); `sm_120a` for the RTX 50 series' release archive, built and never run by the maintainers | `--arch sm_86`, `--arch sm_121a`, `--arch sm_120a` |
+| GPU | sm_86: RTX A6000, RTX 3090; `sm_120a` on the RTX 50 series, whose release archive the maintainers build and never run; `sm_121a` on a DGX Spark's GB10 ([`contrib/dgx-spark.md`](contrib/dgx-spark.md#21-build), section 2.1) | `tools/arch.sh` picks it from the cards ([Building](#building)) |
 | CPU | x86-64; the build targets Zen 3 (see [The CPU flag](#the-cpu-flag)); a GB10's aarch64 cores build for themselves | `.cargo/config.toml` |
 | `just`, `python3` (3.11 or later) | any | only for the Mac checks and the scripts under `tools/`; the commands on this page need neither |
 | `hf` (from `huggingface_hub`) | any | for the downloads below; older releases call it `huggingface-cli download` |
@@ -76,14 +76,17 @@ Every bit gate runs under the x86_64 flags. An x86_64 host that is not Zen 3 has
 Never build a crate with device code (`crates/gpu`, `crates/gpu-deepseek41`, `crates/gpu-glm5next`, `crates/gpu-vision`, or `bloomery-gpu-gates` with its `gpu`, `deepseek41`, `glm5next` or `vision` feature) with plain `cargo build`: the result is not usable. Use `cargo oxide`:
 
 ```sh
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41
+ARCH=$(bash tools/arch.sh)
+cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41
 ```
+
+`tools/arch.sh` prints the target of the cards `nvidia-smi` lists: `sm_120a` when every card is compute capability 12.0 (the RTX 50 series), `sm_121a` when every one is 12.1 (GB10), and `sm_86` on any other machine, one with cards of different capabilities included. The two native targets carry the FP4 and FP8 tensor-core products (`crates/gpu/build.rs`), which an `sm_86` build lacks, and their PTX loads on that capability only. `BLOOMERY_ARCH` set to a target overrides the pick, for a build on a machine without the card. The commands on this page take `$ARCH`.
 
 This builds the V4.1 CLI, the GPU kernels and the host expert tier into one binary, `target/release/generate_ds41`. Each model section below names its bins and features; they are the feature sets the maintainers' recipes build with. Two binaries a stranger needs have no device code and build with plain `cargo`: `r8conv` (in `bloomery-model`) and `bloomery-tokenize` (in `bloomery-tokenizer`).
 
 | Binary | Build | Models |
 |---|---|---|
-| `generate_ds41`, `bloomery-chat` | `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin <bin>` | DeepSeek-V4.1-Flash |
+| `generate_ds41`, `bloomery-chat` | `cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features deepseek41 --release --bin <bin>` | DeepSeek-V4.1-Flash |
 | `bloomery-serve-ds41`, `bloomery-serve-qwen38` | the same, `--features deepseek41,gemma-embedding2,hf` (`gemma-embedding2` attaches the optional embedding side seat) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next |
 | `bloomery-serve` | `… --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm\|qwen3\|mimo2\|solar2\|minimaxm3\|nemotron\|raon1\|musespark\|flint\|decide`, each seat's flags in [`serving.md`](serving.md#flags-by-seat); the ds41 and qwen38 seats are the two binaries above; `vision` adds V4.1's `--mmproj`; `checkpoint` opens a Qwen3.8 safetensors checkpoint folder as stored) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B, Qwen3-30B-A3B, MiMo-V2.6-Flash, Solar-Open2-250B, MiniMax-M3, Raon-1-mini-preview, Nemotron 3 Nano 4B, Nemotron 3.5 Bolt 74B-A9B, Nemotron-3.5-Lightning 30B-A3B, Clef-Flash, lev |
 | `generate_qwen3moe` | `… --features gpu --release --bin generate_qwen3moe` | Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B |
@@ -103,7 +106,7 @@ unchanged.
 The host-reference regressions can also run separately:
 
 ```sh
-BLOOMERY_ARCH=sm_86 bash tools/gate.sh --oxide --release \
+BLOOMERY_ARCH="$ARCH" bash tools/gate.sh --oxide --release \
   -p bloomery-gpu-gates --features gpu --bin gate_gemm -- workers_must_complete
 ```
 
@@ -170,9 +173,9 @@ hf download vcruz305/DeepSeek-V4.1-Flash-GGUF --include 'DeepSeek-V4.1-Flash-Q3_
   --local-dir ~/models/DeepSeek-V4.1-Flash-Q3_K_M
 M=~/models/DeepSeek-V4.1-Flash-Q3_K_M/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf
 
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release \
+cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features deepseek41 --release \
   --bin generate_ds41 --bin bloomery-chat
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41,gemma-embedding2,hf --release \
+cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features deepseek41,gemma-embedding2,hf --release \
   --bin bloomery-serve-ds41
 
 # the r8 sidecar (below): where it goes, then write it and check it
@@ -231,7 +234,7 @@ With one slot a second generation waits until the first finishes; `/tokenize`, `
 hf download unsloth/GLM-5.3-Flash-GGUF --include 'UD-Q4_K_XL/*' --local-dir ~/models/GLM-5.3-Flash
 M=~/models/GLM-5.3-Flash/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf
 
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next-hf --release --bin generate_glm5next
+cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next-hf --release --bin generate_glm5next
 cargo build --release -p bloomery-tokenizer --bin bloomery-tokenize
 
 # "The capital of France is", greedy, on the card the default --place picks
@@ -253,7 +256,7 @@ Flags: `-n N` (default 16), `--ctx C` (default 2048, at most 16,384), `--place a
 The server is `bloomery-serve --model glm` (build it with `--features glm5next,clef,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf --bin bloomery-serve`). With `--place` unset it plans `bp` when a second card is visible and keeps it when the plan puts at least 526 experts on that card (the break-even, derived in `docs/cards/glmbp-ab.card`), else it runs `a`; a `place unset` line on stderr names the pick, the tier's experts and the break-even. On the development machine's A6000 + 3090 the `bp` plan holds 1,501 tier experts, and one request (MTP draft on, residency `mid-p0-s1`) decodes 13.0 % ± 2.8 faster than under `a` after a 512-token prompt and prefills it 11.1 % ± 0.5 faster (rig-log 10-06#glmbp-ab); two requests run 35.26 tok/s in total after a 512-token prompt (rig-log 10-06#num3090). At `--place a` and `--place bp` (the 3090 as an expert tier) it runs adaptive residency and the MTP draft by default (`BLOOMERY_RESIDENCY=off` and `BLOOMERY_DRAFT=off` turn them off), and `--plan` prints the plan and those choices and exits before any card is opened:
 
 ```sh
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf --release --bin bloomery-serve
+cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf --release --bin bloomery-serve
 BLOOMERY_REF_MODEL="$M" target/release/bloomery-serve --model glm --place a --ctx 4096 --host 127.0.0.1 --port 8080
 ```
 
@@ -265,8 +268,8 @@ It serves one slot unless `--parallel N` asks for more. A request keeps the slot
 hf download unsloth/Qwen3.8-Flash-Next-GGUF --include 'UD-Q4_K_XL/*' --local-dir ~/models/Qwen3.8-Flash-Next
 M=~/models/Qwen3.8-Flash-Next/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41,gemma-embedding2,hf --release --bin bloomery-serve-qwen38
+cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe
+cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features deepseek41,gemma-embedding2,hf --release --bin bloomery-serve-qwen38
 
 # greedy, on the largest visible card (the default --place a on one card)
 BLOOMERY_REF_MODEL="$M" target/release/generate_qwen3moe --prompt "The capital of France is" -n 32
@@ -287,7 +290,7 @@ hf download lmstudio-community/Qwen3.6-35B-A3B-GGUF --include 'Qwen3.6-35B-A3B-Q
   --local-dir ~/models/Qwen3.6-35B-A3B
 M=~/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf
 
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe
+cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe
 
 # the whole model on the largest visible card
 BLOOMERY_REF_MODEL="$M" target/release/generate_qwen3moe --prompt "The capital of France is" -n 32
@@ -300,7 +303,7 @@ The same binary opens the Qwen3-30B-A3B-Instruct-2507 `Q4_K_M` file (`unsloth/Qw
 [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) is Cloudflare's decision model: a Qwen3.5 backbone and a small joint schema head that scores every allowed option of every question in one prompt pass. bartowski's current GGUF upload is llama.cpp's `clef` layout, which carries the head inside the file; an older `qwen35`-layout file takes the release's own head file.
 
 ```sh
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf --release --bin bloomery-serve
+cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf --release --bin bloomery-serve
 
 # the backbone on one card (see Picking the card), the head (in the file) on the host
 target/release/bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q8_0 --port 8091
