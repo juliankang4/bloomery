@@ -247,6 +247,25 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   reach the port.
   The key check runs on the headers, before `100 Continue` or body ingestion.
   A denied request gets 401 and the connection closes without draining its body.
+  A file key cannot contain whitespace; blank or whitespace-only lines are skipped.
+  A key file line can narrow its key with fields after it, separated by whitespace
+  (`sk-app scope=inference inflight=2 rate=30/m burst=5`); a key with none reaches every route unlimited:
+  - `scope=` takes `inference` (generation, token counts, the tokenizer, embeddings, the stored responses,
+    `/v1/systemone`), `read` (`GET /props`, `/slots`, `/metrics`), or `admin` (every route, the default),
+    comma-separated; both of the first two reach the model list and lookups (`GET /v1/models`,
+    `/v1/models/{model}`, `/api/tags`, `POST /api/show`). A route outside the scope answers 403
+    (`permission_error`) and closes the connection like the 401. Slot actions, `/residency/reset` and
+    `/shutdown` need `admin`.
+  - `inflight=N` is the most requests the key may have answered at once. A request holds its place until its
+    answer is written and the engine has left its generation, also after a cancel or a disconnect; a
+    background response holds it until both its generation and its initial HTTP answer end. A call on a
+    stored response (`GET`, `DELETE`, `/cancel`) takes none.
+  - `rate=N/s` or `rate=N/m` is a bucket of `burst=B` requests (`N` unless set) that refills `N` a second
+    or a minute; each request the key makes past `/health` takes one.
+  - A request past either limit answers 429 (`rate_limit_error`) with `Retry-After` in whole seconds and
+    starts nothing; the connection stays open. Each key counts apart, so one key never uses another's room.
+  - A field the line does not take, or names twice, refuses the start, naming the file, the line and the
+    field's place, never the key. A key given twice with different fields does too.
   Public health and `OPTIONS` requests are answered from their headers; a declared
   unread body closes that connection rather than becoming another request.
 - **Stopping the server**: `SIGINT`/`SIGTERM` stop it as llama-server's do — no new request is admitted, the

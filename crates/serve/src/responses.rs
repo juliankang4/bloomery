@@ -201,6 +201,7 @@ use super::{
     finish_stream, gen_body, get_b, get_i, get_i_in, invalid, json_type, not_found, progress,
     run_gen, run_whole, send_error, send_json, sse, tool_markup_error, unix_now,
 };
+use crate::admit::Lease;
 use crate::dsml::{ChatParser, Message, ToolCall};
 use crate::genloop::{Event, GenError, Outcome, StopKind, Timings};
 use crate::http::{EventStream, Request};
@@ -1317,7 +1318,7 @@ fn whole(
         prompt,
         parser,
     } = plan;
-    let response = match run_whole(state, &req.path, &input, prompt, &p, w)?
+    let response = match run_whole(state, &input, prompt, &p, req, w)?
         .and_then(|(o, _)| answer(ids, &o, parser))
     {
         Err(e) => return send_error(w, req, &e),
@@ -1340,7 +1341,10 @@ fn background(
     conversation: Vec<Value>,
     plan: ChatPlan,
 ) -> io::Result<bool> {
-    let job = Arc::new(Client::detached());
+    let job = Arc::new(Client {
+        place: Client::place(req),
+        ..Client::detached()
+    });
     let queued = unfinished(&ids, "queued");
     if !state
         .responses
@@ -1358,9 +1362,10 @@ fn background(
     let id = ids.id.clone();
     let runner = Arc::clone(state);
     let route = req.path.clone();
+    let lease = super::relock(&req.lease).clone();
     let spawned = std::thread::Builder::new()
         .name("serve-background".to_owned())
-        .spawn(move || run_background(&runner, &ids, route, conversation, plan, job));
+        .spawn(move || run_background(&runner, &ids, route, conversation, plan, job, lease));
     if let Err(e) = spawned {
         state.responses.delete(&id);
         let e = engine_error(&format!(
@@ -1373,6 +1378,8 @@ fn background(
 
 /// A background response's generation, its first event turning it
 /// `in_progress` and its end, or its error as `failed`, kept in the store.
+/// The worker releases its lease share before the store shows the end;
+/// the HTTP writer retains its own share until its answer ends.
 fn run_background(
     state: &State,
     ids: &Ids,
@@ -1380,6 +1387,7 @@ fn run_background(
     conversation: Vec<Value>,
     plan: ChatPlan,
     job: Arc<Client>,
+    lease: Option<Lease>,
 ) {
     let ChatPlan {
         p,
@@ -1394,7 +1402,9 @@ fn run_background(
         }
         Ok(())
     };
-    let answered = match run_gen(state, &route, &input, prompt, &p, job, &mut sink) {
+    let generated = run_gen(state, &route, &input, prompt, &p, job, &mut sink);
+    drop(lease);
+    let answered = match generated {
         // Cancelled or deleted: the store holds what the cancel left.
         Ok(Err(GenError::Client(_))) => return,
         Ok(Err(e)) => Err(engine_error(&e)),
@@ -1412,6 +1422,13 @@ fn run_background(
             state.responses.finish(&ids.id, v, Vec::new());
         }
     }
+}
+
+/// Whether `method` `path` reads, deletes or cancels a stored response: a
+/// call that runs no generation, so it takes no in-flight place of its key
+/// ([`crate::admit`]) and can cancel the generation that holds one.
+pub(super) fn store_call(method: &str, path: &str) -> bool {
+    stored_id(path).is_some() && (method != "POST" || path.ends_with("/cancel"))
 }
 
 /// The id of a stored response's path: `/v1/responses/{id}` (or
@@ -1561,7 +1578,7 @@ fn stream(
             &input,
             prompt,
             &p,
-            Client::of(peer),
+            Client::of(peer, req),
             &mut sink,
         )
         .map(|r| r.map(|(o, _)| o))

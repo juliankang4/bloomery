@@ -5,6 +5,10 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::sync::Mutex;
+
+use crate::admit::Lease;
+use crate::api::relock;
 
 const MAX_LINE: usize = 16 * 1024;
 const MAX_HEADERS: usize = 100;
@@ -21,9 +25,21 @@ pub(crate) struct Request {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub keep_alive: bool,
+    /// The place the request holds among its key's in-flight requests
+    /// ([`crate::admit`]), ended by [`Request::end_lease`]. A lock because the
+    /// answer's writers hold the request shared: they release their share
+    /// once the answer's last byte is written and flushed. A background
+    /// worker may retain another share until its generation ends.
+    pub lease: Mutex<Option<Lease>>,
 }
 
 impl Request {
+    /// The writer's lease share, taken: the place returns when it and any
+    /// background worker's share have dropped.
+    pub(crate) fn end_lease(&self) -> Option<Lease> {
+        relock(&self.lease).take()
+    }
+
     pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -194,6 +210,7 @@ pub(crate) fn read_head(r: &mut BufReader<TcpStream>) -> io::Result<Option<Reque
         headers,
         body: Vec::new(),
         keep_alive: false,
+        lease: Mutex::default(),
     };
     let conn = req.header("connection").map(str::to_ascii_lowercase);
     req.keep_alive = if http10 {
@@ -329,9 +346,11 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         501 => "Not Implemented",
         503 => "Service Unavailable",
@@ -356,13 +375,14 @@ fn head(req: &Request, status: u16, ctype: &str, extra: &[(&str, String)]) -> St
 
 /// Writes a complete response.
 pub(crate) fn respond(
-    w: &mut TcpStream,
+    w: &mut impl Write,
     req: &Request,
     status: u16,
     ctype: &str,
     extra: &[(&str, String)],
     body: &[u8],
 ) -> io::Result<()> {
+    let _lease = req.end_lease();
     let mut h = head(req, status, ctype, extra);
     h.push_str(&format!("Content-Length: {}\r\n", body.len()));
     h.push_str(if req.keep_alive {
@@ -376,19 +396,17 @@ pub(crate) fn respond(
 }
 
 /// A response whose body is written as it is produced.
-pub(crate) struct EventStream<'a> {
-    w: &'a mut TcpStream,
+pub(crate) struct EventStream<'a, W: Write = TcpStream> {
+    w: &'a mut W,
     chunked: bool,
+    /// The request's lease, ended with the stream, after the body's end is
+    /// written and flushed ([`Request::end_lease`]).
+    lease: Option<Lease>,
 }
 
-impl<'a> EventStream<'a> {
+impl<'a, W: Write> EventStream<'a, W> {
     /// Sends the head. HTTP/1.0 streams end by closing the connection.
-    pub(crate) fn start(
-        w: &'a mut TcpStream,
-        req: &Request,
-        status: u16,
-        ctype: &str,
-    ) -> io::Result<Self> {
+    pub(crate) fn start(w: &'a mut W, req: &Request, status: u16, ctype: &str) -> io::Result<Self> {
         let chunked = !req.http10;
         let mut h = head(
             req,
@@ -406,7 +424,11 @@ impl<'a> EventStream<'a> {
         });
         w.write_all(h.as_bytes())?;
         w.flush()?;
-        Ok(EventStream { w, chunked })
+        Ok(EventStream {
+            w,
+            chunked,
+            lease: req.end_lease(),
+        })
     }
 
     /// Writes and flushes one piece of the body.
@@ -424,12 +446,14 @@ impl<'a> EventStream<'a> {
         self.w.flush()
     }
 
-    /// Ends the body.
+    /// Ends the body, then the lease.
     pub(crate) fn finish(self) -> io::Result<()> {
         if self.chunked {
             self.w.write_all(b"0\r\n\r\n")?;
         }
-        self.w.flush()
+        let flushed = self.w.flush();
+        drop(self.lease);
+        flushed
     }
 
     /// Whether the connection can carry another request afterwards.
@@ -488,9 +512,72 @@ pub(crate) fn read_test_response(r: &mut impl BufRead) -> (u16, String, Vec<u8>)
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BODY, parse_query, read_body, read_chunked, read_head};
-    use std::io::{BufReader, ErrorKind, Write};
+    use super::{EventStream, MAX_BODY, parse_query, read_body, read_chunked, read_head, respond};
+    use crate::admit::{Limits, Meter};
+    use std::io::{self, BufReader, ErrorKind, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// A writer that notes, at each write and flush, whether its key's one
+    /// place is free: a write that blocked there would block with the place
+    /// already given to another request.
+    struct PlaceProbe {
+        meter: Arc<Meter>,
+        free: Vec<bool>,
+    }
+
+    impl PlaceProbe {
+        fn note(&mut self) {
+            self.free
+                .push(self.meter.admit(Instant::now(), true).is_ok());
+        }
+    }
+
+    impl Write for PlaceProbe {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.note();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.note();
+            Ok(())
+        }
+    }
+
+    /// With `inflight=1`, a whole answer and a stream each hold the key's
+    /// place through every write, the last write and flush included, and
+    /// give it back once they end.
+    #[test]
+    fn an_answer_holds_its_place_through_its_last_write_and_flush() {
+        let meter = Arc::new(Meter::new(Limits::parse([("inflight", "1")]).unwrap()));
+        for stream in [false, true] {
+            let req = crate::api::closing();
+            *crate::api::relock(&req.lease) = meter.admit(Instant::now(), true).unwrap();
+            let mut probe = PlaceProbe {
+                meter: Arc::clone(&meter),
+                free: Vec::new(),
+            };
+            if stream {
+                let mut s = EventStream::start(&mut probe, &req, 200, "text/event-stream")
+                    .expect("the head");
+                s.send(b"data: x\n\n").expect("an event");
+                s.finish().expect("the end");
+            } else {
+                respond(&mut probe, &req, 200, "text/plain", &[], b"ok").expect("the answer");
+            }
+            assert!(
+                !probe.free.is_empty() && probe.free.iter().all(|free| !free),
+                "stream={stream}: the place was free at a write: {:?}",
+                probe.free
+            );
+            assert!(
+                meter.admit(Instant::now(), true).is_ok(),
+                "stream={stream}: the place returns once the answer ends"
+            );
+        }
+    }
 
     /// Chunks join into the body, extensions and trailers aside; a chunk size
     /// that carries the body past the limit is refused by name, also when the

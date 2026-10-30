@@ -686,10 +686,11 @@ impl DecideServer {
         open: impl FnOnce() -> io::Result<Listener>,
         seated: &Seated,
         decider: Box<dyn Decide>,
-        api_keys: ApiKeys,
+        mut api_keys: ApiKeys,
     ) -> io::Result<DecideServer> {
         let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidInput, e);
         check_routes(seated.routes).map_err(invalid)?;
+        api_keys.inference_routes = seated.routes;
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -1012,18 +1013,22 @@ mod tests {
 
     /// One request over a fresh HTTP/1.0 connection: the status and the body.
     fn call(addr: SocketAddr, method: &str, path: &str) -> (u16, String) {
-        use std::io::{Read, Write};
+        call_keyed(addr, method, path, None)
+    }
+
+    /// [`call`] with `key` as its bearer key, answered within ten seconds.
+    fn call_keyed(addr: SocketAddr, method: &str, path: &str, key: Option<&str>) -> (u16, String) {
+        use std::io::Write;
         let mut s = std::net::TcpStream::connect(addr).expect("connect");
+        s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        let auth = key.map_or(String::new(), |k| format!("Authorization: Bearer {k}\r\n"));
         write!(
             s,
-            "{method} {path} HTTP/1.0\r\nContent-Length: 2\r\n\r\n{{}}"
+            "{method} {path} HTTP/1.0\r\n{auth}Content-Length: 2\r\n\r\n{{}}"
         )
         .expect("write");
-        let mut raw = String::new();
-        s.read_to_string(&mut raw).expect("read");
-        let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
-        let status = head.split(' ').nth(1).and_then(|c| c.parse().ok());
-        (status.expect("a status line"), body.to_owned())
+        written(&s)
     }
 
     /// A decide server that takes an early listener over: the listener answers `loading` until the
@@ -1054,6 +1059,92 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         assert_eq!((status, body.as_str()), (200, r#"{"status":"ok"}"#));
+    }
+
+    /// A key file's `scope=inference` reaches the routes the decide server
+    /// seats, whichever they are, and `scope=read` gets the 403.
+    #[test]
+    fn an_inference_key_reaches_the_seated_routes() {
+        let (keys, _) = crate::flag::key_file(
+            "decide-scope",
+            "sk-gen scope=inference\nsk-look scope=read\n",
+        );
+        let seated = Seated {
+            routes: ROUTES,
+            name: "m.gguf".to_owned(),
+            n_ctx: 16,
+        };
+        let server = DecideServer::bind_with_keys(
+            "127.0.0.1:0",
+            &seated,
+            Box::new(Echo),
+            keys.expect("the key file"),
+        )
+        .expect("bind");
+        let addr = run_on_helper(server);
+        for path in ROUTES {
+            let (status, raw) = call_keyed(addr, "POST", path, Some("sk-gen"));
+            assert_eq!(status, 200, "inference {path}: {raw}");
+            let (status, raw) = call_keyed(addr, "POST", path, Some("sk-look"));
+            assert_eq!(status, 403, "read {path}: {raw}");
+        }
+    }
+
+    /// A seated route takes its key's in-flight place even where its path is
+    /// a stored-response call's on the generative server: with `inflight=1`,
+    /// a second decision while the first is held in the decider is a 429.
+    #[test]
+    fn a_seated_route_takes_its_key_place() {
+        const CANCEL: &str = "/v1/responses/job/cancel";
+        let (keys, _) = crate::flag::key_file("decide-place", "sk-one inflight=1\n");
+        let (began, started) = mpsc::channel();
+        let (permit, permits) = mpsc::channel();
+        let seated = Seated {
+            routes: &[CANCEL],
+            name: "m.gguf".to_owned(),
+            n_ctx: 16,
+        };
+        let server = DecideServer::bind_with_keys(
+            "127.0.0.1:0",
+            &seated,
+            Box::new(Held { began, permits }),
+            keys.expect("the key file"),
+        )
+        .expect("bind");
+        let addr = run_on_helper(server);
+        let (answer, first) = mpsc::channel();
+        threads::helper::spawn_helper(
+            "decide-test-first",
+            threads::helper::Placement::Float,
+            move || {
+                let _ = answer.send(call_keyed(addr, "POST", CANCEL, Some("sk-one")));
+            },
+        )
+        .expect("the first request's thread");
+        started
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the first decision began");
+        let (status, raw) = call_keyed(addr, "POST", CANCEL, Some("sk-one"));
+        assert_eq!(status, 429, "the held decision keeps the place: {raw}");
+        permit.send(()).expect("release the decision");
+        let (status, raw) = first
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the first request");
+        assert_eq!(status, 200, "{raw}");
+    }
+
+    /// Runs `server` on a helper thread; its address comes back.
+    fn run_on_helper(server: DecideServer) -> SocketAddr {
+        let addr = server.local_addr().expect("addr");
+        threads::helper::spawn_helper(
+            "decide-test-serve",
+            threads::helper::Placement::Float,
+            move || {
+                let _ = server.run();
+            },
+        )
+        .expect("the server's thread");
+        addr
     }
 
     /// A decide server over `decider`, its lock poisoned first when `poison`, run on a free port;

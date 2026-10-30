@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use crate::admit::{Limits, Meter};
 
 /// Startup configuration files are read once per path, including failures and pipe inputs.
 pub(crate) fn file_snapshot(path: &Path) -> Result<String, String> {
@@ -46,7 +48,7 @@ where
 
 /// The server's API keys: what `--api-key` and `--api-key-file` add to
 /// ([`ApiKeys::add`]) and what every request of both servers is checked
-/// against before its dispatch ([`ApiKeys::allows`]). No key set checks
+/// against before its dispatch ([`ApiKeys::check`]). No key set checks
 /// nothing, as llama-server's empty key list does.
 ///
 /// The check is llama-server's `middleware_validate_api_key`: no key set
@@ -61,21 +63,126 @@ where
 /// actions, `/metrics`, `/v1/models` (`/models`), `/v1/messages` and its
 /// `count_tokens`, `/residency/reset`, `POST /shutdown` (loopback-only as
 /// well) and the decision server's routes (`/v1/systemone`).
+///
+/// A key file line may narrow its key past llama-server's: `scope=` limits
+/// the routes it reaches ([`Scope`]; a route outside them is a 403), and
+/// `inflight=`, `rate=` and `burst=` limit its requests
+/// ([`crate::admit`]; a request past them is a 429 with `Retry-After`). A
+/// key with none of them reaches every route unlimited, as before.
 #[derive(Debug, Default, Clone)]
 pub struct ApiKeys {
-    /// The keys, in the order the flags added them.
-    keys: Vec<String>,
+    /// The keys, in the order the flags added them, each once.
+    keys: Vec<Key>,
+    /// The POST routes a decide server seats ([`crate::decide`]), which
+    /// `scope=inference` reaches beside [`Scope::of`]'s, each a decision that
+    /// takes its key's in-flight place.
+    pub(crate) inference_routes: &'static [&'static str],
+}
+
+/// One key, what it reaches and its limits; clones share the limits' count.
+#[derive(Debug, Clone)]
+struct Key {
+    key: String,
+    scope: Scope,
+    meter: Arc<Meter>,
+}
+
+/// The routes a key reaches, a key file line's `scope=` with one or more of
+/// `inference`, `read` and `admin`, comma-separated: `inference` the model
+/// routes (generation, token counts, the tokenizer, embeddings, the stored
+/// responses, the decision routes) and the model list; `read` the status
+/// routes (`GET /props`, `/slots`, `/metrics`) and the model list; `admin`
+/// every route, as a key with no `scope=` reaches. The routes neither of the
+/// first two names (slot actions, `/residency/reset`, `/shutdown`) need
+/// `admin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Scope(u8);
+
+impl Scope {
+    const INFERENCE: Scope = Scope(1);
+    const READ: Scope = Scope(2);
+    /// The routes only `admin` reaches.
+    const ADMIN: Scope = Scope(4);
+    /// `admin`: every route.
+    const ALL: Scope = Scope(7);
+
+    /// `scope=`'s value, or the error naming it.
+    fn parse(value: &str) -> Result<Scope, String> {
+        value.split(',').try_fold(Scope(0), |s, name| match name {
+            "inference" => Ok(Scope(s.0 | Scope::INFERENCE.0)),
+            "read" => Ok(Scope(s.0 | Scope::READ.0)),
+            "admin" => Ok(Scope::ALL),
+            _ => Err(format!(
+                "scope={value}: takes inference, read or admin, comma-separated"
+            )),
+        })
+    }
+
+    /// The scopes any one of which reaches `method` `path`.
+    fn of(method: &str, path: &str) -> Scope {
+        use crate::api::path;
+        const MODEL_ROUTES: [&str; 17] = [
+            path::COMPLETION,
+            "/completions",
+            path::COMPLETIONS,
+            path::CHAT,
+            "/chat/completions",
+            "/v1/chat/completions/input_tokens",
+            "/chat/completions/input_tokens",
+            path::MESSAGES,
+            "/v1/messages/count_tokens",
+            path::RESPONSES,
+            "/responses",
+            path::EMBEDDINGS,
+            "/embeddings",
+            "/embedding",
+            path::TOKENIZE,
+            path::DETOKENIZE,
+            "/apply-template",
+        ];
+        let stored = crate::http::below(path, "responses").is_some();
+        let model_info = match method {
+            "GET" => {
+                matches!(path, "/v1/models" | "/models" | "/api/tags")
+                    || crate::models::named(path).is_some()
+            }
+            "POST" => path == "/api/show",
+            _ => false,
+        };
+        match method {
+            _ if model_info => Scope(Scope::INFERENCE.0 | Scope::READ.0),
+            "GET" if matches!(path, "/props" | "/slots" | "/metrics") => Scope::READ,
+            "POST" if MODEL_ROUTES.contains(&path) || decision::request::ROUTES.contains(&path) => {
+                Scope::INFERENCE
+            }
+            "GET" | "DELETE" | "POST" if stored => Scope::INFERENCE,
+            _ => Scope::ADMIN,
+        }
+    }
+}
+
+/// Why the key check refused a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Denied {
+    /// No key, or one the set does not hold: llama-server's 401.
+    Key,
+    /// A known key whose `scope=` does not reach the route: a 403.
+    Scope,
 }
 
 impl ApiKeys {
     /// `flag`'s value added to the set. `--api-key` takes llama-server's
     /// comma-separated list — a quoted field may hold commas, `""` inside
     /// quotes an escaped quote — with empty items dropped; `--api-key-file`
-    /// takes one key per line, skipping empty lines and `#` comments. A file
-    /// that cannot be read is an error naming it; a flag whose value names no
-    /// key at all is an error naming it, where llama-server would start with
-    /// the check off, serving anyone who reaches the port while the user
-    /// believes it locked.
+    /// takes one key per line, skipping empty lines and `#` comments, each
+    /// key optionally followed, after whitespace, by `name=value` fields:
+    /// `scope=` ([`Scope`]), `inflight=`, `rate=` and `burst=`
+    /// ([`crate::admit`]). A file that cannot be read is an error naming it,
+    /// and so is a field it does not take, by its line; a flag whose value
+    /// names no key at all is an error naming it, where llama-server would
+    /// start with the check off, serving anyone who reaches the port while
+    /// the user believes it locked. A key given twice is kept once; given
+    /// again with other fields, it is an error naming where.
     ///
     /// A key file is a startup snapshot: the process reads each path once,
     /// and every later parse of the same flags takes what that read found,
@@ -83,20 +190,27 @@ impl ApiKeys {
     /// parses the flags more than once, and a change to the file after the
     /// first read is not seen.
     pub fn add(&mut self, flag: &str, value: &str) -> Result<(), String> {
-        let added: Vec<String> = match flag {
+        let unlimited = || (Scope::ALL, Limits::default());
+        let added: Vec<(String, (Scope, Limits), String)> = match flag {
             "--api-key" => csv_row(value)
                 .into_iter()
                 .filter(|k| !k.is_empty())
+                .map(|k| (k, unlimited(), flag.to_owned()))
                 .collect(),
             "--api-key-file" => {
                 let text = file_snapshot(Path::new(value))
                     .map_err(|e| format!("{flag} {value:?}: cannot read it: {e}"))?;
-                // `lines` drops a CRLF line's `\r`; llama-server's getline on
-                // Linux keeps it, in a key no header value ever matches.
-                text.lines()
-                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                    .map(str::to_owned)
-                    .collect()
+                let mut added = Vec::new();
+                for (i, line) in text.lines().enumerate() {
+                    let mut fields = line.split_whitespace();
+                    let Some(key) = fields.next().filter(|k| !k.starts_with('#')) else {
+                        continue;
+                    };
+                    let at = format!("{flag} {value:?} line {}", i + 1);
+                    let narrowed = narrowing(fields).map_err(|e| format!("{at}: {e}"))?;
+                    added.push((key.to_owned(), narrowed, at));
+                }
+                added
             }
             other => return Err(format!("{other} is not one of the key flags")),
         };
@@ -105,7 +219,21 @@ impl ApiKeys {
                 "{flag} {value:?}: names no key, and a server with no key checks no request"
             ));
         }
-        self.keys.extend(added);
+        for (key, (scope, limits), at) in added {
+            match self.keys.iter().find(|k| k.key == key) {
+                Some(k) if (k.scope, k.meter.limits()) == (scope, limits) => {}
+                Some(_) => {
+                    return Err(format!(
+                        "{at}: gives a key again with another scope or limits than it had"
+                    ));
+                }
+                None => self.keys.push(Key {
+                    key,
+                    scope,
+                    meter: Arc::new(Meter::new(limits)),
+                }),
+            }
+        }
         Ok(())
     }
 
@@ -114,29 +242,69 @@ impl ApiKeys {
         self.keys.is_empty()
     }
 
-    /// Whether the request passes the key check: the request's method, path
-    /// and the two headers a key can ride on, against this set, as
-    /// [the type](ApiKeys) states. A request the set is empty for passes.
-    #[must_use]
-    pub fn allows(
+    /// The key check of a request, its method, path and the two headers a key
+    /// can ride on, against this set, as [the type](ApiKeys) states: the
+    /// limits its key counts it against, `None` when it passes without a key
+    /// (no key set, or a public route), or why it is refused.
+    pub(crate) fn check(
         &self,
         method: &str,
         path: &str,
         authorization: Option<&str>,
         x_api_key: Option<&str>,
-    ) -> bool {
+    ) -> Result<Option<&Arc<Meter>>, Denied> {
         if self.keys.is_empty() {
-            return true;
+            return Ok(None);
         }
         if method == "OPTIONS" || matches!(path, "/health" | "/v1/health") {
-            return true;
+            return Ok(None);
         }
         let sent = authorization
             .filter(|v| !v.is_empty())
             .or(x_api_key)
             .map(|v| v.strip_prefix("Bearer ").unwrap_or(v));
-        sent.is_some_and(|k| self.keys.iter().any(|known| known == k))
+        let key = sent
+            .and_then(|s| self.keys.iter().find(|k| k.key == s))
+            .ok_or(Denied::Key)?;
+        let reaching = if method == "POST" && self.inference_routes.contains(&path) {
+            Scope::INFERENCE
+        } else {
+            Scope::of(method, path)
+        };
+        if key.scope.0 & reaching.0 == 0 {
+            return Err(Denied::Scope);
+        }
+        Ok(Some(&key.meter))
     }
+}
+
+/// A key file line's fields past its key: the scope (every route unless
+/// set) and the limits.
+fn narrowing<'a>(fields: impl Iterator<Item = &'a str>) -> Result<(Scope, Limits), String> {
+    let mut scope = Scope::ALL;
+    let mut limits = Vec::new();
+    let mut named = Vec::new();
+    for (n, field) in fields.enumerate() {
+        let name = field.split_once('=').map(|(name, _)| name);
+        if let Some(name) = name.filter(|name| named.contains(name)) {
+            return Err(format!("field {} after the key names {name}= again", n + 1));
+        }
+        named.extend(name);
+        // A field not taken is named by its place alone: it may be the rest
+        // of a key that holds whitespace.
+        match field.split_once('=') {
+            Some(("scope", value)) => scope = Scope::parse(value)?,
+            Some(limit @ ("inflight" | "rate" | "burst", _)) => limits.push(limit),
+            _ => {
+                return Err(format!(
+                    "field {} after the key is not scope=, inflight=, rate= or burst= (a key \
+                     holds no whitespace)",
+                    n + 1
+                ));
+            }
+        }
+    }
+    Ok((scope, Limits::parse(limits)?))
 }
 
 /// One `--api-key` value's fields, llama-server's `parse_csv_row`: `"`
@@ -176,9 +344,182 @@ fn csv_row(v: &str) -> Vec<String> {
     fields
 }
 
+/// The in-crate tests' key file: `keys` written to a file of its own (a
+/// path is read once a process, so each `name` is a new one) and added by
+/// it; the set or the error, and the file's path.
+#[cfg(test)]
+pub(crate) fn key_file(name: &str, keys: &str) -> (Result<ApiKeys, String>, String) {
+    let dir = std::env::temp_dir().join(format!("bloomery-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("the key file's directory");
+    let file = dir.join("keys");
+    std::fs::write(&file, keys).expect("the key file");
+    let path = file.display().to_string();
+    let mut set = ApiKeys::default();
+    let added = set.add("--api-key-file", &path).map(|()| set);
+    std::fs::remove_dir_all(&dir).expect("the key file's directory removed");
+    (added, path)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ApiKeys, CTX, KEYS, UBATCH, csv_row, number};
+    use super::{ApiKeys, CTX, Denied, KEYS, UBATCH, csv_row, key_file, number};
+
+    impl ApiKeys {
+        /// Whether the key check lets the request through.
+        fn allows(&self, method: &str, path: &str, auth: Option<&str>, x: Option<&str>) -> bool {
+            self.check(method, path, auth, x).is_ok()
+        }
+    }
+
+    /// A key file line's `scope=`: `inference` reaches the model routes and
+    /// the model list, `read` the status routes and the model list, `admin`
+    /// (and a key with no `scope=`) every route; a route outside the scope is
+    /// [`Denied::Scope`], an unknown key still [`Denied::Key`].
+    #[test]
+    fn a_key_scope_reaches_its_routes_and_no_other() {
+        let (keys, _) = key_file(
+            "scopes",
+            "sk-gen scope=inference\nsk-look   scope=read\nsk-both scope=read,inference\n\
+             sk-root scope=admin\nsk-plain\n",
+        );
+        let keys = keys.unwrap();
+        let check = |key: &str, method: &str, path: &str| {
+            keys.check(method, path, Some(key), None).map(|_| ())
+        };
+        // Every model route `route()` serves, the aliases too.
+        let model = [
+            ("POST", "/completion"),
+            ("POST", "/completions"),
+            ("POST", "/v1/completions"),
+            ("POST", "/v1/chat/completions"),
+            ("POST", "/chat/completions"),
+            ("POST", "/v1/chat/completions/input_tokens"),
+            ("POST", "/chat/completions/input_tokens"),
+            ("POST", "/v1/messages"),
+            ("POST", "/v1/messages/count_tokens"),
+            ("POST", "/v1/responses"),
+            ("POST", "/responses"),
+            ("POST", "/v1/responses/input_tokens"),
+            ("POST", "/responses/input_tokens"),
+            ("GET", "/v1/responses/resp_1"),
+            ("DELETE", "/responses/resp_1"),
+            ("POST", "/v1/responses/resp_1/cancel"),
+            ("POST", "/v1/embeddings"),
+            ("POST", "/embeddings"),
+            ("POST", "/embedding"),
+            ("POST", "/tokenize"),
+            ("POST", "/detokenize"),
+            ("POST", "/apply-template"),
+            ("POST", "/v1/systemone"),
+        ];
+        let status = [("GET", "/props"), ("GET", "/slots"), ("GET", "/metrics")];
+        let admin = [
+            ("POST", "/slots/0"),
+            ("POST", "/residency/reset"),
+            ("POST", "/shutdown"),
+            ("GET", "/no-such-route"),
+            ("GET", "/v1/responses/"),
+        ];
+        let list = [
+            ("GET", "/v1/models"),
+            ("GET", "/models"),
+            ("GET", "/api/tags"),
+            ("GET", "/v1/models/m"),
+            ("GET", "/models/m"),
+            ("POST", "/api/show"),
+        ];
+        for (key, reaches) in [
+            ("sk-gen", [true, false, false]),
+            ("sk-look", [false, true, false]),
+            ("sk-both", [true, true, false]),
+            ("sk-root", [true, true, true]),
+            ("sk-plain", [true, true, true]),
+        ] {
+            for (routes, reach) in [&model[..], &status[..], &admin[..]]
+                .into_iter()
+                .zip(reaches)
+            {
+                for &(method, path) in routes {
+                    let want = if reach { Ok(()) } else { Err(Denied::Scope) };
+                    assert_eq!(check(key, method, path), want, "{key} {method} {path}");
+                }
+            }
+            for (method, path) in list {
+                assert_eq!(check(key, method, path), Ok(()), "{key} {method} {path}");
+            }
+        }
+        // Every route the live view lists is reached by its own scope.
+        for (method, path) in crate::api::LISTED {
+            let key = if method == "POST" {
+                "sk-gen"
+            } else {
+                "sk-look"
+            };
+            assert_eq!(check(key, method, path), Ok(()), "{key} {method} {path}");
+        }
+        assert_eq!(check("sk-none", "GET", "/props"), Err(Denied::Key));
+        assert!(keys.allows("GET", "/health", None, None));
+    }
+
+    /// A field the line does not take is refused by its line and place, and
+    /// the refusal never carries the key: a key with whitespace in it reads
+    /// as a key and a field, and only the field's place is named.
+    #[test]
+    fn a_key_file_field_it_does_not_take_names_its_line_and_never_the_key() {
+        for (i, (text, error)) in [
+            (
+                "ok\nsk-sec ret\n",
+                "line 2: field 1 after the key is not scope=, inflight=",
+            ),
+            (
+                "sk-secret colour=red\n",
+                "line 1: field 1 after the key is not scope=",
+            ),
+            (
+                "sk-secret scope=write\n",
+                "line 1: scope=write: takes inference, read or admin",
+            ),
+            (
+                "sk-secret rate=5/s inflight=0\n",
+                "line 1: inflight=0: takes a whole number",
+            ),
+            (
+                "sk-secret burst=2\n",
+                "line 1: burst= needs a rate= beside it",
+            ),
+            (
+                "sk-secret scope=read scope=admin\n",
+                "line 1: field 2 after the key names scope= again",
+            ),
+            (
+                "sk-secret\nsk-secret scope=read\n",
+                "line 2: gives a key again with another scope or limits",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (got, path) = key_file(&format!("fields-{i}"), text);
+            let e = got.unwrap_err();
+            assert!(
+                e.starts_with(&format!("--api-key-file {path:?} {error}")),
+                "{text:?}: {e}"
+            );
+            assert!(!e.contains("sk-"), "the refusal carries no key: {e}");
+        }
+        // The same key again with the same fields is kept once.
+        let (keys, _) = key_file("again", "sk-a inflight=1\n  sk-a   inflight=1\n");
+        let keys = keys.unwrap();
+        let admit = || {
+            let meter = keys.check("POST", "/completion", Some("sk-a"), None);
+            meter
+                .unwrap()
+                .unwrap()
+                .admit(std::time::Instant::now(), true)
+        };
+        let _held = admit().unwrap();
+        assert!(admit().is_err(), "one key, one count");
+    }
 
     #[test]
     fn the_context_flag_takes_llama_servers_spellings() {

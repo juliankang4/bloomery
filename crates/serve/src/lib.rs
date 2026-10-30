@@ -23,6 +23,7 @@
 //! the server runs, [`event`] prints the start's events as JSON lines on
 //! stdout, and [`exit`] is the one table of exit statuses.
 
+mod admit;
 mod api;
 pub use api::embeddings;
 pub use api::listener::{self, Listener};

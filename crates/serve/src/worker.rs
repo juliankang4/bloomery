@@ -49,6 +49,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 
+use crate::admit::Lease;
 use crate::api::{Answers, End, EngineFailure, Stop, Waited, client_gone, panic_text, relock};
 use crate::engine::{
     Drafted, EngineError, Sampler, SamplerFactory, Saved, SlotPass, SlotRow, StateError,
@@ -168,11 +169,23 @@ pub(crate) struct Submit {
 pub(crate) struct Events {
     tx: mpsc::Sender<(usize, Msg)>,
     choice: usize,
+    /// The request's key place, held while the engine has the job.
+    lease: Option<Lease>,
 }
 
 impl Events {
-    pub(crate) fn new(tx: mpsc::Sender<(usize, Msg)>, choice: usize) -> Events {
-        Events { tx, choice }
+    pub(crate) fn new(
+        tx: mpsc::Sender<(usize, Msg)>,
+        choice: usize,
+        lease: Option<Lease>,
+    ) -> Events {
+        Events { tx, choice, lease }
+    }
+
+    /// Sends the job's last message, its place given back first.
+    fn last(mut self, m: Msg) {
+        drop(self.lease.take());
+        let _ = self.send(m);
     }
 
     /// Fails, as a gone client, once the HTTP thread dropped its end.
@@ -1220,7 +1233,7 @@ impl Worker {
             t.stuck = false;
             self.show_turns();
         }
-        let _ = a.events.send(Msg::Done(r));
+        a.events.last(Msg::Done(r));
     }
 }
 
@@ -1373,7 +1386,7 @@ impl Worker {
                 relock(&self.sh.stats).n_swap_refused_total += 1;
                 relock(&self.sh.board).release(p.slot);
                 self.show_turns();
-                let _ = p.sub.events.send(Msg::Refused(why));
+                p.sub.events.last(Msg::Refused(why));
                 return Ok(());
             }
             // A pending request has no parked state to lose.
