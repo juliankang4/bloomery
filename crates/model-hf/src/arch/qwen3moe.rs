@@ -338,6 +338,7 @@ mod tests {
             &Config::parse(config, None).unwrap(),
             entries,
             false,
+            folder::Keep::InPlace,
         )
         .unwrap();
         assert!(
@@ -591,7 +592,7 @@ mod tests {
         let refuse = |edit: &dyn Fn(&mut Entries)| {
             let mut e = base.clone();
             edit(&mut e);
-            folder::plan_tensors(&checkpoint, &quant, &e, false)
+            folder::plan_tensors(&checkpoint, &quant, &e, false, folder::Keep::InPlace)
                 .err()
                 .expect("refused")
                 .to_string()

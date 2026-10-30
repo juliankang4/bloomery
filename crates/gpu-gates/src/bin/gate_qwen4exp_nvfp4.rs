@@ -25,9 +25,9 @@
 //!   3,000 positions before it may lie on their path.
 //! - (s) the split: the plan of (l) under a card budget `SPLIT_HOST` short of the bytes (l) puts
 //!   on the card, so each layer keeps an id prefix of its experts on the card and the rest on the
-//!   host, where qdot's NVFP4 dot reads the file's blocks. The load opens, and the batch set's eager
-//!   steps hold (c)'s band, flips and last argmax against the oracle; the last logits' distance to
-//!   the all-card run is printed. Mutant: the plan's refusal of an NVFP4 stack split between a card
+//!   host, where qdot's NVFP4 dot reads the split's blocks or the folder's rows where they lie.
+//!   The load opens, and the batch set's eager steps hold (c)'s band, flips and last argmax
+//!   against the oracle; the last logits' distance to the all-card run is printed. Mutant: the plan's refusal of an NVFP4 stack split between a card
 //!   and the host, which refuses the load by name.
 //! - (rt) the load made for a route trace (`HostCfg::route_trace`): it opens, every layer keeps its
 //!   host leg, which writes the trace, and the host run holds no view (no layer holds a host
@@ -501,8 +501,8 @@ mod gate {
         })
     }
 
-    /// The header's dims, the file's routed gate type, which must be NVFP4, and its dense form
-    /// ([`dense_of`]).
+    /// The header's dims, the file's routed gate type, which must be NVFP4 (a split's blocks, or
+    /// the rows a checkpoint folder stores), and its dense form ([`dense_of`]).
     fn dims(path: &Path) -> Result<Dims, GateError> {
         let model = model_of(path)?;
         let file = model.header();
@@ -512,7 +512,7 @@ mod gate {
             .find(&names::ffn_gate_exps(0))
             .map(|(_, t)| t.ty)
             .ok_or("the file has no routed gate stack on layer 0")?;
-        if gate != GgmlType::NVFP4 {
+        if !matches!(gate, GgmlType::NVFP4 | GgmlType::NVFP4_ROWS) {
             return Err(format!(
                 "{}: layer 0's routed gate is {gate:?}, not NVFP4",
                 path.display()

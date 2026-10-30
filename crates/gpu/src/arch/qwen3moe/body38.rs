@@ -1696,12 +1696,14 @@ pub struct Body38 {
 /// checkpoint folder ([`Folder38`]). A folder carries the PLE table's rows beside its parts.
 pub type Model38 = Model<Option<StoredRows>>;
 
-/// A checkpoint folder as a Qwen3.8 load reads it: its header (`gguf::Split::header_only`, the
+/// A checkpoint folder as a Qwen3.8 load reads it: its header (`gguf::Split::located`, the
 /// header its plan was made from), its card tensors through its part source, and the PLE
 /// table's rows where the folder stores them, which the table's NVMe reader maps
-/// ([`StoredRows`]). The load holds every tensor on its one card and the PLE table on the NVMe
-/// tier ([`crate::parts::OnCard`]): no host set, so no residency machine. The part source also
-/// reads the folder's MTP tensors when a draft is planned. Each part's pages leave the cache once it is
+/// ([`StoredRows`]). The host set and the residency machine read the routed stacks the header
+/// locates where the folder stores them ([`crate::parts::OnCard`]); a folder whose header
+/// locates none holds every tensor on its one card and the PLE table on the NVMe tier, and
+/// runs no residency machine. The part source also reads the folder's MTP tensors when a draft
+/// is planned. Each part's pages leave the cache once it is
 /// staged under the host config's `card_dontneed`, as a split's card segments do.
 pub type Folder38 = Folder<Option<StoredRows>>;
 

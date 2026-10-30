@@ -1295,8 +1295,14 @@ mod tests {
         let table = Dims::real().table();
         assert_eq!(folder_bytes(&table), 248_369_266_176);
         let quant = Config::parse(&config, None).unwrap();
-        let plan = plan_tensors(&checkpoint, &quant, &dtyped(&table), false)
-            .unwrap_or_else(|e| panic!("{e}"));
+        let plan = plan_tensors(
+            &checkpoint,
+            &quant,
+            &dtyped(&table),
+            false,
+            folder::Keep::InPlace,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(plan.skipped.len(), 4);
         assert!(
             plan.skipped
@@ -1644,8 +1650,14 @@ mod tests {
         // The cut keeps the quantization block as it is.
         config["text_config"]["num_hidden_layers"] = json!(3);
         let quant = Config::parse(&config, None).unwrap();
-        let plan = plan_tensors(&checkpoint, &quant, &dtyped(&table), false)
-            .unwrap_or_else(|e| panic!("{e}"));
+        let plan = plan_tensors(
+            &checkpoint,
+            &quant,
+            &dtyped(&table),
+            false,
+            folder::Keep::InPlace,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(plan.skipped.len(), 4);
         // 3 model-level tensors, 12 a layer, a dense block of 3, two routed blocks of 8 and
         // their 3 `.scale` tensors.

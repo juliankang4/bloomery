@@ -92,7 +92,7 @@ fn plan_with(
     q8: bool,
 ) -> Result<folder::Planning<Step>, folder::Error> {
     let quant = Config::parse(config, hf_quant).unwrap();
-    folder::plan_tensors(checkpoint, &quant, entries, q8)
+    folder::plan_tensors(checkpoint, &quant, entries, q8, folder::Keep::InPlace)
 }
 
 /// [`plan_with`] over ModelOpt's `hf_quant_config.json`.

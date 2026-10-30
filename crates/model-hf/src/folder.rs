@@ -152,8 +152,20 @@ pub enum Origin {
     /// them in place.
     File(GgmlType),
     /// The sources, a matrix each in expert order, as the folder stores them, declared as the
-    /// type in the layout: the host reads each matrix in place.
+    /// type in the layout: the host reads each matrix in place. Kept only where the stored
+    /// format is that type's rows ([`modelopt::type_of`] of [`Use::Rows`]); a stack stored in
+    /// another (NVFP4 with `csf` block scales, BF16) is made.
     Stack { ty: GgmlType, layout: StackLayout },
+}
+
+/// Where a plan reads a tensor its map keeps in place ([`Origin::File`], [`Origin::Stack`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keep {
+    /// Where the folder stores it: a load of the folder ([`open`]).
+    InPlace,
+    /// Nowhere: every tensor is made, as in the split `prepare` writes ([`read`]) and in a
+    /// draft, whose tensors join the part source.
+    Made,
 }
 
 /// One tensor of the header and how it is made of the folder's.
@@ -337,7 +349,7 @@ struct Folded<M: FolderMap> {
     kvs: Vec<(String, Value)>,
 }
 
-fn fold<M: FolderMap>(dir: &Path, config: &Json, q8: bool) -> Result<Folded<M>, Error> {
+fn fold<M: FolderMap>(dir: &Path, config: &Json, q8: bool, keep: Keep) -> Result<Folded<M>, Error> {
     let checkpoint = M::parse(config)?;
     let folder = Folder::open(dir)?;
     let entries: Vec<(String, Dtype, Vec<usize>)> = folder
@@ -352,7 +364,7 @@ fn fold<M: FolderMap>(dir: &Path, config: &Json, q8: bool) -> Result<Folded<M>, 
         plan,
         planned,
         skipped,
-    } = plan_tensors(&checkpoint, &Config::read(dir)?, &entries, q8)?;
+    } = plan_tensors(&checkpoint, &Config::read(dir)?, &entries, q8, keep)?;
     let kvs = checkpoint.header(
         &planned
             .iter()
@@ -384,7 +396,8 @@ fn tokenized<M: FolderMap>(
 }
 
 /// The folder `dir` read and checked as the map `M` reads it: `config.json`, its tensors placed
-/// by its quantization config and planned ([`plan_tensors`], `q8` as there), the header's keys
+/// by its quantization config and planned for the split `prepare` writes ([`plan_tensors`],
+/// [`Keep::Made`], `q8` as there), the header's keys
 /// (the model's and the tokenizer's), and serving's tokenizer built from them and checked against
 /// Hugging Face's ([`served_as_hf`]).
 pub fn read<M: FolderMap>(dir: &Path, q8: bool) -> Result<Read<M>, Error> {
@@ -395,7 +408,7 @@ pub fn read<M: FolderMap>(dir: &Path, q8: bool) -> Result<Read<M>, Error> {
         planned,
         skipped,
         kvs,
-    } = fold::<M>(dir, &read_config(dir)?, q8)?;
+    } = fold::<M>(dir, &read_config(dir)?, q8, Keep::Made)?;
     let (kvs, tokenizer) = tokenized(dir, &checkpoint, kvs)?;
     Ok(Read {
         checkpoint,
@@ -499,7 +512,7 @@ pub fn open_as<M: FolderMap>(dir: &Path, config: &Json) -> Result<Opened, Error>
         planned,
         skipped,
         kvs,
-    } = fold::<M>(dir, config, false)?;
+    } = fold::<M>(dir, config, false, Keep::InPlace)?;
     let (kvs, tokenizer) = tokenized(dir, &checkpoint, kvs)?;
     let Assembled {
         header,
@@ -912,16 +925,17 @@ fn stored_as(dtype: Dtype, ty: GgmlType) -> bool {
 }
 
 /// The folder's `entries` (name, dtype, shape) placed by its `config`, and each tensor the map
-/// makes of them declared in the type its placed format and role give (or, for a tensor kept in
-/// place, the type its origin names), its `.scale` beside it where the type reads one. An
-/// unquantized matrix the map reads as Q8_0 stays in its stored format unless `q8` asks for the
-/// rewrite; F32 matrices need that rewrite. Unquantized expert stacks are unsupported. A folder
-/// tensor the map neither reads nor skips is refused by name.
+/// makes of them declared in the type its placed format and role give (or, for a tensor `keep`
+/// keeps in place, the type its origin names), its `.scale` beside it where the type
+/// reads one. An unquantized matrix the map reads as Q8_0 stays in its stored format unless `q8`
+/// asks for the rewrite; F32 matrices need that rewrite. Unquantized expert stacks are
+/// unsupported. A folder tensor the map neither reads nor skips is refused by name.
 pub fn plan_tensors<M: FolderMap>(
     checkpoint: &M,
     config: &Config,
     entries: &[(String, Dtype, Vec<usize>)],
     q8: bool,
+    keep: Keep,
 ) -> Result<Planning<M::Step>, Error> {
     let plan = quant_config::plan(
         config,
@@ -966,7 +980,7 @@ pub fn plan_tensors<M: FolderMap>(
         } else {
             HashMap::new()
         };
-    let mut planned = planned_tensors(&plan, mapped, q8, &stored)?;
+    let mut planned = planned_tensors(&plan, mapped, q8, &stored, keep)?;
     for (name, constant) in checkpoint.constants()? {
         let one = planned_constant(&planned, name, constant)?;
         planned.push(one);
@@ -980,18 +994,28 @@ pub fn plan_tensors<M: FolderMap>(
 
 /// Each tensor of `mapped` declared in the type its place in `plan` and its role give (or, for a
 /// tensor kept in place, the type its origin names, its source's stored dtype and shape in
-/// `stored`), its `.scale` beside it where the type reads one ([`plan_tensors`], `q8` as there).
-/// A router stored F32 keeps F32 whatever role the map reads it in.
+/// `stored`), its `.scale` beside it where the type reads one ([`plan_tensors`], `q8` and
+/// `keep` as there). A router stored F32 keeps F32 whatever role the map reads it in.
 pub fn planned_tensors<S>(
     plan: &Plan,
     mapped: BTreeMap<String, Mapped<S>>,
     q8: bool,
     stored: &HashMap<&str, (Dtype, &[usize])>,
+    keep: Keep,
 ) -> Result<Vec<Planned<S>>, Error> {
     let mut planned = Vec::new();
     for (name, mut m) in mapped {
         let source = &m.sources[0];
         let format = modelopt::format_of(&m.placed(plan)?)?;
+        m.origin = match (keep, m.origin) {
+            (Keep::Made, _) => Origin::Made,
+            (Keep::InPlace, Origin::Stack { ty, .. })
+                if modelopt::type_of(format, Use::Rows) != Some(ty.as_u32()) =>
+            {
+                Origin::Made
+            }
+            (Keep::InPlace, origin) => origin,
+        };
         let type_id = match m.origin {
             Origin::Made => {
                 if m.role == Use::Matrix(Plain::Q8_0)
@@ -1470,7 +1494,7 @@ mod tests {
                 skipped: BTreeMap::new(),
             };
             let mut experts = BTreeMap::new();
-            // A model that keeps nothing in place makes every tensor, as Qwen3.8's map does.
+            // A model that keeps nothing in place makes every tensor.
             let kept = |origin| if self.1 { origin } else { Origin::Made };
             for &(name, shape) in tensors {
                 let one = |role, origin, steps| Mapped {
@@ -1714,7 +1738,7 @@ mod tests {
             planned,
             kvs,
             ..
-        } = fold::<Toy>(dir, &config, false)?;
+        } = fold::<Toy>(dir, &config, false, Keep::InPlace)?;
         assemble(&checkpoint, dir, folder, plan, planned, &kvs)
     }
 
@@ -1851,7 +1875,7 @@ mod tests {
             .unwrap();
             read_config(&dir).unwrap()
         };
-        let folded = |name: &str| fold::<Toy>(&dir, &config(name), false);
+        let folded = |name: &str| fold::<Toy>(&dir, &config(name), false, Keep::InPlace);
         let Folded {
             checkpoint,
             folder,
@@ -2039,7 +2063,7 @@ mod tests {
         toy_folder(&dir, Experts::Planes, &[vision]);
         let planning = {
             let config = read_config(&dir).unwrap();
-            let Folded { skipped, .. } = fold::<Toy>(&dir, &config, false).unwrap();
+            let Folded { skipped, .. } = fold::<Toy>(&dir, &config, false, Keep::InPlace).unwrap();
             skipped
         };
         assert_eq!(
@@ -2198,7 +2222,7 @@ mod tests {
             planned,
             skipped,
             kvs,
-        } = fold::<Toy>(&dir, &config, false).unwrap();
+        } = fold::<Toy>(&dir, &config, false, Keep::InPlace).unwrap();
         let a = assemble(&checkpoint, &dir, folder, plan, planned, &kvs).unwrap();
         let name = |ty: GgmlType| ty.name().unwrap();
         // Header: token_embd BF16 64 B and ffn_gate_inp F32 64 B in place; exps NVFP4 3 x 144 B a

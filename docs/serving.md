@@ -670,8 +670,12 @@ the `checkpoint` feature (the release's has it; any other build refuses the fold
 folder that holds `model.safetensors.index.json`, and `--hf <repo>` names a repo that holds such a checkpoint and no
 GGUF set (a `:<quant>` on that repo is refused by name, as the checkpoint is the repo's one model). Every part keeps the
 format the checkpoint stores it in. Checked with `nvidia/Qwen3.8-Flash-Next-NVFP4` on a DGX Spark's GB10, where it plans
-the same bytes and gives the same greedy ids as the GGUF split made from it. The load holds every tensor on the stage
-card and reads the PLE table from the folder on the NVMe tier, so a plan that puts a tensor elsewhere and a set
+the same bytes and gives the same greedy ids as the GGUF split made from it. The load reads the PLE table from the
+folder on the NVMe tier. The NVFP4 folder's routed experts stay where the folder stores them for the host and the
+residency machine, so its plan splits them between the card and the host as a GGUF's and `BLOOMERY_RESIDENCY` runs
+the machine over them. A plan that pages them to the NVMe expert tier is refused by name, as the arena reads an
+expert's one run of a file and a folder stores each matrix as two. The FP4-Local folder's experts carry compressed block scales the
+host does not read: its load holds every tensor on the stage card, so a plan that puts a tensor elsewhere and a set
 `BLOOMERY_RESIDENCY` other than `off` are refused by name. The folder's MTP layer uses the same draft and verification
 path as a shared GGUF draft, under the same `BLOOMERY_DRAFT` rule (Speculative decoding, below): `mtp` selects it,
 `off` disables it, and unset selects it where the rule would select a GGUF draft. The draft borrows the target's

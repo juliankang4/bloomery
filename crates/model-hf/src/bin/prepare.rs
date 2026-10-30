@@ -433,7 +433,7 @@ mod tests {
     use gguf::{GENERAL_ARCHITECTURE, GgmlType};
     use hf::quant_config::{Config, Format};
     use model_hf::arch::qwen35moe::Checkpoint;
-    use model_hf::arch::qwen35moe::folder::{plan_tensors, served_as_hf};
+    use model_hf::arch::qwen35moe::folder::{Keep, plan_tensors, served_as_hf};
     use safetensors::Dtype;
     fn split_fixture(count: usize) -> Vec<super::Layout> {
         (0..count)
@@ -1086,7 +1086,7 @@ mod tests {
             assert!(q8_0.contains(&name.as_str()), "{name}");
         }
         let types = |q8| -> BTreeMap<String, GgmlType> {
-            let (_, planned) = plan_tensors(&checkpoint, &quant, &entries, q8).unwrap();
+            let (_, planned) = plan_tensors(&checkpoint, &quant, &entries, q8, Keep::Made).unwrap();
             planned
                 .into_iter()
                 .map(|p| (p.decl.name, GgmlType::from_u32(p.decl.type_id)))
@@ -1127,7 +1127,8 @@ mod tests {
                 mixed.iter_mut().find(|(n, _, _)| n == source).unwrap().1 = *dtype;
             }
             for q8 in [false, true] {
-                let (_, planned) = plan_tensors(&checkpoint, &quant, &mixed, q8).unwrap();
+                let (_, planned) =
+                    plan_tensors(&checkpoint, &quant, &mixed, q8, Keep::Made).unwrap();
                 for (_, target, dtype) in &parts {
                     let p = planned.iter().find(|p| p.decl.name == *target).unwrap();
                     let want = if *dtype == Dtype::F32 {
@@ -1158,7 +1159,7 @@ mod tests {
             let mut f32 = entries.clone();
             f32.iter_mut().find(|(n, _, _)| n == source).unwrap().1 = Dtype::F32;
             for q8 in [false, true] {
-                let result = plan_tensors(&checkpoint, &quant, &f32, q8);
+                let result = plan_tensors(&checkpoint, &quant, &f32, q8, Keep::Made);
                 if !q8 {
                     let Err(e) = result else {
                         panic!("F32 matrix {target} must be refused");
@@ -1209,7 +1210,7 @@ mod tests {
                 .collect();
             for (checkpoint, stack) in [(&checkpoint, &stack), (&single, &one)] {
                 for q8 in [false, true] {
-                    let Err(e) = plan_tensors(checkpoint, &quant, stack, q8) else {
+                    let Err(e) = plan_tensors(checkpoint, &quant, stack, q8, Keep::Made) else {
                         panic!(
                             "{dtype:?} expert stacks must be refused for q8={q8}, entries={}",
                             stack.len()

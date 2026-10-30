@@ -33,11 +33,14 @@
 //! vocabulary, `tokenizer.chat_template` the chat template
 //! (`--chat-template-file` replaces it) and `general.name` the default alias.
 //! A model path that is a directory is a Qwen3.8 checkpoint folder, served as
-//! stored (`qwen38_folder::open`): its header (`gguf::Split::header_only`)
+//! stored (`qwen38_folder::open`): its header (`gguf::Split::located`)
 //! takes the first shard's place in every rule and plan, its tokenizer is the
 //! vocabulary, and the engine loads every card tensor from the folder's parts
-//! ([`Folder38`]) and reads its PLE rows where the folder stores them. Such a
-//! load holds every tensor on the stage card and runs no residency machine.
+//! ([`Folder38`]) and reads its PLE rows where the folder stores them. The
+//! host and the residency machine read a plain NVFP4 folder's routed experts
+//! where the folder stores them, so its plan splits them as a GGUF's; an
+//! FP4-Local folder's stacks, whose block scales the host does not read, are
+//! made for the card, and its load holds every routed expert there.
 //! Unless `BLOOMERY_MTP_DRAFT` names a file, its MTP draft is the folder's own
 //! MTP layer, under the draft rule below; a folder without the layer turns the
 //! unset draft off naming the folder and refuses `BLOOMERY_DRAFT=mtp` by name

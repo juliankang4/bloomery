@@ -109,8 +109,9 @@ NVIDIA publishes Qwen3.8-Flash-Next in two checkpoint folders that a Spark serve
 step: `nvidia/Qwen3.8-Flash-Next-NVFP4` (132.7 GB on disk) and `nvidia/Qwen3.8-Flash-Next-FP4-Local` (102.3 GB at
 revision `b9ce18a6`; NVFP4 experts with compressed block scales, MXFP8 and FP8 dense weights,
 [#543](https://github.com/midagedev/bloomery/pull/543)). `bloomery-serve -m <folder>` (the GB10 archive or a build
-with the `checkpoint` feature, 2.1) holds every routed expert on the GB10 and reads the PLE table from the folder on
-the NVMe tier ([`serving.md`](../serving.md), the seats). On the `sm_121a` build the routed experts' prompt products run W4A4 and the
+with the `checkpoint` feature, 2.1) holds every FP4-Local routed expert on the GB10, splits the NVFP4 folder's
+between the GB10 and the host where the card holds fewer, and reads the PLE table from the folder on the NVMe tier
+([`serving.md`](../serving.md), the seats). On the `sm_121a` build the routed experts' prompt products run W4A4 and the
 MXFP8 sites W8A8 (2.1). A checkpoint folder's KV cache is q8_0 unless `--cache-type-k f16` says otherwise
 (a GGUF file's stays f16 unless `--cache-type-k q8_0` asks): K and V take 17/16 B a value against f16's 2, and the
 attention store is 773,279,360 B against 967,921,280 B at 16,896 positions on FP4-Local (the index keys stay f16;
