@@ -18,9 +18,83 @@
 //! output — [`ThinkSplit::ending_at`]); the span is not re-entered, so a later
 //! `<think>` is content. A span still
 //! open when the stream ends leaves all its text in reasoning and none in
-//! content.
+//! content. A tag the vocabulary holds as one special token is a tag only
+//! where that token wrote it ([`SpecialTags`]): the same characters spelled
+//! by ordinary tokens are text.
 
 use serde_json::Value;
+
+use crate::callstream::held;
+use crate::engine::Tokenizer;
+
+/// The markers a vocabulary holds as one special token each
+/// ([`Tokenizer::is_special`]). The output parsers read such a marker only
+/// where that token wrote it, so a model that quotes `</think>` or copies a
+/// `<tool_call>` example in ordinary tokens writes text, not markup. A marker
+/// with no special token of its own is read by its text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SpecialTags(Vec<&'static str>);
+
+impl SpecialTags {
+    /// Those of `tags` that `tok` encodes to one special id.
+    pub(crate) fn of(tok: &dyn Tokenizer, tags: &[&'static str]) -> SpecialTags {
+        SpecialTags(
+            tags.iter()
+                .copied()
+                .filter(|tag| matches!(tok.encode(tag)[..], [id] if tok.is_special(id)))
+                .collect(),
+        )
+    }
+
+    fn special(&self, tag: &str) -> bool {
+        self.0.contains(&tag)
+    }
+
+    /// Whether the marker `tag` starts at byte `at` of `m`.
+    pub(crate) fn at(&self, m: &Marked, at: usize, tag: &str) -> bool {
+        m.text.get(at..).is_some_and(|t| t.starts_with(tag))
+            && (!self.special(tag) || m.specials.binary_search(&at).is_ok())
+    }
+
+    /// Where the first marker `tag` starts in `m`.
+    pub(crate) fn find(&self, m: &Marked, tag: &str) -> Option<usize> {
+        if self.special(tag) {
+            m.specials
+                .iter()
+                .copied()
+                .find(|&at| m.text[at..].starts_with(tag))
+        } else {
+            m.text.find(tag)
+        }
+    }
+}
+
+/// Generated text and the byte offsets in it, ascending, where a special
+/// token's text starts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Marked {
+    pub(crate) text: String,
+    pub(crate) specials: Vec<usize>,
+}
+
+impl Marked {
+    /// Appends `text`, its special tokens starting at `specials`.
+    pub(crate) fn push(&mut self, text: &str, specials: &[usize]) {
+        let base = self.text.len();
+        self.specials.extend(specials.iter().map(|at| base + at));
+        self.text.push_str(text);
+    }
+
+    /// Takes out the first `n` bytes.
+    pub(crate) fn take_front(&mut self, n: usize) -> Marked {
+        let k = self.specials.partition_point(|&at| at < n);
+        let rest = Marked {
+            text: self.text.split_off(n),
+            specials: self.specials.split_off(k).iter().map(|at| at - n).collect(),
+        };
+        std::mem::replace(self, rest)
+    }
+}
 
 /// The two tags of a think span: the text the model writes to open its
 /// reasoning and to end it. Both are in the model's vocabulary, and the chat
@@ -140,6 +214,18 @@ pub struct Split {
     /// `</think>` was consumed by this push.
     pub closed: bool,
     pub content: String,
+    /// Where special tokens' texts start in `content`.
+    pub specials: Vec<usize>,
+}
+
+impl Split {
+    fn content(m: Marked) -> Split {
+        Split {
+            content: m.text,
+            specials: m.specials,
+            ..Split::default()
+        }
+    }
 }
 
 /// Streaming splitter. Inside the span it holds back a tail that could still grow
@@ -153,7 +239,9 @@ pub struct ThinkSplit {
     /// The model may still open the span on a leading `<think>`: true until
     /// the output names the tag, or names any other text first.
     may_open: bool,
-    held: String,
+    held: Marked,
+    /// The tags read only where their special token wrote them.
+    specials: SpecialTags,
     /// A tag that ends the span too and stays in the output: a call the
     /// markup lets follow the reasoning without `</think>`.
     ends_too: Option<&'static str>,
@@ -187,7 +275,8 @@ impl ThinkSplit {
             tags,
             inside: entry == ThinkEntry::Open,
             may_open: entry == ThinkEntry::MayOpen,
-            held: String::new(),
+            held: Marked::default(),
+            specials: SpecialTags::default(),
             ends_too: None,
             trim_content: false,
             trimming: false,
@@ -224,35 +313,45 @@ impl ThinkSplit {
         self
     }
 
+    /// The same splitter, reading its tags and the tag that ends its span
+    /// too ([`ThinkSplit::ending_at`], set before this) only where their
+    /// special tokens wrote them, for those `tok` holds as one special token.
+    #[must_use]
+    pub(crate) fn reading_specials(mut self, tok: &dyn Tokenizer) -> Self {
+        let tags = [self.tags.open, self.tags.close];
+        self.specials = SpecialTags::of(tok, &[&tags[..], self.ends_too.as_slice()].concat());
+        self
+    }
+
     /// Whether the output is inside the span: the reasoning budget counts
     /// only there.
     pub(crate) fn in_span(&self) -> bool {
         self.inside
     }
 
-    /// Feeds generated text.
-    pub fn push(&mut self, piece: &str) -> Split {
+    /// Feeds generated text, its special tokens' texts starting at
+    /// `specials`.
+    pub fn push(&mut self, piece: &str, specials: &[usize]) -> Split {
         if self.may_open {
-            return self.may_open_step(piece);
+            return self.may_open_step(piece, specials);
         }
         if !self.inside {
-            return Split {
-                content: self.past_span(piece),
-                ..Split::default()
-            };
+            let mut m = Marked::default();
+            m.push(piece, specials);
+            return Split::content(self.past_span(m));
         }
-        self.in_span_step(piece)
+        self.in_span_step(piece, specials)
     }
 
     /// Text past the span: as given, or with its opening whitespace dropped
     /// while the content is still being trimmed.
-    fn past_span(&mut self, text: &str) -> String {
-        if !self.trimming {
-            return text.to_owned();
+    fn past_span(&mut self, mut m: Marked) -> Marked {
+        if self.trimming {
+            let ws = m.text.len() - m.text.trim_start_matches(is_space).len();
+            self.trimming = ws == m.text.len();
+            m.take_front(ws);
         }
-        let rest = text.trim_start_matches(is_space);
-        self.trimming = rest.is_empty();
-        rest.to_owned()
+        m
     }
 
     /// Outside a span the model may still open. Leading whitespace and a
@@ -261,67 +360,63 @@ impl ThinkSplit {
     /// whitespace and the tag (as llama-server's optional leading span takes
     /// them, into neither field), and any other text ends the chance: from
     /// there the text passes through.
-    fn may_open_step(&mut self, piece: &str) -> Split {
-        self.held.push_str(piece);
-        let ws = self.held.len() - self.held.trim_start().len();
-        let rest = &self.held[ws..];
-        if let Some(tail) = rest.strip_prefix(self.tags.open).map(str::to_owned) {
+    fn may_open_step(&mut self, piece: &str, specials: &[usize]) -> Split {
+        self.held.push(piece, specials);
+        let ws = self.held.text.len() - self.held.text.trim_start().len();
+        if self.specials.at(&self.held, ws, self.tags.open) {
             self.may_open = false;
             self.inside = true;
             self.trim_content |= self.trim_after_opened;
-            self.held.clear();
-            let mut s = self.in_span_step(&tail);
+            self.held.take_front(ws + self.tags.open.len());
+            let mut s = self.in_span_step("", &[]);
             s.opened = true;
             return s;
         }
-        if rest.is_empty() || self.tags.open.starts_with(rest) {
+        let rest = &self.held.text[ws..];
+        if rest.is_empty() || held(self.tags.open, rest) {
             return Split::default();
         }
         self.may_open = false;
         self.trimming = self.trim_content;
         let held = std::mem::take(&mut self.held);
-        Split {
-            content: self.past_span(&held),
-            ..Split::default()
-        }
+        Split::content(self.past_span(held))
     }
 
     /// Inside the span: everything up to the first `</think>` (or the tag
     /// that ends it too) is reasoning, a tail that could still grow into
     /// either held back.
-    fn in_span_step(&mut self, piece: &str) -> Split {
-        self.held.push_str(piece);
-        let close = self.held.find(self.tags.close);
-        let call = self.ends_too.and_then(|tag| self.held.find(tag));
+    fn in_span_step(&mut self, piece: &str, specials: &[usize]) -> Split {
+        self.held.push(piece, specials);
+        let close = self.specials.find(&self.held, self.tags.close);
+        let call = self
+            .ends_too
+            .and_then(|tag| self.specials.find(&self.held, tag));
         if let Some(at) = call.filter(|&c| close.is_none_or(|t| c < t)) {
             self.inside = false;
-            let content = self.held.split_off(at);
+            let reasoning = self.held.take_front(at).text;
             return Split {
-                reasoning: std::mem::take(&mut self.held),
-                content,
-                ..Split::default()
+                reasoning,
+                ..Split::content(std::mem::take(&mut self.held))
             };
         }
         if let Some(at) = close {
             self.inside = false;
             self.trimming = self.trim_content;
-            let after = self.held[at + self.tags.close.len()..].to_owned();
-            let content = self.past_span(&after);
-            self.held.truncate(at);
+            let reasoning = self.held.take_front(at).text;
+            let mut after = std::mem::take(&mut self.held);
+            after.take_front(self.tags.close.len());
             return Split {
-                reasoning: std::mem::take(&mut self.held),
+                reasoning,
                 closed: true,
-                content,
-                ..Split::default()
+                ..Split::content(self.past_span(after))
             };
         }
         let keep = self
             .ends_too
-            .map_or(0, |tag| partial_suffix(&self.held, tag))
-            .max(partial_suffix(&self.held, self.tags.close));
-        let rest = self.held.split_off(self.held.len() - keep);
+            .map_or(0, |tag| partial_suffix(&self.held.text, tag))
+            .max(partial_suffix(&self.held.text, self.tags.close));
         Split {
-            reasoning: std::mem::replace(&mut self.held, rest),
+            reasoning: self.held.take_front(self.held.text.len() - keep).text,
             ..Split::default()
         }
     }
@@ -332,13 +427,10 @@ impl ThinkSplit {
             self.may_open = false;
             self.trimming = self.trim_content;
             let held = std::mem::take(&mut self.held);
-            return Split {
-                content: self.past_span(&held),
-                ..Split::default()
-            };
+            return Split::content(self.past_span(held));
         }
         Split {
-            reasoning: std::mem::take(&mut self.held),
+            reasoning: std::mem::take(&mut self.held).text,
             ..Split::default()
         }
     }
@@ -368,19 +460,19 @@ mod tests {
     #[test]
     fn holds_a_partial_close_tag() {
         let mut s = ThinkSplit::for_prompt("<｜Assistant｜><think>");
-        assert_eq!(s.push("abc</th").reasoning, "abc");
-        let p = s.push("ink>x");
+        assert_eq!(s.push("abc</th", &[]).reasoning, "abc");
+        let p = s.push("ink>x", &[]);
         assert_eq!(
             (p.reasoning.as_str(), p.closed, p.content.as_str()),
             ("", true, "x")
         );
-        assert_eq!(s.push("<think>y").content, "<think>y");
+        assert_eq!(s.push("<think>y", &[]).content, "<think>y");
     }
 
     #[test]
     fn a_closed_prompt_passes_through() {
         let mut s = ThinkSplit::for_prompt("<｜Assistant｜></think>");
-        assert_eq!(s.push("a</think>b").content, "a</think>b");
+        assert_eq!(s.push("a</think>b", &[]).content, "a</think>b");
     }
 
     #[test]
@@ -428,27 +520,27 @@ mod tests {
     #[test]
     fn a_model_opened_span_enters_on_a_leading_tag() {
         let mut s = ThinkSplit::for_prompt("<|im_start|>assistant\n");
-        let p = s.push(" \n<think>\nwhy\n</think>\nHello");
+        let p = s.push(" \n<think>\nwhy\n</think>\nHello", &[]);
         assert_eq!(
             (p.reasoning.as_str(), p.opened, p.closed, p.content.as_str()),
             ("\nwhy\n", true, true, "\nHello")
         );
         let mut s = ThinkSplit::for_prompt("<|im_start|>assistant\n").trimming_after_opened();
-        let p = s.push(" \n<think>\nwhy\n</think>\n");
+        let p = s.push(" \n<think>\nwhy\n</think>\n", &[]);
         assert_eq!((p.reasoning.as_str(), p.content.as_str()), ("\nwhy\n", ""));
-        assert_eq!(s.push(" Hello").content, "Hello");
+        assert_eq!(s.push(" Hello", &[]).content, "Hello");
         // Whitespace alone decides nothing; at the end it is content.
         let mut s = ThinkSplit::for_prompt("<|im_start|>assistant\n");
-        assert_eq!(s.push("  "), Split::default());
+        assert_eq!(s.push("  ", &[]), Split::default());
         assert_eq!(s.finish().content, "  ");
         // Text before the tag leaves everything content, the tag included.
         let mut s = ThinkSplit::for_prompt("<|im_start|>assistant\n");
-        assert_eq!(s.push("hi <think>x").content, "hi <think>x");
-        assert_eq!(s.push("</think>y").content, "</think>y");
+        assert_eq!(s.push("hi <think>x", &[]).content, "hi <think>x");
+        assert_eq!(s.push("</think>y", &[]).content, "</think>y");
         // A partial tag is held until the text names it.
         let mut s = ThinkSplit::for_prompt("<|im_start|>assistant\n");
-        assert_eq!(s.push("<thi"), Split::default());
-        assert_eq!(s.push("nk>ok").reasoning, "ok");
+        assert_eq!(s.push("<thi", &[]), Split::default());
+        assert_eq!(s.push("nk>ok", &[]).reasoning, "ok");
     }
 
     /// The splitter reads the tags it is given and no others: with Solar's
@@ -475,25 +567,25 @@ mod tests {
         assert_eq!(ThinkEntry::of_prompt(closed), ThinkEntry::MayOpen);
 
         let mut s = ThinkSplit::for_prompt_with(open, SOLAR);
-        assert_eq!(s.push("why <think>").reasoning, "why <think>");
-        assert_eq!(s.push("x<|think:en").reasoning, "x");
-        let p = s.push("d|>ans");
+        assert_eq!(s.push("why <think>", &[]).reasoning, "why <think>");
+        assert_eq!(s.push("x<|think:en", &[]).reasoning, "x");
+        let p = s.push("d|>ans", &[]);
         assert_eq!(
             (p.reasoning.as_str(), p.closed, p.content.as_str()),
             ("", true, "ans")
         );
-        assert_eq!(s.push("<|think:end|>").content, "<|think:end|>");
+        assert_eq!(s.push("<|think:end|>", &[]).content, "<|think:end|>");
 
         let mut s = ThinkSplit::for_prompt_with("<|im:start|>assistant<|im:content|>", SOLAR);
-        assert_eq!(s.push("<|think:sta"), Split::default());
-        let p = s.push("rt|>why<|think:end|>ok");
+        assert_eq!(s.push("<|think:sta", &[]), Split::default());
+        let p = s.push("rt|>why<|think:end|>ok", &[]);
         assert_eq!(
             (p.reasoning.as_str(), p.opened, p.closed, p.content.as_str()),
             ("why", true, true, "ok")
         );
 
         let mut s = ThinkSplit::for_prompt(open);
-        assert_eq!(s.push("a<|think:end|>b").content, "a<|think:end|>b");
+        assert_eq!(s.push("a<|think:end|>b", &[]).content, "a<|think:end|>b");
     }
 
     /// The opening whitespace dropped is C's `isspace` over bytes, as
@@ -502,11 +594,11 @@ mod tests {
     #[test]
     fn the_content_drops_the_six_ascii_spaces_and_no_other() {
         let mut s = ThinkSplit::for_prompt("<think></think>").trimming_content();
-        assert_eq!(s.push(" \t\n").content, "");
-        assert_eq!(s.push("\x0B\x0C\rHello \n").content, "Hello \n");
+        assert_eq!(s.push(" \t\n", &[]).content, "");
+        assert_eq!(s.push("\x0B\x0C\rHello \n", &[]).content, "Hello \n");
         let mut s = ThinkSplit::for_prompt("<think></think>").trimming_content();
-        assert_eq!(s.push("\u{3000}Hello").content, "\u{3000}Hello");
+        assert_eq!(s.push("\u{3000}Hello", &[]).content, "\u{3000}Hello");
         let mut s = ThinkSplit::for_prompt("<think></think>").trimming_content();
-        assert_eq!(s.push("\u{a0}Hello").content, "\u{a0}Hello");
+        assert_eq!(s.push("\u{a0}Hello", &[]).content, "\u{a0}Hello");
     }
 }

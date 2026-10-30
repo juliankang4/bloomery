@@ -125,6 +125,13 @@ impl Tokenizer for Vocab {
     fn user_start(&self) -> Vec<u32> {
         self.user_start.clone()
     }
+
+    fn is_special(&self, id: u32) -> bool {
+        use tokenizer::attr::{CONTROL, USER_DEFINED};
+        self.tok
+            .attr(id)
+            .is_some_and(|a| a & (CONTROL | USER_DEFINED) != 0)
+    }
 }
 
 /// `tokenizer::Decoder`'s rule over an owned vocabulary handle: pieces with

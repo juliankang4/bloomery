@@ -3922,7 +3922,7 @@ fn run_choices(
                 Ok(())
             }
             Msg::Prompt(t) => sink(Event::Prompt(&t), choice, at),
-            Msg::Text(text, t) => sink(Event::Text(&text, &t), choice, at),
+            Msg::Text(text, specials, t) => sink(Event::Text(&text, &specials, &t), choice, at),
             Msg::Done(Ok(o)) => {
                 done[choice] = Some(o);
                 if done.iter().all(Option::is_some) {
@@ -4524,6 +4524,7 @@ fn completion_plan(state: &State, b: &Map<String, Value>) -> Result<CompletionPl
                 Some(Tools::QwenXml(framing, ParamKinds::default())),
                 state.think,
             )
+            .reading_specials(&*state.tok)
             .think;
         }
     }
@@ -4594,7 +4595,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
                     "content": "", "stop": false, "id_slot": slot, "multimodal": false,
                     "prompt_progress": progress(t),
                 }),
-                Event::Text(text, t) => {
+                Event::Text(text, _, t) => {
                     let mut v = json!({ "content": text, "stop": false, "id_slot": slot, "multimodal": false });
                     if tpt {
                         v["timings"] = t.to_json();
@@ -4883,8 +4884,9 @@ fn chat_plan(
     let (text, input) = chat_input(state, b)?;
     let tools = tool_scan(state, b)?;
     gate_think_span(&mut p, &text);
-    let parser =
-        ChatParser::with_tags(&text, format, tools, state.think).for_template(state.tool_format);
+    let parser = ChatParser::with_tags(&text, format, tools, state.think)
+        .for_template(state.tool_format)
+        .reading_specials(&*state.tok);
     // Without a reasoning split or tool scan, the guard still tracks the server's think tags.
     p.think_split.clone_from(&parser.think);
     Ok(ChatPlan {
@@ -4948,7 +4950,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         let mut choices = Vec::with_capacity(n);
         for (i, ((o, _), parser)) in all.iter().zip(&mut parsers).enumerate() {
             if let Err(e) = parser
-                .try_push(&o.content)
+                .try_push(&o.content, &o.specials)
                 .and_then(|_| parser.try_finish_at(o.cut()))
             {
                 return send_error(w, req, &tool_markup_error(&e));
@@ -4995,9 +4997,9 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                     v["prompt_progress"] = progress(t);
                     sse(s, &v)
                 }
-                Event::Text(text, t) => {
+                Event::Text(text, specials, t) => {
                     let parser = &mut parsers[i];
-                    let d = match parser.try_push(text) {
+                    let d = match parser.try_push(text, specials) {
                         Ok(d) => d,
                         Err(e) => {
                             markup = Some(e);

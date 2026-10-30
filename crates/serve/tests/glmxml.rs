@@ -329,7 +329,7 @@ fn streamed_as(
         total.calls.extend(d.calls);
     };
     for piece in pieces {
-        add(p.try_push(piece)?);
+        add(p.try_push(piece, &[])?);
     }
     add(p.try_finish()?);
     assert_eq!(&total, p.message(), "deltas sum to the message");
@@ -904,7 +904,7 @@ fn solar_pieces(pieces: &[&str], finish: bool) -> (Message, Vec<CallPiece>) {
         .streaming_calls();
     let mut out = Vec::new();
     for piece in pieces {
-        p.try_push(piece).expect("parses");
+        p.try_push(piece, &[]).expect("parses");
         out.extend(p.take_pieces());
     }
     if finish {

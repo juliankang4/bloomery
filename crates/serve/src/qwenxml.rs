@@ -43,7 +43,10 @@
 //! ([`Scanned::open`]): its name once `<function=NAME>` is whole, and the
 //! arguments so far, a prefix of the arguments the call closes with, the text
 //! of a string parameter as it arrives. Every decision depends on the text
-//! only, never on how it was cut into pieces.
+//! only, never on how it was cut into pieces. A `<tool_call>` or `</tool_call>`
+//! the vocabulary holds as one special token is markup only where that token
+//! wrote it ([`SpecialTags`]): spelled in ordinary tokens it is text, content
+//! outside a call and no close inside one.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -53,7 +56,8 @@ use serde_json::Value;
 use crate::callstream::{self, Reading, held, read_value};
 use crate::constrain::{Fun, Part, Refusal, Style, call, value};
 use crate::dsml::{Scanned, ToolCall};
-use crate::reasoning::partial_suffix;
+use crate::engine::Tokenizer;
+use crate::reasoning::{Marked, SpecialTags, partial_suffix};
 
 // The format's markup is its description's (the models crate's `function_xml`, not this crate's `models` module),
 // the strings the template table names a file's format by.
@@ -343,7 +347,9 @@ pub struct QwenScan {
     /// apart.
     after_call: bool,
     /// Text not yet decided.
-    buf: String,
+    buf: Marked,
+    /// The tags read only where their special tokens wrote them.
+    specials: SpecialTags,
     calls: usize,
     read: CallRead,
 }
@@ -358,29 +364,47 @@ impl QwenScan {
             framing,
             inside: false,
             after_call: false,
-            buf: String::new(),
+            buf: Marked::default(),
+            specials: SpecialTags::default(),
             calls: 0,
             read: CallRead::default(),
         }
     }
 
+    /// Reads `<tool_call>` and `</tool_call>` only where their special
+    /// tokens wrote them, for those `tok` holds as one special token.
+    pub(crate) fn read_specials(&mut self, tok: &dyn Tokenizer) {
+        self.specials = SpecialTags::of(tok, &[CALL_OPEN, CALL_CLOSE]);
+    }
+
     /// Feeds text; returns the content that may be sent and the calls that
     /// closed.
     pub fn push(&mut self, piece: &str) -> Result<Scanned, QwenXmlError> {
-        Ok(self.push_stream(piece)?.whole(&self.read.call, self.calls))
+        Ok(self
+            .push_stream(piece, &[])?
+            .whole(&self.read.call, self.calls))
     }
 
-    /// [`QwenScan::push`] that reports the call text as `advances`, each
-    /// piece's new arguments, instead of the open call's whole text.
-    pub(crate) fn push_stream(&mut self, piece: &str) -> Result<Scanned, QwenXmlError> {
-        self.buf.push_str(piece);
+    /// [`QwenScan::push`] of text whose special tokens' texts start at
+    /// `specials`, reporting the call text as `advances`, each piece's new
+    /// arguments, instead of the open call's whole text.
+    pub(crate) fn push_stream(
+        &mut self,
+        piece: &str,
+        specials: &[usize],
+    ) -> Result<Scanned, QwenXmlError> {
+        self.buf.push(piece, specials);
         let mut out = Scanned::default();
         let advances = out.advances.insert(Vec::new());
         loop {
             if self.inside {
-                let closed = self
-                    .read
-                    .advance(&self.buf, self.calls, &self.kinds, self.framing)?;
+                let closed = self.read.advance(
+                    &self.buf,
+                    &self.specials,
+                    self.calls,
+                    &self.kinds,
+                    self.framing,
+                )?;
                 let Some((name, arguments, used)) = closed else {
                     self.read.call.send(self.calls, advances);
                     return Ok(out);
@@ -393,17 +417,16 @@ impl QwenScan {
                 std::mem::take(&mut self.read).call.close(&call, advances);
                 out.calls.push(call);
                 self.calls += 1;
-                self.buf.drain(..used);
+                self.buf.take_front(used);
                 self.inside = false;
                 self.after_call = true;
             } else if self.after_call {
-                let ws = self.buf.len() - self.buf.trim_start().len();
-                let rest = &self.buf[ws..];
-                if held(CALL_OPEN, rest) {
+                let ws = self.buf.text.len() - self.buf.text.trim_start().len();
+                if held(CALL_OPEN, &self.buf.text[ws..]) {
                     return Ok(out);
                 }
-                if rest.starts_with(CALL_OPEN) {
-                    self.buf.drain(..ws + CALL_OPEN.len());
+                if self.specials.at(&self.buf, ws, CALL_OPEN) {
+                    self.buf.take_front(ws + CALL_OPEN.len());
                     self.inside = true;
                     self.after_call = false;
                 } else {
@@ -411,14 +434,13 @@ impl QwenScan {
                     // whitespace with it.
                     self.after_call = false;
                 }
-            } else if let Some(at) = self.buf.find(CALL_OPEN) {
-                out.content.push_str(&self.buf[..at]);
-                self.buf.drain(..at + CALL_OPEN.len());
+            } else if let Some(at) = self.specials.find(&self.buf, CALL_OPEN) {
+                out.content.push_str(&self.buf.take_front(at).text);
+                self.buf.take_front(CALL_OPEN.len());
                 self.inside = true;
             } else {
-                let upto = self.buf.len() - partial_suffix(&self.buf, CALL_OPEN);
-                out.content.push_str(&self.buf[..upto]);
-                self.buf.drain(..upto);
+                let upto = self.buf.text.len() - partial_suffix(&self.buf.text, CALL_OPEN);
+                out.content.push_str(&self.buf.take_front(upto).text);
                 return Ok(out);
             }
         }
@@ -430,9 +452,16 @@ impl QwenScan {
     /// and the whitespace a closed call's layout left is nothing.
     pub fn finish(&mut self) -> Result<Scanned, QwenXmlError> {
         if self.inside {
-            parse_call(&self.buf, self.calls, &self.kinds, self.framing, true)?;
+            parse_call(
+                &self.buf,
+                &self.specials,
+                self.calls,
+                &self.kinds,
+                self.framing,
+                true,
+            )?;
         }
-        let rest = std::mem::take(&mut self.buf);
+        let rest = std::mem::take(&mut self.buf).text;
         if self.inside {
             return Err(QwenXmlError::Unterminated {
                 index: self.calls,
@@ -516,7 +545,7 @@ fn quote(s: &str) -> String {
     s.chars().take(QUOTE).collect()
 }
 
-/// One call, the text after `<tool_call>`, at the start of `s`: its function
+/// One call, the text after `<tool_call>`, at the start of `m`: its function
 /// name, its parameters as a JSON object's text, and the bytes it took
 /// through `</tool_call>`. `Ok(None)` when the text so far can only be the
 /// start of a call. An error that quotes the text after the fault waits for
@@ -525,14 +554,17 @@ fn quote(s: &str) -> String {
 /// writes a newline after each); where a value starts and ends is the
 /// `framing`'s: under [`Framing::Lines`] the newline that opens a value is not
 /// whitespace between tags but the value's own boundary, under
-/// [`Framing::Compact`] the value is the bytes between its tags.
+/// [`Framing::Compact`] the value is the bytes between its tags. Its
+/// `</tool_call>` is the one `specials` reads as the marker.
 fn parse_call(
-    s: &str,
+    m: &Marked,
+    specials: &SpecialTags,
     index: usize,
     kinds: &ParamKinds,
     framing: Framing,
     end: bool,
 ) -> Result<Option<(String, String, usize)>, QwenXmlError> {
+    let s = m.text.as_str();
     let settled = |found: &str| end || found.chars().nth(QUOTE - 1).is_some();
     let lead = s.len() - s.trim_start().len();
     let rest = &s[lead..];
@@ -585,7 +617,7 @@ fn parse_call(
             if held(CALL_CLOSE, rest) {
                 return Ok(None);
             }
-            if !rest.starts_with(CALL_CLOSE) {
+            if !specials.at(m, s.len() - rest.len(), CALL_CLOSE) {
                 if !settled(rest) {
                     return Ok(None);
                 }
@@ -694,22 +726,24 @@ struct CallRead {
 impl CallRead {
     fn advance(
         &mut self,
-        s: &str,
+        m: &Marked,
+        specials: &SpecialTags,
         index: usize,
         kinds: &ParamKinds,
         framing: Framing,
     ) -> Result<Option<(String, String, usize)>, QwenXmlError> {
+        let s = m.text.as_str();
         if self.call.name.is_none() {
             let rest = s.trim_start();
             let Some(body) = rest.strip_prefix(FUNCTION_OPEN) else {
-                return parse_call(s, index, kinds, framing, false);
+                return parse_call(m, specials, index, kinds, framing, false);
             };
             let Some(end) = body.find('>') else {
                 return Ok(None);
             };
             let name = &body[..end];
             if name.is_empty() || name.contains(['<', '\n', '"']) || !kinds.names(name) {
-                return parse_call(s, index, kinds, framing, false);
+                return parse_call(m, specials, index, kinds, framing, false);
             }
             self.call.name = Some(name.to_owned());
             self.call.args.push('{');
@@ -732,13 +766,13 @@ impl CallRead {
                     match kind {
                         Some(Kind::Bool) => match boolean(raw) {
                             Some(word) => self.call.args.push_str(word),
-                            None => return parse_call(s, index, kinds, framing, false),
+                            None => return parse_call(m, specials, index, kinds, framing, false),
                         },
                         Some(Kind::Json(_)) => match json_value(raw) {
                             Some(value) => self.call.args.push_str(&value),
-                            None => return parse_call(s, index, kinds, framing, false),
+                            None => return parse_call(m, specials, index, kinds, framing, false),
                         },
-                        _ => return parse_call(s, index, kinds, framing, false),
+                        _ => return parse_call(m, specials, index, kinds, framing, false),
                     }
                 }
                 self.at = end + close.len();
@@ -754,7 +788,7 @@ impl CallRead {
                 {
                     return Ok(None);
                 }
-                return parse_call(s, index, kinds, framing, false);
+                return parse_call(m, specials, index, kinds, framing, false);
             };
             let Some(end) = p.find('>') else {
                 return Ok(None);
@@ -766,10 +800,10 @@ impl CallRead {
                     .kind(self.call.name.as_deref().unwrap_or_default(), key)
                     .is_none()
             {
-                return parse_call(s, index, kinds, framing, false);
+                return parse_call(m, specials, index, kinds, framing, false);
             }
             let Some(v) = p[end + 1..].strip_prefix(framing.value_open()) else {
-                return parse_call(s, index, kinds, framing, false);
+                return parse_call(m, specials, index, kinds, framing, false);
             };
             let text = kinds.kind(self.call.name.as_deref().unwrap_or_default(), key)
                 == Some(&Kind::String);

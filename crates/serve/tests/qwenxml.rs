@@ -513,7 +513,7 @@ fn streamed(
         total.calls.extend(d.calls);
     };
     for piece in pieces {
-        add(p.try_push(piece)?);
+        add(p.try_push(piece, &[])?);
     }
     add(p.try_finish()?);
     assert_eq!(&total, p.message(), "deltas sum to the message");
@@ -708,7 +708,7 @@ fn hw_compact_calls_parse_as_the_reference_reads_them() {
                 )),
             );
             for piece in &pieces {
-                p.try_push(piece)
+                p.try_push(piece, &[])
                     .unwrap_or_else(|e| panic!("{name}: {e}: {pieces:?}"));
             }
             p.try_finish()
@@ -940,7 +940,7 @@ fn hw_compact_calls_are_the_mimo_templates_markup() {
         .strip_suffix("<|im_end|>")
         .expect("the assistant turn's end");
     let mut p = ChatParser::with_tools(&prompt, ReasoningFormat::Deepseek, qwen(mimo_framing()));
-    let _ = p.try_push(script).expect("the markup parses");
+    let _ = p.try_push(script, &[]).expect("the markup parses");
     let _ = p.try_finish().expect("the markup finishes");
     let m = p.message().clone();
     assert_eq!(m.content, "", "{m:?}");
@@ -1062,7 +1062,7 @@ fn hw_qwen_fixtures_are_the_templates_markup() {
         .strip_suffix("<|im_end|>\n")
         .expect("the assistant turn's end");
     let mut p = ChatParser::with_tools(&prompt, ReasoningFormat::Deepseek, qwen(Framing::Lines));
-    let _ = p.try_push(script).expect("the markup parses");
+    let _ = p.try_push(script, &[]).expect("the markup parses");
     let _ = p.try_finish().expect("the markup finishes");
     let m = p.message().clone();
     assert_eq!(m.content, "", "{m:?}");

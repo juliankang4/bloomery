@@ -72,6 +72,11 @@ impl StopScan {
         send
     }
 
+    /// The bytes of the text sent so far.
+    pub(crate) fn sent(&self) -> usize {
+        self.sent
+    }
+
     /// The whole content so far (stop word excluded).
     pub(crate) fn text(&self) -> &str {
         &self.text

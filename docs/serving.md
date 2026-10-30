@@ -147,6 +147,10 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   Hermes treats a complete `<tool_call>` opener at EOF as an unterminated call, including immediately after a
   previous call closed. Only a proper prefix of that opener remains text at EOF; neither decision depends on
   stream chunk boundaries.
+  A think tag or a Qwen3-Coder `<tool_call>` or `</tool_call>` that the vocabulary holds as one special token is
+  markup only where the model generated that token. The same characters written in ordinary tokens (a quoted
+  `</think>`, a copied `<tool_call>` example) stay reasoning or content, streamed or not, and the
+  `reasoning_budget` and `reasoning_loop` span below ends at the same place.
 - **Refused by name** (a 400 naming the field): `samplers` in an order other than llama-server's default list for the
   stages that are on, or naming a sampler this server lacks; typical_p, mirostat, `dry_*`, `xtc_*`, `top_n_sigma` and
   `dynatemp_*` when a request turns them on; `n_predict` or `max_tokens` outside -1..=i32::MAX (-2 does not mean "no

@@ -252,7 +252,7 @@ fn run(
     }
     let mut out = Vec::new();
     for piece in pieces {
-        p.try_push(piece)?;
+        p.try_push(piece, &[])?;
         out.extend(p.take_pieces());
     }
     p.try_finish()?;
@@ -380,7 +380,7 @@ fn hw_a_call_announced_and_ended_otherwise_is_a_named_error() {
     let mut parser =
         ChatParser::with_tools("", ReasoningFormat::None, Some(dsml.clone())).keeping_cut_call();
     for c in char_by_char(&recut) {
-        parser.try_push(&c).expect("parses");
+        parser.try_push(&c, &[]).expect("parses");
     }
     assert_eq!(
         parser.try_finish_at(true).expect("cut").calls,
@@ -468,7 +468,7 @@ fn hw_a_cut_call_streams_its_arguments_once() {
             ChatParser::with_tools("", ReasoningFormat::None, Some(case.tools)).streaming_calls();
         let mut pieces = Vec::new();
         for c in cut.chars() {
-            p.try_push(&c.to_string())
+            p.try_push(&c.to_string(), &[])
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             pieces.extend(p.take_pieces());
         }
@@ -519,7 +519,7 @@ fn hw_a_cut_call_streams_its_arguments_once() {
             let mut p =
                 ChatParser::with_tools("", ReasoningFormat::None, Some(tools)).streaming_calls();
             for c in text.chars() {
-                p.try_push(&c.to_string()).expect("no close yet");
+                p.try_push(&c.to_string(), &[]).expect("no close yet");
             }
             let e = p.try_finish_at(true).expect_err("a wrong argument");
             assert!(
@@ -613,16 +613,16 @@ fn hw_long_string_stream_is_linear() {
         let mut arguments = String::new();
         let began = std::time::Instant::now();
         ALLOCATED.with(|n| n.set(Some(0)));
-        p.try_push(prefix).expect("call opens");
+        p.try_push(prefix, &[]).expect("call opens");
         for line in content.split_inclusive('\n') {
-            p.try_push(line).expect("string advances");
+            p.try_push(line, &[]).expect("string advances");
             for piece in p.take_pieces() {
                 if let CallPiece::Args { text, .. } = piece {
                     arguments.push_str(&text);
                 }
             }
         }
-        p.try_push(suffix).expect("call closes");
+        p.try_push(suffix, &[]).expect("call closes");
         for piece in p.take_pieces() {
             if let CallPiece::Args { text, .. } = piece {
                 arguments.push_str(&text);

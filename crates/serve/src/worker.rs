@@ -220,7 +220,8 @@ pub(crate) enum Msg {
     /// The request took this slot; sent before any other message.
     Started(usize),
     Prompt(Timings),
-    Text(String, Timings),
+    /// Text and where its special tokens start ([`Event::Text`]).
+    Text(String, Vec<usize>, Timings),
     /// The last message.
     Done(Result<Outcome, GenError>),
     /// The request took its slot but did not start: the state of the request
@@ -600,7 +601,9 @@ fn sink_of(events: &Events) -> impl FnMut(Event<'_>) -> io::Result<()> + '_ {
     |ev| {
         let m = match ev {
             Event::Prompt(t) => Msg::Prompt(t.clone()),
-            Event::Text(text, t) => Msg::Text(text.to_owned(), t.clone()),
+            Event::Text(text, specials, t) => {
+                Msg::Text(text.to_owned(), specials.to_vec(), t.clone())
+            }
         };
         events.send(m)
     }
