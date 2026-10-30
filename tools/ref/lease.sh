@@ -1686,7 +1686,10 @@ case $1 in
     ;;
   script) echo '0 stub' ;;
   annotate | report)
-    case $* in *next*) exit 0 ;; esac
+    while [ "$#" -gt 1 ]; do
+      case "$1:$2" in -s:next | -S:next) exit 0 ;; esac
+      shift
+    done
     exec "$STUB_PERF_HELD" "$STUB_PERF_RECORD"
     ;;
   *) exit 64 ;;
@@ -1735,7 +1738,8 @@ EOF
     kill "$own_tp" "$own_stub" "$own_reaper" 2> /dev/null
     wait "$own_tp" "$own_stub" "$own_reaper" 2> /dev/null
     for phase in record fork startup annotate callers fail bound; do
-      pdir=$t/perf-$phase
+      # A path holding `next`, `-s next` and `-S next` checks that the stub skips only the `next` symbol argument.
+      pdir="$t/perf-next -s next -S next $phase"
       mkdir "$pdir"
       bpath=$t/perf-bin:$PATH
       [ "$phase" != fork ] || bpath=$t/fork-bin:$bpath
