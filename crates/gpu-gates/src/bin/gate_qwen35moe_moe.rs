@@ -1330,7 +1330,11 @@ mod gate {
         let ubatch = c
             .router
             .enqueue_ubatch(stream, bf, &short, 1, sink, &mut ub_got);
-        let named = |e: &bloomery_gpu::GpuError| e.to_string().contains("x.len()");
+        // The fused launch names `x.len()`; the ubatch's tile checks name the values `x holds`.
+        let named = |e: &bloomery_gpu::GpuError| {
+            let e = e.to_string();
+            e.contains("x.len()") || e.contains("x holds")
+        };
         let refused = fused.is_err_and(|e| named(&e)) && ubatch.is_err_and(|e| named(&e));
         println!(
             "wide512 bf16 short activation row: fused and ubatch refused {}",
