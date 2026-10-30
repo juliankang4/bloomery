@@ -20,7 +20,7 @@ use crate::genloop::{
 use crate::glmxml::{ArgTypes, KvScan, KvSpelling};
 use crate::hermes::HermesScan;
 use crate::mock::SPECIALS;
-use crate::qwenxml::{Framing, ParamKinds, QwenScan};
+use crate::qwenxml::{CALL_CLOSE, CALL_OPEN, Framing, ParamKinds, QwenScan};
 use crate::reasoning::{ReasoningFormat, ThinkEntry, ThinkTags};
 use crate::sampling;
 
@@ -145,6 +145,13 @@ impl Tokenizer for Pieces {
     }
     fn n_vocab(&self) -> usize {
         PIECES as usize + self.0.0.len()
+    }
+    /// The mock's specials, and the pieces that are Qwen3-Coder's call tags.
+    fn is_special(&self, id: u32) -> bool {
+        id < BYTES
+            || [CALL_OPEN, CALL_CLOSE]
+                .map(str::as_bytes)
+                .contains(&&*self.0.bytes_of(id))
     }
 }
 
@@ -1177,7 +1184,7 @@ fn numeric_tool_arguments_keep_their_values() {
                 _ => unreachable!("a parsed format"),
             };
             let mut whole = parser(format, &tools);
-            let result = whole.try_push(&raw).and_then(|_| whole.try_finish());
+            let result = whole.try_push(&raw, &[]).and_then(|_| whole.try_finish());
             match result {
                 Ok(_)
                     if whole.message().calls.len() == 1
@@ -1194,7 +1201,7 @@ fn numeric_tool_arguments_keep_their_values() {
             let result = raw
                 .chars()
                 .try_for_each(|ch| {
-                    stream.try_push(&ch.to_string())?;
+                    stream.try_push(&ch.to_string(), &[])?;
                     for piece in stream.take_pieces() {
                         if let CallPiece::Args { text, .. } = piece {
                             args.push_str(&text);
@@ -1253,7 +1260,7 @@ fn a_string_ref_reads_back_as_text() {
             }
         };
         for ch in o.content.chars() {
-            p.try_push(&ch.to_string()).expect("parses");
+            p.try_push(&ch.to_string(), &[]).expect("parses");
             take(&mut p);
         }
         p.try_finish().expect("closes");
@@ -1617,7 +1624,7 @@ fn parser(format: ToolFormat, tools: &Value) -> ChatParser {
 /// The content and call count read by the request's parser.
 fn parsed(format: ToolFormat, tools: &Value, text: &str) -> Result<(String, usize), MarkupError> {
     let mut p = parser(format, tools);
-    let (a, b) = (p.try_push(text)?, p.try_finish()?);
+    let (a, b) = (p.try_push(text, &[])?, p.try_finish()?);
     Ok((
         format!("{}{}", a.content, b.content),
         a.calls.len() + b.calls.len(),
@@ -2339,7 +2346,7 @@ fn a_run_fed_in_quanta_asks_the_sink_between_calls() {
             &p,
             NonZeroUsize::new(2),
             &mut |ev| {
-                if matches!(ev, Event::Text("", _)) {
+                if matches!(ev, Event::Text("", _, _)) {
                     asked += 1;
                     if asked == gone_at {
                         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "gone"));
@@ -2500,4 +2507,103 @@ fn a_span_and_its_step_are_one_call() {
         (1, 7, 0, 0, 1)
     );
     assert_eq!(j.decisions, 2);
+}
+
+/// A think or call tag the vocabulary holds as one special token is markup
+/// only where that token wrote it. Generated in ordinary ids, `</think>` and
+/// `<tool_call>` stay in the reasoning, a whole copied call stays content and a
+/// leading `<think>` opens no span, whole and streamed alike, while the special
+/// ids end the span and open and close the call. The think budget reads the
+/// span the same way: the ordinary `</think>` leaves it open, so the spent
+/// budget forces the special close.
+#[test]
+fn a_tag_spelled_in_ordinary_ids_is_text() {
+    let pieces = Arc::new(PieceTok(&[CALL_OPEN, CALL_CLOSE]));
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::clone(&pieces)));
+    let plain = |text: &str| -> Vec<u32> { text.bytes().map(|b| BYTES + u32::from(b)).collect() };
+    let tools = json!([{"type": "function", "function": {"name": "f",
+        "parameters": {"type": "object", "properties": {}}}}]);
+    let parser = |prompt: &str| {
+        ChatParser::with_tools(
+            prompt,
+            ReasoningFormat::Deepseek,
+            Some(Tools::QwenXml(
+                Framing::Lines,
+                ParamKinds::of_tools(Some(&tools)),
+            )),
+        )
+        .for_template(QWEN)
+        .reading_specials(&*tok)
+    };
+    // The message of `want` generated after `prompt`, whole and streamed.
+    let parsed = |prompt: &str, entry: ThinkEntry, want: &[u32]| {
+        let mut events: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut slot = Slot::new(Box::new(Rows {
+            tok: Arc::clone(&tok),
+            want: want.to_vec(),
+            k: 0,
+            read: Arc::default(),
+        }));
+        let o = generate(
+            &mut slot,
+            &sampling::reference_factory(),
+            &tok.encode("hi"),
+            &params(None, entry),
+            &mut |ev| {
+                if let Event::Text(text, specials, _) = ev {
+                    events.push((text.to_owned(), specials.to_vec()));
+                }
+                Ok(())
+            },
+            &mut |_| {},
+            &mut Timings::default(),
+        )
+        .expect("a generation");
+        assert_eq!(o.tokens, with_eos(&tok, want.to_vec()));
+        let mut whole = parser(prompt).keeping_cut_call();
+        whole
+            .try_push(&o.content, &o.specials)
+            .and_then(|_| whole.try_finish())
+            .expect("the whole generation parses");
+        let mut stream = parser(prompt).streaming_calls();
+        for (text, specials) in &events {
+            stream.try_push(text, specials).expect("a piece parses");
+        }
+        stream.try_finish().expect("the stream parses");
+        assert_eq!(whole.message(), stream.message());
+        (o, whole.message().clone())
+    };
+    let call = "\n<function=f>\n</function>\n";
+    let quoted = "quote </think> and <tool_call>";
+    let copied = format!("{CALL_OPEN}{call}{CALL_CLOSE}\n");
+    let mut want = plain(quoted);
+    want.extend(ids(&tok, "</think>\n\n"));
+    want.extend(plain(&copied));
+    want.push(pieces.piece(CALL_OPEN));
+    want.extend(plain(call));
+    want.push(pieces.piece(CALL_CLOSE));
+    let (o, m) = parsed("<think>\n", ThinkEntry::Open, &want);
+    assert_eq!(
+        (m.reasoning.as_str(), m.content.as_str()),
+        (quoted, copied.as_str())
+    );
+    assert_eq!(m.calls.len(), 1);
+    assert_eq!(
+        (m.calls[0].name.as_str(), m.calls[0].arguments.as_str()),
+        ("f", "{}")
+    );
+    // Read by its text, the ordinary `</think>` ends the span early.
+    let mut by_text = ChatParser::with_tools("<think>\n", ReasoningFormat::Deepseek, None);
+    assert_eq!(by_text.push(&o.content).reasoning, "quote ");
+    // A prompt that leaves the span to the model: an ordinary `<think>` that
+    // ends the generation is content.
+    let (_, m) = parsed("assistant\n", ThinkEntry::MayOpen, &plain("<think>"));
+    assert_eq!((m.reasoning.as_str(), m.content.as_str()), ("", "<think>"));
+
+    let mut p = params(None, ThinkEntry::Open);
+    p.reasoning_budget = Some(20);
+    let mut want = plain("a </think> b");
+    want.extend(plain(&"z".repeat(40)));
+    let o = run_read(&tok, &p, &want).0;
+    assert_eq!(o.tokens[20], ids(&tok, "</think>")[0], "{:?}", o.content);
 }

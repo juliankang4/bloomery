@@ -1296,7 +1296,7 @@ fn keep(state: &State, ids: &Ids, response: &Value, conversation: Vec<Value>) {
 /// The finished response of the whole generation `o`.
 fn answer(ids: &Ids, o: &Outcome, mut parser: ChatParser) -> Result<Value, ApiError> {
     parser
-        .try_push(&o.content)
+        .try_push(&o.content, &o.specials)
         .and_then(|_| parser.try_finish_at(o.cut()))
         .map_err(|e| tool_markup_error(&e))?;
     let mut items = Items::new(ids);
@@ -1562,8 +1562,8 @@ fn stream(
                         last["prompt_progress"] = progress(t);
                     }
                 }
-                Event::Text(text, t) => {
-                    let d = parser.try_push(text).map_err(|e| {
+                Event::Text(text, specials, t) => {
+                    let d = parser.try_push(text, specials).map_err(|e| {
                         markup = Some(e);
                         io::Error::other("tool-call markup does not parse")
                     })?;

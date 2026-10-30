@@ -351,6 +351,9 @@ pub(crate) fn cause_word(stop: Option<StopKind>, failed: bool) -> &'static str {
 /// A finished generation.
 pub(crate) struct Outcome {
     pub content: String,
+    /// Where a special token's text starts in `content`: byte offsets,
+    /// ascending ([`Event::Text`]).
+    pub specials: Vec<usize>,
     /// Every generated id, the end-of-generation one included.
     pub tokens: Vec<u32>,
     pub stop: StopKind,
@@ -371,11 +374,13 @@ impl Outcome {
 pub(crate) enum Event<'a> {
     /// The prompt is evaluated (llama-server's `prompt_progress`, sent once, complete).
     Prompt(&'a Timings),
-    /// Text safe to stream. Empty between the calls of a prompt or of a run
-    /// of fixed ids ([`Need::Fill`]) run a call a round ([`Prompt`]): the
-    /// event a client gone fails on, as a token's text does, its timings the
-    /// request's so far.
-    Text(&'a str, &'a Timings),
+    /// Text safe to stream, and the byte offsets in it, ascending, where a
+    /// special token's text starts ([`Tokenizer::is_special`]): the output
+    /// parsers read a marker only there. Empty between the calls of a prompt
+    /// or of a run of fixed ids ([`Need::Fill`]) run a call a round
+    /// ([`Prompt`]): the event a client gone fails on, as a token's text
+    /// does, its timings the request's so far.
+    Text(&'a str, &'a [usize], &'a Timings),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1974,6 +1979,10 @@ pub(crate) struct Gen {
     budget: usize,
     scan: StopScan,
     dec: Box<dyn Decoder>,
+    /// The vocabulary, for which generated ids are special.
+    vocab: Arc<dyn Tokenizer>,
+    /// Where a special id's text starts in the scan's text, ascending.
+    specials: Vec<usize>,
     generated: Vec<u32>,
     /// The ids a draw sees, in order: the prompt's tail (its last
     /// `repeat_last_n` ids, as much of the prompt as there is), then the
@@ -2099,6 +2108,8 @@ impl Gen {
             budget: usize::try_from(p.n_predict).unwrap_or(usize::MAX),
             scan: StopScan::new(p.stop.clone()),
             dec: slot.vocab.decoder(),
+            vocab: Arc::clone(&slot.vocab),
+            specials: Vec::new(),
             generated: Vec::new(),
             history: Vec::new(),
             stop: StopKind::Limit,
@@ -2111,9 +2122,10 @@ impl Gen {
             tok: None,
             think: (p.reasoning_budget.is_some() || p.reasoning_loop).then(|| {
                 Think::new(
-                    p.think_split
-                        .clone()
-                        .unwrap_or_else(|| ThinkSplit::for_entry_with(p.think_entry, p.think)),
+                    p.think_split.clone().unwrap_or_else(|| {
+                        ThinkSplit::for_entry_with(p.think_entry, p.think)
+                            .reading_specials(&*slot.vocab)
+                    }),
                     p.reasoning_budget,
                     slot.vocab.encode(p.think.close),
                     p.reasoning_loop,
@@ -2229,18 +2241,31 @@ impl Gen {
         self.think.as_ref().map_or(usize::MAX, |t| t.left)
     }
 
+    /// The special ids' starts in `text`, the scan's text it last sent, as
+    /// offsets into it.
+    fn sending(&self, text: &str) -> Vec<usize> {
+        let to = self.scan.sent();
+        let from = to - text.len();
+        let range = &self.specials[self.specials.partition_point(|&at| at < from)..];
+        range
+            .iter()
+            .take_while(|&&at| at < to)
+            .map(|at| at - from)
+            .collect()
+    }
+
     /// One taken id against the think budget and the loop guard: its text
     /// first — a piece that closes the span retires the tracker, the closing
     /// id spending nothing, and a piece that opens a model-opened span
     /// spending nothing either and starting the guard's span after it — then,
     /// only for a span already open, the count, which arms the forced close
     /// at zero, and the guard. Whether the guard found a loop.
-    fn spend(&mut self, piece: Option<&str>) -> bool {
+    fn spend(&mut self, piece: Option<&str>, special: Option<usize>) -> bool {
         let Some(t) = self.think.as_mut() else {
             return false;
         };
         if let Some(text) = piece {
-            let s = t.split.push(text);
+            let s = t.split.push(text, special.as_slice());
             if s.closed || !s.content.is_empty() {
                 self.think = None;
                 return false;
@@ -2450,7 +2475,7 @@ impl Gen {
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
     ) -> Result<bool, GenError> {
         if p.ran > 0 {
-            sink(Event::Text("", &self.tim))?;
+            sink(Event::Text("", &[], &self.tim))?;
         }
         let from = p.ran.checked_sub(1).map_or(p.kept.cache_n, |i| p.ends[i]);
         let to = p.ends[p.ran];
@@ -2542,7 +2567,7 @@ impl Gen {
             // a prompt's calls do: a client that went away ends the
             // generation, not the run.
             if span.fed > 0 {
-                sink(Event::Text("", &self.tim))?;
+                sink(Event::Text("", &[], &self.tim))?;
             }
             return Ok(Need::Fill);
         }
@@ -2562,6 +2587,15 @@ impl Gen {
                 break;
             }
             let piece = self.dec.push(tok);
+            // Where a special id's text starts in its piece: the piece ends
+            // with it, after any bytes the decoder held.
+            let special = piece
+                .as_deref()
+                .filter(|_| self.vocab.is_special(tok))
+                .map(|p| p.len().saturating_sub(self.vocab.decode(&[tok]).len()));
+            if let Some(at) = special {
+                self.specials.push(self.scan.text().len() + at);
+            }
             // The token's text out. A request that asks for probabilities
             // sends an event a token, its value written first, the text
             // possibly empty; any other sends text alone, when there is some.
@@ -2576,7 +2610,8 @@ impl Gen {
                 let token = self.generated.len() - 1;
                 c.take(tok, &self.logits, &pushed.send)
                     .map_err(|error| GenError::Logprobs { token, error })?;
-                sink(Event::Text(&pushed.send, &self.tim))?;
+                let specials = self.sending(&pushed.send);
+                sink(Event::Text(&pushed.send, &specials, &self.tim))?;
                 if let Some(w) = pushed.stopped {
                     self.stop = StopKind::Word;
                     self.stopping_word = w;
@@ -2585,7 +2620,8 @@ impl Gen {
             } else if let Some(piece) = &piece {
                 let pushed = self.scan.push(piece);
                 if !pushed.send.is_empty() {
-                    sink(Event::Text(&pushed.send, &self.tim))?;
+                    let specials = self.sending(&pushed.send);
+                    sink(Event::Text(&pushed.send, &specials, &self.tim))?;
                 }
                 if let Some(w) = pushed.stopped {
                     self.stop = StopKind::Word;
@@ -2595,7 +2631,7 @@ impl Gen {
             }
             // The think budget and the loop guard: the text first, then the
             // count and the guard, whose loop ends the generation here.
-            if self.spend(piece.as_deref()) {
+            if self.spend(piece.as_deref(), special) {
                 self.stop = StopKind::Loop;
                 break;
             }
@@ -2907,11 +2943,15 @@ impl Gen {
             None => false,
         };
         if valued || !rest.is_empty() {
-            sink(Event::Text(&rest, &self.tim))?;
+            let specials = self.sending(&rest);
+            sink(Event::Text(&rest, &specials, &self.tim))?;
         }
         self.tim.predicted_ms = ms_since(self.t1);
+        let content = self.scan.text().to_owned();
+        self.specials.retain(|&at| at < content.len());
         Ok(Outcome {
-            content: self.scan.text().to_owned(),
+            content,
+            specials: std::mem::take(&mut self.specials),
             tokens: std::mem::take(&mut self.generated),
             stop: self.stop,
             stopping_word: std::mem::take(&mut self.stopping_word),

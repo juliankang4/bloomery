@@ -112,7 +112,7 @@ pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io
                     v["prompt_progress"] = progress(t);
                     v
                 }
-                Event::Text(text, t) => {
+                Event::Text(text, _, t) => {
                     let mut v = ids.chunk(json!([choice(i, text, Value::Null)]));
                     if tpt {
                         v["timings"] = t.to_json();

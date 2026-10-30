@@ -235,6 +235,13 @@ pub trait Tokenizer: Send + Sync {
     }
     /// Vocabulary size, which is also the logit vector length.
     fn n_vocab(&self) -> usize;
+    /// Whether `id` is one of the vocabulary's special tokens (CONTROL or
+    /// USER_DEFINED): a marker the output parsers read only where this id
+    /// wrote it, never where ordinary tokens spell its text. The default marks none,
+    /// so every marker is read by its text.
+    fn is_special(&self, _id: u32) -> bool {
+        false
+    }
     /// The ids that open a user (or tool) message in this vocabulary's chat
     /// format: where a prompt's messages start, which a prompt call is cut at
     /// ([`Engine::prefill_splits`]). Empty (the default) marks none.

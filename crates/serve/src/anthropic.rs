@@ -591,7 +591,7 @@ fn whole(
         Ok(done) => done,
     };
     if let Err(e) = parser
-        .try_push(&o.content)
+        .try_push(&o.content, &o.specials)
         .and_then(|_| parser.try_finish_at(o.cut()))
     {
         return send_error(w, req, &tool_markup_error(&e));
@@ -831,7 +831,7 @@ fn stream(
     let r = {
         let mut sink = |ev: Event<'_>, _slot: usize| -> io::Result<()> {
             let s = out.open()?;
-            let Event::Text(text, t) = ev else {
+            let Event::Text(text, specials, t) = ev else {
                 return Ok(());
             };
             if text.is_empty() {
@@ -841,7 +841,7 @@ fn stream(
                 started = true;
                 event(s, &message_start(ids, t))?;
             }
-            let d = parser.try_push(text).map_err(|e| {
+            let d = parser.try_push(text, specials).map_err(|e| {
                 markup = Some(e);
                 io::Error::other("tool-call markup does not parse")
             })?;

@@ -44,6 +44,7 @@ use crate::callstream::{
     self, Advance, Args, CallPiece, Progress, Reading, Streamer, find_from, held, read_value,
 };
 use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
+use crate::engine::Tokenizer;
 use crate::glmxml::{self, ArgTypes, KvError, KvScan, KvSpelling};
 use crate::hermes::{self, HermesError, HermesScan};
 use crate::qwenxml::{self, Framing, ParamKinds, QwenScan, QwenXmlError};
@@ -611,11 +612,6 @@ impl ToolFormat {
     /// The source's own spelling, `framing` read (only when the source
     /// spells Qwen3-Coder's markup) from a rendered call.
     fn spelled(source: &str, framing: impl FnOnce() -> Option<Framing>) -> ToolFormat {
-        let qwen = [
-            qwenxml::CALL_OPEN,
-            qwenxml::FUNCTION_OPEN,
-            qwenxml::PARAM_OPEN,
-        ];
         // The recipient protocol's two markers, as llama.cpp's template
         // detection reads them (`to=commentary` and `<|eom|>`): Muse
         // Glimmer's template carries the end token but no commentary
@@ -624,7 +620,7 @@ impl ToolFormat {
             ToolFormat::MuseSpark
         } else if let Some(spelling) = KvSpelling::of_template(source) {
             ToolFormat::KvMarkup(spelling)
-        } else if qwen.iter().all(|tag| source.contains(tag)) {
+        } else if ::models::ToolFormat::of_template(source) == Some(::models::ToolFormat::QwenXml) {
             framing().map_or(ToolFormat::Unparsed, ToolFormat::QwenXml)
         } else if source.contains(DSML) {
             ToolFormat::Dsml(Spelling::of_template(source))
@@ -886,6 +882,19 @@ impl ChatParser {
         self
     }
 
+    /// The same parser, its think split and call scan reading their tags
+    /// only where their special tokens wrote them, for those `tok` holds as
+    /// one special token (`SpecialTags`). The text it is fed then carries
+    /// where its special tokens start ([`ChatParser::try_push`]).
+    #[must_use]
+    pub(crate) fn reading_specials(mut self, tok: &dyn Tokenizer) -> Self {
+        self.think = self.think.take().map(|t| t.reading_specials(tok));
+        if let Some(Scan::Qwen(q)) = &mut self.scan {
+            q.read_specials(tok);
+        }
+        self
+    }
+
     /// Parses a whole generation.
     #[must_use]
     pub fn parse(
@@ -910,7 +919,7 @@ impl ChatParser {
     /// On markup a key/value, Hermes or Qwen scan refuses, or a streamed call the
     /// markup ends otherwise, naming it.
     pub fn push(&mut self, text: &str) -> Message {
-        self.try_push(text)
+        self.try_push(text, &[])
             .unwrap_or_else(|e| panic!("ChatParser::push on a scan that failed: {e}"))
     }
 
@@ -926,13 +935,15 @@ impl ChatParser {
             .unwrap_or_else(|e| panic!("ChatParser::finish on a scan that failed: {e}"))
     }
 
-    /// Feeds generated text; returns what may be sent now, or the tool-call
-    /// markup that does not parse.
-    pub fn try_push(&mut self, text: &str) -> Result<Message, MarkupError> {
+    /// Feeds generated text, its special tokens' texts starting at
+    /// `specials` (byte offsets, ascending); returns what may be sent now, or
+    /// the tool-call markup that does not parse.
+    pub fn try_push(&mut self, text: &str, specials: &[usize]) -> Result<Message, MarkupError> {
         let split = match &mut self.think {
-            Some(t) => t.push(text),
+            Some(t) => t.push(text, specials),
             None => Split {
                 content: text.to_owned(),
+                specials: specials.to_vec(),
                 ..Split::default()
             },
         };
@@ -941,7 +952,7 @@ impl ChatParser {
             Some(Scan::Dsml(d)) => Some(d.push_stream(&split.content)),
             Some(Scan::Kv(k)) => Some(k.push_stream(&split.content)?),
             Some(Scan::Hermes(h)) => Some(h.push(&split.content)?),
-            Some(Scan::Qwen(q)) => Some(q.push_stream(&split.content)?),
+            Some(Scan::Qwen(q)) => Some(q.push_stream(&split.content, &split.specials)?),
             Some(Scan::Muse(m)) => Some(m.push(&split.content)),
         };
         self.stream(scanned.as_ref())?;

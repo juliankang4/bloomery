@@ -255,7 +255,7 @@ fn streamed(
         total.calls.extend(d.calls);
     };
     for piece in pieces {
-        add(p.try_push(piece)?);
+        add(p.try_push(piece, &[])?);
     }
     add(p.try_finish()?);
     assert_eq!(&total, p.message(), "deltas sum to the message");
