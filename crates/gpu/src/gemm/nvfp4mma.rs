@@ -104,6 +104,8 @@ fn nvfp4_pack_q8(words: [u32; 4], d: f32, gs: f32) -> ([u32; 2], u32) {
         let decoded = crate::mxfp4::ue4m3_half(scale) * 2.0;
         inv = if decoded > 0.0 { 1.0 / decoded } else { 0.0 };
     }
+    // Byte i holds values i and i + 8, the order a weight stores its 16-value
+    // block in ([`nvfp4_walk`]).
     let mut packed = [0u32; 2];
     #[unroll]
     for i in 0..8 {
@@ -112,7 +114,7 @@ fn nvfp4_pack_q8(words: [u32; 4], d: f32, gs: f32) -> ([u32; 2], u32) {
         unsafe {
             ptx_asm!(
                 "{ .reg .b8 b; cvt.rn.satfinite.e2m1x2.f32 b, %2, %1; cvt.u32.u8 %0, b; }",
-                out("=r") byte, in("f") values[2 * i] * inv, in("f") values[2 * i + 1] * inv,
+                out("=r") byte, in("f") values[i] * inv, in("f") values[i + 8] * inv,
             );
         }
         packed[i / 4] |= byte << (8 * (i & 3));
@@ -303,27 +305,6 @@ mod swiglu {
 use swiglu::fused_swiglu;
 
 #[inline(always)]
-fn packed_pair(a: u32, b: u32) -> [u32; 2] {
-    let (lo, hi): (u32, u32);
-    // SAFETY: shifts, nibble selection and byte permutation use registers only.
-    unsafe {
-        ptx_asm!(
-            "{ .reg .b32 a4, a8, b4, b8, al, ah, bl, bh;\n\
-             shr.u32 a4, %2, 4; shr.u32 a8, %2, 8;\n\
-             shr.u32 b4, %3, 4; shr.u32 b8, %3, 8;\n\
-             lop3.b32 al, %2, a4, 0x0f0f0f0f, 0xe4;\n\
-             lop3.b32 ah, a4, a8, 0x0f0f0f0f, 0xe4;\n\
-             lop3.b32 bl, %3, b4, 0x0f0f0f0f, 0xe4;\n\
-             lop3.b32 bh, b4, b8, 0x0f0f0f0f, 0xe4;\n\
-             prmt.b32 %0, al, bl, 0x6420;\n\
-             prmt.b32 %1, ah, bh, 0x6420; }",
-            out("=r") lo, out("=r") hi, in("r") a, in("r") b,
-        );
-    }
-    [lo, hi]
-}
-
-#[inline(always)]
 fn mma(c: [f32; 4], a: [u32; 4], b: [u32; 2], sa: u32, sb: u32) -> [f32; 4] {
     let (d0, d1, d2, d3): (f32, f32, f32, f32);
     // SAFETY: the caller executes this register-only instruction in every lane of its warp.
@@ -443,15 +424,15 @@ impl TileColumns {
 /// chunk `q % 2`. The chunk number is XORed with bit 1 of the row index (onto
 /// its bit 1) and bit 2 (onto its bit 0), so neither the eight rows one
 /// `ldmatrix` phase reads at one chunk nor the four rows' two chunks of one
-/// half that eight threads copy and pack at a time meet a bank twice.
+/// half that eight threads copy at a time meet a bank twice.
 #[inline(always)]
 const fn chunk(row: usize, q: usize) -> usize {
     row * ROW_W + 4 * (q ^ ((row & 2) | ((row >> 2) & 1)))
 }
 // Every row's chunks are aligned, inside the row and distinct; the eight rows
 // one `ldmatrix` phase reads at one chunk, and the four rows' two chunks of
-// one half that eight threads (`sr = tid / 2`, `half = tid & 1`) copy and pack
-// at a time, cover the 32 banks once.
+// one half that eight threads (`sr = tid / 2`, `half = tid & 1`) copy at a
+// time, cover the 32 banks once.
 const _: () = {
     use cuda_device::swizzle::{WARP_LANES, conflict_degree};
     let mut row = 0;
@@ -560,8 +541,10 @@ macro_rules! nvfp4_copy {
 /// weight row `$wrow` (`$wq` codes, `$we` scales) and, for `$sr < 64`, from
 /// activation column `$col` (`$aq`, `$ae`) two steps ahead
 /// ([`nvfp4_copy`]), the activation codes of its first `$bc <= 64` rows
-/// alone, and before a step's barrier turns its own weight halves of the
-/// step's stage into the MMA's nibble order ([`packed_pair`]); then `$body`
+/// alone. The MMA reads both operands' codes as stored: a weight keeps values
+/// `i` and `i + 8` of a 16-value block in byte `i`, and the activation planes
+/// hold theirs in the same order ([`nvfp4_pack_q8`]), so each block's products
+/// pair the same values under one scale pair. Then `$body`
 /// reads each live half `$h` of the stage, in K order: its codes through
 /// `$wp` and `$bp` at [`chunk`] `2 * $h` and `2 * $h + 1`, the activation's
 /// in its first `$bc` rows, its scale words through `$sp`. Every thread of the block runs it, `$steps` 64-value
@@ -610,24 +593,6 @@ macro_rules! nvfp4_walk {
             let bs = unsafe { $bp.add(st * B_STAGE) };
             // SAFETY: st < STAGES, so stage st starts inside the STAGES·S_STAGE words of S.
             let ss = unsafe { $sp.add(st * S_STAGE) };
-            for h in 0..HALVES {
-                ::cuda_device::thread::__unroll_config::<0>();
-                if h < halves {
-                    let own = chunk($sr, 2 * h + $half);
-                    // SAFETY: sr < TILE_ROWS and 2 * h + half < 2 * HALVES, so own is an aligned
-                    // four-word chunk inside row sr of stage st of W; the wait above completed
-                    // this thread's copy of it.
-                    let w = unsafe { (*ws.add(own).cast::<cuda_device::vector::U32x4>()).0 };
-                    let p0 = packed_pair(w[0], w[1]);
-                    let p1 = packed_pair(w[2], w[3]);
-                    // SAFETY: the same chunk; chunk maps each (row, q) to its own words, so this
-                    // thread is its one writer, and no thread reads it before the barrier below.
-                    unsafe {
-                        *ws.add(own).cast::<cuda_device::vector::U32x4>() =
-                            cuda_device::vector::U32x4::new([p0[0], p0[1], p1[0], p1[1]]);
-                    }
-                }
-            }
             // Publishes the stage and tells that every thread is done with step - 1's, which the
             // copies of step + 2 refill.
             thread::sync_threads();
