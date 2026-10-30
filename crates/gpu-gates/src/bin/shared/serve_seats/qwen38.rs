@@ -24,7 +24,10 @@
 //! context it asks and sizes the load's ubatch arena, each at most the slot's context.
 //!
 //! `--slot-save-path` names the directory the slot actions answer from, as
-//! llama-server's; without it every slot action is refused. `--ctx` is `--ctx-size` under its family's other spelling. The model is
+//! llama-server's; without it every slot action is refused. A saved slot is
+//! the snapshot the prompt cache takes, in its byte form, and a restore puts
+//! it back as the cache does, the draft rejoining where it left; a slot that
+//! holds an image is refused, as the cache keeps none. `--ctx` is `--ctx-size` under its family's other spelling. The model is
 //! `$BLOOMERY_REF_MODEL` (a `--model` flag is not taken: the family's
 //! binaries read the one the profile pins); its first shard gives the
 //! vocabulary, `tokenizer.chat_template` the chat template
@@ -417,6 +420,7 @@
 //! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
 //! kinds and exits.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -427,6 +431,7 @@ use bloomery_gpu::arch::qwen3moe::{
     Body38, Folder38, KvQ8, Model38, Prompt38, Seq38, TargetRows, checkpoint_budget38,
     checkpoint_price38, point_row_budget38, seq38_bytes,
 };
+use bloomery_gpu::checkpoint::bytes;
 use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::route_trace::RouteTrace;
@@ -438,7 +443,7 @@ use bloomery_gpu_gates::bind::{
     AutoSlots, CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine,
     SlotAsk, SlotFlags, SlotPassRow, SlotStep, SlotsFrom, TemplateFile, Vocab, arm_screen, begin,
     bind_server, eprint_noted, model_props, note_line, parallel_line, place_word, placement_of,
-    prefill_then_step, put_back, slots_of,
+    prefill_then_step, put_back, seat_failure, slots_of,
 };
 use bloomery_gpu_gates::generate::{BreakEven, FloorShort, Lane, Place, lane_of};
 use bloomery_gpu_gates::need;
@@ -477,7 +482,7 @@ use runtime::width::Mode as WidthMode;
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
     CacheNote, DraftProps, Drafted, EngineProps, Pending, ResidencyReset, Saved, ServeError,
-    SharedPrefix,
+    SharedPrefix, StateError,
 };
 use tokenizer::Tokenizer;
 
@@ -3190,6 +3195,42 @@ type Saved38 = Cached<Seq38, Option<ParkedDraft<TargetRows>>>;
 /// What a refusal of another seat's state names ([`put_back`]).
 const WHOSE: &str = "a qwen4exp body's";
 
+/// The reasons this seat turns a slot's draft off for, each coded in a saved
+/// state's byte form by its place here ([`ParkedDraft::put`]). Append only:
+/// a saved file names each by its place.
+const OFF_WHYS: [&str; 1] = [DRAFT_OFF_WHY];
+
+/// An arena's code in a saved state's byte form ([`ParkedDraft::put`]). A
+/// code, once saved files hold it, keeps its arena.
+fn arena_code(walk: TargetRows) -> u8 {
+    match walk {
+        TargetRows::Step => 0,
+        TargetRows::Pass => 1,
+        TargetRows::Ubatch => 2,
+    }
+}
+
+/// The carried arena and its row capacity for a code [`arena_code`] gave:
+/// a parked state keeps the step and pass rows alone.
+fn arena_of(code: u8) -> Option<(TargetRows, usize)> {
+    [
+        (TargetRows::Step, 1),
+        (TargetRows::Pass, Prompt38::PASS_ROWS),
+    ]
+    .into_iter()
+    .find(|&(a, _)| arena_code(a) == code)
+}
+
+/// A failure of a slot file's byte form as the server's kind: a refusal by
+/// name is the request's (`Format`), a failure of the stream the file's
+/// (`Io`).
+fn byte_failure(e: bytes::Fail) -> StateError {
+    match e {
+        bytes::Fail::Refused(e) => StateError::Format(e.to_string()),
+        bytes::Fail::Io(e) => StateError::Io(e),
+    }
+}
+
 /// The draft's three steps around a Qwen3.8 state's put-back ([`put_back`]).
 impl PutBack for Q38 {
     type Body = Seq38;
@@ -3688,6 +3729,61 @@ impl Seat for Q38 {
         Ok(at)
     }
 
+    /// The selected slot's state as [`Seat::snapshot`] takes it, in its
+    /// byte form: the body's ([`Seq38::put`]), then the draft's side
+    /// ([`ParkedDraft::put`]); the bytes written. Refused as the snapshot
+    /// refuses (a sequence that holds an image).
+    fn save_state(&mut self, out: &mut dyn Write) -> Result<u64, StateError> {
+        let failed = |e: GateError| seat_failure(&*e, "a slot save".to_owned());
+        let saved = Seat::snapshot(self).map_err(failed)?;
+        let saved = Saved38::of(&*saved, WHOSE).map_err(failed)?;
+        let mut w = bytes::Put::new(out);
+        saved
+            .body()
+            .map_err(failed)?
+            .put(&mut w)
+            .map_err(byte_failure)?;
+        ParkedDraft::put(saved.draft.as_ref(), &mut w, arena_code, &OFF_WHYS)
+            .map_err(byte_failure)?;
+        w.flush().map_err(byte_failure)?;
+        Ok(w.bytes())
+    }
+
+    /// The state [`Seat::save_state`] wrote, read whole and then put back
+    /// into the selected slot as [`Seat::resume`] puts back a cached one: the
+    /// slot's next call runs as it would have with no save between, its
+    /// draft joining where it left. Refused by name, nothing on the card
+    /// touched, for a stream that is not such a state of this load, for
+    /// one saved under another draft ([`PutBack::takes`]), and for a draft's
+    /// side the state cannot carry: an id past the vocabulary or rows waiting
+    /// that the state's arenas do not hold ([`ParkedDraft::check`]). The file
+    /// does not name the MTP draft's weights: a draft file other than the
+    /// save's drafts from the saved store, which the target's verify keeps
+    /// correct at a lower acceptance.
+    fn restore_state(&mut self, input: &mut dyn Read) -> Result<usize, StateError> {
+        let mut r = bytes::Take::new(input);
+        let body = self.s.model().seq_take(&mut r).map_err(byte_failure)?;
+        let draft = ParkedDraft::take(&mut r, arena_of, &OFF_WHYS).map_err(byte_failure)?;
+        r.end().map_err(byte_failure)?;
+        PutBack::takes(self, &draft)
+            .map_err(|e| StateError::Format(format!("a slot restore: {e}")))?;
+        if let Some(side) = &draft {
+            let vocab = self
+                .s
+                .model()
+                .n_vocab()
+                .map_err(|e| seat_failure(&e, "a slot restore".to_owned()))?;
+            side.check(vocab, body.positions(), |walk, rows, pos0| {
+                body.check_draft_rows(walk, rows, pos0)
+            })
+            .map_err(byte_failure)?;
+        }
+        let n = body.positions() as usize;
+        Seat::resume(self, &Saved38::landed(body, draft))
+            .map_err(|e| seat_failure(&*e, "a slot restore".to_owned()))?;
+        Ok(n)
+    }
+
     /// The body's share rule (`GpuModel::seq_share_point`): the nearest
     /// point of slot `from`'s sequence at or below `n` the selected slot can
     /// stand at, where under the MTP draft the draft rejoins.
@@ -3740,6 +3836,67 @@ mod tests {
     use super::parse_args;
     use super::ubatch_rule;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
+
+    /// Saved arena codes stay fixed; both parked arena fields refuse rows
+    /// the state does not carry. Mutant: accept Ubatch in `arena_of`.
+    #[test]
+    fn parked_arenas_keep_their_codes_and_refuse_uncarried_rows() {
+        use super::{OFF_WHYS, ParkedDraft, TargetRows, arena_code, arena_of, bytes};
+
+        assert_eq!(
+            [TargetRows::Step, TargetRows::Pass, TargetRows::Ubatch].map(arena_code),
+            [0, 1, 2],
+            "saved files keep these arena codes"
+        );
+        assert_eq!(
+            [arena_of(0), arena_of(1)],
+            [
+                Some((TargetRows::Step, 1)),
+                Some((TargetRows::Pass, super::Prompt38::PASS_ROWS))
+            ],
+            "the reader uses the carried arenas' physical capacities"
+        );
+        for refresh in [true, false] {
+            for code in 0..=u8::MAX {
+                let mut b = Vec::new();
+                let mut w = bytes::Put::new(&mut b);
+                w.one(1u8).unwrap(); // MTP draft side.
+                w.one(u8::from(refresh)).unwrap();
+                if refresh {
+                    w.array(&[7u32]).unwrap();
+                    w.one(3u32).unwrap();
+                    w.one(code).unwrap();
+                    w.count(0).unwrap();
+                    w.one(0u8).unwrap(); // No last unit.
+                } else {
+                    w.one(1u8).unwrap(); // Last unit.
+                    w.one(code).unwrap();
+                    w.count(1).unwrap();
+                }
+                w.one(0u8).unwrap(); // No skip.
+                w.one(0u8).unwrap(); // Draft on.
+                w.flush().unwrap();
+                let mut input = b.as_slice();
+                let mut r = bytes::Take::new(&mut input);
+                let back = ParkedDraft::take(&mut r, arena_of, &OFF_WHYS);
+                if code < 2 {
+                    let back = back.expect("a carried arena");
+                    r.end().unwrap();
+                    let mut out = Vec::new();
+                    let mut w = bytes::Put::new(&mut out);
+                    ParkedDraft::put(back.as_ref(), &mut w, arena_code, &OFF_WHYS).unwrap();
+                    w.flush().unwrap();
+                    assert_eq!(out, b, "a carried arena keeps the parked state's bytes");
+                } else {
+                    let e = back.expect_err("an uncarried arena").to_string();
+                    assert!(
+                        e.contains(&format!("a parked draft's arena of code {code}")),
+                        "{e}"
+                    );
+                }
+            }
+        }
+    }
 
     /// The seat reads the ubatch flag under both of llama-server's spellings
     /// (`LLAMA_ARG_UBATCH` reaches it as `--ubatch-size`), and the size it

@@ -144,6 +144,23 @@ impl Drop for Served {
     }
 }
 
+/// A slot action (`POST /slots/{slot}?action=...`) through [`curl`], printed:
+/// its status and its JSON (`Null` when the body is not JSON).
+pub fn slot_action(
+    url: &dyn Fn(&str) -> String,
+    slot: u64,
+    action: &str,
+    body: &Value,
+) -> Result<(u16, Value), GateError> {
+    let (st, text) = curl(
+        &url(&format!("/slots/{slot}?action={action}")),
+        Some(body),
+        false,
+    )?;
+    println!("slots {action} of slot {slot}: HTTP {st}: {text}");
+    Ok((st, serde_json::from_str(&text).unwrap_or(Value::Null)))
+}
+
 /// One request through curl: the status and the body. The request body goes
 /// through curl's stdin, not its argv: a prompt of a serving context's ids is
 /// longer than one argument may be (Linux `MAX_ARG_STRLEN`, 128 KiB).

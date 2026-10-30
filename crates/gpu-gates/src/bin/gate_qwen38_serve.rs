@@ -18,10 +18,11 @@
 //! draft-off server's, and each slot's chooser ends its warm-up
 //! ([`lookup_cost_turns`]). `plain` runs the main server with the
 //! draft off, then every clause of its own below. `drafted` runs the main
-//! server with MTP and its drafted clauses alone, stopped before any other
-//! server. These last two arms load their mains, the slots clause's two, the
-//! width chooser's one, the sampled rounds' one, the unhosted-pool clause's
-//! one and the draft share clause's unset-draft one (stopped at its `load
+//! server with MTP and its drafted clauses alone, stopped before the one
+//! other server it starts, the slot-file clause's. These last two arms load
+//! their mains, the slots clause's two, the width chooser's one, the sampled
+//! rounds' one, the slot-file clause's one, the unhosted-pool clause's one
+//! and the draft share clause's unset-draft one (stopped at its `load
 //! draft=off` record); the `ctx` clause's three starts, the residency word's
 //! one and the unhosted-pool clause's plan-only one stop before the load.
 //! The plain and drafted arms start the server beside this binary (`--host
@@ -304,7 +305,10 @@
 //!   round clause alone (the fallback loop's ids are its alone ids too).
 //!
 //! Then the server is killed by the handle this binary spawned it with and
-//! waited for — the drafted arm ends here — and, on the plain arm, more
+//! waited for (the drafted arm then runs the slot-file clause on a server
+//! of its own and ends, [`slot_file`]: a slot saved to a file, erased and
+//! restored under the draft continues as the straight run does, and the file
+//! cut short is refused by name), and, on the plain arm, more
 //! servers start on the card, one at a time: the `ctx` clause's three, the
 //! `paged` clause's probes, the draft share clause's three and the residency
 //! word's one (they stop before the load, or are refused before it, but the
@@ -520,14 +524,14 @@ mod gate {
     use app::mtp::MtpBody;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, CHECKPOINT_EVERY, KvQ8, checkpoint_budget38, seq38_bytes,
+        Body38, CHECKPOINT_EVERY, KvQ8, Prompt38, checkpoint_budget38, seq38_bytes,
     };
     use bloomery_gpu::host::xstream::XSTREAM_ROOM;
     use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, step_above};
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
         LookupCompletion, PrefixRestore, curl, draft_counts, ids_of, json_of, metric, parse_ids,
-        prefix_restore, server_log, shared_system_prompt, slot_erased,
+        prefix_restore, server_log, shared_system_prompt, slot_action, slot_erased,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -5237,7 +5241,462 @@ mod gate {
         ok &= sampled_served((st, &body), (st1, &body1), &first)?;
         ok &= cache(&url, &err_log, true, "drafted")?;
         println!("server stopped: {}", served.stop()?);
+        ok &= slot_file(dir, levers, ids)?;
         Ok(ok)
+    }
+
+    /// The slot-file clause (the module header): a server of its own under
+    /// `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off`, the fixed window and
+    /// `--cache-ram 0`, so an erased slot leaves no state any other owner
+    /// could give back. `--ids` fed fresh, then `--ids` plus its greedy reply
+    /// continued on the slot that holds it (the straight run); `--ids` fed
+    /// fresh again, the slot saved to a file, erased and restored from it,
+    /// and the same continuation. The restore puts back the positions the
+    /// save wrote, reading every byte of the engine's part
+    /// (`slot_file_round_trip`), and the continuation after it is the
+    /// straight run's: its ids, its kept prefix, its draft counts and joins,
+    /// no draft-off line on either (`slot_file_restore_is_the_straight_run`:
+    /// the draft's side came back with the body's). The same file cut short
+    /// by one byte is refused by name, a 400, and the server serves on with
+    /// the fresh run's ids (`slot_file_cut_short_is_refused_by_name`), and
+    /// so is each file whose current or one checkpoint PLE history holds an
+    /// id past the vocabulary or the model's reserved image placeholder,
+    /// one history and one bad id a file
+    /// (`slot_file_past_vocab_ple_history_is_refused_by_name`,
+    /// `slot_file_image_ple_history_is_refused_by_name`). Changing
+    /// only a pending refresh's arena to the uncarried ubatch arena is also
+    /// a 400 and leaves the server serving the same fresh ids
+    /// (`slot_file_uncarried_refresh_arena_is_refused_by_name`), as do an
+    /// overflowing refresh first row and a last unit past its arena
+    /// (`slot_file_refresh_past_its_arena_is_refused_by_name`,
+    /// `slot_file_last_unit_past_its_arena_is_refused_by_name`), a refresh
+    /// id past the vocabulary
+    /// (`slot_file_past_vocab_refresh_id_is_refused_by_name`) and a refresh
+    /// whose first row is one on, reading rows of other positions
+    /// (`slot_file_shifted_refresh_rows_are_refused_by_name`): the draft's
+    /// side is checked against the restored state before it is put back.
+    /// Then a slot whose draft a cut turned off saves and restores
+    /// ([`slot_file_off_draft`]).
+    /// FAIL-first mutants: a restore that puts no state back keeps 0; one
+    /// whose state carries no draft side is refused (`a state saved with the
+    /// MTP draft off put back with it on`); a draft side left parked drafts
+    /// other counts or leaves the draft off by name.
+    fn slot_file(
+        dir: &Path,
+        levers: &bloomery_levers::Levers,
+        ids: &[u32],
+    ) -> Result<bool, GateError> {
+        const FILE: &str = "q38.slot";
+        const CUT: &str = "q38-cut.slot";
+        const BAD_PLE: &str = "q38-bad-ple.slot";
+        const BAD_ARENA: &str = "q38-bad-arena.slot";
+        const BAD_FIRST: &str = "q38-bad-first.slot";
+        const BAD_LAST: &str = "q38-bad-last.slot";
+        const BAD_ID: &str = "q38-bad-id.slot";
+        const BAD_ROW: &str = "q38-bad-row.slot";
+        let own = dir.join("slot-file");
+        let save = own.join("save");
+        std::fs::create_dir_all(&save)?;
+        let save_dir = save
+            .to_str()
+            .ok_or_else(|| format!("{}: not UTF-8", save.display()))?;
+        let err_log = own.join("server.err");
+        let ctx = CTX.to_string();
+        let args = [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--place",
+            "gate",
+            "--ctx-size",
+            &ctx,
+            "--parallel",
+            "1",
+            "--cache-ram",
+            "0",
+            "--slot-save-path",
+            save_dir,
+        ];
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::DRAFT, "mtp")
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env(bloomery_levers::MTP_WIDTH, "fixed");
+        drafted_card_budget(&mut cmd, levers, 1)?;
+        let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
+        println!("slot-file server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+
+        let first = greedy(&url, &err_log, ids, N_PREDICT, false)?;
+        first.show("slot file: --ids fresh");
+        let cont: Vec<u32> = ids.iter().chain(&first.tokens).copied().collect();
+        let straight = greedy(&url, &err_log, &cont, N_PREDICT, true)?;
+        straight.show("slot file: the continuation straight");
+        let again = greedy(&url, &err_log, ids, N_PREDICT, false)?;
+        again.show("slot file: --ids fresh again");
+        let file = json!({ "filename": FILE });
+        let (st_save, saved) = slot_action(&url, 0, "save", &file)?;
+        let (st_erase, _) = slot_action(&url, 0, "erase", &json!({}))?;
+        let (st_restore, restored) = slot_action(&url, 0, "restore", &file)?;
+        let back = greedy(&url, &err_log, &cont, N_PREDICT, true)?;
+        back.show("slot file: the continuation after the restore");
+        let mut ok = true;
+        check(
+            &mut ok,
+            "slot_file_round_trip",
+            first.ok
+                && again.tokens == first.tokens
+                && st_save == 200
+                && saved["n_saved"].as_u64().is_some_and(|n| n > 0)
+                && st_erase == 200
+                && st_restore == 200
+                && restored["n_restored"] == saved["n_saved"]
+                && restored["n_read"] == saved["n_written"],
+        );
+        check(
+            &mut ok,
+            "slot_file_restore_is_the_straight_run",
+            straight.ok
+                && back.ok
+                && back.tokens == straight.tokens
+                && back.cache_n == straight.cache_n
+                && back.cache_n > 0
+                && back.draft_n == straight.draft_n
+                && back.offs.is_empty()
+                && straight.offs.is_empty()
+                && format!("{:?}", back.joins) == format!("{:?}", straight.joins),
+        );
+
+        let bytes = std::fs::read(save.join(FILE))?;
+        std::fs::write(save.join(CUT), &bytes[..bytes.len().saturating_sub(1)])?;
+        let (st_cut, cut) = slot_action(&url, 0, "restore", &json!({ "filename": CUT }))?;
+        let (hst, health) = curl(&url("/health"), None, false)?;
+        let after = greedy(&url, &err_log, ids, N_PREDICT, false)?;
+        after.show("slot file: --ids fresh after the refusal");
+        check(
+            &mut ok,
+            "slot_file_cut_short_is_refused_by_name",
+            st_cut == 400
+                && cut["error"]["type"] == "invalid_request_error"
+                && cut["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("a short stream"))
+                && hst == 200
+                && health.contains("\"ok\"")
+                && after.tokens == first.tokens,
+        );
+
+        let fed: Vec<u32> = ids.iter().chain(&again.tokens).copied().collect();
+        let n = saved["n_saved"].as_u64().unwrap_or(0) as usize;
+        let (arena_at, side_at, arena, rows) = pending_refresh(&bytes, &fed, n)?;
+        println!("slot file: the pending refresh holds {rows} rows of arena {arena} from row 0");
+        let mut bad_arena = bytes.clone();
+        bad_arena[arena_at] = 2;
+        let mut bad_first = bytes.clone();
+        bad_first[arena_at + 1..arena_at + 9].copy_from_slice(&u64::MAX.to_le_bytes());
+        // The refresh's first id past the vocabulary, after its tags and its
+        // count.
+        let mut bad_id = bytes.clone();
+        bad_id[side_at + 10..side_at + 14].copy_from_slice(&u32::MAX.to_le_bytes());
+        // Its first row one on: inside the pass arena it reads rows that hold
+        // other positions, past the step arena's one row it is outside it.
+        let mut bad_row = bytes.clone();
+        bad_row[arena_at + 1..arena_at + 9].copy_from_slice(&1u64.to_le_bytes());
+        let shifted = if arena == 1 && rows < Prompt38::PASS_ROWS {
+            "arena as positions"
+        } else {
+            "a parked draft's refresh outside its arena"
+        };
+        let mut bad_last = bytes[..side_at].to_vec();
+        let mut w = bloomery_gpu::checkpoint::bytes::Put::new(&mut bad_last);
+        w.vals(&[1u8, 0, 1, 0])?; // MTP, no refresh, last unit in Step.
+        w.one(u64::MAX)?;
+        w.vals(&[0u8; 2])?; // No skip or off reason.
+        w.flush()?;
+        for (name, bad, clause, says) in [
+            (
+                BAD_ARENA,
+                bad_arena,
+                "slot_file_uncarried_refresh_arena_is_refused_by_name",
+                "a parked draft's arena of code 2",
+            ),
+            (
+                BAD_FIRST,
+                bad_first,
+                "slot_file_refresh_past_its_arena_is_refused_by_name",
+                "a parked draft's refresh outside its arena",
+            ),
+            (
+                BAD_LAST,
+                bad_last,
+                "slot_file_last_unit_past_its_arena_is_refused_by_name",
+                "a parked draft's last unit past its arena",
+            ),
+            (
+                BAD_ID,
+                bad_id,
+                "slot_file_past_vocab_refresh_id_is_refused_by_name",
+                "a saved draft id 4294967295 past the vocabulary",
+            ),
+            (
+                BAD_ROW,
+                bad_row,
+                "slot_file_shifted_refresh_rows_are_refused_by_name",
+                shifted,
+            ),
+        ] {
+            std::fs::write(save.join(name), &bad)?;
+            let (st_bad, refused) = slot_action(&url, 0, "restore", &json!({ "filename": name }))?;
+            let (hst, health) = curl(&url("/health"), None, false)?;
+            let after = greedy(&url, &err_log, ids, N_PREDICT, false)?;
+            after.show(&format!("slot file: --ids fresh after {name} was refused"));
+            check(
+                &mut ok,
+                clause,
+                st_bad == 400
+                    && refused["error"]["type"] == "invalid_request_error"
+                    && refused["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains(says))
+                    && hst == 200
+                    && health.contains("\"ok\"")
+                    && after.ok
+                    && after.tokens == first.tokens,
+            );
+        }
+
+        let hit = ple_histories(&bytes, &fed[..n.min(fed.len())]);
+        println!(
+            "slot file: PLE histories at {:?}",
+            hit.iter().map(|&(at, _)| at).collect::<Vec<_>>()
+        );
+        let path = ref_model_path()?;
+        let split = Split::open(&path)?;
+        let vocab = PlanInputs::describe(&split)?.spec.vocab;
+        let hash = engram::Hash::ple_from_keys(split.keys(), "qwen4exp", vocab)?;
+        let engram::hash::Window::Eos(window) = hash.window() else {
+            return Err("slot file: the model has no raw-id PLE hash".into());
+        };
+        for (id, clause, says) in std::iter::once((
+            u32::MAX,
+            "slot_file_past_vocab_ple_history_is_refused_by_name",
+            "vocabulary",
+        ))
+        .chain(window.image.map(|id| {
+            (
+                id,
+                "slot_file_image_ple_history_is_refused_by_name",
+                "image placeholder",
+            )
+        })) {
+            let mut ple_ok = hit.first().is_some_and(|&(at, _)| at == n) && hit.len() > 1;
+            for &(at, newest) in &hit {
+                let mut bad = bytes.clone();
+                bad[newest..newest + 4].copy_from_slice(&id.to_le_bytes());
+                std::fs::write(save.join(BAD_PLE), &bad)?;
+                let (st_bad, refused) =
+                    slot_action(&url, 0, "restore", &json!({ "filename": BAD_PLE }))?;
+                let (hst, health) = curl(&url("/health"), None, false)?;
+                let after = greedy(&url, &err_log, ids, N_PREDICT, false)?;
+                after.show(&format!(
+                    "slot file: --ids fresh after id {id} in the PLE history at {at} was refused"
+                ));
+                ple_ok &= st_bad == 400
+                    && refused["error"]["type"] == "invalid_request_error"
+                    && refused["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("a saved PLE history") && m.contains(says))
+                    && hst == 200
+                    && health.contains("\"ok\"")
+                    && after.ok
+                    && after.tokens == first.tokens;
+            }
+            check(&mut ok, clause, ple_ok);
+        }
+        ok &= slot_file_off_draft(&url, &err_log, &save)?;
+        println!("slot-file server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
+    /// The slot-file clause's draft-off round trip (`slot_file_off_draft_round_trip`):
+    /// the break-even clause's long turn fed fresh, saved, its draft's point
+    /// rows taken out of the file ([`without_draft_points`]) and the file
+    /// restored, so the body keeps no draft side at the turn's end; the turn
+    /// resent with its reply stripped keeps the turn's end with the draft off
+    /// by name and steps past the first state's position. That slot saves,
+    /// and its file restores every position it saved: an off draft holds no
+    /// rows waiting for a walk. Mutant: a draft turned off that keeps its
+    /// waiting refresh (the restore is a 400 naming the refresh's position).
+    fn slot_file_off_draft(
+        url: &dyn Fn(&str) -> String,
+        err_log: &Path,
+        save: &Path,
+    ) -> Result<bool, GateError> {
+        const TURN: &str = "q38-turn.slot";
+        const NO_POINTS: &str = "q38-turn-no-points.slot";
+        const OFF: &str = "q38-off.slot";
+        let k = Keep38::read(err_log)?;
+        let (turn, reply_text) = BREAK_EVEN_TURNS[0];
+        let p1 = rendered(url, json!([{ "role": "user", "content": turn }]))?;
+        let stripped = tokenized(url, reply_text)?;
+        let turn_end = p1.len() - 1;
+        let n = (2..=N_PREDICT)
+            .rev()
+            .find(|&n| k.at(n) <= turn_end)
+            .ok_or_else(|| {
+                format!(
+                    "slot file off: the turn's end {turn_end} is below the break-even of every \
+                     reply of 2 to {N_PREDICT} tokens: the clause needs a longer turn"
+                )
+            })?;
+        let x = greedy(url, err_log, &p1, n, false)?;
+        x.show("slot file off: the turn fresh");
+        if stripped.first() == x.tokens.first() {
+            return Err(format!(
+                "slot file off: the stripped reply's first id {:?} is the reply's: the shared \
+                 prefix would not end at the turn",
+                stripped.first()
+            )
+            .into());
+        }
+        let (st_turn, turned) = slot_action(url, 0, "save", &json!({ "filename": TURN }))?;
+        let held = turned["n_saved"].as_u64().unwrap_or(0) as usize;
+        let fed: Vec<u32> = p1.iter().chain(&x.tokens).copied().collect();
+        let bytes = std::fs::read(save.join(TURN))?;
+        let (_, side_at, _, _) = pending_refresh(&bytes, &fed, held)?;
+        let (cut, points) = without_draft_points(&bytes, side_at)?;
+        println!("slot file off: {points} draft point rows taken out of the turn's file");
+        std::fs::write(save.join(NO_POINTS), cut)?;
+        let (st_cut, _) = slot_action(url, 0, "restore", &json!({ "filename": NO_POINTS }))?;
+        let strip: Vec<u32> = p1.iter().chain(&stripped).copied().collect();
+        let off = greedy(url, err_log, &strip, n, true)?;
+        off.show("slot file off: the turn resent stripped, the draft off");
+        let file = json!({ "filename": OFF });
+        let (st_save, saved) = slot_action(url, 0, "save", &file)?;
+        let (st_erase, _) = slot_action(url, 0, "erase", &json!({}))?;
+        let (st_restore, restored) = slot_action(url, 0, "restore", &file)?;
+        let past = saved["n_saved"].as_u64().unwrap_or(0) as usize;
+        println!(
+            "slot file off: the off slot saved {past} positions, the turn's file {held}; restore \
+             HTTP {st_restore}"
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "slot_file_off_draft_round_trip",
+            x.ok && st_turn == 200
+                && points > 0
+                && st_cut == 200
+                && off.ok
+                && off.cache_n == turn_end as u64
+                && !off.offs.is_empty()
+                && past > held
+                && st_save == 200
+                && st_erase == 200
+                && st_restore == 200
+                && restored["n_restored"] == saved["n_saved"],
+        );
+        Ok(ok)
+    }
+
+    /// The pending refresh's place in a Qwen3.8 slot file `b` of `n`
+    /// positions of the sequence `fed`, laid out as `Parked::put` and
+    /// `ParkedDraft::put` write it (the owners of these offsets): its arena
+    /// byte's offset, the draft side's first byte, the arena's code and the
+    /// refresh's rows. An active parked refresh ends with its first row (0),
+    /// no last unit, no skip and no off reason; its whole draft side,
+    /// including the saved sequence's pending tokens and positions, must
+    /// match once.
+    fn pending_refresh(
+        b: &[u8],
+        fed: &[u32],
+        n: usize,
+    ) -> Result<(usize, usize, u8, usize), GateError> {
+        let mut found = Vec::new();
+        for rows in 1..=<Body38 as MtpBody>::VERIFY_ROWS {
+            let Some(pos0) = (n + 1).checked_sub(rows) else {
+                continue;
+            };
+            let Some(tokens) = fed.get(pos0..n + 1) else {
+                continue;
+            };
+            for arena in [0u8, 1] {
+                let mut suffix = Vec::new();
+                let mut w = bloomery_gpu::checkpoint::bytes::Put::new(&mut suffix);
+                w.vals(&[1u8, 1])?; // MTP side, pending refresh.
+                w.array(tokens)?;
+                w.one(
+                    u32::try_from(pos0).expect("a refresh position fits the saved u32 positions"),
+                )?;
+                w.one(arena)?;
+                w.count(0)?;
+                w.vals(&[0u8; 3])?; // No last unit, skip or off reason.
+                w.flush()?;
+                if b.ends_with(&suffix) {
+                    found.push((b.len() - 12, b.len() - suffix.len(), arena, rows));
+                }
+            }
+        }
+        match found.as_slice() {
+            [one] => Ok(*one),
+            _ => Err(format!(
+                "slot file: expected one pending refresh, found {}",
+                found.len()
+            )
+            .into()),
+        }
+    }
+
+    /// A Qwen3.8 slot file `b` with its draft's point rows taken out, and
+    /// how many it held: they end at the draft side `side_at`, laid out as
+    /// `DraftRows38::put` writes them (a count, u64, then each point, u32,
+    /// and its row, a count, u64, then the f32s, each row of one width).
+    fn without_draft_points(b: &[u8], side_at: usize) -> Result<(Vec<u8>, usize), GateError> {
+        let u64_at = |at: usize| {
+            b.get(at..at + 8)
+                .map(|v| u64::from_le_bytes(v.try_into().expect("eight bytes")))
+        };
+        for wide in 1..side_at / 4 {
+            let rec = 12 + 4 * wide;
+            if side_at < rec + 8 || u64_at(side_at - 4 * wide - 8) != Some(wide as u64) {
+                continue;
+            }
+            for k in (1..).take_while(|k| k * rec + 8 <= side_at) {
+                let row_len = side_at - k * rec + 4;
+                if u64_at(row_len) != Some(wide as u64) {
+                    break;
+                }
+                let count = side_at - k * rec - 8;
+                if u64_at(count) == Some(k as u64) {
+                    let mut out = b[..count].to_vec();
+                    out.extend(0u64.to_le_bytes());
+                    out.extend(&b[side_at..]);
+                    return Ok((out, k));
+                }
+            }
+        }
+        Err("slot file: no draft point rows end at the draft's side".into())
+    }
+
+    /// The PLE histories found in a Qwen3.8 slot file `b` of the sequence
+    /// `fed` (each a count, then the ids before its position, u32, then the
+    /// position, u64: the current one at `fed.len()` first, then the
+    /// checkpoints'): each one's position and its newest id's offset.
+    fn ple_histories(b: &[u8], fed: &[u32]) -> Vec<(usize, usize)> {
+        let mut hit = Vec::new();
+        for at in (1..=fed.len()).rev() {
+            for k in 1..=at {
+                let mut pat = (k as u64).to_le_bytes().to_vec();
+                pat.extend(fed[at - k..at].iter().flat_map(|t| t.to_le_bytes()));
+                pat.extend((at as u64).to_le_bytes());
+                if let Some(i) = b.windows(pat.len()).position(|w| w == pat) {
+                    hit.push((at, i + 8 + 4 * (k - 1)));
+                    break;
+                }
+            }
+        }
+        hit
     }
 
     /// How a lookup arm request takes its tokens after the first.

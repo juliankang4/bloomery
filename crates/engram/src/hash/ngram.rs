@@ -194,6 +194,13 @@ impl History {
         }
     }
 
+    /// The history whose [`History::tokens`] are `tokens` and whose
+    /// [`History::next_pos`] is `next`: one a saved state carries, read back.
+    #[must_use]
+    pub fn of(tokens: Vec<u32>, next: u64) -> History {
+        History { prev: tokens, next }
+    }
+
     /// The last `n_gram − 1` tokens, oldest first.
     #[must_use]
     pub fn tokens(&self) -> &[u32] {

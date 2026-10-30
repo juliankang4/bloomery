@@ -121,7 +121,7 @@ use super::image::{
 };
 use super::mtp38::{
     CHAIN_PAIRS, ChainBlock, DraftRows38, DraftSeq38, MTP_ROWS, Mtp38, MtpCtx, MtpDraft, MtpTaps,
-    Target38, TargetRows, chain_spans,
+    Target38, TargetRows, chain_spans, check_target_rows,
 };
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
@@ -143,8 +143,9 @@ use super::wide38::{
     Gemm38, PleRowsIn, STREAM_FLOOR, SplitWalk, Wide38, WideForce, WideForms, WideParts, WideTaps,
     dense_rows, route_taps_host,
 };
+use crate::checkpoint::bytes::{self, Fail, Put, refused};
 use crate::checkpoint::saved::{
-    Identity, Lent, Pending, SaveLane, SeqState, SeqView, Spans, Streams,
+    HostBytes, Identity, Lent, Pending, SaveLane, SeqState, SeqView, Spans, Streams,
 };
 use crate::checkpoint::staging::NoRoom;
 use crate::checkpoint::{self, Checkpoints};
@@ -239,6 +240,91 @@ impl Seq38 {
     #[must_use]
     pub fn keep_point(&self, n: u32) -> u32 {
         self.state.keep_point(n)
+    }
+
+    /// Refused by name unless a draft walk from `pos0` that reads rows
+    /// `first .. first + m` of the `walk` arena reads the target's final
+    /// hidden rows the state carries for the positions before it, as the
+    /// walk itself checks them ([`check_target_rows`]): a state without the
+    /// draft's side, or the ubatch arena, which a state does not carry, is
+    /// refused.
+    pub fn check_draft_rows(
+        &self,
+        walk: TargetRows,
+        (first, m): (usize, usize),
+        pos0: u32,
+    ) -> Result<(), Fail> {
+        let d = self
+            .draft
+            .as_ref()
+            .ok_or_else(|| refused("a parked MTP draft on a state without the draft's side"))?;
+        let records = match walk {
+            TargetRows::Step => (d.step.0, d.final_rows[0], 1),
+            TargetRows::Pass => (d.pass.0, d.final_rows[1], PASS_ROWS),
+            TargetRows::Ubatch => return Err(refused("a parked MTP draft's ubatch rows")),
+        };
+        check_target_rows("qwen4exp slot restore", walk, records, (first, m), pos0)
+            .map_err(Fail::Refused)
+    }
+}
+
+/// The first eight bytes of a Qwen3.8 state's byte form ([`Seq38::put`]).
+const STATE_TAG: [u8; 8] = *b"BLMQ38SQ";
+
+/// The byte form's layout ([`Seq38::put`]): raised whenever a part, its
+/// order or its encoding changes.
+const STATE_FORMAT: u32 = 1;
+
+/// A PLE history in a state's byte form: its tokens (a count, then each,
+/// u32), then the position it stands before (u64).
+impl HostBytes for History {
+    fn put(&self, w: &mut Put<'_>) -> Result<(), Fail> {
+        w.array(self.tokens())?;
+        w.one(self.next_pos())
+    }
+
+    fn take(r: &mut bytes::Take<'_>) -> Result<History, Fail> {
+        let tokens = r.array("a PLE history")?;
+        Ok(History::of(tokens, r.one("a PLE history")?))
+    }
+}
+
+/// A saved text history has this load's length and only text ids: snapshots
+/// carry no image rotation state.
+fn check_ple_history(h: &History, len: usize, window: &Window) -> Result<(), Fail> {
+    if h.tokens().len() != len {
+        return Err(refused(format!(
+            "a PLE history of {} tokens; this load's holds {len}",
+            h.tokens().len()
+        )));
+    }
+    let Window::Eos(window) = window else {
+        return Err(refused("a PLE history read for a hash of mapped ids"));
+    };
+    for &t in h.tokens() {
+        window
+            .check(t)
+            .map_err(|e| refused(format!("a saved PLE history: {e}")))?;
+    }
+    Ok(())
+}
+
+impl Seq38 {
+    /// The state in its byte form (`checkpoint::bytes`), what a slot file
+    /// carries: [`STATE_TAG`], [`STATE_FORMAT`] (u32), the shared state
+    /// ([`SeqState::put`]), then the draft's side (u8: 0 none, 1 its
+    /// [`DraftRows38`] after it). [`GpuModel::seq_take`] reads it back.
+    pub fn put(&self, w: &mut Put<'_>) -> Result<(), Fail> {
+        w.vals(&STATE_TAG)?;
+        w.one(STATE_FORMAT)?;
+        self.state.put(w)?;
+        match &self.draft {
+            None => w.one(0u8),
+            Some(d) => {
+                w.one(1u8)?;
+                d.put(w)
+            }
+        }
     }
 }
 
@@ -5653,6 +5739,38 @@ impl GpuModel<Body38> {
         body.save_state(gpu.stream(), pos)
     }
 
+    /// The state [`Seq38::put`] wrote, read for this load, the model
+    /// untouched: refused by name for another tag or format, a state of
+    /// another model ([`SeqState::take`]), and a PLE history of another
+    /// length than the load's or with an id the load's hash refuses. The put back ([`GpuModel::seq_resume`])
+    /// holds the rest to the stores.
+    pub fn seq_take(&self, r: &mut bytes::Take<'_>) -> Result<Seq38, Fail> {
+        let body = self.body("qwen4exp state read").map_err(Fail::Refused)?;
+        let tag = r.vals::<u8>(STATE_TAG.len(), "the tag")?;
+        let format: u32 = r.one("the format")?;
+        if tag != STATE_TAG || format != STATE_FORMAT {
+            return Err(refused(format!(
+                "a stream of tag {:?} and format {format}, not a Qwen3.8 state of format \
+                 {STATE_FORMAT}",
+                String::from_utf8_lossy(&tag)
+            )));
+        }
+        let state = SeqState::<History>::take(r, &body.who)?;
+        let n_gram = body.ple.hist.tokens().len();
+        for h in state.values() {
+            check_ple_history(h, n_gram, body.ple.hash.window())?;
+        }
+        let draft = match r.one::<u8>("the draft's side")? {
+            0 => None,
+            1 => Some(DraftRows38::take(r)?),
+            c => return Err(refused(format!("a draft's side of code {c}"))),
+        };
+        Ok(Seq38 {
+            state: Arc::new(state),
+            draft,
+        })
+    }
+
     /// The host arrays a sequence save would hold, without reading the card.
     pub fn seq_save_bytes(&mut self) -> Result<u64, GpuError> {
         const WHAT_S: &str = "qwen4exp snapshot size";
@@ -7238,6 +7356,46 @@ mod tests {
         ple_takes,
     };
     use engram::hash::{EosWindow, Window};
+
+    /// Every position of a saved text history rejects image and out-of-vocab
+    /// ids; text ids, including EOS and the last vocabulary id, pass.
+    #[test]
+    fn saved_ple_histories_take_only_text_ids() {
+        use super::{History, check_ple_history};
+
+        let window = Window::Eos(EosWindow {
+            eos: 1,
+            image: Some(9),
+            n_vocab: 16,
+        });
+        let good = [0, 1, 15];
+        check_ple_history(&History::of(good.to_vec(), 7), 3, &window).unwrap();
+        for (id, says) in [(9, "image"), (16, "vocabulary"), (u32::MAX, "vocabulary")] {
+            for i in 0..good.len() {
+                let mut tokens = good;
+                tokens[i] = id;
+                let why = check_ple_history(&History::of(tokens.to_vec(), 7), 3, &window)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    why.contains("a saved PLE history") && why.contains(says),
+                    "{why}"
+                );
+            }
+        }
+        let why = check_ple_history(&History::of(vec![0, 1], 7), 3, &window)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("a PLE history of 2 tokens"), "{why}");
+        let mapped = Window::Mapped {
+            token_map: vec![0; 16],
+            pad: 0,
+        };
+        let why = check_ple_history(&History::of(good.to_vec(), 7), 3, &mapped)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("a hash of mapped ids"), "{why}");
+    }
 
     /// A checkpoint of Qwen3.8-Flash-Next's 36 delta layers and 12
     /// selecting layers (48 layers at interval 4) copies each delta layer's
