@@ -720,7 +720,11 @@ gguf 7 2 0
 # PIN(2026-10-30): gpu 2839 -> 2840 blocks, a new kernel entry, not old code relaxed: gqa_flash_merge_256_gated
 # (flash_gqa.rs, the decode selected flash's merge under the sigmoid gate) holds one block over merge_body, with its
 # SAFETY line.
-gpu 2840 386 10
+# PIN(2026-10-31): gpu 2840 -> 2848 blocks, 386 -> 387 fns, new code, not old code relaxed: tensor.rs's allocation
+# without a memset (`DeviceTensor::unfilled`, 1 fn and its 2 blocks, the allocation and the buffer taking it over)
+# and its load-time callers that write the buffer whole (weights.rs's `upload_whole` 1 block, `upload_split` 2
+# blocks and the two plane joins 3 blocks, one block an allocation), each with its SAFETY line.
+gpu 2848 387 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
