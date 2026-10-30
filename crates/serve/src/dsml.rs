@@ -720,7 +720,7 @@ enum Scan {
     Kv(KvScan),
     Hermes(HermesScan),
     Qwen(QwenScan),
-    Muse(crate::museatem::MuseScan),
+    Recipient(crate::museatem::MuseScan),
 }
 
 /// A generation whose tool-call markup does not parse: which scan refused,
@@ -829,7 +829,7 @@ impl ChatParser {
                 Tools::KvMarkup(spelling, types) => Scan::Kv(KvScan::new(spelling, types)),
                 Tools::Hermes => Scan::Hermes(HermesScan::default()),
                 Tools::QwenXml(framing, kinds) => Scan::Qwen(QwenScan::new(kinds, framing)),
-                Tools::MuseSpark => Scan::Muse(crate::museatem::MuseScan::default()),
+                Tools::MuseSpark => Scan::Recipient(crate::museatem::MuseScan::default()),
             }),
             streamer: None,
             open: None,
@@ -893,7 +893,7 @@ impl ChatParser {
             Some(Scan::Qwen(q)) => q.read_specials(tok),
             Some(Scan::Hermes(h)) => h.read_specials(tok),
             Some(Scan::Kv(k)) => k.read_specials(tok),
-            Some(Scan::Dsml(_) | Scan::Muse(_)) | None => {}
+            Some(Scan::Dsml(_) | Scan::Recipient(_)) | None => {}
         }
         self
     }
@@ -956,7 +956,7 @@ impl ChatParser {
             Some(Scan::Kv(k)) => Some(k.push_stream(&split.content, &split.specials)?),
             Some(Scan::Hermes(h)) => Some(h.push(&split.content, &split.specials)?),
             Some(Scan::Qwen(q)) => Some(q.push_stream(&split.content, &split.specials)?),
-            Some(Scan::Muse(m)) => Some(m.push(&split.content)),
+            Some(Scan::Recipient(m)) => Some(m.push(&split.content)),
         };
         self.stream(scanned.as_ref())?;
         Ok(self.emit(split, scanned))
@@ -997,7 +997,7 @@ impl ChatParser {
             Some(Scan::Hermes(h)) => Some(ended(h.finish(), HermesError::unclosed, cut, whole)?),
             Some(Scan::Qwen(q)) => Some(ended(q.finish(), QwenXmlError::unclosed, cut, sent)?),
             // The scan closes a message the stream ends inside as its call on its own.
-            Some(Scan::Muse(m)) => Some(m.finish()),
+            Some(Scan::Recipient(m)) => Some(m.finish()),
         };
         self.stream(scanned.as_ref())?;
         Ok(self.emit(split, scanned))
