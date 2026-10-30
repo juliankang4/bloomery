@@ -2859,4 +2859,19 @@ fn a_held_special_is_reported_only_when_its_text_is_sent() {
         );
         assert_eq!(o.specials, offsets, "whole and streamed offsets agree");
     }
+    let mut p = params(None, ThinkEntry::Closed);
+    p.stop = vec![format!("x{CALL_OPEN}")];
+    let want = tok.encode(&format!("{CALL_OPEN}x{CALL_OPEN}"));
+    let o = run_read(&tok, &p, &want).0;
+    assert_eq!(
+        o.stop,
+        StopKind::Word,
+        "the second special completes the stop"
+    );
+    assert_eq!(o.content, CALL_OPEN, "the stop word is excluded");
+    assert_eq!(
+        o.specials,
+        vec![0],
+        "the stopped special has no content offset"
+    );
 }

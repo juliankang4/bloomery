@@ -893,7 +893,7 @@ impl ChatParser {
             Some(Scan::Qwen(q)) => q.read_specials(tok),
             Some(Scan::Hermes(h)) => h.read_specials(tok),
             Some(Scan::Kv(k)) => k.read_specials(tok),
-            _ => {}
+            Some(Scan::Dsml(_) | Scan::Muse(_)) | None => {}
         }
         self
     }

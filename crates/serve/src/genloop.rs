@@ -2592,7 +2592,11 @@ impl Gen {
             let special = piece
                 .as_deref()
                 .filter(|_| self.vocab.is_special(tok))
-                .map(|p| p.len().saturating_sub(self.vocab.decode(&[tok]).len()));
+                .map(|p| {
+                    p.len()
+                        .checked_sub(self.vocab.decode(&[tok]).len())
+                        .expect("a special token's decoded text must fit its decoder piece")
+                });
             if let Some(at) = special {
                 self.specials.push(self.scan.text().len() + at);
             }
