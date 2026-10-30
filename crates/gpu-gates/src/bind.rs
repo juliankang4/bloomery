@@ -70,7 +70,7 @@ use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
     CacheNote, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER, Flight,
     Landed, ModelProps, Pending, PlacementProps, ResidencyReset, Saved, SavedState, ServeError,
-    Server, ServerConfig, SlotConfig, StateError, Tokenizer,
+    Server, ServerConfig, SlotConfig, StateError, Tokenizer, Waits,
 };
 
 use crate::GateError;
@@ -3283,6 +3283,15 @@ impl Engine for SeatEngine {
 
     fn props_engine(&self) -> EngineProps {
         self.props.clone()
+    }
+
+    /// The process's engine waits ([`bloomery_gpu::waits`]), read here with
+    /// no call to the seat's thread: the seat is the process's one engine.
+    fn waits(&self) -> Waits {
+        Waits {
+            card: bloomery_gpu::waits::card_waited(),
+            ple: bloomery_gpu::waits::ple_waited(),
+        }
     }
 }
 

@@ -449,7 +449,8 @@ pub(crate) fn await_done(
 /// The one polling loop: `done` asked until it says done, at most `bound`,
 /// spun on for `spin`, then polled every [`POLL`]; past the bound
 /// [`GpuError::Stalled`] of `what`, with no note. A finished wait bumps the
-/// engine watchdog's progress ([`crate::watchdog`]) when one is guarded.
+/// engine watchdog's progress ([`crate::watchdog`]) and counts as the
+/// engine's card wait ([`crate::waits`]) when one is guarded.
 fn await_within(
     what: &'static str,
     bound: Duration,
@@ -459,7 +460,7 @@ fn await_within(
     let t0 = Instant::now();
     loop {
         if done()? {
-            crate::watchdog::wait_done();
+            crate::watchdog::wait_done(t0.elapsed());
             return Ok(());
         }
         let waited = t0.elapsed();

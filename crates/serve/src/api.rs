@@ -81,7 +81,7 @@ use crate::engine::{
 use crate::event;
 use crate::exit::Code;
 use crate::flag::{ApiKeys, Denied};
-use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
+use crate::genloop::{self, Depth, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
 use crate::glmxml::ArgTypes;
 use crate::guard::{Guard, GuardError, Guarded};
 use crate::http::{self, EventStream, Request};
@@ -94,7 +94,7 @@ use crate::sched::{Board, Refusal, Reserve, SlotConfig, Use, default_depth};
 use crate::slotfile;
 use crate::swap::Park;
 use crate::video::{self, VideoSupport};
-use crate::worker::{self, Acted, Action, Events, Msg, ReqName, Shared, Submit};
+use crate::worker::{self, Acted, Action, Events, Msg, ReqName, Round, Shared, Stats, Submit};
 
 use self::listener::Listener;
 
@@ -2751,7 +2751,7 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
         } else {
             0.0
         };
-        let rows: [(&str, &str, &str, String); 19] = [
+        let rows: [(&str, &str, &str, String); 21] = [
             (
                 "counter",
                 "prompt_tokens_total",
@@ -2794,6 +2794,19 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 "n_decode_total",
                 "Total number of llama_decode() calls",
                 s.n_decode_total.to_string(),
+            ),
+            (
+                "counter",
+                "card_wait_seconds_total",
+                "Time the engine waited for the card's work, every call's; bloomery's own",
+                s.waits.card.as_secs_f64().to_string(),
+            ),
+            (
+                "counter",
+                "ple_wait_seconds_total",
+                "Time the engine waited for PLE table rows read from storage, every call's; \
+                 bloomery's own",
+                s.waits.ple.as_secs_f64().to_string(),
             ),
             (
                 "counter",
@@ -2950,6 +2963,7 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 "# HELP llamacpp:{name} {help}\n# TYPE llamacpp:{name} {kind}\nllamacpp:{name} {value}\n"
             ));
         }
+        labelled_metrics(&mut out, &s, &state.engine_props);
         out
     };
     http::respond(
@@ -2961,6 +2975,81 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
         text.as_bytes(),
     )?;
     Ok(true)
+}
+
+/// `/metrics`' counters split by a label, bloomery's own: the decode rounds
+/// by width (their time and the engine's waits inside
+/// them), and the draft's counts by depth and source (the drafter's kind,
+/// `/props`' `engine.draft.kind`), written to `out`. A width no round ran
+/// has no row.
+fn labelled_metrics(out: &mut String, s: &Stats, engine_props: &Value) {
+    let source = engine_props["draft"]["kind"].as_str().unwrap_or("unknown");
+    let source = source
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    let rounds: Vec<(String, &Round)> = (1..)
+        .zip(&s.rounds)
+        .filter(|(_, r)| r.n > 0)
+        .map(|(w, r)| (format!("width=\"{w}\""), r))
+        .collect();
+    let by_width = |value: fn(&Round) -> String| -> Vec<(String, String)> {
+        rounds.iter().map(|(l, r)| (l.clone(), value(r))).collect()
+    };
+    let by_depth = |value: fn(&Depth) -> u64| -> Vec<(String, String)> {
+        (1..)
+            .zip(&s.draft_depths)
+            .map(|(d, at)| {
+                (
+                    format!("source=\"{source}\",depth=\"{d}\""),
+                    value(at).to_string(),
+                )
+            })
+            .collect()
+    };
+    let families = [
+        (
+            "rounds_total",
+            "Decode rounds by width, the slots a round stepped or passed; bloomery's own",
+            by_width(|r| r.n.to_string()),
+        ),
+        (
+            "round_seconds_total",
+            "Decode round wall time by width: the engine's calls and the server's work \
+             between them; bloomery's own",
+            by_width(|r| (r.ms / 1e3).to_string()),
+        ),
+        (
+            "round_card_wait_seconds_total",
+            "Time the engine waited for the card's work inside decode rounds, by width; \
+             bloomery's own",
+            by_width(|r| r.waits.card.as_secs_f64().to_string()),
+        ),
+        (
+            "round_ple_wait_seconds_total",
+            "Time the engine waited for PLE table rows inside decode rounds, by width; \
+             bloomery's own",
+            by_width(|r| r.waits.ple.as_secs_f64().to_string()),
+        ),
+        (
+            "spec_decode_num_draft_tokens_by_depth_total",
+            "Speculative: draft tokens proposed at each depth of a draft; bloomery's own",
+            by_depth(|d| d.proposed),
+        ),
+        (
+            "spec_decode_num_accepted_tokens_by_depth_total",
+            "Speculative: draft tokens accepted at each depth of a draft; bloomery's own",
+            by_depth(|d| d.accepted),
+        ),
+    ];
+    for (name, help, samples) in families {
+        out.push_str(&format!(
+            "# HELP llamacpp:{name} {help}\n# TYPE llamacpp:{name} counter\n"
+        ));
+        for (labels, value) in samples {
+            out.push_str(&format!("llamacpp:{name}{{{labels}}} {value}\n"));
+        }
+    }
 }
 
 // ---------------------------------------------------------------- tokenizer endpoints
@@ -10722,6 +10811,229 @@ mod tests {
             count("generated"),
             counter(&after, "tokens_predicted_total") - counter(&before, "tokens_predicted_total"),
             "the line's generated count is what /metrics added: {line}"
+        );
+    }
+
+    /// `/metrics` splits the decode rounds by width and the engine's waits
+    /// by phase, and the draft's counts by depth [FAIL-first: no labelled
+    /// row]: two sampled choices on two slots pass in rounds of two, a
+    /// round's card wait is the engine's count of the passes in it, the
+    /// prompts' PLE waits stay out of the rounds, the rounds and the prompt
+    /// calls are every call and slot `n_decode_total` and
+    /// `n_busy_slots_per_decode` count, and the counts by depth, under the
+    /// drafter's kind, sum to the draft's totals. A slot action's wait shows
+    /// in the next scrape with no generation between.
+    #[test]
+    fn metrics_split_rounds_by_width_waits_by_phase_and_drafts_by_depth() {
+        use crate::engine::{Drafted, Sampler, Tokenizer, Waits};
+        const CARD: Duration = Duration::from_millis(1);
+        const PLE: Duration = Duration::from_millis(3);
+        /// A drafting mock that counts [`CARD`] of card wait a generating
+        /// call or a reset and [`PLE`] of PLE wait a prompt call.
+        struct Waiting {
+            inner: crate::DraftMock,
+            waits: Waits,
+        }
+        impl Engine for Waiting {
+            fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+                self.inner.tokenizer()
+            }
+            fn prefill(&mut self, ids: &[u32]) -> Result<(), super::EngineError> {
+                self.waits.ple += PLE;
+                self.inner.prefill(ids)
+            }
+            fn next(
+                &mut self,
+                last: u32,
+                out: Option<&mut [f32]>,
+            ) -> Result<u32, super::EngineError> {
+                self.waits.card += CARD;
+                self.inner.next(last, out)
+            }
+            fn advance(
+                &mut self,
+                last: u32,
+                out: &mut Vec<u32>,
+            ) -> Result<Drafted, super::EngineError> {
+                self.waits.card += CARD;
+                self.inner.advance(last, out)
+            }
+            fn advance_sampled(
+                &mut self,
+                last: u32,
+                history: Vec<u32>,
+                sampler: Sampler,
+                out: &mut Vec<u32>,
+            ) -> (Result<Drafted, super::EngineError>, Vec<u32>, Sampler) {
+                self.waits.card += CARD;
+                self.inner.advance_sampled(last, history, sampler, out)
+            }
+            fn advance_rows(&self) -> usize {
+                self.inner.advance_rows()
+            }
+            fn drafts_sampled(&self) -> bool {
+                self.inner.drafts_sampled()
+            }
+            fn slots(&self) -> usize {
+                self.inner.slots()
+            }
+            fn select_slot(&mut self, slot: usize) -> Result<(), super::EngineError> {
+                self.inner.select_slot(slot)
+            }
+            fn slot_drafts(&self) -> bool {
+                self.inner.slot_drafts()
+            }
+            fn reset(&mut self) -> Result<(), super::EngineError> {
+                self.waits.card += CARD;
+                self.inner.reset()
+            }
+            fn ctx_max(&self) -> usize {
+                self.inner.ctx_max()
+            }
+            fn describe(&self) -> String {
+                self.inner.describe()
+            }
+            fn props_engine(&self) -> EngineProps {
+                let mut props = self.inner.props_engine();
+                props.draft.as_mut().expect("drafting mock").kind =
+                    Some("draft\"v2\\path\nnext\\n".into());
+                props
+            }
+            fn waits(&self) -> Waits {
+                self.waits
+            }
+        }
+        let engine = Waiting {
+            inner: crate::DraftMock::new(256)
+                .with_slots(2)
+                .with_sampled_draft(3, 2, 3),
+            waits: Waits::default(),
+        };
+        let mut config = super::testserve::mock_config();
+        config.sampler = Some(crate::sampling::reference_factory());
+        // Slot actions are served with a save folder; the erase writes none.
+        config.slot_save_path = Some(std::env::temp_dir());
+        let slots = SlotConfig {
+            parallel: 2,
+            ..SlotConfig::default()
+        };
+        let server =
+            Server::bind_with("127.0.0.1:0", Box::new(engine), config, slots).expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let (_state, _ended) = server.start().expect("start");
+        let ask = r#"{"prompt":"abcabcabc","max_tokens":12,"n":2,"temperature":0.8,"seed":5}"#;
+        let (status, body) = super::testserve::roundtrip(addr, "POST", "/v1/completions", &[], ask);
+        assert_eq!(status, 200, "{body}");
+        let scrape = || super::testserve::roundtrip(addr, "GET", "/metrics", &[], "").1;
+        let m = scrape();
+        let rows = |name: &str| -> Vec<(String, f64)> {
+            let head = format!("llamacpp:{name}{{");
+            m.lines()
+                .filter_map(|l| l.strip_prefix(head.as_str()))
+                .map(|l| {
+                    let (labels, value) = l.split_once("} ").expect("a labelled row");
+                    (labels.to_owned(), value.parse().expect("a number"))
+                })
+                .collect()
+        };
+        let value = |m: &str, name: &str| -> f64 {
+            let head = format!("llamacpp:{name} ");
+            m.lines()
+                .find_map(|l| l.strip_prefix(head.as_str()))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("no {name} row: {m}"))
+        };
+        let plain = |name: &str| value(&m, name);
+        let width = |labels: &str| -> f64 {
+            labels
+                .strip_prefix("width=\"")
+                .and_then(|w| w.strip_suffix('"'))
+                .and_then(|w| w.parse().ok())
+                .unwrap_or_else(|| panic!("no width in {labels}"))
+        };
+        let rounds = rows("rounds_total");
+        assert!(
+            rounds.iter().any(|(l, n)| width(l) == 2.0 && *n > 0.0),
+            "the two choices passed together: {m}"
+        );
+        let prompts = 2.0;
+        let calls: f64 = rounds.iter().map(|(_, n)| n).sum();
+        let carried: f64 = rounds.iter().map(|(l, n)| width(l) * n).sum();
+        assert_eq!(calls + prompts, plain("n_decode_total"), "{m}");
+        assert!(
+            ((carried + prompts) / (calls + prompts) - plain("n_busy_slots_per_decode")).abs()
+                < 1e-9,
+            "{m}"
+        );
+        let card = CARD.as_secs_f64();
+        let round_card = rows("round_card_wait_seconds_total");
+        assert_eq!(
+            round_card.len(),
+            rounds.len(),
+            "one card-wait row a width: {m}"
+        );
+        for ((l, n), (cl, waited)) in rounds.iter().zip(&round_card) {
+            assert_eq!(l, cl, "{m}");
+            assert!(
+                (waited - width(l) * n * card).abs() < 1e-9,
+                "a round of {l} waited a card call a slot: {m}"
+            );
+        }
+        assert_eq!(
+            rows("round_seconds_total").len(),
+            rounds.len(),
+            "one round-time row per width: {m}"
+        );
+        assert_eq!(
+            rows("round_ple_wait_seconds_total").len(),
+            rounds.len(),
+            "one PLE-wait row per width: {m}"
+        );
+        assert!(
+            rows("round_ple_wait_seconds_total")
+                .iter()
+                .all(|(_, w)| *w == 0.0),
+            "no prompt ran inside a round: {m}"
+        );
+        assert!(
+            (plain("ple_wait_seconds_total") - prompts * PLE.as_secs_f64()).abs() < 1e-9,
+            "a prompt call's PLE wait: {m}"
+        );
+        let in_rounds: f64 = round_card.iter().map(|(_, w)| w).sum();
+        assert!(plain("card_wait_seconds_total") >= in_rounds, "{m}");
+        let proposed = rows("spec_decode_num_draft_tokens_by_depth_total");
+        let accepted = rows("spec_decode_num_accepted_tokens_by_depth_total");
+        let at = |d: usize| format!(r#"source="draft\"v2\\path\nnext\\n",depth="{d}""#);
+        assert_eq!(
+            proposed.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>(),
+            (1..=3).map(at).collect::<Vec<_>>(),
+            "three depths under the drafter's kind: {m}"
+        );
+        assert_eq!(accepted.len(), proposed.len(), "{m}");
+        for (d, ((label, p), (accepted_label, a))) in proposed.iter().zip(&accepted).enumerate() {
+            assert_eq!(label, accepted_label, "{m}");
+            assert!(a <= p, "depth {}: {m}", d + 1);
+        }
+        let sum = |rows: &[(String, f64)]| -> f64 { rows.iter().map(|(_, n)| n).sum() };
+        assert_eq!(
+            sum(&proposed),
+            plain("spec_decode_num_draft_tokens_total"),
+            "{m}"
+        );
+        assert_eq!(
+            sum(&accepted),
+            plain("spec_decode_num_accepted_tokens_total"),
+            "{m}"
+        );
+        let (status, body) =
+            super::testserve::roundtrip(addr, "POST", "/slots/0?action=erase", &[], "");
+        assert_eq!(status, 200, "{body}");
+        let erased = scrape();
+        assert!(
+            (value(&erased, "card_wait_seconds_total") - plain("card_wait_seconds_total") - card)
+                .abs()
+                < 1e-9,
+            "the erase's reset waited a card call: {erased}"
         );
     }
 

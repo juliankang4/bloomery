@@ -52,11 +52,11 @@ use serde_json::Value;
 use crate::admit::Lease;
 use crate::api::{Answers, End, EngineFailure, Stop, Waited, client_gone, panic_text, relock};
 use crate::engine::{
-    Drafted, EngineError, Sampler, SamplerFactory, Saved, SlotPass, SlotRow, StateError,
+    Drafted, EngineError, Sampler, SamplerFactory, Saved, SlotPass, SlotRow, StateError, Waits,
 };
 use crate::genloop::{
-    Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings, cause_word,
-    ms_since,
+    Depth, Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings,
+    cause_word, ms_since,
 };
 use crate::live::{Ending, Finished, Ring};
 use crate::media::{Held, MediaFeed};
@@ -89,6 +89,17 @@ pub(crate) struct Stats {
     pub n_draft_total: u64,
     pub n_draft_accepted_total: u64,
     pub n_draft_passes_total: u64,
+    /// The draft's counts by depth, depth `d` at index `d - 1`: their sums
+    /// are `n_draft_total` and `n_draft_accepted_total`.
+    pub draft_depths: Vec<Depth>,
+    /// The decode rounds by width, width `w` (the slots a round stepped or
+    /// passed) at index `w - 1`.
+    pub rounds: Vec<Round>,
+    /// The engine's waits since the server began serving, every call's
+    /// (prompts, rounds, the cache's), as last read: at each round's end,
+    /// each request's, each slot action's and each pass of the engine
+    /// thread's loop ([`Worker::publish_waits`]).
+    pub waits: Waits,
     /// Slots that take the engine in turns: the switches that moved a state
     /// (a snapshot parked, a parked state put back or handed back to its
     /// slot's request) and their wall time; a handed-back state's put back
@@ -120,6 +131,16 @@ impl Stats {
     pub(crate) fn decode_rate(&self) -> f64 {
         rate(self.n_predicted_total, self.t_predicted_ms_total)
     }
+}
+
+/// The decode rounds of one width: how many, their wall time on the engine
+/// thread (the engine's calls and the server's work between them), and the
+/// engine's waits inside them.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Round {
+    pub n: u64,
+    pub ms: f64,
+    pub waits: Waits,
 }
 
 /// `n` tokens over `ms` milliseconds as tokens a second; 0 before any. The
@@ -483,6 +504,9 @@ struct Worker {
     /// The slots whose requests ended since the round's last seal
     /// ([`Worker::seal_ended`]).
     ended: Vec<usize>,
+    /// The engine's waits when the thread began serving: `/metrics`' wait
+    /// totals count from it.
+    waits_from: Waits,
 }
 
 /// Runs the engine thread until the engine fails, the thread panics or the
@@ -518,6 +542,7 @@ pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
     } else {
         slot.engine.prompt_quantum()
     };
+    let waits_from = slot.engine.waits();
     let mut w = Worker {
         slot,
         sh: Arc::clone(&sh),
@@ -526,6 +551,7 @@ pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
         quantum,
         turns,
         ended: Vec::new(),
+        waits_from,
     };
     let ran = panic::catch_unwind(AssertUnwindSafe(|| {
         if w.turns.is_some() {
@@ -725,6 +751,7 @@ impl Worker {
             if self.seal_ended().is_err() {
                 return;
             }
+            self.publish_waits();
         }
     }
 
@@ -787,7 +814,7 @@ impl Worker {
             .iter()
             .chain(self.prompting.iter().map(|p| &p.a));
         for a in held {
-            self.book(&a.name, a.job.timings(), Ending::Stopped, None);
+            self.book(a, Ending::Stopped, None);
         }
         self.close();
     }
@@ -819,6 +846,7 @@ impl Worker {
             return Err(self.end(f));
         }
         let acted = (a.run)(&mut self.slot);
+        self.publish_waits();
         if let Some(e) = acted.failure {
             let f = self.fail(&e);
             (acted.reply)();
@@ -1033,16 +1061,25 @@ impl Worker {
                 }
             }
         }
-        let width = needs.iter().filter(|n| !matches!(n, Need::Fill)).count() as u64;
+        let width = needs.iter().filter(|n| !matches!(n, Need::Fill)).count();
         if width == 0 {
             return Ok(());
         }
-        {
-            let mut s = relock(&self.sh.stats);
-            s.n_decode_total += 1;
-            s.n_busy_slots_total += width;
-        }
-        let called = if let [a] = self.active.as_mut_slice() {
+        let (started, before) = (Instant::now(), self.slot.engine.waits());
+        let called = self.call_round(needs);
+        self.book_round(width, started, before);
+        let Err(e) = called else {
+            return Ok(());
+        };
+        Err(self.die(&e))
+    }
+
+    /// The engine calls of one decode round, `needs` the running requests'
+    /// in `active`'s order (a fill's already run): one slot's alone, or
+    /// every slot's in one call of each kind. An orderly stop read between
+    /// the two calls ends the round with no error.
+    fn call_round(&mut self, mut needs: Vec<Need>) -> Result<(), EngineError> {
+        if let [a] = self.active.as_mut_slice() {
             let need = needs.pop().expect("one running request, one need");
             call_alone(&mut self.slot, a, need)
         } else {
@@ -1147,11 +1184,36 @@ impl Worker {
                 };
             }
             called
-        };
-        let Err(e) = called else {
-            return Ok(());
-        };
-        Err(self.die(&e))
+        }
+    }
+
+    /// Books a decode round of `width` slots begun at `started`, when the
+    /// engine's waits read `before`: an engine call and its slots, and the
+    /// round's time and waits into its width's row. A round counts whatever
+    /// its calls returned, as a failed one still ran.
+    fn book_round(&self, width: usize, started: Instant, before: Waits) {
+        let ms = ms_since(started);
+        let waits = self.slot.engine.waits();
+        let mut s = relock(&self.sh.stats);
+        s.n_decode_total += 1;
+        s.n_busy_slots_total += width as u64;
+        if s.rounds.len() < width {
+            s.rounds.resize(width, Round::default());
+        }
+        let row = &mut s.rounds[width - 1];
+        row.n += 1;
+        row.ms += ms;
+        row.waits += waits.since(before);
+        s.waits = waits.since(self.waits_from);
+    }
+
+    /// `/metrics`' wait totals brought up to the engine's after engine work
+    /// that no round or request end books (a slot action, a prompt call, a
+    /// prompt cache save, a change of hands), so a scrape of an idle server
+    /// reads them.
+    fn publish_waits(&self) {
+        let waits = self.slot.engine.waits().since(self.waits_from);
+        relock(&self.sh.stats).waits = waits;
     }
 
     /// An engine failure in a call every running request waits on: each gets
@@ -1167,11 +1229,13 @@ impl Worker {
     }
 
     /// Books an ending request's counters, `/metrics`' totals, from its
-    /// timings `t`, prints its stderr finish line from the same numbers, and
-    /// keeps it with how it ended for the live view; touches no engine and
-    /// no slot. The line and the totals cannot disagree: both come from `t`
+    /// timings, prints its stderr finish line from the same numbers, and
+    /// keeps it with how it ended for the live view; calls no engine (it
+    /// reads the engine's waits, the totals' latest) and touches no slot.
+    /// The line and the totals cannot disagree: both come from the timings
     /// here, the one place a request's counts are booked.
-    fn book(&self, name: &ReqName, t: &Timings, ending: Ending, stop: Option<StopKind>) {
+    fn book(&self, a: &Active, ending: Ending, stop: Option<StopKind>) {
+        let (name, t) = (&a.name, a.job.timings());
         let failed = matches!(ending, Ending::EngineError | Ending::Error);
         self.sh.note(finish_line(name, t, cause_word(stop, failed)));
         relock(&self.sh.done).push(Finished {
@@ -1179,6 +1243,7 @@ impl Worker {
             timings: t.clone(),
             ending,
         });
+        let waits = self.slot.engine.waits();
         let mut s = relock(&self.sh.stats);
         let (pn, dn) = (t.prompt_n as u64, t.predicted_n as u64);
         s.n_prompt_total += pn;
@@ -1197,6 +1262,14 @@ impl Worker {
         s.n_draft_total += t.draft_n as u64;
         s.n_draft_accepted_total += t.draft_n_accepted as u64;
         s.n_draft_passes_total += t.draft_passes as u64;
+        let depths = a.job.draft_depths();
+        if s.draft_depths.len() < depths.len() {
+            s.draft_depths.resize(depths.len(), Depth::default());
+        }
+        for (total, &d) in s.draft_depths.iter_mut().zip(depths) {
+            *total += d;
+        }
+        s.waits = waits.since(self.waits_from);
     }
 
     /// Books a request's counters and view, releases its slot, and sends its
@@ -1210,7 +1283,7 @@ impl Worker {
             Err(_) => Ending::Error,
         };
         let stop = r.as_ref().ok().map(|o| o.stop);
-        self.book(&a.name, t, ending, stop);
+        self.book(&a, ending, stop);
         // An engine failure leaves no state to save; any other end leaves the
         // slot holding what it fed.
         if self.turns.is_none() && !matches!(r, Err(GenError::Engine(_))) {
@@ -1316,6 +1389,7 @@ impl Worker {
             if self.turn().is_err() {
                 return;
             }
+            self.publish_waits();
         }
     }
 
@@ -1506,11 +1580,7 @@ impl Worker {
                 Err(e) => Err(self.die(&e)),
             };
         }
-        {
-            let mut s = relock(&self.sh.stats);
-            s.n_decode_total += 1;
-            s.n_busy_slots_total += 1;
-        }
+        let (started, before) = (Instant::now(), self.slot.engine.waits());
         let a = &mut self.active[i];
         let called = match need {
             Need::Step(t) => self
@@ -1524,6 +1594,7 @@ impl Worker {
             Need::Sampled(t) => a.job.advance_sampled(&mut self.slot, t),
             Need::Fill | Need::Done => unreachable!("a fill is run above, a finished request left"),
         };
+        self.book_round(1, started, before);
         match called {
             Ok(()) => Ok(()),
             Err(e) => Err(self.die(&e)),
