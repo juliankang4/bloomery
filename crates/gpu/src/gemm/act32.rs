@@ -52,7 +52,8 @@ pub struct GemmAct32 {
     pub(super) d: DeviceBuffer<f32>,
     pub(super) s: DeviceBuffer<i32>,
     /// Whether the scratch holds the Q8 planes: false for a native input
-    /// ([`GemmAct32::new_native_input`]), whose planes are empty.
+    /// ([`GemmAct32::new_native_input`]) and a fused gate and up output
+    /// ([`GemmAct32::new_gate_up_output`]), whose planes are empty.
     pub(super) q8_required: bool,
     pub(super) cols: usize,
     pub(super) k: usize,
@@ -305,6 +306,39 @@ impl GemmAct32 {
         Self::new(stream, cols, k)
     }
 
+    /// The down's input columns the fused NVFP4 gate and up launch writes
+    /// (`Gemm32Kernels::enqueue_gate_up_sel32`): [`GemmAct32::new_native_input`]'s
+    /// scratch, with the frames the launch keeps beside the native FP4 form
+    /// where it has one. Load-time only.
+    pub fn new_gate_up_output(
+        stream: &CudaStream,
+        cols: usize,
+        k: usize,
+    ) -> Result<Self, GpuError> {
+        let act = Self::new_native_input(stream, cols, k)?;
+        #[cfg(bloomery_nvfp4_mma)]
+        let act = Self {
+            native: act.native.map(|n| n.for_gate_up(stream)).transpose()?,
+            ..act
+        };
+        Ok(act)
+    }
+
+    /// The native FP4 form's codes (`k / 8` words a column), block scale
+    /// words (`k / 64` a column) and column scales; `None` on a scratch
+    /// without the form.
+    #[must_use]
+    pub fn fp4_planes(
+        &self,
+    ) -> Option<(&DeviceBuffer<u32>, &DeviceBuffer<u32>, &DeviceBuffer<f32>)> {
+        #[cfg(bloomery_nvfp4_mma)]
+        {
+            self.native.as_ref().map(super::nvfp4mma::Act::planes)
+        }
+        #[cfg(not(bloomery_nvfp4_mma))]
+        None
+    }
+
     /// Whether the scratch holds the native FP4 form beside the 32-value one
     /// ([`GemmAct32::new_routed`] on a native FP4 build).
     #[must_use]
@@ -386,8 +420,9 @@ impl GemmAct32 {
     }
 
     /// The launch shape a quantizer that stores the Q8 planes takes for
-    /// `n_cols` columns ([`GemmAct32::input_launch`]); a native input, which
-    /// holds none ([`GemmAct32::new_native_input`]), is refused by name.
+    /// `n_cols` columns ([`GemmAct32::input_launch`]); a scratch that holds
+    /// none ([`GemmAct32::new_native_input`],
+    /// [`GemmAct32::new_gate_up_output`]) is refused by name.
     pub(super) fn quant_launch(
         &self,
         what: &'static str,
@@ -396,7 +431,7 @@ impl GemmAct32 {
         if !self.q8_required {
             return Err(GpuError::state(
                 what,
-                "a scratch with Q8 planes; a native input holds none",
+                "a scratch with Q8 planes; a native FP4 scratch holds none",
             ));
         }
         self.input_launch(what, n_cols)
@@ -599,7 +634,7 @@ impl Gemm32Kernels {
         )?;
         act.fill(n_cols);
         #[cfg(bloomery_nvfp4_mma)]
-        self.native.quantize(stream, act, None)?;
+        self.native.quantize(stream, act)?;
         Ok(())
     }
 

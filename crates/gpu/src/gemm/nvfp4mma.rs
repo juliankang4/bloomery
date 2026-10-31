@@ -37,6 +37,19 @@ pub(super) struct Act {
     q: DeviceBuffer<u32>,
     e: DeviceBuffer<u32>,
     scale: DeviceBuffer<f32>,
+    /// The fused gate and up launch's frames and tile arrivals
+    /// ([`Act::for_gate_up`]); `None` on any other scratch.
+    gate_up: Option<GateUpFrames>,
+}
+
+/// What [`native::gate_up_nvfp4_mma`] keeps beside the FP4 planes it
+/// writes: each (column, 64-value step)'s frame, the largest scale exponent
+/// of its four sub-blocks ([`FRAME_NONE`] for none, [`FRAME_REFUSED`] for a
+/// refused block), and per route tile the count of its blocks that stored
+/// their steps, which the last one returns to 0.
+struct GateUpFrames {
+    frames: DeviceBuffer<i32>,
+    arrivals: DeviceBuffer<u32>,
 }
 
 impl Act {
@@ -45,11 +58,44 @@ impl Act {
             q: DeviceBuffer::zeroed(stream, cols * k / 8)?,
             e: DeviceBuffer::zeroed(stream, cols * k / 64)?,
             scale: DeviceBuffer::zeroed(stream, cols)?,
+            gate_up: None,
+        })
+    }
+
+    /// These planes with the frames and arrivals the fused gate and up
+    /// launch writes them through: a frame per 64-value step (a block scale
+    /// word's) and an arrival word per column, a route tile holding at least
+    /// one.
+    pub(super) fn for_gate_up(self, stream: &CudaStream) -> Result<Self, GpuError> {
+        Ok(Self {
+            gate_up: Some(GateUpFrames {
+                frames: DeviceBuffer::zeroed(stream, self.e.len())?,
+                arrivals: DeviceBuffer::zeroed(stream, self.scale.len())?,
+            }),
+            ..self
         })
     }
 
     pub(super) fn bytes(&self) -> usize {
-        self.q.num_bytes() + self.e.num_bytes() + self.scale.num_bytes()
+        self.q.num_bytes()
+            + self.e.num_bytes()
+            + self.scale.num_bytes()
+            + self
+                .gate_up
+                .as_ref()
+                .map_or(0, |f| f.frames.num_bytes() + f.arrivals.num_bytes())
+    }
+
+    /// Whether the fused gate and up launch writes this scratch
+    /// ([`Act::for_gate_up`]).
+    pub(super) fn takes_gate_up(&self) -> bool {
+        self.gate_up.is_some()
+    }
+
+    /// The codes (`k / 8` words a column), the block scale words (`k / 64`
+    /// a column) and the column scales.
+    pub(super) fn planes(&self) -> (&DeviceBuffer<u32>, &DeviceBuffer<u32>, &DeviceBuffer<f32>) {
+        (&self.q, &self.e, &self.scale)
     }
 }
 
@@ -120,6 +166,185 @@ fn nvfp4_pack_q8(words: [u32; 4], d: f32, gs: f32) -> ([u32; 2], u32) {
         packed[i / 4] |= byte << (8 * (i & 3));
     }
     (packed, scale)
+}
+
+/// A step frame ([`GateUpFrames`]) of four zero sub-blocks.
+const FRAME_NONE: i32 = i32::MIN;
+/// A step frame of a step that holds a refused block.
+const FRAME_REFUSED: i32 = i32::MAX;
+/// The smallest sub-block scale exponent of the fused gate and up launch's
+/// FP4: the column scale `2^(e - 7)` of a column whose largest sub-block
+/// scale has exponent `e` stays an f32 down to `e = -142`.
+const FP4_MIN_EXP: i32 = -142;
+/// The UE4M3 field the largest sub-block scale of a column takes in the
+/// fused launch's FP4: `(8 + m) · 2^(e - 3)` is stored as field 14, at most
+/// 240, times the column scale `2^(e - 7)`.
+const FP4_TOP_FIELD: i32 = 14;
+
+/// The fused gate and up launch's FP4 of one 16-value sub-block of Q8 codes
+/// `words` (value order, four a word) at block scale `d`: the two code
+/// words (byte `i` holds values `i` and `i + 8`, low nibble first) and the
+/// sub-block's scale `s = (8 + m) · 2^(e - 3)`, `amax / 6` rounded to three
+/// mantissa bits (ties to even), as `(e, m)`, where `amax / 6` is
+/// `big · d / 6` in f32, or in f64 rounded once to f32 where `d` is above
+/// `f32::MAX / 128` and `big · d` could overflow; each code is the E2M1 level
+/// nearest `code · (d / s)` (ties to even, saturating). A sub-block whose
+/// codes are all zero or whose `e` is below [`FP4_MIN_EXP`] is zero, `e`
+/// [`FRAME_NONE`]. No other sub-block moves it: the column's scale is a
+/// power of two ([`scale_byte`]), so a block that holds part of a column
+/// packs its part alone.
+#[cuda_device::device]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+fn fp4_sub(words: [u32; 4], d: f32) -> ([u32; 2], i32, u32) {
+    let mut big = 0u32;
+    #[unroll]
+    for i in 0..16 {
+        big = big.max(u32::from(
+            ((words[i / 4] >> (8 * (i % 4))) as i8).unsigned_abs(),
+        ));
+    }
+    let t = if d > f32::MAX / 128.0 {
+        (f64::from(big) * f64::from(d) / 6.0) as f32
+    } else {
+        big as f32 * d / 6.0
+    };
+    // A subnormal t is scaled to a normal one, exactly, before its exponent is read.
+    let (bits, off) = if t < f32::MIN_POSITIVE {
+        ((t * 18_446_744_073_709_551_616.0).to_bits(), -64)
+    } else {
+        (t.to_bits(), 0)
+    };
+    let rounded = bits + 0x7_ffff + ((bits >> 20) & 1);
+    let e = (rounded >> 23) as i32 - 127 + off;
+    let m = (rounded >> 20) & 7;
+    if t == 0.0 || e < FP4_MIN_EXP {
+        return ([0, 0], FRAME_NONE, 0);
+    }
+    let s = if e >= -126 {
+        f32::from_bits((((e + 127) as u32) << 23) | (m << 20))
+    } else {
+        f32::from_bits((8 + m) << (e + 146) as u32)
+    };
+    let ratio = d / s;
+    let mut packed = [0u32; 2];
+    #[unroll]
+    for i in 0..8 {
+        let lo = f32::from((words[i / 4] >> (8 * (i % 4))) as i8) * ratio;
+        let hi = f32::from((words[i / 4 + 2] >> (8 * (i % 4))) as i8) * ratio;
+        let byte: u32;
+        // SAFETY: this conversion only reads and writes registers.
+        unsafe {
+            ptx_asm!(
+                "{ .reg .b8 b; cvt.rn.satfinite.e2m1x2.f32 b, %2, %1; cvt.u32.u8 %0, b; }",
+                out("=r") byte, in("f") lo, in("f") hi,
+            );
+        }
+        packed[i / 4] |= byte << (8 * (i & 3));
+    }
+    (packed, e, m)
+}
+
+/// The UE4M3 byte of a sub-block scale `(e, m)` ([`fp4_sub`]) in a frame
+/// whose largest exponent is `frame`: field `e - frame + 14`, 0 below field
+/// 1, and 0 for a zero sub-block or in a refused frame.
+#[inline(always)]
+fn scale_byte(e: i32, m: u32, frame: i32) -> u32 {
+    if e == FRAME_NONE || frame == FRAME_REFUSED {
+        return 0;
+    }
+    let field = e - frame + FP4_TOP_FIELD;
+    if field >= 1 {
+        ((field as u32) << 3) | m
+    } else {
+        0
+    }
+}
+
+/// A step's four scale bytes of a frame `by` exponents below its column's
+/// moved into the column's frame ([`scale_byte`] there).
+#[inline(always)]
+fn shift_scales(word: u32, by: i32) -> u32 {
+    let mut out = 0;
+    let mut j = 0;
+    while j < 4 {
+        let byte = (word >> (8 * j)) & 255;
+        let field = (byte >> 3) as i32 - by;
+        if byte != 0 && field >= 1 {
+            out |= (((field as u32) << 3) | (byte & 7)) << (8 * j);
+        }
+        j += 1;
+    }
+    out
+}
+
+/// The column scale of a column whose largest sub-block scale exponent is
+/// `top`: `2^(top - 7)`, NaN for a refused column and 1 for a zero one.
+#[inline(always)]
+fn column_scale(top: i32) -> f32 {
+    if top == FRAME_REFUSED {
+        f32::NAN
+    } else if top == FRAME_NONE {
+        1.0
+    } else if top - 7 >= -126 {
+        f32::from_bits(((top - 7 + 127) as u32) << 23)
+    } else {
+        f32::from_bits(1 << (top - 7 + 149) as u32)
+    }
+}
+
+/// The u32 at `p` in global memory as the GPU sees it now (`ld.relaxed.gpu`,
+/// past this SM's L1).
+///
+/// # Safety
+/// `p` addresses a live u32 of a global allocation.
+#[inline(always)]
+unsafe fn load_gpu(p: *const u32) -> u32 {
+    let v: u32;
+    // SAFETY: the caller's live global word; the generic-to-global conversion is exact.
+    unsafe {
+        ptx_asm!(
+            "{ .reg .b64 g; cvta.to.global.u64 g, %1; ld.relaxed.gpu.global.b32 %0, [g]; }",
+            out("=r") v, in("l") p as u64, clobber("memory")
+        );
+    }
+    v
+}
+
+/// Makes the i32 at `p` in this block's shared memory the larger of itself
+/// and `v`.
+///
+/// # Safety
+/// `p` addresses a live, aligned i32 of this block's shared memory.
+#[inline(always)]
+unsafe fn shared_max(p: *mut i32, v: i32) {
+    // SAFETY: p is in this block's shared window (this fn's contract).
+    let at = unsafe { cuda_device::shared::cvta_generic_to_shared_u32(p.cast_const().cast()) };
+    // SAFETY: a reduction on the caller's live shared word.
+    unsafe {
+        ptx_asm!("red.shared.max.s32 [%0], %1;", in("r") at, in("r") v, clobber("memory"));
+    }
+}
+
+/// Adds 1 to the u32 at `p` in global memory, acquiring and releasing at
+/// GPU scope, and returns the value before.
+///
+/// # Safety
+/// `p` addresses a live u32 of a global allocation that is accessed only
+/// through this and plain stores ordered after it.
+#[inline(always)]
+unsafe fn arrive(p: *mut u32) -> u32 {
+    let v: u32;
+    // SAFETY: the caller's live global word; the generic-to-global conversion is exact.
+    unsafe {
+        ptx_asm!(
+            "{ .reg .b64 g; cvta.to.global.u64 g, %1; atom.acq_rel.gpu.global.add.u32 %0, [g], 1; }",
+            out("=r") v, in("l") p as u64, clobber("memory")
+        );
+    }
+    v
 }
 
 /// Dynamic shared bytes of `fused_swiglu` for a K-wide column: its Q8 words,
@@ -375,9 +600,15 @@ unsafe fn scale_quad(sp: *mut u32, g: usize, q: usize) -> [u32; 4] {
 /// u32 words of a route tile's [`TileColumns`]: each of its 64 columns' slot,
 /// then its input scale's bits.
 const COLUMN_WORDS: usize = 2 * 64;
+/// Where `gate_up_nvfp4_mma`'s epilogue keeps a tile's two block scales a
+/// column in the B stages, after its 64 columns' sixteen Q8 code words.
+const Q8_SCALES: usize = 64 * 16;
 const _: () = assert!(
     (STAGES * (W_STAGE + B_STAGE + S_STAGE) + COLUMN_WORDS) * 4 <= 48 * 1024
         && 64 * PAIR_PITCH <= STAGES * W_STAGE
+        && Q8_SCALES + 2 * 64 <= STAGES * B_STAGE
+        // The last block's flag word and its 64 columns' top frames.
+        && 64 < STAGES * S_STAGE
 );
 
 /// A route tile's column slots and input scales in the block's
@@ -1101,10 +1332,6 @@ mod native {
         );
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
     #[kernel]
     #[launch_bounds(32)]
     #[launch_contract(domain = 1, block = (32, 1, 1))]
@@ -1112,28 +1339,11 @@ mod native {
         q: &[u32],
         d: &[f32],
         steps: u32,
-        cols: &[u32],
-        tiles: &[u32],
-        ntiles: &[u32],
-        routed: bool,
         mut out: DisjointSlice<u32>,
         mut scales: DisjointSlice<u32>,
         mut global: DisjointSlice<f32>,
     ) {
-        let index = thread::blockIdx_x() as usize;
-        let col = if routed {
-            let count = ntiles[0] as usize;
-            if count == 0 {
-                return;
-            }
-            let (start, len) = super::super::route::tile_parts(tiles[2 * count - 1]);
-            if index >= (start + len) as usize {
-                return;
-            }
-            cols[index] as usize
-        } else {
-            index
-        };
+        let col = thread::blockIdx_x() as usize;
         let lane = warp::lane_id() as usize;
         let steps = steps as usize;
         let mut max = 0.0f32;
@@ -1479,9 +1689,14 @@ mod native {
     /// `tile · row_tiles + rt`, rows `rt · PAIR_ROWS ..`) over the tile's
     /// columns, each (slot, row) the value `gemm_nvfp4_mma` stores for the
     /// gate and for the up; then their SwiGLU (NaN where either is not
-    /// finite) and the 32-value Q8 of each slot's two blocks into `q`, `d`,
-    /// `s` (`quant32_group`'s planes of `row_tiles` steps a column), a
-    /// refused block raised as [`crate::FaultSite::QuantColumn`].
+    /// finite), the 32-value Q8 of each slot's two blocks (a refused block
+    /// raised as [`crate::FaultSite::QuantColumn`]) and its FP4 ([`fp4_sub`])
+    /// into the slot's step `rt` of the planes `q`, `e` (`rows / 8` and
+    /// `row_tiles` words a slot), the scale bytes in the step's own frame,
+    /// which goes to `frames`. The tile's last block to store its step
+    /// (`arrivals`, a word a tile, back to 0 after it) moves every step's
+    /// scale bytes into its column's frame and writes the column scale
+    /// ([`column_scale`]) to `scale`.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -1507,8 +1722,10 @@ mod native {
         slot_div: u32,
         row_tiles: u32,
         mut q: DisjointSlice<u32>,
-        mut d: DisjointSlice<f32>,
-        mut s: DisjointSlice<i32>,
+        mut e: DisjointSlice<u32>,
+        mut scale: DisjointSlice<f32>,
+        mut frames: DisjointSlice<i32>,
+        mut arrivals: DisjointSlice<u32>,
         fault: crate::fault::FaultSink,
     ) {
         let block = thread::blockIdx_x() as usize;
@@ -1697,14 +1914,12 @@ mod native {
             }
         }
         thread::sync_threads();
-        let osteps = row_tiles as usize;
         let i = lane & 7;
-        // Each octet quantizes one (column, block) of the tile: 64 columns of two blocks.
+        // Each octet quantizes one (column, block) of the tile: 64 columns of two blocks,
+        // whose codes and scales the B stages keep for the pack.
         let mut item = 4 * wi + (lane >> 3);
         while item - (lane >> 3) < 2 * 64 {
             let (c, blk) = (item / 2, item & 1);
-            // SAFETY: c < len <= 64, after the walk's barriers.
-            let slot = (c < len).then(|| unsafe { columns.get(c) }.0);
             let v = if c < len {
                 // SAFETY: the barrier published this live column's aligned quad.
                 unsafe {
@@ -1715,28 +1930,131 @@ mod native {
             } else {
                 [0.0; 4]
             };
-            let (word, sum, dv, refused) = super::super::act32::quant32_lane(v, lane);
-            if let Some(slot) = slot {
-                let b = 2 * rt + blk;
-                // SAFETY: one lane owns word i of block b < 2·osteps of this live slot's column.
-                unsafe {
-                    *q.get_unchecked_mut(slot * 16 * osteps + 8 * b + i) = word;
-                }
+            let (word, _, dv, refused) = super::super::act32::quant32_lane(v, lane);
+            if c < len {
+                // SAFETY: word i of block blk of column c < 64, one lane each, inside the B
+                // stages the walk no longer reads.
+                unsafe { *bp.add(16 * c + 8 * blk + i) = word };
                 if i == 0 {
-                    // SAFETY: the octet's first lane owns the block's scale.
-                    unsafe {
-                        *d.get_unchecked_mut(slot * 2 * osteps + b) = dv;
-                    }
-                    // SAFETY: the octet's first lane owns the block's code sum.
-                    unsafe {
-                        *s.get_unchecked_mut(slot * 2 * osteps + b) = sum;
-                    }
+                    // SAFETY: the block's scale word after the 64 columns' codes, the octet's
+                    // first lane's.
+                    unsafe { *bp.add(Q8_SCALES + 2 * c + blk) = dv.to_bits() };
                     if refused {
                         fault.raise(crate::FaultSite::QuantColumn);
                     }
                 }
             }
             item += 32;
+        }
+        thread::sync_threads();
+        // Thread (c, sb) packs sub-block sb of column c's step; a column's quad of
+        // lanes takes the step's frame, the largest exponent of its sub-blocks.
+        let (c, sb) = (tid / 4, tid & 3);
+        let (codes, sub, m) = if c < len {
+            // SAFETY: the barrier published the live column's block scale.
+            let dv = f32::from_bits(unsafe { *bp.add(Q8_SCALES + 2 * c + sb / 2) });
+            if dv.is_nan() {
+                ([0; 2], FRAME_REFUSED, 0)
+            } else {
+                // SAFETY: the barrier published these four aligned code words of column c.
+                let words =
+                    unsafe { (*bp.add(16 * c + 4 * sb).cast::<cuda_device::vector::U32x4>()).0 };
+                fp4_sub(words, dv)
+            }
+        } else {
+            ([0; 2], FRAME_NONE, 0)
+        };
+        let mut frame = sub;
+        frame = frame.max(warp::shuffle_xor(frame as u32, 1) as i32);
+        frame = frame.max(warp::shuffle_xor(frame as u32, 2) as i32);
+        let mut word = scale_byte(sub, m, frame) << (8 * sb);
+        word |= warp::shuffle_xor(word, 1);
+        word |= warp::shuffle_xor(word, 2);
+        let n_steps = row_tiles as usize;
+        if c < len {
+            // SAFETY: c < len <= 64, after the walk's barriers.
+            let slot = unsafe { columns.get(c) }.0;
+            let at = slot * rows / 8 + 2 * (4 * rt + sb);
+            // SAFETY: the two code words of sub-block 4·rt + sb < rows / 16 of this live slot's
+            // column, this thread's.
+            unsafe {
+                *q.get_unchecked_mut(at) = codes[0];
+                *q.get_unchecked_mut(at + 1) = codes[1];
+            }
+            if sb == 0 {
+                // SAFETY: step rt < row_tiles of this live slot's column, the quad's first thread's.
+                unsafe {
+                    *e.get_unchecked_mut(slot * n_steps + rt) = word;
+                    *frames.get_unchecked_mut(slot * n_steps + rt) = frame;
+                }
+            }
+        }
+        // The tile's last block to store moves every step into its column's frame.
+        thread::sync_threads();
+        if tid == 0 {
+            cuda_device::fence::threadfence();
+            // SAFETY: tile < ntiles[0], at most the filled slots (a route tile holds one at least),
+            // which the arrival words cover; only the tile's blocks arrive at it, and its last
+            // one returns it to 0 after every block arrived.
+            let last = unsafe { arrive(arrivals.as_mut_ptr().add(tile)) } + 1 == row_tiles;
+            if last {
+                // SAFETY: the same word, which no block of this launch reads again.
+                unsafe { *arrivals.get_unchecked_mut(tile) = 0 };
+            }
+            // SAFETY: the S stages' first word, which the walk no longer reads.
+            unsafe { *sp = u32::from(last) };
+        }
+        thread::sync_threads();
+        // SAFETY: the flag the barrier published.
+        if unsafe { *sp } == 0 {
+            return;
+        }
+        // SAFETY: the 64 words after the flag, inside the S stages.
+        let top = unsafe { sp.add(1) }.cast::<i32>();
+        if tid < 64 {
+            // SAFETY: column tid's word of the 64.
+            unsafe { *top.add(tid) = FRAME_NONE };
+        }
+        thread::sync_threads();
+        let (fp, ep) = (frames.as_mut_ptr(), e.as_mut_ptr());
+        let mut item = tid;
+        while item < len * n_steps {
+            let (c, j) = (item / n_steps, item % n_steps);
+            // SAFETY: c < len <= 64, after the walk's barriers; the frame of step j < row_tiles
+            // of the live slot's column, stored before every block's arrival.
+            unsafe {
+                let slot = columns.get(c).0;
+                let f = load_gpu(fp.add(slot * n_steps + j).cast()) as i32;
+                shared_max(top.add(c), f);
+            }
+            item += TILE_THREADS as usize;
+        }
+        thread::sync_threads();
+        if tid < len {
+            // SAFETY: tid < len <= 64: the live column's slot and its top frame after the barrier.
+            unsafe {
+                let slot = columns.get(tid).0;
+                *scale.get_unchecked_mut(slot) = column_scale(*top.add(tid));
+            }
+        }
+        item = tid;
+        while item < len * n_steps {
+            let (c, j) = (item / n_steps, item % n_steps);
+            // SAFETY: as the walk over the frames above; this thread alone touches step j's
+            // scale word now.
+            unsafe {
+                let at = columns.get(c).0 * n_steps + j;
+                let column_top = *top.add(c);
+                if column_top == FRAME_REFUSED {
+                    *ep.add(at) = 0;
+                } else {
+                    let f = load_gpu(fp.add(at).cast()) as i32;
+                    if f != FRAME_NONE && f < column_top {
+                        *ep.add(at) = shift_scales(load_gpu(ep.add(at)), column_top - f);
+                    }
+                }
+            }
+            item += TILE_THREADS as usize;
         }
     }
 
@@ -2179,7 +2497,6 @@ impl Kernels {
         &self,
         stream: &CudaStream,
         act: &mut GemmAct32,
-        route: Option<&GemmRoute>,
     ) -> Result<(), GpuError> {
         let filled = act.filled() as u32;
         if let Some(out) = act.native.as_mut() {
@@ -2192,10 +2509,6 @@ impl Kernels {
                 &act.q,
                 &act.d,
                 (act.k / 64) as u32,
-                route.map_or(&act.q, |r| &r.cols),
-                route.map_or(&act.q, |r| &r.tiles),
-                route.map_or(&act.q, |r| &r.n_tiles),
-                route.is_some(),
                 &mut out.q,
                 &mut out.e,
                 &mut out.scale,
@@ -2317,10 +2630,13 @@ impl Kernels {
     }
 
     /// Enqueue the gate and up of `a.route`'s card slots over `a.x` in one
-    /// launch (`gate_up_nvfp4_mma`), the SwiGLU of each (slot, row) and its
-    /// 32-value Q8 into `a.act` (the bytes `swiglu` stores for the slot),
-    /// then `a.act`'s FP4 from that Q8 ([`Kernels::quantize`]) for the route's
-    /// listed slots. Other slots keep every activation plane untouched.
+    /// launch (`gate_up_nvfp4_mma`): the SwiGLU of each (slot, row), its
+    /// 32-value Q8 (the codes `swiglu` takes for the slot) and from them the
+    /// FP4 planes of `a.act`, a scratch made for the launch
+    /// ([`GemmAct32::new_gate_up_output`]), for the route's listed slots,
+    /// each column scaled by a power of two ([`fp4_sub`]). Other slots keep
+    /// every activation plane untouched. Refused by name: another scratch,
+    /// one of another K than the rows, or `n_cols` past its columns.
     pub(super) fn gate_up(
         &self,
         stream: &CudaStream,
@@ -2342,15 +2658,27 @@ impl Kernels {
             .native
             .as_ref()
             .ok_or_else(|| GpuError::shape(WHAT, "activation K must divide 64"))?;
-        if act.native.is_none() || act.k != rows as usize {
+        if act.k != rows as usize || n_cols == 0 || n_cols > act.cols {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "a SwiGLU of {rows} rows into native 32-value columns of {} values",
-                    act.k
+                    "a SwiGLU of {rows} rows over {n_cols} slots into {} columns of {} values",
+                    act.cols, act.k
                 ),
             ));
         }
+        let Some(Act {
+            q,
+            e,
+            scale,
+            gate_up: Some(GateUpFrames { frames, arrivals }),
+        }) = act.native.as_mut()
+        else {
+            return Err(GpuError::state(
+                WHAT,
+                "a scratch made for the fused gate and up",
+            ));
+        };
         let rt = rows / PAIR_ROWS as u32;
         let grid = max_tiles
             .checked_mul(rt)
@@ -2377,13 +2705,15 @@ impl Kernels {
             (x.k / 64) as u32,
             slot_div,
             rt,
-            &mut act.q,
-            &mut act.d,
-            &mut act.s,
+            q,
+            e,
+            scale,
+            frames,
+            arrivals,
             fault,
         )?;
         act.fill(n_cols);
-        self.quantize(stream, act, Some(route))
+        Ok(())
     }
 
     pub(super) fn product(&self, stream: &CudaStream, a: ProductArgs<'_>) -> Result<(), GpuError> {
@@ -2602,7 +2932,7 @@ mod tests {
             kernels.enqueue_quantize_gemm32(stream, &input, cols, &mut reference, sink)?;
             let reference_fault = gpu.take_fault()?;
             reference.native = Some(Act::new(stream, cols, k)?);
-            kernels.native.quantize(stream, &mut reference, None)?;
+            kernels.native.quantize(stream, &mut reference)?;
             for only_native in [false, true] {
                 let mut act = if only_native {
                     GemmAct32::new_native_input(stream, cols, k)?
@@ -2639,7 +2969,7 @@ mod tests {
                         .enqueue_swiglu_quant32(stream, &input, &input, cols, &mut act, sink)
                         .expect_err("a SwiGLU into a native input");
                     assert!(
-                        err.to_string().contains("a native input holds none"),
+                        err.to_string().contains("a native FP4 scratch holds none"),
                         "{err}"
                     );
                 } else {
@@ -2655,59 +2985,8 @@ mod tests {
                     act.bytes()
                 );
             }
-            // Remapped routes leave HOST holes between the listed prefix and refused suffix.
-            let ids = DeviceBuffer::from_host(stream, &[0u32, 1, 2, 0, 1, 2, 3])?;
-            let map = DeviceBuffer::from_host(stream, &[0u32, crate::hybrid::HOST, 1, 9])?;
-            let mut route = GemmRoute::new(stream, cols, 2)?;
-            kernels.enqueue_route_remap(stream, &ids, &map, cols, &mut route, sink)?;
-            let _ = gpu.take_fault()?;
-            // Cells past the four listed slots name unlisted slot 1, so a block
-            // past the prefix overwrites a sentinel.
-            let mut listed = route.cols.to_host_vec(stream)?;
-            listed[4..].fill(1);
-            route.cols.copy_from_host(stream, &listed)?;
-            let expected = reference.native.as_ref().unwrap();
-            let expected_q = expected.q.to_host_vec(stream)?;
-            let expected_e = expected.e.to_host_vec(stream)?;
-            let expected_scale = bits(expected.scale.to_host_vec(stream)?);
-            let out = reference.native.as_mut().unwrap();
-            out.q
-                .copy_from_host(stream, &vec![0xdead_beef; cols * k / 8])?;
-            out.e
-                .copy_from_host(stream, &vec![0xdead_beef; cols * k / 64])?;
-            out.scale.copy_from_host(stream, &vec![-123.0; cols])?;
-            kernels
-                .native
-                .quantize(stream, &mut reference, Some(&route))?;
-            let out = reference.native.as_ref().unwrap();
-            let (q, e, scale) = (
-                out.q.to_host_vec(stream)?,
-                out.e.to_host_vec(stream)?,
-                out.scale.to_host_vec(stream)?,
-            );
-            for slot in [0, 2, 3, 5] {
-                let qr = slot * k / 8..(slot + 1) * k / 8;
-                let er = slot * k / 64..(slot + 1) * k / 64;
-                assert_eq!(q[qr.clone()], expected_q[qr]);
-                assert_eq!(e[er.clone()], expected_e[er]);
-                assert_eq!(scale[slot].to_bits(), expected_scale[slot]);
-            }
-            for slot in [1, 4, 6] {
-                assert!(
-                    q[slot * k / 8..(slot + 1) * k / 8]
-                        .iter()
-                        .all(|&v| v == 0xdead_beef)
-                );
-                assert!(
-                    e[slot * k / 64..(slot + 1) * k / 64]
-                        .iter()
-                        .all(|&v| v == 0xdead_beef)
-                );
-                assert_eq!(scale[slot], -123.0);
-            }
-            println!(
-                "native_activation k={k} routed_listed=4 host=2 refused=1 inactive_planes_untouched=true PASS"
-            );
+            // PIN(2026-10-31): routed quantize coverage retires with its route ABI; nvfp4_gate_up
+            // checks inactive slots.
         }
         Ok(())
     }

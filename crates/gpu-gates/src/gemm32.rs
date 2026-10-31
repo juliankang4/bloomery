@@ -169,6 +169,19 @@ pub fn dot32_nv(wq: &[i8], wsc: &[f32], scale: f32, a: &HostAct, col: usize) -> 
     )
 }
 
+/// The index of the ascending `table`'s entry nearest `x`, ties to the even
+/// index.
+fn nearest(table: &[f64], x: f64) -> usize {
+    (1..table.len()).fold(0, |best, i| {
+        let (di, db) = ((x - table[i]).abs(), (x - table[best]).abs());
+        if di < db || (di == db && i % 2 == 0) {
+            i
+        } else {
+            best
+        }
+    })
+}
+
 /// One output of the native NVFP4 product (`gemm_nvfp4_mma`, W4A4): weight
 /// row `(wq, wsc, scale)` as [`dot32_nv`] takes it, against column `col` of
 /// `a` packed as that product's activation producer packs it. The column
@@ -210,17 +223,6 @@ pub fn dot32_nv_fp4(
         .iter()
         .map(|&v| f64::from(v) / 2.0)
         .collect();
-    // The index of the ascending table's entry nearest x, ties to the even index.
-    let nearest = |table: &[f64], x: f64| {
-        (1..table.len()).fold(0, |best, i| {
-            let (di, db) = ((x - table[i]).abs(), (x - table[best]).abs());
-            if di < db || (di == db && i % 2 == 0) {
-                i
-            } else {
-                best
-            }
-        })
-    };
     let (mut y, mut mag) = (0.0f64, 0.0f64);
     for (s, q) in codes.as_chunks::<16>().0.iter().enumerate() {
         let pack = |unit: f32, g: f32| {
@@ -254,6 +256,90 @@ pub fn dot32_nv_fp4(
     }
     let g = f64::from(scale) * f64::from(gs);
     Ok((g * y, g.abs() * mag))
+}
+
+/// One column's native FP4 form as the fused NVFP4 gate and up launch
+/// (`Gemm32Kernels::enqueue_gate_up_sel32`) stores it: each value's E2M1
+/// level (signed), the UE4M3 scale words (four sub-blocks a word) and the
+/// column scale.
+pub struct Fp4Column {
+    pub levels: Vec<f32>,
+    pub scale_words: Vec<u32>,
+    pub scale: f32,
+}
+
+/// The host transcription of the fused launch's FP4 of one column from its
+/// 32-value Q8 codes `codes` (value order) and block scales `d` (NaN for a
+/// refused block). Each 16-value sub-block takes the scale `s = (8 + m) ·
+/// 2^(e - 3)`, `amax / 6` (`big · d / 6` in f32, in f64 rounded once to
+/// f32 where `d` is above `f32::MAX / 128`) rounded to three mantissa bits
+/// (ties to even), and each value the E2M1 level nearest `code · (d / s)`
+/// (ties to even, saturating at 6). A sub-block whose codes are all zero or whose `e`
+/// is below -142 is zero, scale byte 0. The column scale is `2^(E - 7)` for
+/// the largest `e` of the column, each scale byte the UE4M3 field
+/// `e - E + 14` with `m`, 0 below field 1; a refused column's bytes are 0
+/// and its scale NaN, a zero column's scale 1.
+#[must_use]
+pub fn gate_up_fp4(codes: &[i8], d: &[f32]) -> Fp4Column {
+    let levels_of: [f64; 8] = std::array::from_fn(|j| f64::from(KVALUES_MXFP4[j]) / 2.0);
+    let mut levels = vec![0.0f32; codes.len()];
+    let mut subs = Vec::with_capacity(codes.len() / 16);
+    for (s, q) in codes.as_chunks::<16>().0.iter().enumerate() {
+        let db = d[s / 2];
+        let big = q.iter().map(|c| c.unsigned_abs()).max().unwrap_or(0);
+        let t = if db > f32::MAX / 128.0 {
+            (f64::from(big) * f64::from(db) / 6.0) as f32
+        } else {
+            f32::from(big) * db / 6.0
+        };
+        if db.is_nan() || t == 0.0 {
+            subs.push(None);
+            continue;
+        }
+        let (bits, off) = if t < f32::MIN_POSITIVE {
+            ((t * 2f32.powi(64)).to_bits(), -64)
+        } else {
+            (t.to_bits(), 0)
+        };
+        let rounded = bits + 0x7_ffff + ((bits >> 20) & 1);
+        let (e, m) = ((rounded >> 23) as i32 - 127 + off, (rounded >> 20) & 7);
+        if e < -142 {
+            subs.push(None);
+            continue;
+        }
+        let ratio = db / (f64::from(8 + m) * 2f64.powi(e - 3)) as f32;
+        for (i, &c) in q.iter().enumerate() {
+            let x = f64::from(f32::from(c) * ratio);
+            levels[16 * s + i] =
+                (levels_of[nearest(&levels_of, x.abs())] as f32).copysign(x as f32);
+        }
+        subs.push(Some((e, m)));
+    }
+    let refused = d.iter().any(|v| v.is_nan());
+    let top = subs.iter().flatten().map(|&(e, _)| e).max();
+    let mut scale_words = vec![0u32; codes.len() / 64];
+    if let (false, Some(top)) = (refused, top) {
+        for (s, &(e, m)) in subs
+            .iter()
+            .enumerate()
+            .filter_map(|(s, v)| v.as_ref().map(|v| (s, v)))
+        {
+            let field = e - top + 14;
+            if field >= 1 {
+                scale_words[s / 4] |= (((field as u32) << 3) | m) << (8 * (s % 4));
+            }
+        }
+    }
+    let scale = match (refused, top) {
+        (true, _) => f32::NAN,
+        (false, None) => 1.0,
+        (false, Some(top)) => 2f64.powi(top - 7) as f32,
+    };
+    Fp4Column {
+        levels,
+        scale_words,
+        scale,
+    }
 }
 
 /// The f32 roundings that separate a `gemm_q5_0p` output from the Q5_0

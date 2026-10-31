@@ -2006,12 +2006,13 @@ impl Gemm32Kernels {
     /// the last fill of `route` ([`GateUp32Args`]): the gate GEMM
     /// ([`Gemm32Kernels::enqueue_gemm32`]) into `g`, then
     /// [`Gemm32Kernels::enqueue_up_swiglu32`] — or, on a native FP4 build with
-    /// both stacks in NVFP4 planes and `x` and `act` in the native form, one
-    /// launch that holds each tile's gate and up rows in the block and stores
-    /// the same Q8 bytes for every slot the route lists (`g`, `u` and `sel`
-    /// untouched), then `act`'s FP4 from them. Either way a GEMM over the same
-    /// route reads the same activations. Asynchronous, allocation-free,
-    /// capturable.
+    /// both stacks in NVFP4 planes, `x` in the native form and `act` made for
+    /// it ([`GemmAct32::new_gate_up_output`]), one launch that holds each
+    /// tile's gate and up rows in the block and stores, for every slot the
+    /// route lists, the FP4 of the Q8 codes the split pair quantizes
+    /// (`g`, `u` and `sel` untouched), each column scaled by a power of two
+    /// where the pair's FP4 scale is its blocks' largest Q8 scale · 127/6.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_gate_up_sel32(
         &self,
         stream: &CudaStream,
@@ -2033,12 +2034,14 @@ impl Gemm32Kernels {
         #[cfg(bloomery_nvfp4_mma)]
         if let (Gemm32Weight::Nvfp4Planes(gp), Gemm32Weight::Nvfp4Planes(upp)) = (gate, up)
             && x.native.is_some()
-            && act.native.is_some()
+            && act
+                .native
+                .as_ref()
+                .is_some_and(super::nvfp4mma::Act::takes_gate_up)
         {
             const WHAT: &str = "Gemm32Kernels::enqueue_gate_up_sel32";
             let l = Gemm32Launch::operands(WHAT, gate, rows_per_expert, x, route, input)?;
             Gemm32Launch::operands(WHAT, up, rows_per_expert, x, route, input)?;
-            act.quant_launch(WHAT, l.n_slots as usize)?;
             return self.native.gate_up(
                 stream,
                 super::nvfp4mma::GateUpArgs {
