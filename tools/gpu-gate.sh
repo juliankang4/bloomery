@@ -422,9 +422,11 @@ selftest_load_down() {
   SELFTEST_LOAD_PIDS=()
 }
 self_test() {
-  local self t n=0 bad=0 out rc rc1 p1 r1 r2 prc fs=300 cap=870 part=${1:-all}
+  local self t n=0 bad=0 out rc rc1 p1 r1 r2 prc since fs=300 cap=870 part=${1:-all}
   gg_part() { [ "$part" = all ] || [ "$part" = "$1" ]; }
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+  # shellcheck source=tools/ref/cancel-stubs.sh
+  source "${self%/*}/ref/cancel-stubs.sh"
   # The cases pin the box's /root paths, so a lock directory from local mode is dropped; the local cases name their own.
   unset BLOOMERY_LOCK_DIR
   t=$(mktemp -d "${TMPDIR:-/tmp}/gpu-gate-test.XXXXXX") || return 70
@@ -730,8 +732,10 @@ PY
   exec 6>&-
   judge 'a run that is not a V4.1 load does not wait for one' "$rc" 0 'ok on the 3090 \(asked 3090\)' 'V4\.1'
   # gate()'s bound ends a held run, under the watch too. The stub writes `up` once its TERM handler is installed
-  # and then holds; that line is the event, and SIGALRM to the outer timeout is the bound (the signal its own timer
-  # sends). A clock from the spawn can run out before the stub holds, and says nothing of the contract. The failsafe
+  # and then holds; that line, then its monitor asleep, is the event, and SIGALRM to the outer timeout is the bound
+  # (the signal its own timer sends). The monitor sleeps once its fork has returned: GNU coreutils timeout before 9.5
+  # (Ubuntu 24.04's 9.4) ends 128+n without signalling a child that ran before its fork returned. A clock from the
+  # spawn can run out before the stub holds, and says nothing of the contract. The failsafe
   # bound ($fs) only catches a hang: a run that never parks and never exits has no exit to wait on. The handler exits
   # 7 with no sleep. The runner's cleanup sends KILL at LEASE_STOP_GRACE-2 s (grace 9, 2 s kept so the KILL and reap
   # finish before an enclosing kill-after of 10 s), and a sleep in the handler is a clock that KILL can win, so the
@@ -752,6 +756,10 @@ PY
       if [ "$line" = up ]; then ready=yes
       elif [ "$line" = end ]; then ended=yes
       fi
+    fi
+    if [ "$ready" = yes ]; then
+      since=$SECONDS
+      until cancel_ready "$t/stub.pid" || [ $((SECONDS - since)) -ge "$fs" ]; do sleep 0.05; done
     fi
     if [ "$ready" = yes ] && [ -s "$t/timeout.pid" ]; then
       read -r tp < "$t/timeout.pid" || tp=
@@ -779,8 +787,6 @@ PY
   # A PID-only TERM while the watch sleeps must wait for a TERM-ignoring command's KILL.
   # The sleep fixture holds that foreground wait until the TERM, then delays its trap by two seconds.
   # Descriptor 5 keeps the output FIFO inherited even while the watch redirects its command's output.
-  # shellcheck source=tools/ref/cancel-stubs.sh
-  source "${self%/*}/ref/cancel-stubs.sh"
   # shellcheck source=tools/gate-bound.sh
   source "${self%/*}/gate-bound.sh"
   local ready signalled before state child lock forward child_status want
@@ -1833,6 +1839,9 @@ with open(os.environ["LIB_STARTED"], "w", encoding="utf-8") as stream:
 signal.signal(signal.SIGTERM, lambda *_: os._exit(int(os.environ.get("LIB_TERM", "143"))))
 if os.environ.get("LIB_IGNORE_TERM"):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if os.environ.get("LIB_PID"):
+    with open(os.environ["LIB_PID"], "w", encoding="utf-8") as stream:
+        stream.write(f"{os.getpid()} {os.getppid()}\n")
 if os.environ.get("LIB_READY"):
     with open(os.environ["LIB_READY"], "w", encoding="utf-8") as stream:
         stream.write("up\n")
@@ -2032,11 +2041,15 @@ PY
     if [ "$stop" = bound ] || [ "$stop" = kill ]; then
       lib_gate "$t/lib-first" 3090 BLOOMERY_GATE_BOUND=1 LIB_HOLD="$t/hold" LIB_IGNORE_TERM="$([ "$stop" = kill ] && echo 1)" &
     else
-      lib_gate "$t/lib-first" 3090 LIB_READY="$t/ready" LIB_HOLD="$t/hold" LIB_TERM=23 &
+      rm -f "$t/lib.pid"
+      lib_gate "$t/lib-first" 3090 LIB_PID="$t/lib.pid" LIB_READY="$t/ready" LIB_HOLD="$t/hold" LIB_TERM=23 &
     fi
     p1=$!
     if [ "$stop" = signal ]; then
+      # The ready line, then the test's monitor asleep past its fork (the held run's case above says why), is the event.
       event 'lib test ready for cancellation'
+      since=$SECONDS
+      until cancel_ready "$t/lib.pid" || [ $((SECONDS - since)) -ge "$fs" ]; do sleep 0.05; done
       kill -TERM "$(cat "$t/lib-runner")"
     fi
     rc=0
