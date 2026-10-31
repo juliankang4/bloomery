@@ -3296,7 +3296,7 @@ PY
     k=$((k + 1))
   done
   wait "$sp" 2> /dev/null || true
-  # PIN(2026-10-31): the pattern names the cancel request; a bare `cancel` matched the logged `stdbuf -o0 tail -c +1 -F <run dir>/fix-gate-cancel-status/tmp/r.XXXXXX/gate-batch-test.XXXXXX/...` when the run directory carried the item name.
+  # PIN(2026-10-31): the pattern names the cancel request; a bare `cancel` also matched the logged `tail -F <run dir>/...` path when the run directory name contained `cancel`.
   if [ -n "$pkmark" ] && [ -n "$ap" ] && ! kill -0 "$ap" 2> /dev/null && ! grep -Eq '/jobs/[^ ]+/cancel' "$t/twin-ssh.log" 2> /dev/null; then
     pass 'twin: TERM to a batch ends a pack item'"'"'s attach client, and the twin job is not cancelled'
   else
