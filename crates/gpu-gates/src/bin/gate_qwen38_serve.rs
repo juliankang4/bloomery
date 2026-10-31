@@ -1,5 +1,7 @@
-//! `gate_qwen38_serve` — `bloomery-serve-qwen38` on the 3090 (placement
-//! gate), driven over HTTP, as one process under the GPU gate lock.
+//! `gate_qwen38_serve` — `bloomery-serve-qwen38` on the card in view
+//! (placement gate: the 3090's bytes on it), driven over HTTP, as one process
+//! under the GPU gate lock. The gate's own plans resolve the card as each
+//! server does, so a unified card plans its pool there too.
 //!
 //!     gate_qwen38_serve --arm plain|drafted|lookup --gen <generate_qwen3moe log>
 //!                       --prompt <text> --ids <a,b,…> --dir <out>
@@ -330,7 +332,10 @@
 //!   the seat's composition and its lines;
 //! - `paged` ([`paged`], deferred by name in the fixture tier: its rooms
 //!   are the real file's shapes): the NVMe tier's paged rule at two
-//!   rooms (`BLOOMERY_HOST_ROOM`): at 27 GiB, where the gate plan pages its
+//!   rooms (`BLOOMERY_HOST_ROOM`), each its bytes beside the gate card and,
+//!   on a unified card, the card's share of the pool in the plan at that
+//!   room ([`room_beside_card`]), the gate's own plans made on the card the
+//!   servers resolved: at 27 GiB, where the gate plan pages its
 //!   host experts through the tier's RAM arena, the server with no
 //!   `--ctx-size` serves its default one slot with no `paged` line (the
 //!   rule has no count to reduce, and the placement left the draft off) on a
@@ -342,7 +347,7 @@
 //!   (`paged_draft_mtp_serves_one_slot`);
 //!   at 40 GiB, where the tier pages experts with no arena, `--parallel 2`
 //!   serves its two slots (`unpaged_parallel_serves_as_asked`). The small
-//!   card's case last: a server with no `--place` (the box pin's one card,
+//!   card's case last: a server with no `--place` (the one card in view,
 //!   `a`) under the budget whose drafted one-slot plan fits a context the
 //!   plain plan holds twice of, at 27 GiB — the unset draft yields to the
 //!   context on that plan (`paged_small_card_yields_on_one_card`, the
@@ -367,7 +372,11 @@
 //!   clear: the gate reads both floors off its own plans
 //!   (`paged_floor_band_is_between_the_slot_floors`), and at the band's
 //!   middle `--parallel 2` is refused by the floor, by name
-//!   (`paged_floor_set_parallel_is_refused_by_the_floor`).
+//!   (`paged_floor_set_parallel_is_refused_by_the_floor`). On a unified card
+//!   the pool lowers the card budget until the floor holds, so the gate asks
+//!   `--parallel 2` at the two-slot floor at one position instead: its plan
+//!   is the pool's (`paged_floor_pool_lowers_the_two_slot_budget`), and the
+//!   server stands on it (`paged_floor_set_parallel_stands_on_the_pool_budget`).
 //!   Then `generate_qwen3moe` with no `--place` at 27 GiB: its unset
 //!   draft at `a` falls to the same rule, and the run's `load draft=off`
 //!   record names it (`paged_cli_drafts_nothing_by_the_rule`). FAIL-first:
@@ -517,7 +526,7 @@ mod gate {
     use std::fs::File;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
-    use std::sync::mpsc;
+    use std::sync::{OnceLock, mpsc};
     use std::thread::JoinHandle;
     use std::time::Duration;
 
@@ -528,6 +537,7 @@ mod gate {
     };
     use bloomery_gpu::host::xstream::XSTREAM_ROOM;
     use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, step_above};
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
         LookupCompletion, PrefixRestore, curl, draft_counts, ids_of, json_of, metric, parse_ids,
@@ -539,11 +549,12 @@ mod gate {
     use model::arch::models::Mixer;
     use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
-        Experts, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs, machine_for_experts,
-        machine_for_route,
+        Experts, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs, machine_for_route,
     };
     use model::placement::ctx::CtxLimit;
-    use model::placement::workstation::{HostNeed, HostRead, RTX_3090};
+    use model::placement::workstation::{
+        CHECKPOINTS_RESERVE, CardSpec, DeviceInfo, HostNeed, HostRead,
+    };
     use model::placement::{PlacementError, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::draft_file;
@@ -906,29 +917,22 @@ mod gate {
         println!("props engine {e}");
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
-        // The card the server's `--place gate` resolved to (the 3090's spec
-        // on the 3090, a unified card's own elsewhere) and the room the
-        // server planned at: its free bytes and host room as its plan record
-        // names them. A reading beside the loaded server sees its bytes as
-        // taken; a unified card's pool is the free bytes, and the room
-        // places the row-gathered tables.
-        let plan_room = seat_log(err_log)?.one(&record::PLAN38)?.u64("plan_room")?;
+        // The card the server's `--place gate` resolved to and the room the
+        // server planned at, as its plan record names them ([`server_stage`]).
+        // A reading beside the loaded server sees its bytes as taken; a
+        // unified card's pool is the free bytes, and the room places the
+        // row-gathered tables.
+        let (stage, plan_room) = server_stage(err_log)?;
         let inputs = PlanInputs::describe_in(&split, (plan_room, HostRead::Given))?;
         let experts = experts38(levers)?;
         let ub = ubatch_for(CTX)?;
-        let mut stage = bloomery_gpu_gates::generate::Place::Gate
-            .on(&bloomery_gpu::census()?)?
-            .card_specs()?[0];
-        stage.free_bytes = Some(server_card_free(err_log)?);
-        let mut machine = machine_for_route(
+        let machine = route_machine(
+            &inputs,
             stage,
-            inputs.spec.layers.len(),
-            u64::try_from(ub)?,
+            (u64::try_from(ub)?, u64::try_from(CTX)?),
             experts,
-            inputs.route_form(bloomery_gpu::NATIVE_FP4),
-        );
-        let page = bloomery_gpu_gates::generate::stage_page(stage)?;
-        inputs.reserve_room(&mut machine, (u64::try_from(CTX)?, 1, mtp), page)?;
+            (1, mtp),
+        )?;
         // Under the draft the plan carries it (its granules, its store, its
         // row map and its program's arena beside the target's card terms),
         // and `/props` files its bytes as the card's `draft` class.
@@ -1503,6 +1507,38 @@ mod gate {
         let free = seat_log(err_log)?.one(&record::PLAN38)?.u64("card_free")?;
         println!("the server's plan record: card_free={free}");
         Ok(free)
+    }
+
+    /// The gate card a `--place gate` server plans on ([`stage_at`]) at the free
+    /// reading its `plan` record names ([`server_card_free`]), and the host
+    /// room that record names.
+    fn server_stage(err_log: &Path) -> Result<(CardSpec, u64), GateError> {
+        let room = seat_log(err_log)?.one(&record::PLAN38)?.u64("plan_room")?;
+        Ok((stage_at(Place::Gate, server_card_free(err_log)?)?, room))
+    }
+
+    /// This process's census, read once before the arm's first server holds
+    /// a card ([`run`]): a census opens a context on each device, which beside
+    /// a loaded server takes from the pool the server planned, and the plans
+    /// the gate derives take the server's own free reading
+    /// ([`server_card_free`]), not this one's.
+    fn census() -> Result<&'static [DeviceInfo], GateError> {
+        static CENSUS: OnceLock<Vec<DeviceInfo>> = OnceLock::new();
+        if let Some(c) = CENSUS.get() {
+            return Ok(c);
+        }
+        let read = bloomery_gpu::census()?;
+        Ok(CENSUS.get_or_init(|| read))
+    }
+
+    /// The card `place` resolves to on this census, as the server resolves
+    /// it — `--place gate` the 3090's bytes on the card in view, no `--place`
+    /// (`a`) the card as it reports itself; a unified card plans its pool —
+    /// at the free reading `free` a server's `plan` record names.
+    fn stage_at(place: Place, free: u64) -> Result<CardSpec, GateError> {
+        let mut stage = place.on(census()?)?.card_specs()?[0];
+        stage.free_bytes = Some(free);
+        Ok(stage)
     }
 
     /// The first line on the server's stderr at `err_log` that starts with
@@ -2343,7 +2379,8 @@ mod gate {
     /// alone; under the adaptive residency a stream's bits need not equal
     /// its alone run's, so no id equality is asked. The recipe leaves the
     /// box env file's CUDA_VISIBLE_DEVICES pin (the 3090) in place, so the
-    /// seat sees one card: the unset rule's `place unset` record names it
+    /// seat sees one card (under the gate card's budget,
+    /// [`gate_card_budget`]): the unset rule's `place unset` record names it
     /// (`unset_place_is_the_rule`), and the server's load waits out a timing
     /// sitting by the box guard this gate runs under. The seat's own wiring
     /// of the two machines it runs by default is read here too: the
@@ -2378,6 +2415,7 @@ mod gate {
         // fixture runner's, the target's alone: the set draft's card bytes (PIN above) leave the
         // least default context of two slots no room beside it, so the seat refused by name.
         drafted_card_budget(&mut cmd, levers, SLOTS_DEFAULT)?;
+        gate_card_budget(&mut cmd, levers)?;
         let parallel = SLOTS_DEFAULT.to_string();
         let args = [
             "--host",
@@ -2650,9 +2688,44 @@ mod gate {
         }
     }
 
+    /// `cmd`'s `BLOOMERY_CARD_BUDGET` on any card where neither `cmd`
+    /// nor this process's `levers` set one: the gate card's usable bytes
+    /// ([`Place::Gate`], the 3090's on the card in view, as `gate_card` plans
+    /// them), so a flagless server's `a` holds part of the routed experts on
+    /// the card, as the 3090 does, even when the card's own bytes could hold
+    /// every routed expert. On a unified card the set budget also keeps the
+    /// plan off the pool's budget search (`plan_in_pool` lowers only an unset
+    /// one): these servers hold the 3090's split, and the pool's search is the
+    /// [`paged`] clause's.
+    fn gate_card_budget(
+        cmd: &mut Command,
+        levers: &bloomery_levers::Levers,
+    ) -> Result<(), GateError> {
+        let gate = Place::Gate.on(census()?)?.card_specs()?[0];
+        let set = match cmd
+            .get_envs()
+            .find(|&(k, _)| k == bloomery_levers::CARD_BUDGET)
+        {
+            Some((_, v)) => v.is_some(),
+            None => levers.card_budget().is_set(),
+        };
+        if !set {
+            cmd.env(
+                bloomery_levers::CARD_BUDGET,
+                gate.usable_bytes().to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// A server of the unhosted-pool clause under `room` bytes of host, the
-    /// residency word `word` (unset for `None`).
-    fn churn_server(room: u64, word: Option<&str>) -> Result<Command, GateError> {
+    /// residency word `word` (unset for `None`), on any card under the
+    /// gate card's budget ([`gate_card_budget`]).
+    fn churn_server(
+        room: u64,
+        word: Option<&str>,
+        levers: &bloomery_levers::Levers,
+    ) -> Result<Command, GateError> {
         let mut cmd = Command::new(Served38::exe()?);
         match word {
             Some(word) => cmd.env(bloomery_levers::RESIDENCY, word),
@@ -2664,6 +2737,7 @@ mod gate {
             .env_remove(bloomery_levers::MTP_DRAFT)
             .env_remove(bloomery_levers::MTP_WIDTH)
             .env(bloomery_levers::HOST_ROOM, room.to_string());
+        gate_card_budget(&mut cmd, levers)?;
         Ok(cmd)
     }
 
@@ -2673,10 +2747,11 @@ mod gate {
     fn churn_plan_only(
         own: &Path,
         room: u64,
+        levers: &bloomery_levers::Levers,
     ) -> Result<Result<(PathBuf, record::Log), String>, GateError> {
         std::fs::create_dir_all(own)?;
         let err_log = own.join("server.err");
-        let mut cmd = churn_server(room, None)?;
+        let mut cmd = churn_server(room, None, levers)?;
         let args: Vec<&str> = CHURN_ARGS.iter().copied().chain(["--plan"]).collect();
         let mut served = Served38::spawn_with(&args, own, &mut cmd)?;
         println!("churn-unhosted plan server pid {}", served.child.id());
@@ -2704,8 +2779,11 @@ mod gate {
     /// pool must be hosted at P 0 on this room and non-empty, and its `cache`
     /// line must name the room asked and the same pool, so the terms are the
     /// plan the second server loads.
-    fn churn_plan(own: &Path) -> Result<Result<ChurnRoom, String>, GateError> {
-        let (err_log, log) = match churn_plan_only(own, CHURN_PLAN_ROOM)? {
+    fn churn_plan(
+        own: &Path,
+        levers: &bloomery_levers::Levers,
+    ) -> Result<Result<ChurnRoom, String>, GateError> {
+        let (err_log, log) = match churn_plan_only(own, CHURN_PLAN_ROOM, levers)? {
             Ok(ran) => ran,
             Err(why) => return Ok(Err(why)),
         };
@@ -2768,9 +2846,9 @@ mod gate {
     /// a victim served from the file ([`CHURN_VICTIMS`]). The unset word on
     /// the same room climbs ([`churn_unset_climbs`], [`CHURN_CLIMBS`]).
     /// FAIL-first: the module header's mutants.
-    fn churn_unhosted(dir: &Path) -> Result<bool, GateError> {
+    fn churn_unhosted(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let mut ok = true;
-        let room = match churn_plan(&dir.join("churn-plan"))? {
+        let room = match churn_plan(&dir.join("churn-plan"), levers)? {
             Ok(room) => room,
             Err(why) => {
                 println!("churn-unhosted: no room can be derived: {why}");
@@ -2799,7 +2877,7 @@ mod gate {
         let own = dir.join("churn-unhosted");
         std::fs::create_dir_all(&own)?;
         let err_log = own.join("server.err");
-        let mut cmd = churn_server(asked, Some(CHURN_WORD))?;
+        let mut cmd = churn_server(asked, Some(CHURN_WORD), levers)?;
         let mut served = Served38::spawn_with(&CHURN_ARGS, &own, &mut cmd)?;
         println!("churn-unhosted server pid {}", served.child.id());
         let completed = match served.address(&err_log, POLLS, POLL) {
@@ -2899,7 +2977,7 @@ mod gate {
             CHURN_VICTIMS,
             rereads.saturating_add(unresident) > 0 && !refused,
         );
-        churn_unset_climbs(dir, &room, &mut ok)?;
+        churn_unset_climbs(dir, &room, levers, &mut ok)?;
         Ok(ok)
     }
 
@@ -2910,8 +2988,13 @@ mod gate {
     /// the climbed word at `pinned=<q>` with the pool hosted, whatever the
     /// body carries ([`CHURN_CLIMBS`]). FAIL-first: an unset word that keeps
     /// P 0 with the pool unhosted prints `p0` kept and `hosted=unhosted`.
-    fn churn_unset_climbs(dir: &Path, room: &ChurnRoom, ok: &mut bool) -> Result<(), GateError> {
-        let log = match churn_plan_only(&dir.join("churn-climbs"), room.room())? {
+    fn churn_unset_climbs(
+        dir: &Path,
+        room: &ChurnRoom,
+        levers: &bloomery_levers::Levers,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let log = match churn_plan_only(&dir.join("churn-climbs"), room.room(), levers)? {
             Ok((_, log)) => log,
             Err(why) => {
                 println!("churn-unset-climbs: {why}");
@@ -3572,43 +3655,49 @@ mod gate {
         Ok(ok)
     }
 
-    /// The plan's routed-expert bytes on the gate card at a slot's `ctx`, the
-    /// stage card's and the NVMe tier's, `slots` resident sequences counted
-    /// (`plan_with_slots`), plain, as the server makes it — the clause's
-    /// flagless server's two, the refusal arm's one; `None` when no plan
-    /// takes the context.
-    fn card_at(
+    /// The seat's machine of the file `inputs` describes on the stage card
+    /// `stage` (`Place38::machine_read`'s for `--place a` and `gate`): the
+    /// file's route form at ubatches of `ub`, and the room its `slots`
+    /// sequences of a slot's `ctx` positions reserve (`drafted` the draft
+    /// beside the target), rounded to the stage card's allocation granule as
+    /// the census read it. The seat's checkpoint reserves and its route
+    /// widening are its own.
+    fn route_machine(
         inputs: &PlanInputs,
-        levers: &PlanLevers,
+        stage: CardSpec,
+        (ub, ctx): (u64, u64),
         experts: Experts,
-        ctx: usize,
-        free: Option<u64>,
-        slots: usize,
-    ) -> Result<Option<(u64, u64)>, GateError> {
-        let ub = u64::try_from(ubatch_for(ctx)?)?;
-        let mut machine = machine_for_experts(RTX_3090, inputs.spec.layers.len(), ub, experts);
-        machine.cards[0].free_bytes = free;
-        Ok(inputs
-            .plan_with_slots(&machine, (u64::try_from(ctx)?, ub), levers, experts, slots)
-            .ok()
-            .and_then(|p| {
-                p.cards
-                    .first()
-                    .map(|c| (c.expert_bytes, p.host.nvme_expert_bytes))
-            }))
+        (slots, drafted): (u64, bool),
+    ) -> Result<model::placement::Machine, GateError> {
+        let mut machine = machine_for_route(
+            stage,
+            inputs.spec.layers.len(),
+            ub,
+            experts,
+            inputs.route_form(bloomery_gpu::NATIVE_FP4),
+        );
+        inputs.reserve_room(
+            &mut machine,
+            (ctx, slots, drafted),
+            stage.granule_bytes.get(),
+        )?;
+        Ok(machine)
     }
 
-    /// The gate's own plan of the file on the gate card (`free` bytes free,
-    /// as the server's `plan` record names them) at a slot's `ctx` positions
-    /// for `slots` resident sequences, plain, under the host room `room`
-    /// (given, not read), handed to `then` — the server's plan but for its
-    /// machine's host reserve of the checkpoints, which this machine, the
-    /// OS's alone, does not hold.
+    /// The gate's own plan of the file on the gate card `stage` (its free
+    /// bytes the server's `plan` record names, [`stage_at`]) at a slot's
+    /// `ctx` positions for `slots` resident sequences, plain, under the host
+    /// room `room` (given, not read), handed to `then` — the server's plan on
+    /// the seat's machine (the file's route form and the store page rounding
+    /// on the stage card, which a unified card counts in its share of the
+    /// host room) but for its host reserve of the checkpoints, which this
+    /// machine holds only as `held` ([`CHECKPOINTS_RESERVE`], the OS's alone
+    /// for `None`).
     fn gate_plan_at<T>(
         levers: &bloomery_levers::Levers,
         (ctx, slots): (usize, usize),
-        free: u64,
-        room: u64,
+        stage: CardSpec,
+        (room, held): (u64, Option<u64>),
         then: impl FnOnce(Result<model::placement::Plan<'_>, PlaceError>) -> Result<T, GateError>,
     ) -> Result<T, GateError> {
         let path = ref_model_path()?;
@@ -3617,8 +3706,19 @@ mod gate {
         inputs.room = (room, HostRead::Given);
         let experts = experts38(levers)?;
         let ub = u64::try_from(ubatch_for(ctx)?)?;
-        let mut machine = machine_for_experts(RTX_3090, inputs.spec.layers.len(), ub, experts);
-        machine.cards[0].free_bytes = Some(free);
+        let mut machine = route_machine(
+            &inputs,
+            stage,
+            (ub, u64::try_from(ctx)?),
+            experts,
+            (u64::try_from(slots)?, false),
+        )?;
+        if let Some(bytes) = held {
+            machine
+                .host_mut()
+                .reserves
+                .push((CHECKPOINTS_RESERVE.to_owned(), bytes));
+        }
         then(inputs.plan_with_slots(
             &machine,
             (u64::try_from(ctx)?, ub),
@@ -3628,34 +3728,82 @@ mod gate {
         ))
     }
 
+    /// The rounds [`room_beside_card`] moves the room by the plan's card share
+    /// before it refuses by name.
+    const SHARE_ROUNDS: usize = 8;
+
+    /// The host room the [`paged`] clause asks for `host` bytes beside the
+    /// gate card `stage`: `host` plus the card's share of a unified pool in
+    /// the gate plan at that room (`pool_card_bytes`, 0 on a card of memory
+    /// of its own, where the room is `host`). The share moves with the room
+    /// (at a small room the pool plan lowers the card's experts), so the room
+    /// is taken where the plan at `host + share` holds that same share,
+    /// starting from the share at `host`; a share that does not settle within
+    /// [`SHARE_ROUNDS`] is a named error.
+    fn room_beside_card(
+        levers: &bloomery_levers::Levers,
+        stage: CardSpec,
+        host: u64,
+    ) -> Result<u64, GateError> {
+        let share_at = |room: u64| {
+            gate_plan_at(levers, (CTX, 1), stage, (room, None), |plan| {
+                Ok(plan?.host.pool_card_bytes)
+            })
+        };
+        let mut share = share_at(host)?;
+        for _ in 0..SHARE_ROUNDS {
+            let next = share_at(host + share)?;
+            if next == share {
+                return Ok(host + share);
+            }
+            share = next;
+        }
+        Err(format!(
+            "paged: the card share of {} at {host} B beside it did not settle in {SHARE_ROUNDS} \
+             rounds (last {share} B)",
+            stage.name
+        )
+        .into())
+    }
+
     /// The NVMe tier's RAM arena and the host's need ([`HostNeed::bytes`],
     /// the arena inside it) of [`gate_plan_at`]'s plan at the host room
     /// `room`.
     fn host_split_at(
         levers: &bloomery_levers::Levers,
         shape: (usize, usize),
-        free: u64,
+        stage: CardSpec,
         room: u64,
     ) -> Result<(u64, u64), GateError> {
-        gate_plan_at(levers, shape, free, room, |plan| {
+        gate_plan_at(levers, shape, stage, (room, None), |plan| {
             let plan = plan?;
             Ok((plan.host.nvme_arena_bytes, HostNeed::of(&plan, 0).bytes()))
         })
     }
 
-    /// The NVMe expert tier's floor of [`gate_plan_at`]'s plan: the one
-    /// `HostRoomFloor` names for a room of one byte (the planner's one owner
-    /// of the floor), read by type.
+    /// The NVMe expert tier's floor of [`gate_plan_at`]'s plan beside the
+    /// gate card, and the card's share of a unified pool it carries: the
+    /// floor `HostRoomFloor` names for a room of one byte (the planner's one
+    /// owner of the floor), read by type, less the share
+    /// (`pool_card_bytes`, 0 on a card of memory of its own) of the plan at
+    /// that floor, whose cards are the refused plan's.
     fn host_floor(
         levers: &bloomery_levers::Levers,
         shape: (usize, usize),
-        free: u64,
-    ) -> Result<u64, GateError> {
-        gate_plan_at(levers, shape, free, 1, |plan| match plan {
+        stage: CardSpec,
+    ) -> Result<(u64, u64), GateError> {
+        let floor = gate_plan_at(levers, shape, stage, (1, None), |plan| match plan {
             Err(PlaceError::Placement(PlacementError::HostRoomFloor { floor, .. })) => Ok(floor),
             Err(e) => Err(e.into()),
             Ok(_) => Err("a host room of one byte planned: no floor to read".into()),
-        })
+        })?;
+        let share = gate_plan_at(levers, shape, stage, (floor, None), |plan| {
+            Ok(plan?.host.pool_card_bytes)
+        })?;
+        let beside = floor.checked_sub(share).ok_or_else(|| {
+            format!("the floor {floor} B at {shape:?} is under its plan's card share {share} B")
+        })?;
+        Ok((beside, share))
     }
 
     /// The host bytes the seat's `slots` sequences of a slot's `ctx` positions
@@ -3750,12 +3898,28 @@ mod gate {
         let pfield = |k: &str| ctx_ladder::field(&parallel, k);
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::describe(&split)?;
-        let experts = experts38(levers)?;
-        let plan_levers = PlanLevers::from_levers(levers)?;
-        let free = Some(server_card_free(&err_log)?);
+        let (stage, plan_room) = server_stage(&err_log)?;
+        let inputs = PlanInputs::describe_in(&split, (plan_room, HostRead::Given))?;
         let limit = limit38(&inputs)?;
-        let at = |c: u64| card_at(&inputs, &plan_levers, experts, usize::try_from(c)?, free, 1);
+        // The gate's own one-slot plan at the server's free reading and room,
+        // on the seat's machine with its checkpoint reserve: the card's and
+        // the NVMe tier's routed-expert bytes, `None` when no plan takes `c`.
+        let at = |c: u64| -> Result<Option<(u64, u64)>, GateError> {
+            let shape = (usize::try_from(c)?, 1);
+            gate_plan_at(
+                levers,
+                shape,
+                stage,
+                (plan_room, Some(pinned_checkpoints(shape)?)),
+                |plan| {
+                    Ok(plan.ok().and_then(|p| {
+                        p.cards
+                            .first()
+                            .map(|c| (c.expert_bytes, p.host.nvme_expert_bytes))
+                    }))
+                },
+            )
+        };
         let ctx = ctx_ladder::field(&line, "ctx").ok_or("the `ctx` line names no ctx")?;
         let above = step_above(limit.0, ctx);
         let (at_ctx, at_above) = (at(ctx)?, above.map(at).transpose()?);
@@ -3811,7 +3975,7 @@ mod gate {
         );
         // The one-slot fit at the default server's free reading: the largest
         // share whose plan the card holds, up to the limit.
-        let at1 = |c: usize| card_at(&inputs, &plan_levers, experts, c, free, 1);
+        let at1 = |c: usize| at(u64::try_from(c)?);
         let cap = usize::try_from(limit.0)?;
         let (mut lo, mut hi) = (1, cap);
         while lo < hi {
@@ -4201,7 +4365,8 @@ mod gate {
 
     /// The NVMe tier's paged rule (the seat's module doc,
     /// `bloomery_levers::paged_columns`) on the gate plan at two rooms
-    /// (`BLOOMERY_HOST_ROOM`, the split dial's default arena). Planning probes
+    /// (`BLOOMERY_HOST_ROOM`, the split dial's default arena), each its bytes
+    /// beside the gate card ([`room_beside_card`]). Planning probes
     /// stop before the load; request clauses wait for listening and completion.
     /// At 27 GiB the plan pages its host experts through the
     /// tier's RAM arena (`bloomery_placement`'s
@@ -4232,7 +4397,10 @@ mod gate {
     /// slots' (the gate's own plans' floors, read off `HostRoomFloor`, plus
     /// `pinned_checkpoints(slots)`) `--parallel 2` is refused by the floor, by
     /// name
-    /// (`paged_floor_set_parallel_is_refused_by_the_floor`). Last, the small
+    /// (`paged_floor_set_parallel_is_refused_by_the_floor`); on a unified card,
+    /// whose pool lowers the card budget instead, it stands at the two-slot
+    /// floor on the plan the pool gives the gate too
+    /// (`paged_floor_set_parallel_stands_on_the_pool_budget`). Last, the small
     /// card's case (below, at its server). The fixture tier defers the clause by name: its rooms and
     /// budget are the real file's shapes.
     /// FAIL-first: a default of two slots prints a `paged` line at 27 GiB; a
@@ -4318,8 +4486,16 @@ mod gate {
                 .is_some())
         };
         let mut ok = true;
+        let gate_card = Place::Gate.on(census()?)?.card_specs()?[0];
+        let paged_room = room_beside_card(levers, gate_card, 27 << 30)?;
+        let mapped_room = room_beside_card(levers, gate_card, 40 << 30)?;
+        println!(
+            "paged: the rooms {paged_room} B and {mapped_room} B, 27 GiB and 40 GiB beside the card \
+             and its share of a unified pool"
+        );
+        let (paged_arg, mapped_arg) = (paged_room.to_string(), mapped_room.to_string());
 
-        let (line, _, text) = run(&[(bloomery_levers::HOST_ROOM, "27G")], &[])?;
+        let (line, _, text) = run(&[(bloomery_levers::HOST_ROOM, &paged_arg)], &[])?;
         let paged = paged_line(&text);
         println!("paged: {}", paged.as_deref().unwrap_or("no paged line"));
         let arena = text
@@ -4386,6 +4562,7 @@ mod gate {
             .first(&record::PLAN38)?
             .ok_or("the 27 GiB server printed no `plan` record")?
             .u64("card_free")?;
+        let stage = stage_at(Place::Gate, free)?;
 
         // The checkpoints every resident sequence may pin sit outside the
         // room the split fills: the host reserves them, so the plan's need
@@ -4418,7 +4595,7 @@ mod gate {
             term(cache.as_deref(), "need"),
         );
         let bare = shape
-            .map(|shape| host_split_at(levers, shape, free, 27 << 30))
+            .map(|shape| host_split_at(levers, shape, stage, paged_room))
             .transpose()?;
         println!(
             "paged: the seat's arena {:?} and need {:?}, the gate's plan with no checkpoint \
@@ -4442,7 +4619,7 @@ mod gate {
         // PIN(2026-10-23): judge the paged parallel clause again, through listening
         // and requests; the plan's arena floor counts every resident slot's columns.
         let mut cmd = Command::new(Served38::exe()?);
-        cmd.env(bloomery_levers::HOST_ROOM, "27G")
+        cmd.env(bloomery_levers::HOST_ROOM, &paged_arg)
             .env(bloomery_levers::DRAFT, "off")
             .env(bloomery_levers::RESIDENCY, "off")
             .env(bloomery_levers::STEP_STATS, "1")
@@ -4521,7 +4698,7 @@ mod gate {
         // line. Was two slots asked, one served (`from=paged`, `draft=on`).
         let (line, failed, text) = run(
             &[
-                (bloomery_levers::HOST_ROOM, "27G"),
+                (bloomery_levers::HOST_ROOM, &paged_arg),
                 (bloomery_levers::DRAFT, "mtp"),
             ],
             &[],
@@ -4560,7 +4737,7 @@ mod gate {
         );
         let mut cmd = Command::new(Served38::exe()?);
         cmd.env(bloomery_levers::RESIDENCY, RESIDENCY_WORD)
-            .env(bloomery_levers::HOST_ROOM, "27G")
+            .env(bloomery_levers::HOST_ROOM, &paged_arg)
             .env_remove(bloomery_levers::DRAFT)
             .env_remove(bloomery_levers::NVTIER_BYTES)
             .env_remove(bloomery_levers::MTP_HEAD_ROWS)
@@ -4620,7 +4797,10 @@ mod gate {
                 && reads.is_some_and(|(slot, mapping)| slot > 0 && mapping == 0),
         );
 
-        let (line, _, text) = run(&[(bloomery_levers::HOST_ROOM, "40G")], &["--parallel", "2"])?;
+        let (line, _, text) = run(
+            &[(bloomery_levers::HOST_ROOM, &mapped_arg)],
+            &["--parallel", "2"],
+        )?;
         let asked = line.as_deref().is_some_and(|l| {
             field(l, "slots").as_deref() == Some("2") && field(l, "from").as_deref() == Some("flag")
         });
@@ -4637,51 +4817,140 @@ mod gate {
         // one-slot plan's at [`CTX`] — a band of rooms a set `--parallel 2`
         // cannot clear. At its middle that server is refused by the floor, by
         // name (its context choice's first plan fails before the `paged` rule).
+        // On a unified card the floors are read beside the card
+        // ([`host_floor`]), and the band is not the rule: the cards and the
+        // host read one pool, and a plan the floor refuses at the cards' full
+        // share is planned again under a lowered card budget (`plan_in_pool`),
+        // so no room refuses the server by the floor while the pool can give
+        // way. There the server is asked at the two-slot plan's floor at one
+        // position, its full share in, under which every context its choice
+        // takes is refused at the full share: the gate's own plan at the
+        // server's shape and room, with the checkpoint reserve the server
+        // holds, is the pool's (`paged_floor_pool_lowers_the_two_slot_budget`),
+        // and the server stands at two slots on that plan, its card and host
+        // experts the gate plan's (`paged_floor_set_parallel_stands_on_the_pool_budget`).
         // PIN(2026-10-14): `paged_floor_fallback_serves_one_column` is gone with the
         // seat's floor fallback: it served a default of two slots as one, and the
         // default is one slot now (ctx-first, D2).
-        let one_floor = host_floor(levers, (CTX, 1), free)? + pinned_checkpoints((CTX, 1))?;
-        let two_floor = host_floor(levers, (1, 2), free)? + pinned_checkpoints((1, 2))?;
-        let band = one_floor < two_floor;
-        let room = one_floor + two_floor.saturating_sub(one_floor) / 2;
+        let (one_floor, one_share) = host_floor(levers, (CTX, 1), stage)?;
+        let one_floor = one_floor + pinned_checkpoints((CTX, 1))?;
+        let (two_floor, two_share) = host_floor(levers, (1, 2), stage)?;
+        let two_floor = two_floor + pinned_checkpoints((1, 2))?;
+        // PIN(2026-10-31): a unified card's pool lowers the card budget, so the floor's
+        // refusal is the discrete card's only.
+        let unified = stage.integrated;
+        let room = if unified {
+            two_floor + two_share
+        } else {
+            one_floor + two_floor.saturating_sub(one_floor) / 2
+        };
         println!(
-            "paged: floors with the checkpoints: one slot at {CTX} positions {one_floor} B, two \
-             slots at one position {two_floor} B; the band's middle {room} B"
+            "paged: floors beside the card with the checkpoints: one slot at {CTX} positions \
+             {one_floor} B (card share {one_share} B), two slots at one position {two_floor} B \
+             (card share {two_share} B); the server's room {room} B"
         );
-        check(&mut ok, "paged_floor_band_is_between_the_slot_floors", band);
+        if !unified {
+            check(
+                &mut ok,
+                "paged_floor_band_is_between_the_slot_floors",
+                one_floor < two_floor,
+            );
+        }
         let room_arg = room.to_string();
         let (line, failed, text) = run(
             &[(bloomery_levers::HOST_ROOM, &room_arg)],
             &["--parallel", "2"],
         )?;
-        check(
-            &mut ok,
-            "paged_floor_set_parallel_is_refused_by_the_floor",
-            failed
-                && line.is_none()
-                && text.contains(&format!(
-                    "the host room {room} B is under the NVMe expert tier's floor"
-                ))
-                && !listened(&text)?,
-        );
+        if unified {
+            let seat = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
+                .first(&record::PLAN38)?
+                .map(|p| {
+                    Ok::<_, GateError>((
+                        p.u64("card_experts")?,
+                        p.u64("host_experts")?,
+                        p.u64("card_free")?,
+                    ))
+                })
+                .transpose()?;
+            let shape = term(line.as_deref(), "slot_ctx").zip(term(line.as_deref(), "slots"));
+            let pool = match (seat, shape) {
+                (Some((_, _, free)), Some((ctx, slots))) => {
+                    let shape = (usize::try_from(ctx)?, usize::try_from(slots)?);
+                    let held = pinned_checkpoints(shape)?;
+                    Some(gate_plan_at(
+                        levers,
+                        shape,
+                        stage_at(Place::Gate, free)?,
+                        (room, Some(held)),
+                        |plan| {
+                            Ok(plan
+                                .map(|p| (p.budget_from_pool, p.cards[0].experts, p.host.experts))
+                                .map_err(|e| e.to_string()))
+                        },
+                    )?)
+                }
+                _ => None,
+            };
+            println!(
+                "paged: the two-slot server's plan (card experts, host experts, card free) \
+                 {seat:?} at (slot_ctx, slots) {shape:?}; the gate's plan there with the \
+                 checkpoints (from the pool, card experts, host experts) {pool:?}"
+            );
+            check(
+                &mut ok,
+                "paged_floor_pool_lowers_the_two_slot_budget",
+                matches!(pool, Some(Ok((true, _, _)))),
+            );
+            let from_flag = line
+                .as_deref()
+                .is_some_and(|l| field(l, "from").as_deref() == Some("flag"));
+            check(
+                &mut ok,
+                "paged_floor_set_parallel_stands_on_the_pool_budget",
+                !failed
+                    && from_flag
+                    && shape.is_some_and(|(_, slots)| slots == 2)
+                    && matches!(
+                        (seat, &pool),
+                        (Some((card, host, _)), Some(Ok((true, c, h)))) if card == *c && host == *h
+                    ),
+            );
+        } else {
+            check(
+                &mut ok,
+                "paged_floor_set_parallel_is_refused_by_the_floor",
+                failed
+                    && line.is_none()
+                    && text.contains(&format!(
+                        "the host room {room} B is under the NVMe expert tier's floor"
+                    ))
+                    && !listened(&text)?,
+            );
+        }
 
         // The small card's case: a flagless server — no `--place`, so the
-        // box pin's one-card view runs `a` on the 3090, as
-        // `slots_default_residency`'s does — under the budget whose drafted
-        // one-slot plan fits a context the plain plan holds twice of
-        // ([`small_card_budget`]), at 27 GiB. The unset draft yields to the
-        // context on that plan, and the load runs the plain plan the yield
-        // was judged on: its `load draft=off` record names the yield, the
-        // positions the `draft yield` record holds. The residency is pinned
-        // off: the clause holds the draft. Stopped at that record.
+        // one card in view runs `a`, as `slots_default_residency`'s does —
+        // under the budget whose drafted one-slot plan fits a context the
+        // plain plan holds twice of ([`small_card_budget`]), at 27 GiB. The
+        // unset draft yields to the context on that plan, and the load runs
+        // the plain plan the yield was judged on: its `load draft=off` record
+        // names the yield, the positions the `draft yield` record holds. The
+        // residency is pinned off: the clause holds the draft. Stopped at that
+        // record.
         // PIN(2026-10-14): was the two-slot default, whose yield the paged rule
         // overrode on the one-slot plan it fell to (`paged_small_card_load_names_the_rule`);
         // with one default slot (ctx-first, D2) the yield's plan is the load's, so its
         // record names the yield (`paged_small_card_load_names_the_yield`).
-        let (budget, fitted) = small_card_budget(levers, free)?;
+        // A unified card's reading beside the paged server is the pool its
+        // room caps; the search plans the card's own pool, the census's.
+        let small = match stage_at(Place::A, free)? {
+            card if card.integrated => Place::A.on(census()?)?.card_specs()?[0],
+            card => card,
+        };
+        let (budget, fitted) = small_card_budget(levers, small)?;
         let budget_bytes = budget.to_string();
         let mut cmd = Command::new(Served38::exe()?);
-        cmd.env(bloomery_levers::HOST_ROOM, "27G")
+        cmd.env(bloomery_levers::HOST_ROOM, &paged_arg)
             .env(bloomery_levers::CARD_BUDGET, &budget_bytes)
             .env(bloomery_levers::RESIDENCY, "off")
             .env_remove(bloomery_levers::DRAFT)
@@ -4758,17 +5027,28 @@ mod gate {
             one && paged_line(&text).is_none() && why.is_some() && off == why,
         );
 
-        // `generate_qwen3moe` under the same rule: with no `--place` (the
-        // box pin's one card, `a`) at 27 GiB, the unset draft runs at `a`
-        // with its file there, its plan pages, and the run drafts nothing —
-        // its `load draft=off` record names the paged rule at the arena it
-        // names, and no `load draft=mtp` line prints. The residency is pinned
-        // off, as at the small card. It runs whole: `-n 2` past its load. The
-        // four-slot run sets the draft off and answers each slot from the arena.
+        // `generate_qwen3moe` under the same rule: at `a` (the one card in
+        // view) at the paged room, the unset draft runs at `a` with its file
+        // there, its plan pages, and the run drafts nothing — its `load
+        // draft=off` record names the paged rule at the arena it names, and no
+        // `load draft=mtp` line prints. The residency is pinned off, as at the
+        // small card. It runs whole: `-n 2` past its load. The four-slot run
+        // sets the draft off and answers each slot from the arena. A card of
+        // memory of its own runs `--place a` under the gate card's bytes (the
+        // binary takes `BLOOMERY_CARD_BUDGET` only beside a `--place`): a
+        // larger card holds more experts at 27 GiB, so its plan has no arena
+        // and the draft stays on. A unified card's room is beside its share
+        // already, so it runs with no `--place`.
+        // PIN(2026-10-31): was no `--place` on the 3090 alone, gpu-gate.sh's `PIN_3090`.
+        let place_a: &[&str] = if gate_card.integrated {
+            &[]
+        } else {
+            &["--place", "a"]
+        };
         for slots in [1, 4] {
             let mut cmd =
                 Command::new(std::env::current_exe()?.with_file_name("generate_qwen3moe"));
-            cmd.env(bloomery_levers::HOST_ROOM, "27G")
+            cmd.env(bloomery_levers::HOST_ROOM, &paged_arg)
                 .env(bloomery_levers::GEN_SLOTS, slots.to_string())
                 .env(bloomery_levers::RESIDENCY, "off")
                 .env_remove(bloomery_levers::DRAFT)
@@ -4776,14 +5056,21 @@ mod gate {
                 .env_remove(bloomery_levers::MTP_HEAD_ROWS)
                 .env_remove(bloomery_levers::MTP_DRAFT)
                 .env_remove(bloomery_levers::MTP_WIDTH);
+            if !gate_card.integrated {
+                cmd.env(
+                    bloomery_levers::CARD_BUDGET,
+                    gate_card.usable_bytes().to_string(),
+                );
+            }
             if slots > 1 {
                 cmd.env(bloomery_levers::DRAFT, "off");
             }
-            let args = if slots == 1 {
+            let fed = if slots == 1 {
                 ["--prompt", prompt, "-n", "2"]
             } else {
                 ["--tokens", "1,2,3,4", "-n", "2"]
             };
+            let args: Vec<&str> = place_a.iter().chain(&fed).copied().collect();
             let mut run = Served38::spawn_with(&args, &own, &mut cmd)?;
             let mut status = None;
             for _ in 0..POLLS {
@@ -4860,21 +5147,22 @@ mod gate {
     }
 
     /// The card budget under which the unset draft yields to the context on
-    /// the 3090 (its free bytes `free`, the seat's census reading), to a
-    /// MiB, and the context the drafted choice fits there: for each context
-    /// `c` from half the target down by halves to the floor
+    /// `card` (`a` as the small-card server resolves it, at the seat's free
+    /// reading, [`stage_at`], or a unified card's own pool), to a MiB, and
+    /// the context the drafted choice fits there: for each context `c` from
+    /// half the target down by halves to the floor
     /// ([`ctx_ladder::target_of`] under [`limit38`]), the least budget under
     /// which the file's drafted one-slot plan holds `c`, kept when the
     /// drafted plan holds not the step above and the plain plan holds twice
     /// `c` there — the drafted choice fits to `c` and the plain one holds at
     /// least twice as much, as on a 12 GB card. The plan is the small-card server's: the unset head and
     /// the draft file beside the target (that server sets neither lever),
-    /// the census's 3090 as `a` resolves it (`devices::spec_of_device`: the
-    /// known spec with the census's free bytes) and no draft reserve in the
-    /// machine, which a one-card plan counts in `plan_mtp_with_slots`.
+    /// `card` on the seat's machine (route form and store page rounding) and
+    /// no draft reserve in it, which a one-card plan counts in
+    /// `plan_mtp_with_slots`.
     fn small_card_budget(
         levers: &bloomery_levers::Levers,
-        free: u64,
+        card: CardSpec,
     ) -> Result<(u64, u64), GateError> {
         const MIB: u64 = 1 << 20;
         let path = ref_model_path()?;
@@ -4893,8 +5181,7 @@ mod gate {
         let mtp = MtpInputs::read(&draft, &split, &inputs, rows)?;
         let holds = |budget: u64, c: u64, drafted: bool| -> Result<bool, GateError> {
             let ub = u64::try_from(ubatch_for(usize::try_from(c)?)?)?;
-            let mut machine = machine_for_experts(RTX_3090, inputs.spec.layers.len(), ub, experts);
-            machine.cards[0].free_bytes = Some(free);
+            let machine = route_machine(&inputs, card, (ub, c), experts, (1, drafted))?;
             let plan_levers = PlanLevers {
                 card_budget_bytes: Some(budget).into(),
             };
@@ -4909,6 +5196,9 @@ mod gate {
                 )
                 .is_ok())
         };
+        let free = card
+            .free_bytes
+            .ok_or("the small card's spec carries no free reading")?;
         let target = ctx_ladder::target_of(limit38(&inputs)?.0);
         let mut tried = Vec::new();
         let mut c = target / 2 / ctx_ladder::STEP * ctx_ladder::STEP;
@@ -4937,9 +5227,10 @@ mod gate {
             c = c / 2 / ctx_ladder::STEP * ctx_ladder::STEP;
         }
         Err(format!(
-            "the 3090's {free} free bytes give no budget under which the drafted one-slot plan \
+            "the {}'s {free} free bytes give no budget under which the drafted one-slot plan \
              fits a context the plain plan holds twice of ({tried:?}): no budget makes the small \
-             card's case"
+             card's case",
+            card.name
         )
         .into())
     }
@@ -4966,7 +5257,7 @@ mod gate {
     ) -> Result<bool, GateError> {
         // The devices' totals for the plan line's bound, read before the
         // server holds any of them.
-        let census = bloomery_gpu::census()?;
+        let census = census()?;
         let exe = Served38::exe()?;
         let err_log = dir.join("server.err");
         let mut cmd = Command::new(&exe);
@@ -4993,7 +5284,7 @@ mod gate {
         // that bound, turns this red.
         let plan = seat_log(&err_log)?.one(&record::PLAN38)?;
         let free = plan.opt_u64("card_free")?;
-        let limit = record::stage_device_free_limit(&plan, &census)?;
+        let limit = record::stage_device_free_limit(&plan, census)?;
         let free_named = free.is_some_and(|f| f <= limit);
         println!(
             "plan names the stage card's free bytes {free_named}: card_free={free:?}, usable \
@@ -5077,7 +5368,7 @@ mod gate {
         // An unset residency whose churn pool the host's room cannot take
         // keeps its P and runs the pool from the file (the module header):
         // its own two servers.
-        ok &= churn_unhosted(dir)?;
+        ok &= churn_unhosted(dir, levers)?;
         // The width chooser's server (the module header): the draft on, the
         // residency off, `BLOOMERY_MTP_WIDTH=cost`.
         ok &= width_cost(dir, prompt)?;
@@ -5395,7 +5686,10 @@ mod gate {
 
         let fed: Vec<u32> = ids.iter().chain(&again.tokens).copied().collect();
         let n = saved["n_saved"].as_u64().unwrap_or(0) as usize;
-        let (arena_at, side_at, arena, rows) = pending_refresh(&bytes, &fed, n)?;
+        let path = ref_model_path()?;
+        let split = Split::open(&path)?;
+        let vocab = PlanInputs::describe(&split)?.spec.vocab;
+        let (arena_at, side_at, arena, rows) = pending_refresh(&bytes, &fed, n, vocab)?;
         println!("slot file: the pending refresh holds {rows} rows of arena {arena} from row 0");
         let mut bad_arena = bytes.clone();
         bad_arena[arena_at] = 2;
@@ -5477,9 +5771,6 @@ mod gate {
             "slot file: PLE histories at {:?}",
             hit.iter().map(|&(at, _)| at).collect::<Vec<_>>()
         );
-        let path = ref_model_path()?;
-        let split = Split::open(&path)?;
-        let vocab = PlanInputs::describe(&split)?.spec.vocab;
         let hash = engram::Hash::ple_from_keys(split.keys(), "qwen4exp", vocab)?;
         let engram::hash::Window::Eos(window) = hash.window() else {
             return Err("slot file: the model has no raw-id PLE hash".into());
@@ -5570,7 +5861,10 @@ mod gate {
         let held = turned["n_saved"].as_u64().unwrap_or(0) as usize;
         let fed: Vec<u32> = p1.iter().chain(&x.tokens).copied().collect();
         let bytes = std::fs::read(save.join(TURN))?;
-        let (_, side_at, _, _) = pending_refresh(&bytes, &fed, held)?;
+        let path = ref_model_path()?;
+        let split = Split::open(&path)?;
+        let vocab = PlanInputs::describe(&split)?.spec.vocab;
+        let (_, side_at, _, _) = pending_refresh(&bytes, &fed, held, vocab)?;
         let (cut, points) = without_draft_points(&bytes, side_at)?;
         println!("slot file off: {points} draft point rows taken out of the turn's file");
         std::fs::write(save.join(NO_POINTS), cut)?;
@@ -5611,43 +5905,66 @@ mod gate {
     /// `ParkedDraft::put` write it (the owners of these offsets): its arena
     /// byte's offset, the draft side's first byte, the arena's code and the
     /// refresh's rows. An active parked refresh ends with its first row (0),
-    /// no last unit, no skip and no off reason; its whole draft side,
-    /// including the saved sequence's pending tokens and positions, must
-    /// match once.
+    /// no last unit, no skip and no off reason, its last row at position `n`.
+    /// Its ids are read from the file: on the positions `fed` holds they are
+    /// `fed`'s; past it they are the server's, the ids a verify window kept
+    /// past the request's last one, each under the file's `vocab`, and the id
+    /// it waits on, a placeholder the next call's id replaces, for which no
+    /// id is expected. Its whole draft side must match once.
     fn pending_refresh(
         b: &[u8],
         fed: &[u32],
         n: usize,
+        vocab: u32,
     ) -> Result<(usize, usize, u8, usize), GateError> {
+        let suffix = |tokens: &[u32], pos0: usize, arena: u8| -> Result<Vec<u8>, GateError> {
+            let mut suffix = Vec::new();
+            let mut w = bloomery_gpu::checkpoint::bytes::Put::new(&mut suffix);
+            w.vals(&[1u8, 1])?; // MTP side, pending refresh.
+            w.array(tokens)?;
+            w.one(u32::try_from(pos0).expect("a refresh position fits the saved u32 positions"))?;
+            w.one(arena)?;
+            w.count(0)?;
+            w.vals(&[0u8; 3])?; // No last unit, skip or off reason.
+            w.flush()?;
+            Ok(suffix)
+        };
         let mut found = Vec::new();
         for rows in 1..=<Body38 as MtpBody>::VERIFY_ROWS {
             let Some(pos0) = (n + 1).checked_sub(rows) else {
                 continue;
             };
-            let Some(tokens) = fed.get(pos0..n + 1) else {
+            let Some(side_at) = b.len().checked_sub(suffix(&vec![0; rows], pos0, 0)?.len()) else {
                 continue;
             };
+            // PIN(2026-10-31): was every id `fed`'s; a verify window keeps ids past the
+            // request's last.
+            // The refresh's ids, after 2 tag bytes and the 8-byte count.
+            let tokens: Vec<u32> = b[side_at + 10..][..4 * rows]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| u32::from_le_bytes(c))
+                .collect();
+            if tokens
+                .iter()
+                .zip(pos0..)
+                .any(|(t, p)| fed.get(p).is_some_and(|f| f != t))
+                || tokens[..rows - 1].iter().any(|&t| t >= vocab)
+            {
+                continue;
+            }
             for arena in [0u8, 1] {
-                let mut suffix = Vec::new();
-                let mut w = bloomery_gpu::checkpoint::bytes::Put::new(&mut suffix);
-                w.vals(&[1u8, 1])?; // MTP side, pending refresh.
-                w.array(tokens)?;
-                w.one(
-                    u32::try_from(pos0).expect("a refresh position fits the saved u32 positions"),
-                )?;
-                w.one(arena)?;
-                w.count(0)?;
-                w.vals(&[0u8; 3])?; // No last unit, skip or off reason.
-                w.flush()?;
-                if b.ends_with(&suffix) {
-                    found.push((b.len() - 12, b.len() - suffix.len(), arena, rows));
+                if b.ends_with(&suffix(&tokens, pos0, arena)?) {
+                    found.push((b.len() - 12, side_at, arena, rows));
                 }
             }
         }
         match found.as_slice() {
             [one] => Ok(*one),
             _ => Err(format!(
-                "slot file: expected one pending refresh, found {}",
+                "slot file: expected one pending refresh, its kept ids under the vocabulary \
+                 {vocab}, found {}",
                 found.len()
             )
             .into()),
@@ -6015,6 +6332,7 @@ mod gate {
         }
         let reference = gen_tokens(&a.gen_log)?;
         std::fs::create_dir_all(&a.dir)?;
+        census()?;
         let ok = match a.arm {
             Arm::Plain => plain(&a.dir, &levers, &a.prompt, &reference)?,
             Arm::Drafted => drafted_main(&a.dir, &levers, &a.prompt, &a.ids, &reference)?,

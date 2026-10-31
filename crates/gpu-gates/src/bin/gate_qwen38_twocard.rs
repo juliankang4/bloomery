@@ -1,12 +1,14 @@
 //! GPU gate for Qwen3.8's plan (b′) on both cards (`--place bp`): the stage
-//! on the A6000 and its expert tier on the 3090 (`tier38`), against one card
-//! holding the same expert sets. No MTP draft: a verify of each width the
-//! draft's windows use (2, 3 and 4 rows) is driven directly.
+//! on the stage card and its expert tier on the tier card (`tier38`), against
+//! one card holding the same expert sets. No MTP draft: a verify of each width
+//! the draft's windows use (2, 3 and 4 rows) is driven directly. The cards are
+//! the two in view ([`bp_machine`]): the real tier plans the workstation
+//! pair's bytes on them, the fixture tier the cards as they report themselves.
 //!
 //! The plans are made under a card budget (`PlanLevers::card_budget_bytes`)
-//! that caps both cards, so the A6000 can hold the stage's and the tier's
+//! that caps both cards, so the stage card can hold the stage's and the tier's
 //! sets at once: the gate takes the largest budget of [`BUDGETS`] whose plan
-//! puts tier experts on every layer, whose union fits the A6000 (its stage
+//! puts tier experts on every layer, whose union fits the stage card (its stage
 //! bytes and the tier's expert and rounding bytes under the card's usable
 //! bytes less its margin) and whose union counts a layer hold at most two
 //! values (the ubatch walk's card route is built for two), and prints why each
@@ -138,6 +140,7 @@ mod gate {
     use bloomery_gpu::hybrid::Chain;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{GpuError, HostFlags};
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::q38_fixture::Shape;
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
@@ -148,9 +151,11 @@ mod gate {
     };
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg};
     use gguf::Split;
-    use model::arch::qwen35moe::place::{Experts, PlaceError, PlanInputs, machine_bp, tier_batch};
+    use model::arch::qwen35moe::place::{
+        Experts, PlaceError, PlanInputs, machine_bp_on, tier_batch,
+    };
     use model::placement::host_lock::{HostFile, HostSet};
-    use model::placement::workstation::RTX_3090;
+    use model::placement::workstation::{self, A6000, Pick, RTX_3090, TierBatchBytes};
     use model::placement::{
         Device, ExpertList, Machine, PlacementError, Plan, PlanLevers, Role, Row, Segment,
     };
@@ -177,8 +182,9 @@ mod gate {
     /// for the steps after it.
     const CTX_4K: usize = 4352;
     const PROMPT_4K: usize = 4096;
-    /// The card budget the real file's gate takes, GiB: the literal the budget
-    /// search ([`chosen_plan`]) replaced, the witness the real tier prints the
+    /// The card budget the real file's gate takes on the workstation pair's
+    /// bytes ([`bp_machine`]), GiB: the literal the budget search
+    /// ([`chosen_plan`]) replaced, the witness the real tier prints the
     /// search's pick beside and requires equal.
     const REAL_BUDGET_GIB: u64 = 26;
     /// The go deadline and the grace a lost card is named within, plus room.
@@ -249,13 +255,43 @@ mod gate {
         Ok(a)
     }
 
+    /// Plan (b′)'s machine for `layers` layers at ubatches of `ub` on the two
+    /// cards in view, the stage card then its tier. The real tier resolves them
+    /// as the workstation pair's room (`Pick::Room` of the A6000, then of the
+    /// 3090 on the devices the stage card leaves: each plans that card's total
+    /// and driver reserve on the device it lands on, held as
+    /// `tier::real_card` holds a census card), the bytes
+    /// [`REAL_BUDGET_GIB`] and the union limit were found on, and refuses a
+    /// pair without that room by name; the fixture tier plans `bp` as the
+    /// devices report themselves (`--place bp`).
+    fn bp_machine(layers: usize, ub: u64, batch: TierBatchBytes) -> Result<Machine, GateError> {
+        let census = bloomery_gpu::census()?;
+        let specs = match tier::Tier::from_env()? {
+            tier::Tier::Real => {
+                let stage = workstation::resolve(&[Pick::Room(&A6000)], &census)?[0];
+                let rest: Vec<_> = census
+                    .iter()
+                    .filter(|d| Some(d.device()) != stage.device)
+                    .cloned()
+                    .collect();
+                let tier_card = workstation::resolve(&[Pick::Room(&RTX_3090)], &rest)?[0];
+                vec![tier::real_card(stage), tier::real_card(tier_card)]
+            }
+            tier::Tier::Fixture => Place::Bp.on(&census)?.card_specs()?,
+        };
+        let [stage, tier_card] = specs[..] else {
+            return Err(format!("plan (b′) takes two cards, {} resolved", specs.len()).into());
+        };
+        Ok(machine_bp_on((stage, tier_card), layers, ub, None, batch))
+    }
+
     /// The tier's device index in the plan's cards.
     fn tier_device(plan: &Plan<'_>) -> Device {
         Device::Card(plan.machine.cards.len())
     }
 
     /// Why plan (b′) under a budget cannot be the gate's: no tier expert on
-    /// some layer, a union past the A6000, or more than two union counts.
+    /// some layer, a union past the stage card, or more than two union counts.
     fn unfit(plan: &Plan<'_>) -> Option<String> {
         let tier = plan.tier_n_l.first()?;
         if let Some(l) = tier.iter().position(|&n| n == 0) {
@@ -274,7 +310,10 @@ mod gate {
             + t.rounding_bytes;
         let limit = card.usable_bytes.saturating_sub(card.margin_bytes);
         if union > limit {
-            return Some(format!("the union takes {union} B of the A6000's {limit}"));
+            return Some(format!(
+                "the union takes {union} B of the stage card {}'s {limit}",
+                card.name
+            ));
         }
         let mut counts: Vec<u64> = plan.n_l.iter().zip(tier).map(|(a, b)| a + b).collect();
         counts.sort_unstable();
@@ -621,12 +660,12 @@ mod gate {
     fn lost_case(m: &mut Qwen38Model, ids: &[u32]) -> Result<bool, GateError> {
         m.reset()?;
         m.step(&ids[..4])?;
-        let flags = {
+        let (flags, lost) = {
             let body = m.body(NAME)?;
             let tier = body.hybrid().tiers().first().ok_or("no tier card")?;
             let flags = HostFlags::new(tier.gpu()?.context(), 1)?;
             flags.enqueue_wait(tier.gpu()?.stream(), 0)?;
-            flags
+            (flags, tier.name().to_string())
         };
         let t0 = Instant::now();
         let r = m.step(&[ids[4]]);
@@ -634,7 +673,7 @@ mod gate {
         let mut ok = match &r {
             Err(e)
                 if e.to_string().contains("the card is lost")
-                    && e.to_string().contains(RTX_3090.name)
+                    && e.to_string().contains(&lost)
                     && secs < LOST_BOUND_S =>
             {
                 println!("ok lost: the step fails in {secs:.1} s naming the lost card: {e}");
@@ -742,7 +781,7 @@ mod gate {
     /// usable GiB, printed with why each larger one did not. The pick is held
     /// to be the largest: the next whole GiB above it is refused (re-planned
     /// here, not read off the search). On the real file the search lands on
-    /// [`REAL_BUDGET_GIB`], where the next one's union passes the A6000's bytes.
+    /// [`REAL_BUDGET_GIB`], where the next one's union passes the stage card's bytes.
     fn chosen_plan<'a>(
         inputs: &'a PlanInputs,
         bp: &'a Machine,
@@ -976,7 +1015,7 @@ mod gate {
             .into());
         }
         let layers = inputs.spec.layers.len();
-        let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.spec, ub as u64));
+        let bp = bp_machine(layers, ub as u64, tier_batch(&inputs.spec, ub as u64))?;
         let Chosen { plan, tight, .. } = chosen_plan(inputs, &bp, CTX_4K)?;
         let tl = tier_layers(&plan);
         let ids = prose_ids("qwen4exp", PROMPT_4K)?;
@@ -1631,7 +1670,7 @@ mod gate {
         tier::plan_levers(&split, &levers, 0)?;
         let ub = ubatch_for(CTX)?;
         let layers = inputs.spec.layers.len();
-        let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.spec, ub as u64));
+        let bp = bp_machine(layers, ub as u64, tier_batch(&inputs.spec, ub as u64))?;
         let Chosen {
             plan,
             tight: tight_3k,
@@ -1666,7 +1705,7 @@ mod gate {
             um.tiers.clear();
             let uplan = union_plan(&plan, &um)?;
             println!(
-                "reference: the A6000 holds {} experts, the union of the stage's and the tier's",
+                "reference: the stage card holds {} experts, the union of the stage's and the tier's",
                 uplan.n_l.iter().sum::<u64>()
             );
             let mut r = open(path, &uplan, &inputs, (host, ub, CTX), Residency::Off)?;

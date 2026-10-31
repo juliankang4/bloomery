@@ -1167,32 +1167,59 @@ fn fixture_card() -> Result<model::placement::workstation::CardSpec, GateError> 
     Ok(*A.get_or_init(|| card))
 }
 
-/// The move proof of the card a plan is made on: its bytes (total, the driver's reserve, the
-/// resolved device, the free bytes, the holders) beside `RTX_3090`'s, the lookup every plan made
-/// before the card was derived. The real tier requires them equal; the name is the one difference,
-/// printed apart: the plan lookup opens the card in view by its own name.
+/// A census card as the real tier's plans hold it: a card of memory of its own with no free
+/// reading and no holders, as the workstation literals the real tier's pins were made on, so its
+/// plan moves with no other process's bytes; a unified card keeps its free reading, the pool it
+/// plans against (`workstation::unified_of`).
+#[must_use]
+pub fn real_card(
+    spec: model::placement::workstation::CardSpec,
+) -> model::placement::workstation::CardSpec {
+    if spec.integrated {
+        spec
+    } else {
+        model::placement::workstation::CardSpec {
+            free_bytes: None,
+            held_by: None,
+            ..spec
+        }
+    }
+}
+
+/// The move proof of the card a plan is made on: the bytes it plans (total and the driver's
+/// reserve) beside `RTX_3090`'s, the lookup every plan made before the card was derived, and on a
+/// card of memory of its own no free reading and no holders, as the literal has. The real tier
+/// requires them equal. The card's own facts are printed apart: its name and device, by which the
+/// open finds it, whether it shares the host's memory (a unified card plans the pool its free
+/// reading is) and its allocation granule.
+// PIN(2026-10-31): was name, device, integrated, free and holders too; the card in view
+// carries them, printed apart.
 #[cfg(feature = "gpu")]
 pub fn witness_card(derived: &model::placement::workstation::CardSpec) -> bool {
     use model::placement::workstation::{CardSpec, RTX_3090};
 
-    let bytes = |c: &CardSpec| {
-        (
-            c.total_bytes,
-            c.driver_reserve_bytes,
-            c.device,
-            c.free_bytes,
-            c.held_by,
-            c.integrated,
-        )
-    };
-    let ok = witness(
-        "card bytes (total, driver reserve, device, free, holders)",
+    let bytes = |c: &CardSpec| (c.total_bytes, c.driver_reserve_bytes);
+    let mut ok = witness(
+        "card bytes (total, driver reserve)",
         bytes(derived),
         bytes(&RTX_3090),
     );
+    if !derived.integrated {
+        ok &= witness(
+            "a discrete card's free reading and holders",
+            (derived.free_bytes, derived.held_by),
+            (RTX_3090.free_bytes, RTX_3090.held_by),
+        );
+    }
     println!(
-        "named difference: the card's name {:?}, the old literal's {:?}",
-        derived.name, RTX_3090.name
+        "named difference: the card {:?} on {:?}, integrated {}, free {:?}, granule {} B; the old \
+         literal's {:?}",
+        derived.name,
+        derived.device,
+        derived.integrated,
+        derived.free_bytes,
+        derived.granule_bytes,
+        RTX_3090.name
     );
     ok
 }

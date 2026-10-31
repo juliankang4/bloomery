@@ -449,10 +449,10 @@ start. A machine whose every card is cc 12.0 builds `sm_120a`, and every other m
   (`tools/recipes.py:2498` at `3d750af3`: "both cards here are sm_86"). A green fixture pass shows no gross error.
   The logits-row diff in [#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6159465373) against a 3090 run of the same commit
   and fixture closes that bits question. `gate-gpu-e2e` on cc 12.1 can come later.
-- **Device pick.** The real-tier gate plan opens the card by the names in `CARDS` and refuses any other card by name
-  (`crates/gpu-gates/src/bin/shared/gate_card.rs:8-9, 38-47`: "none of this workstation's cards"). The fixture tier plans on
-  `--place a`, "the largest visible card as the device reports itself" (`gate_card.rs:4-6`) and is not affected. The real
-  tier is the maintainers' tier regardless (section 4).
+- **Device pick.** The real-tier gate plan resolves the one card in view as `--place gate` does: the 3090's total and
+  driver reserve on that device, which keeps its own name, identity and granule (`crates/gpu-gates/src/bin/shared/gate_card.rs`).
+  A GB10 plans those bytes against its unified pool; a card smaller than the 3090's bytes is refused by name. The fixture
+  tier plans on `--place a`, "the largest visible card as the device reports itself".
 - **K-quant bits and the `llc`.** `gate-gpu-kquant` failed when the PTX came from the Rust toolchain's `llc` (LLVM 23),
   which cuda-oxide picks ahead of LLVM 21, and passed under LLVM 21.1.8
   ([#54](https://github.com/midagedev/bloomery/issues/54)). [#63](https://github.com/midagedev/bloomery/pull/63)
