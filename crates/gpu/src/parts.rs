@@ -1418,10 +1418,11 @@ mod tests {
     /// A placed source plans a card's parts once for the plans that hold the same tensors on it,
     /// as a context search asks of plans at other contexts and rooms and the load then reads at
     /// its own room, and again for a plan whose card tensors differ; another room takes its
-    /// read-ahead again. Mutants: the last read never reused, so a second ask plans the parts
-    /// again; the last read reused at another room, or its read-ahead not taken again, so a room
-    /// for one part reads ahead as far as a room for both; `OnCard` left out of the key, so the
-    /// larger tensor reuses the smaller one's read.
+    /// read-ahead again; a churn pool beside the plan leaves the reads their room. Mutants: the
+    /// last read never reused, so a second ask plans the parts again; the last read reused at
+    /// another room, or its read-ahead not taken again, so a room for one part reads ahead as far
+    /// as a room for both; `OnCard` left out of the key, so the larger tensor reuses the smaller
+    /// one's read; the reads' room less the pool, so they read one part at a time.
     #[test]
     fn a_placed_source_plans_a_cards_parts_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1506,6 +1507,14 @@ mod tests {
             large.window
         );
         assert_eq!(load.source.0.load(Ordering::Relaxed), 1);
+        // The need plans the reads in the room its other terms leave: a churn pool, read in once
+        // the reads end, takes none of it.
+        let base = workstation::HostNeed::of(&plan(4096), 0).bytes();
+        let (need, peak) = load
+            .host_need(&plan(4096), 0, large.host_bytes, base + large.host_bytes)
+            .unwrap();
+        assert_eq!(peak, large.host_bytes);
+        assert_eq!(need.read_ahead, large.window);
         // A plan that holds other bytes of the tensor on the card is planned again.
         let other = plan_with(&larger, &machine, 4096, &NoKv, None).expect("a plan");
         load.host_bytes(&other, 0, 1 << 30).unwrap();
