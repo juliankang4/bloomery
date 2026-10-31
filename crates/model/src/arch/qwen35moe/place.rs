@@ -543,9 +543,10 @@ impl PlanInputs {
 
     /// The form a load of the file holds its card route's runs in, on a
     /// build that has the native FP4 products or not (`native_fp4`):
-    /// [`RouteForm::Native`] where every routed stack of the file's layers
-    /// is NVFP4, which the card's experts of any layers then read in one
-    /// native launch; [`RouteForm::Rows`] otherwise.
+    /// [`RouteForm::Native`] where the card reads every routed stack of the
+    /// file's layers in NVFP4's planes ([`card_routed`]: a GGUF's NVFP4 or a
+    /// checkpoint folder's NVFP4 rows), which the card's experts of any
+    /// layers then read in one native launch; [`RouteForm::Rows`] otherwise.
     #[must_use]
     pub fn route_form(&self, native_fp4: bool) -> RouteForm {
         let nvfp4 = self
@@ -555,7 +556,7 @@ impl PlanInputs {
             .filter(|t| {
                 t.role == Role::RoutedExperts && t.layer.is_some_and(|l| l < self.model.layers)
             })
-            .all(|t| t.ty == GgmlType::NVFP4);
+            .all(|t| card_routed(t.ty) == Some(CardFormat::Nvfp4Planes));
         if native_fp4 && nvfp4 {
             RouteForm::Native
         } else {
@@ -5471,8 +5472,9 @@ mod tests {
 
         /// A file's card route form ([`PlanInputs::route_form`]): native on a
         /// native FP4 build over a file whose layers' routed stacks are all
-        /// NVFP4 (a stack past its layers, a draft's, not read), the rows'
-        /// form on another build or with one stack of another type; and a
+        /// NVFP4, a GGUF's or a folder's rows (a stack past its layers, a
+        /// draft's, not read), the rows' form on another build or with one
+        /// stack of another type; and a
         /// card-experts machine counts its route in the form it is given,
         /// 2,048 run tokens of 170,360 − 108,172 B fewer at U 4,096 in the
         /// native one [derived: 127,361,024 B], a host-routed machine none.
@@ -5495,6 +5497,8 @@ mod tests {
                 (RouteForm::Native, RouteForm::Rows)
             );
             let last = inputs.model.tensors.len() - 2;
+            inputs.model.tensors[last].ty = GgmlType::NVFP4_ROWS;
+            assert_eq!(inputs.route_form(true), RouteForm::Native);
             inputs.model.tensors[last].ty = GgmlType::Q4_K;
             assert_eq!(inputs.route_form(true), RouteForm::Rows);
             let scratch = |experts: Experts, form: RouteForm| {
