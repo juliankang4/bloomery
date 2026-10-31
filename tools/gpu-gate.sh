@@ -732,15 +732,15 @@ PY
   exec 6>&-
   judge 'a run that is not a V4.1 load does not wait for one' "$rc" 0 'ok on the 3090 \(asked 3090\)' 'V4\.1'
   # gate()'s bound ends a held run, under the watch too. The stub writes `up` once its TERM handler is installed
-  # and then holds; that line, then its monitor asleep, is the event, and SIGALRM to the outer timeout is the bound
-  # (the signal its own timer sends). The monitor sleeps once its fork has returned: GNU coreutils timeout before 9.5
+  # and then holds; that line, then both timeout monitors asleep, is the event, and SIGALRM to the outer timeout is the bound
+  # (the signal its own timer sends). Each monitor sleeps once its fork has returned: GNU coreutils timeout before 9.5
   # (Ubuntu 24.04's 9.4) ends 128+n without signalling a child that ran before its fork returned. A clock from the
   # spawn can run out before the stub holds, and says nothing of the contract. The failsafe
   # bound ($fs) only catches a hang: a run that never parks and never exits has no exit to wait on. The handler exits
   # 7 with no sleep. The runner's cleanup sends KILL at LEASE_STOP_GRACE-2 s (grace 9, 2 s kept so the KILL and reap
   # finish before an enclosing kill-after of 10 s), and a sleep in the handler is a clock that KILL can win, so the
   # runner records 137. The judge waits on the run's exit and on the output's `end` line. A stub still held is let go.
-  local w ended left sp ip lk tp line ready
+  local w ended left sp ip lk tp line ready outer_state
   for w in '' "BLOOMERY_GATE_STACKS=$((fs + 60))"; do
     fifos
     streams "$t/s1"
@@ -757,12 +757,15 @@ PY
       elif [ "$line" = end ]; then ended=yes
       fi
     fi
-    if [ "$ready" = yes ]; then
-      since=$SECONDS
-      until cancel_ready "$t/stub.pid" || [ $((SECONDS - since)) -ge "$fs" ]; do sleep 0.05; done
-    fi
     if [ "$ready" = yes ] && [ -s "$t/timeout.pid" ]; then
       read -r tp < "$t/timeout.pid" || tp=
+      since=$SECONDS
+      until { cancel_ready "$t/stub.pid" &&
+        outer_state=$(ps -o stat= -p "$tp" 2> /dev/null) &&
+        [[ $outer_state = *S* ]]; } ||
+        [ $((SECONDS - since)) -ge "$fs" ]; do
+        sleep 0.05
+      done
       [ -z "$tp" ] || kill -s ALRM -- "$tp" 2> /dev/null || true
     fi
     wait "$p1" || rc=$?
