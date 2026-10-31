@@ -29,6 +29,12 @@
 //!   The load opens, and the batch set's eager steps hold (c)'s band, flips and last argmax
 //!   against the oracle; the last logits' distance to the all-card run is printed. Mutant: the plan's refusal of an NVFP4 stack split between a card
 //!   and the host, which refuses the load by name.
+//! - (rs) the split under `mid` residency, each pinned count the fewest card experts a layer
+//!   leaves past a spare and one that moves (a small churn pool), every layer's card set reseeded
+//!   to its highest ids: the machine stages those host experts onto the card, an NVFP4 stack's
+//!   codes, block scales and tensor scale each through its own transform, and every part of each
+//!   is the bytes a static load uploads; the batch set's eager steps after it hold (c)'s band.
+//!   Mutant: the codes of a folder's rows staged as stored, not in the card's block order.
 //! - (rt) the load made for a route trace (`HostCfg::route_trace`): it opens, every layer keeps its
 //!   host leg, which writes the trace, and the host run holds no view (no layer holds a host
 //!   expert); the batch set's ids by eager steps as one prompt call fill a complete trace, every
@@ -92,6 +98,14 @@ mod qwen38_open;
 mod quiet;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/residency_clauses.rs"]
+#[allow(
+    dead_code,
+    reason = "the residency clauses serve several gates; this one takes the seed lists and the transform check"
+)]
+mod residency_clauses;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::path::Path;
     use std::time::Instant;
@@ -103,6 +117,7 @@ mod gate {
     use crate::q38_oracle::{FLIP_ERR_CAP, FREE_BAND, IkRoute, route_flips};
     use crate::qwen38_folder;
     use crate::qwen38_open::{Open38, open_split};
+    use crate::residency_clauses;
 
     use bloomery_gpu::arch::qwen3moe::{
         Body38, KvQ8, Model38, Prompt38, Qwen38Model, RouteTap, TargetRows,
@@ -606,7 +621,8 @@ mod gate {
     }
 
     /// (s): `toks`, the batch set `batch`'s ids, by eager steps on the split load, judged as (c)
-    /// judges the all-card run, whose logits are `card`. A load that fails is a named FAIL.
+    /// judges the all-card run, whose logits are `card`, then (rs) on the same split
+    /// ([`reseeded`]). A load that fails is a named FAIL.
     fn split(
         path: &Path,
         d: &Dims,
@@ -653,6 +669,7 @@ mod gate {
             p.host_experts, p.card_experts
         );
         let split_plan = p.host_experts > 0 && split_layers > 0;
+        let n_l = p.n_l.clone();
         let mut m = match planned.open() {
             Ok(o) => o.model,
             Err(e) => {
@@ -674,6 +691,72 @@ mod gate {
             argmax(ours),
             argmax(all),
             rel(ours, all),
+            verdict(ok)
+        );
+        drop(m);
+        let staged = reseeded(open, path, &n_l, d, (batch, toks), vocab)?;
+        Ok(ok && staged)
+    }
+
+    /// (rs): `open`, (s)'s split, under `mid` residency pinned at the fewest card experts a layer
+    /// of `n_l` less a spare and one that moves, every layer's card set reseeded to its highest
+    /// ids, then `toks` by eager steps judged as (s) judges them. A load that fails is a named
+    /// FAIL.
+    fn reseeded(
+        open: Open38<'_>,
+        path: &Path,
+        n_l: &[u64],
+        d: &Dims,
+        (batch, toks): (&RefManifest, &[u32]),
+        vocab: usize,
+    ) -> Result<bool, GateError> {
+        let fewest = n_l
+            .iter()
+            .copied()
+            .filter(|&n| n > 0)
+            .min()
+            .ok_or("(rs) the split holds no card expert")?;
+        let pinned = usize::try_from(fewest)?
+            .checked_sub(2)
+            .filter(|&p| p > 0)
+            .ok_or("(rs) a card layer of fewer than three experts")?;
+        let residency = Residency::Mid { pinned, spares: 1 };
+        let mut m = match (Open38 { residency, ..open }).plan(model_of(path)?)?.open() {
+            Ok(o) => o.model,
+            Err(e) => {
+                println!(
+                    "(rs) the split load under mid-p{pinned}-s1 FAILED: {e} {}",
+                    verdict(false)
+                );
+                return Ok(false);
+            }
+        };
+        let start = {
+            let b = m.body("reseeded")?;
+            let machine = b.hybrid().swap().ok_or("(rs) the load runs no machine")?;
+            residency_clauses::layer_seeds(machine, b.hybrid().slots().layers())?
+        };
+        let highest: Vec<u32> = (0..u32::try_from(d.n_expert)?).rev().collect();
+        let rule = m.residency_rule().ok_or("(rs) the load runs no machine")?;
+        let order = vec![highest.as_slice(); rule.layers()];
+        m.residency_reseed(&order)?
+            .ok_or("(rs) the load reseeded no machine")?;
+        let (checked, bad) = {
+            let b = m.body("reseeded")?;
+            let machine = b.hybrid().swap().ok_or("(rs) the load runs no machine")?;
+            let source = b
+                .residency_source()
+                .ok_or("(rs) the load has no residency source")?;
+            residency_clauses::transform_check(m.gpu(), machine, source, &start)?
+        };
+        let staged = residency_clauses::transform_verdict(checked, &bad);
+        m.reset()?;
+        let r = run_steps(&mut m, toks)?;
+        let held = free(batch, &r, d, vocab, true)?;
+        let ok = staged && held;
+        println!(
+            "(rs) mid-p{pinned}-s1, each layer reseeded to its highest ids: {checked} host experts \
+             staged onto the card, the oracle's band held {held} {}",
             verdict(ok)
         );
         Ok(ok)

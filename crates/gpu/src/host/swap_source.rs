@@ -873,7 +873,9 @@ impl FileSwap {
     /// NVFP4 blocks is that plane of the run as the load splits its rows
     /// ([`crate::planes::split_rows`]), and its tensor scale the f32 the
     /// stack's `.scale` holds. A plane of NVFP4 rows a checkpoint folder
-    /// locates is refused by name.
+    /// locates is that plane of the expert's matrix in the card's order: the
+    /// codes moved into its blocks by the scalar rule
+    /// (`qdot::nvfp4_codes_to_blocks_scalar`), the block scales as stored.
     pub fn card_bytes(
         &self,
         layer: usize,
@@ -888,16 +890,15 @@ impl FileSwap {
             .zip(p.of.get(part))
             .ok_or_else(|| GpuError::shape(WHAT, format!("part {part} of an expert")))?;
         let t = &p.tensors[stack];
-        let blocks = t.ty == GgmlType::NVFP4;
         match plane {
             Plane::Whole => self.file_run(WHAT, layer, id, t, *per).map(Cow::Borrowed),
-            Plane::Scale if blocks => p.scales[stack]
+            Plane::Scale => p.scales[stack]
                 .get(4 * id as usize..4 * id as usize + 4)
                 .map(Cow::Borrowed)
                 .ok_or_else(|| {
                     GpuError::shape(WHAT, format!("layer {layer} expert {id}: its scale"))
                 }),
-            Plane::Codes | Plane::BlockScales if blocks => {
+            Plane::Codes | Plane::BlockScales if t.ty == GgmlType::NVFP4 => {
                 use crate::planes::{Format, split_rows};
                 let run = self.file_run(WHAT, layer, id, t, file_part(t, self.experts))?;
                 let k = t.dims.first().copied().unwrap_or(0) as usize;
@@ -913,14 +914,22 @@ impl FileSwap {
                     heads
                 }))
             }
-            _ => Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "layer {layer} part {part}: {plane:?} of {}, a plane of a folder's matrix, no \
-                     run of the file",
-                    t.name
-                ),
-            )),
+            Plane::Codes | Plane::BlockScales => {
+                let m = self
+                    .pair
+                    .source()
+                    .split()
+                    .matrix(&t.name, id as usize)
+                    .map_err(|e| GpuError::plan(WHAT, e))?;
+                if plane == Plane::BlockScales {
+                    return Ok(Cow::Borrowed(m.block_scales));
+                }
+                let mut blocks = vec![0u8; m.codes.len()];
+                qdot::nvfp4_codes_to_blocks_scalar(m.codes, &mut blocks).map_err(|e| {
+                    GpuError::shape(WHAT, format!("layer {layer} expert {id}: {e}"))
+                })?;
+                Ok(Cow::Owned(blocks))
+            }
         }
     }
 

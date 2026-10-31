@@ -18,8 +18,8 @@
 //! card copy's accessor its body owns: V4.1 `Body::slots`, GLM
 //! `Body::slot_copy`), its session open, its churn pool, its layer seeds,
 //! its rule reader and pass taker, its constants (the refusal's bound, a
-//! history's step count, a source's part count). The readback and the table
-//! helpers stay in `generate` ([`Residence`], [`slot_table`], `place_table`).
+//! history's step count). The readback and the table helpers stay in
+//! `generate` ([`Residence`], [`slot_table`], `place_table`).
 //! The printed lines are keyed on by the records' readers, so the shared
 //! half owns them whole; a gate hands the clause the history's own name for
 //! its line.
@@ -133,25 +133,34 @@ pub fn layer_seeds(
 }
 
 /// `transform`'s check: every live non-seed expert of `layers` (each layer
-/// with its seed) holds in its slot, part by part (`parts` of a layer), the
-/// bytes a static load uploads for it (`source`), read back on `gpu`'s
-/// stream — the count checked and each differing part's first byte.
+/// with its seed) holds in its slot, part by part (every part `source`
+/// stages of the layer: an NVFP4 stack's codes, block scales and tensor scale
+/// each one), the bytes a static load uploads for it, read back on `gpu`'s
+/// stream — the count checked and each differing part's first byte. A layer
+/// the machine runs whose source stages no part is refused by name, so no
+/// expert counts as checked with nothing compared.
 pub fn transform_check(
     gpu: &Gpu,
     machine: &SwapMachine,
     source: &FileSwap,
     layers: &[(usize, Vec<u32>)],
-    parts: impl Fn(usize) -> usize,
 ) -> Result<(usize, Vec<String>), GateError> {
     let stream = gpu.stream();
     stream.synchronize()?;
     let (mut checked, mut bad) = (0usize, Vec::new());
     for (l, seed) in layers {
         let l = *l;
-        let parts = parts(l);
+        let parts = source.part_bytes(l).len();
         let Some(row) = machine.ledger().row(l) else {
             continue;
         };
+        if parts == 0 {
+            return Err(format!(
+                "transform: layer {l} holds slots the machine runs, but its source stages no part \
+                 of it"
+            )
+            .into());
+        }
         for (slot, st) in row.iter().enumerate() {
             let SlotState::Live(e) = *st else { continue };
             if seed.contains(&e) {

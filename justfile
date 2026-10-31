@@ -1756,7 +1756,9 @@ gate-gpu-qwen4exp-iqleg:
 # router's flips named, and its last argmax; the batch set by one ubatch and D3K's step after its prefill by ubatches hold
 # the oracle's argmax (D3K's a named tie allowed); the distances to the other form's sets are recorded. The same plan
 # under a card budget 8 GiB short splits each layer's experts between the card and the host, and its eager steps hold
-# the same band. The bin's unit
+# the same band; under a small `mid` residency, every layer's card set reseeded to its highest ids, the machine stages
+# those host experts onto the card, every part of each (an NVFP4 stack's codes, block scales and tensor scale) the bytes a
+# static load uploads, and the eager steps hold the band again. The bin's unit
 # test, which holds the choice of sets to the split's dense form, runs first. BLOOMERY_REF_MODEL moves the split from
 # the model folder below, including to prepare's stored-form output, or names the checkpoint folder itself, which the
 # load reads as stored (no prepare). Needs BLOOMERY_CARD_ALL_EXPERTS: only a card of 128 GB or more holds the plan, so the
