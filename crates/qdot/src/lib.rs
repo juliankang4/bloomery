@@ -8571,6 +8571,7 @@ const IQ1S_BLOCK: usize = 50;
 /// ik's `iq1s_grid_us` (iqk_gemm_1bit.cpp:12): the grid values with +1 a byte, maddubs'
 /// unsigned side (bytes 0..=2). The offset is applied a byte at compile time — a `u64` add
 /// of `0x0101…` would carry a `0xFF` byte (the value −1) into its neighbour.
+#[cfg(target_arch = "x86_64")]
 static IQ1S_GRID_US: [u64; 2048] = {
     let mut t = [0u64; 2048];
     let mut i = 0;
