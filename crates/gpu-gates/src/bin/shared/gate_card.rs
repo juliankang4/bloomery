@@ -2,12 +2,14 @@
 //! put in view — `workstation::plan_gate`'s machine, the 3090's bytes, so the plan and every pin a
 //! gate reads from it are the 3090's — on whichever one card is visible (tools/gpu-gate.sh's pick
 //! under `BLOOMERY_GATE_CARD`); the fixture tier plans on `a`, the largest visible card as the
-//! device reports itself (`--place a`), its free bytes included. The card spec keeps every byte of
-//! `RTX_3090` in the real tier and takes the visible card's name, by which the open finds the
-//! device, so on the 3090 the machine is `plan_gate`'s exactly and on the A6000 or RTX 5090 it
-//! plans the 3090's usable bytes. A census of other than one visible card, or a card outside
-//! the named workstation cards and RTX 5090, is refused by name before any load. A two-card arm
-//! plans its own machine with both cards in view and never reads the gate card
+//! device reports itself (`--place a`), its free bytes included. The real tier resolves the card as
+//! the gate placement does (`Pick::Room(&RTX_3090)`, a server's `--place gate`): the 3090's total
+//! and driver reserve on the device in view, which keeps its own name, identity, allocation granule
+//! and whether it shares the host's memory, held as `tier::real_card` holds a census card. On the
+//! 3090 the machine is `plan_gate`'s exactly, on any larger card it plans the 3090's usable bytes,
+//! and a unified card plans the pool its free reading is. A census of other than one visible card,
+//! or a card with less room than the 3090's bytes, is refused by name before any load. A two-card
+//! arm plans its own machine with both cards in view and never reads the gate card
 //! (`lcpp_e2e::Arm::machine`'s `bp`).
 
 use std::sync::OnceLock;
@@ -15,18 +17,17 @@ use std::sync::OnceLock;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::tier;
 use model::placement::Machine;
-use model::placement::workstation::{self, CARDS, CardSpec, RTX_3090};
+use model::placement::workstation::{self, CardSpec, Pick, RTX_3090};
 
 static CARD: OnceLock<CardSpec> = OnceLock::new();
 
-/// The census's card: the one card the runner put in view, planned by the 3090's bytes under its
-/// own name.
+/// The census's card: the one card the runner put in view, planned by the 3090's bytes.
 ///
 /// # Errors
-/// A census of other than one visible card, or a card outside the named gate cards.
+/// A census of other than one visible card, or a card with less room than the 3090's bytes.
 fn census() -> Result<CardSpec, GateError> {
     let census = bloomery_gpu::census()?;
-    let [device] = census.as_slice() else {
+    if census.len() != 1 {
         return Err(format!(
             "the gate plan runs on one visible card and {} are visible ({}): run it through \
              tools/gpu-gate.sh, which puts the card it takes in view",
@@ -34,20 +35,12 @@ fn census() -> Result<CardSpec, GateError> {
             workstation::visible(&census)
         )
         .into());
-    };
-    let names = CARDS.map(|c| c.name).into_iter().chain(["5090"]);
-    let name = names
-        .clone()
-        .find(|&name| device.name.contains(name))
-        .ok_or_else(|| {
-            format!(
-                "the visible card {} is none of this workstation's cards ({}): the gate plan \
-                 opens its card by name",
-                device.name,
-                names.collect::<Vec<_>>().join(", ")
-            )
-        })?;
-    Ok(CardSpec { name, ..RTX_3090 })
+    }
+    // PIN(2026-10-31): was a refusal outside `CARDS` and the 5090 by name; `Pick::Room` now
+    // requires the 3090's bytes on the card in view and refuses a card with less room.
+    Ok(tier::real_card(
+        workstation::resolve(&[Pick::Room(&RTX_3090)], &census)?[0],
+    ))
 }
 
 /// Reads the census (the real tier) or resolves `a` (the fixture tier) once and fixes the card

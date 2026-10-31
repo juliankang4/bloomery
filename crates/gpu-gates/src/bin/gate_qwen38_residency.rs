@@ -176,9 +176,11 @@ mod gate {
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency, SlotState};
     use bloomery_gpu::host::xstream::{Costs, XLayer, XMode, XReport};
     use bloomery_gpu_gates::flip;
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
+    use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{
-        Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, prose_ids, verdict,
+        Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, prose_ids, ref_model_path, verdict,
     };
     use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE};
     use gguf::Split;
@@ -186,8 +188,7 @@ mod gate {
     use model::placement::Machine;
     use model::placement::PlanLevers;
     use model::placement::churn::ChurnPool;
-    use model::placement::workstation::{A6000, HostRead, PLAN_ROOM};
-    use refset::arch::qwen4exp::MODEL;
+    use model::placement::workstation::{CardSpec, HostRead, PLAN_ROOM};
     use runtime::swaprule::SwapRule;
     use runtime::{Out, Target, Verify, Want};
 
@@ -236,6 +237,71 @@ mod gate {
                 Experts::Card,
             )
             .map_err(|e| format!("the plan: {e}").into())
+    }
+
+    /// The machine the gate plans on: the card `a` resolves on the census (the
+    /// placement the Qwen3.8 defaults treat as plan (a)), held as the real tier
+    /// holds a census card (`tier::real_card`; a unified card plans its pool),
+    /// laid out by `machine_for_experts`, at the largest usable bytes at which
+    /// every card layer leaves the residency its pinned, spare and moving
+    /// experts ([`residency_of`]) and the plan's host holds the churn pool
+    /// beside it (`ChurnPool::check`): the card's own bytes where they do, else
+    /// the largest whole GiB below them that does, each larger one printed
+    /// with why it did not.
+    fn residency_machine(inputs: &PlanInputs, ub: usize) -> Result<Machine, GateError> {
+        let card = tier::real_card(Place::A.on(&bloomery_gpu::census()?)?.card_specs()?[0]);
+        let layers = inputs.spec.layers.len();
+        let at = |c: CardSpec| machine_for_experts(c, layers, ub as u64, Experts::Card);
+        let why_not = |m: &Machine| -> Result<Option<String>, GateError> {
+            let plan = match plan_of(inputs, m) {
+                Ok(plan) => plan,
+                Err(e) => return Ok(Some(e.to_string())),
+            };
+            let Some(Residency::Mid { pinned, .. }) = residency_of(&plan) else {
+                return Ok(Some(
+                    "the plan's card experts leave no layer the machine's pinned, spare and one \
+                     that moves"
+                        .into(),
+                ));
+            };
+            let pool =
+                ChurnPool::of(&plan, 0, pinned).map_err(|e| format!("the churn pool: {e}"))?;
+            Ok(pool.check(&plan).err().map(|e| e.to_string()))
+        };
+        let own = at(card);
+        let Some(mut why) = why_not(&own)? else {
+            println!(
+                "residency card: {} at its own {} B",
+                card.name,
+                card.usable_bytes()
+            );
+            return Ok(own);
+        };
+        let mut above = card.usable_bytes();
+        for gib in (1..=card.usable_bytes().saturating_sub(1) >> 30).rev() {
+            let budget = CardSpec {
+                total_bytes: (gib << 30) + card.driver_reserve_bytes,
+                ..card
+            };
+            let machine = at(budget);
+            match why_not(&machine)? {
+                None => {
+                    println!(
+                        "residency card: {} under {gib} GiB, the largest whole GiB its plan fits; \
+                         at {above} B: {why}",
+                        card.name
+                    );
+                    return Ok(machine);
+                }
+                Some(w) => (why, above) = (w, budget.usable_bytes()),
+            }
+        }
+        Err(format!(
+            "no budget on {} gives the residency its card experts and the churn pool its host \
+             room: {why}",
+            card.name
+        )
+        .into())
     }
 
     /// The residency the gate runs over `plan`: half of the plan's smallest
@@ -1489,16 +1555,17 @@ mod gate {
             bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
         ])?;
         let host = levers.host();
-        let path = Path::new(MODEL);
+        let path_buf = ref_model_path()?;
+        let path = path_buf.as_path();
         // PIN(2026-10-28): the plan read `MemAvailable`, which another process's load moves; the
-        // room is the workstation's own, so the machine's host figure alone binds `refuse`.
+        // room is the workstation's own, so the machine's host figure alone binds `refuse`. A
+        // unified card's pool caps it (`Plan::plan_at`).
         let inputs = PlanInputs::describe_in(
             &Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?,
             (PLAN_ROOM, HostRead::Given),
         )?;
         let ub = ubatch_for(CTX)?;
-        let machine =
-            machine_for_experts(A6000, inputs.spec.layers.len(), ub as u64, Experts::Card);
+        let machine = residency_machine(&inputs, ub)?;
         let (residency, slots) = {
             let plan = plan_of(&inputs, &machine)?;
             let slots = plan

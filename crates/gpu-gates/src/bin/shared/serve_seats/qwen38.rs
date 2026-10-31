@@ -576,11 +576,11 @@ struct Branch38 {
 /// Which placement `--place` names, as `generate_qwen3moe` takes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind38 {
-    /// The stage on the largest visible card (the A6000 here, the timing
-    /// card; the default), and any single card a list names: the plan is
-    /// made on that card's own bytes.
+    /// The stage on the largest visible card (the default), and any single
+    /// card a list names: the plan is made on that card's own bytes.
     A,
-    /// The word `gate`: the 3090, the gate card.
+    /// The word `gate`: the gate card, the 3090's bytes on the card that has
+    /// their room (`Pick::Room`).
     Gate,
     /// Plan (b′): the stage as under `a`, the next-largest card its expert
     /// tier (`q38place::machine_bp38`), and any card list with a tier card.

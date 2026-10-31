@@ -644,20 +644,10 @@ PY
   case_ "a run closes with its own wall and exit" 0 '^gpu-gate\.sh: ok ran [0-9]+ s \(exit 0\)$' 3090 "$t/lease"
   case_ 'BLOOMERY_GATE_GDB other than 0 or 1: 64, named' 64 'BLOOMERY_GATE_GDB is 1' 3090 "$t/lease" BLOOMERY_GATE_GDB=yes
   case_ 'BLOOMERY_GATE_GDB with BLOOMERY_GATE_STACKS: 64, named' 64 'set one' 3090 "$t/lease" BLOOMERY_GATE_GDB=1 BLOOMERY_GATE_STACKS=5
-  # A 3090-only gate (PIN_3090) asked of another card stops by name before any lock; on the 3090 it runs.
+  # PIN(2026-10-31): PIN_3090 is gone: the Qwen3.8 serve gate's paged clause plans its rooms and its CLI on the gate card's bytes.
   cp "$t/tree/target/release/ok" "$t/tree/target/release/gate_qwen38_serve"
-  # TL names a lock directory whose gate.lock cannot open: a refusal moved below the lock opening ends 69, not 64.
-  mkdir -p "$t/pin-refusal/gate.lock"
-  TL="$t/pin-refusal" GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate forced to the A6000: 64, named' 64 'gate_qwen38_serve runs on the 3090 only' a6000 "$t/lease"
-  TL="$t/pin-refusal" GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate under any: 64, named' 64 'gate_qwen38_serve runs on the 3090 only' any "$t/lease"
-  GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate on the 3090 runs' 0 'ran on ' 3090 "$t/lease"
-  GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate in the fixture tier runs on the A6000' 0 'ran on ' a6000 "$t/lease" BLOOMERY_TIER=fixture
-  for arm in lookup drafted; do
-    gate_args=(--arm "$arm")
-    GATE_BIN=gate_qwen38_serve case_ "the $arm arm runs on another card" 0 'ran on ' a6000 "$t/lease"
-    gate_args=(--arm "$arm" --arm plain)
-    GATE_BIN=gate_qwen38_serve case_ "plain after $arm still pins the paged clauses" 64 'gate_qwen38_serve runs on the 3090 only' a6000 "$t/lease"
-  done
+  gate_args=(--arm plain)
+  GATE_BIN=gate_qwen38_serve case_ "the Qwen3.8 serve gate's plain arm runs on the A6000 in the real tier" 0 'ran on ' a6000 "$t/lease" BLOOMERY_TIER=real
   gate_args=()
   # Events, not seconds. A run in the background is held by what it waits for and released by what the test saw it do, so no case reads
   # the clock: the stub binary says `up` on STUB_READY once its run holds its locks and then blocks on STUB_HOLD until the test writes a
@@ -1736,16 +1726,10 @@ PY
   gate "$t/out" any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller || rc=$?
   judge_all 'local: any takes the local lock and leaves CUDA_VISIBLE_DEVICES as it was' "$rc" 0 "$ON_LOCAL \\(asked any\\)$" '^ran on GPU-caller$'
   case_ '  … a6000 takes it too' 0 "$ON_LOCAL \\(asked a6000\\)$" a6000 "$t/lease" "${LOC[@]}"
-  # A 3090-only gate (PIN_3090) in local mode runs only when the run sees one RTX 3090 by its UUID.
   cp "$t/tree/target/release/ok" "$t/tree/target/release/gate_qwen38_serve"
-  GATE_BIN=gate_qwen38_serve case_ '  … a 3090-only gate on another local card: 64, named' 64 'local mode requires one RTX 3090' any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller
-  GATE_BIN=gate_qwen38_serve case_ '  … a 3090-only gate on the local 3090 by its UUID runs' 0 "gate_qwen38_serve on this machine's card\\(s\\), the local gate lock \\(asked any\\)$" any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES="$GPU_3090"
-  for arm in lookup drafted; do
-    gate_args=(--arm "$arm")
-    GATE_BIN=gate_qwen38_serve case_ "  … the $arm arm runs on another local card" 0 '^ran on GPU-caller$' any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller
-  done
+  gate_args=(--arm plain)
+  GATE_BIN=gate_qwen38_serve case_ "  … the Qwen3.8 serve gate's plain arm runs on another local card in the real tier" 0 '^ran on GPU-caller$' any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller BLOOMERY_TIER=real
   gate_args=()
-  GATE_BIN=gate_qwen38_serve case_ '  … a 3090-only gate in the fixture tier runs on another local card' 0 '^ran on GPU-caller$' any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller BLOOMERY_TIER=fixture
   case_ '  … a V4.1 load takes the V4.1 load lock with it' 0 "$ON_LOCAL \\(asked any\\), V4\\.1 load lock$" any "$t/lease" "${LOC[@]}" BLOOMERY_GATE_V41_LOAD=1
   exec 5> "$t/gate.lock" 6> "$t/gate-a6000.lock"
   { flock -x 5 && flock -x 6; } || { echo "FAIL: the test cannot hold the two card locks"; return 1; }
@@ -2269,49 +2253,6 @@ esac
     } ;;
   *) echo "gpu-gate.sh: BLOOMERY_GATE_CARD is 3090, a6000, any or both, got '$CARD'" >&2; exit 64 ;;
 esac
-# Gates whose checks hold on the 3090 alone, a fact the gate placement's bytes (gate_card) do not carry: one row a gate,
-# `<binary>: <the fact>`. Asked of another card (a6000, any, both, or box.sh's A6000 view) one stops here by name, before
-# any lock, with 64. The facts are the real file's, so the fixture tier pins nothing.
-PIN_3090=(
-  "gate_qwen38_serve: its paged clause runs generate_qwen3moe at 27 GiB of host room on the card in view, and only the 3090's plan pages there (on the A6000 the experts fit and the draft stays on)"
-)
-# As in the gate's parser, every flag takes a value and the last --arm wins.
-qwen38_arm=''
-if [ "$NAME" = gate_qwen38_serve ]; then
-  arm_args=("$@")
-  for ((i = 0; i < ${#arm_args[@]}; i += 2)); do
-    [ "${arm_args[i]}" != --arm ] || qwen38_arm=${arm_args[i+1]:-}
-  done
-fi
-# In box.sh's local mode the run must see one RTX 3090 alone: CUDA_VISIBLE_DEVICES set to its full UUID, or, unset, a
-# machine whose one card is it (tools/ref/cards.sh, the card-name owner).
-for row in "${PIN_3090[@]}"; do
-  # PIN(2026-10-31): The fixture tier defers paged (Tag::Scale), so the real file's card pin does not apply.
-  [ "$TIER" = real ] || break
-  [ "${row%%:*}" = "$NAME" ] || continue
-  # PIN(2026-10-20): Only plain runs paged(); lookup and drafted have no card-specific paged clause.
-  case "$qwen38_arm" in lookup|drafted) continue ;; esac
-  if [ "$BOXC" = local ]; then
-    # shellcheck source=tools/ref/cards.sh
-    source "${BASH_SOURCE[0]%/*}/ref/cards.sh"
-    visible=${CUDA_VISIBLE_DEVICES-}
-    if [ "${CUDA_VISIBLE_DEVICES+x}" != x ]; then
-      visible=$(nvidia-smi --query-gpu=uuid --format=csv,noheader) || {
-        echo "gpu-gate.sh: $NAME cannot read local cards" >&2
-        exit 64
-      }
-    fi
-    if [ -n "$GPU_3090" ] && [ "$visible" = "$GPU_3090" ]; then
-      continue
-    fi
-    echo "gpu-gate.sh: $NAME runs on the 3090 only — ${row#*: }; local mode requires one RTX 3090 selected by its full GPU UUID in CUDA_VISIBLE_DEVICES" >&2
-    exit 64
-  fi
-  if [ "$CARD" != 3090 ]; then
-    echo "gpu-gate.sh: $NAME runs on the 3090 only — ${row#*: }; BLOOMERY_GATE_CARD=$CARD (box.sh's view $BOXC) names another card: leave both unset or name the 3090" >&2
-    exit 64
-  fi
-done
 uuid_of() { nvidia-smi --query-gpu=uuid,name --format=csv,noheader | grep "$1" | cut -d, -f1 | head -1; }
 a6000_idle() {
   local u processes; u=$(uuid_of A6000); [ -n "$u" ] || return 1

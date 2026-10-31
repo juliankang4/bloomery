@@ -2974,18 +2974,21 @@ gate-gpu-nvtier:
 # Qwen3.8's adaptive expert residency on one card (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P from the plan's
 # card experts): the churn pool's host refusal at load, a verify keeping its counted rows only, the same history twice
 # with flips landed, every admitted slot byte for byte a static load's, the passes' kinds and kept rows (the prompt one
-# pass keeping 0, each step 1, a verify its accepted rows), and a reset back to the seed. Plan (a) on the A6000 (the
-# gate plans with the A6000 machine). Loads the whole host set under the big-load lock: a chain member (v41-load, not solo) on
-# the A6000 (no conversion), its plan room the workstation's own (PLAN_ROOM), so a neighbour's load moves no plan. Real-only: no
-# fixture tier yet (the router double, R4); it opens the real file whatever the tier names.
+# pass keeping 0, each step 1, a verify its accepted rows), and a reset back to the seed. Plan (a) on the card in view
+# (the gate plans `a` from the census, under the largest budget whose plan leaves every card layer the residency's experts
+# and the host the churn pool: a unified card's pool holds both). Loads the whole host set under the big-load lock: a chain
+# member (v41-load, not solo) on any card (no fact pins it), its plan room the workstation's own (PLAN_ROOM, which a unified
+# pool caps), so a neighbour's load moves no plan. Real-only: no fixture tier yet (the router double, R4); it opens the
+# real file whatever the tier names.
 [group('v41-load')]
 gate-gpu-qwen38-residency:
-    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen38-residency && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_residency && bash tools/gpu-gate.sh gate_qwen38_residency'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen38-residency && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_residency && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen38_residency'
 
-# Qwen3.8 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier on the 3090, its decode walks (a
-# step and the 2-, 3- and 4-row verifies) and its ubatch prompt walk serving the tier. The reference is the same plan
-# with every tier set joined to the stage card's (one card, no tier code), the plans made under a card budget so the
-# A6000 holds both sets. --union: 32 prose ids step by step, greedy steps, six verifies, greedy steps, then a 600-id
+# Qwen3.8 plan (b′) on both cards (--place bp): the stage on the stage card, the expert tier on the tier card (the real
+# tier plans the A6000's and the 3090's bytes on the two cards in view, the fixture tier the cards as they report), its
+# decode walks (a step and the 2-, 3- and 4-row verifies) and its ubatch prompt walk serving the tier. The reference is
+# the same plan with every tier set joined to the stage card's (one card, no tier code), the plans made under a card
+# budget so the stage card holds both sets. --union: 32 prose ids step by step, greedy steps, six verifies, greedy steps, then a 600-id
 # prompt call and 8 greedy steps, every token and logits row bit for bit the reference's; the stage graphs' nodes the
 # reference's less one a tier layer, the tier's graphs eight a tier layer and the fault copy; preconditions: every tier
 # layer sent a routed slot, the prompt's tier services one a tier layer. --residency: the tier load under mid-p<P>-s1,
@@ -3039,7 +3042,7 @@ gate-gpu-qwen38-nodes *ARGS='':
 gate-gpu-qwen38-nodes-remote:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen38-nodes-remote BLOOMERY_TIER_NODES && export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen38_nodes -- --ignored hw_a_refused_remote_replay_resets_to_its_fresh_history --nocapture'
 
-# The HTTP server on the Qwen3.8 engine (3090, placement gate). The prompt is the profile's five-id text
+# The HTTP server on the Qwen3.8 engine (placement gate: the 3090's bytes on the card in view). The prompt is the profile's five-id text
 # ("The capital of France is") and its ids the profile's REF_TOKENS — ik's llama-tokenize on this model's
 # vocabulary, never our own tokenizer (the derivation command is the profile comment's) — and five is at most the
 # eight the gate needs: below Prompt38::GEMM_FROM both engines feed the prompt by bit-for-bit passes, so the
@@ -3064,7 +3067,7 @@ gate-gpu-qwen38-nodes-remote:
 # the server surface it links (gpu-gates' bind, serve_client; the serve and sampler crates) sits behind
 # that feature today — `just affected` and the recipes.py pins scope it so.
 # Stays solo, reason: the host set (tools/gate-batch-resources.tsv) loads under the big-load lock, and the seat's unset residency pick reads MemAvailable against the churn pool, so a neighbour's load moves it.
-# Never solo-real: the generate call and the two main servers pass `--place gate` (the 3090's bytes on the smallest card with the room for them: the 3090 on the box), the unset-place servers plan on the one card in view, and the gate plans on RTX_3090 directly (no shared/gate_card.rs); its plain arm's gpu-gate.sh call is 3090-only in the real tier, and solo-real balances on `any`.
+# Never solo-real: the generate call and the two main servers pass `--place gate` (the 3090's bytes on the smallest card with the room for them: the 3090 on the box), the unset-place servers plan on the one card in view, and the gate plans on the card each server resolves (no shared/gate_card.rs); its gpu-gate.sh calls name no card (the 3090's lock on the box), and solo-real balances on `any`.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-serve:
