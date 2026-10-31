@@ -47,6 +47,7 @@ generate_ds41 bf16_cols 0 0
 generate_ds41 bf16_gemv 0 0
 generate_ds41 bf16_gemv_ids 0 0
 generate_ds41 bf16_mma_cols_gemm 0 0
+generate_ds41 bf16_mma_cols_gemm_bf16 0 0
 # PIN(2026-10-25): formed BF16 norm-gate spill and GB10 JIT local measured with ptxas 13.3.73, driver 595.84, sm_121a.
 # PIN(2026-10-28): 572 -> 644 spill bytes, 160 -> 168 JIT local bytes (ptxas 13.3.73 sm_121a, GB10 driver
 # 595.84) once the shared MMA tile's columns stage and replay through generic types (`MmaCols::Exact`,
@@ -185,6 +186,8 @@ generate_ds41 gather_pairs 0 0
 generate_ds41 gdn_carry_keep 0 0
 generate_ds41 gdn_chunk_prepare 0 0
 generate_ds41 gdn_conv_prep 0 0
+# PIN(2026-10-31): gdn_conv_prep_bf16 48 B spill, 24 B JIT local (sm_121a ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84): the BF16 conv's launch bound budgets registers for six 128-thread blocks a SM (launch_bounds(128, 6), 80 registers).
+generate_ds41 gdn_conv_prep_bf16 48 24
 generate_ds41 gdn_delta 0 0
 generate_ds41 gdn_delta_lanes 0 0
 generate_ds41 gdn_delta_recovery 0 0
@@ -357,6 +360,8 @@ generate_ds41 mxfp8_tile_gemm 0 0
 # PIN(2026-10-31): JIT local 0 -> 8 bytes (cc 12.1 JIT on GB10 driver 595.84; ptxas 13.3.73 sm_121a spills 0), read
 # after the tile's last device-code change, which takes its stages by TMA on stage barriers.
 generate_ds41 mxfp8_w8a8_gemm 0 8
+# PIN(2026-10-31): mxfp8_w8a8_gemm_bf16 JIT local 8 B, spill 0 (sm_121a ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84), as mxfp8_w8a8_gemm's: the same tile and a BF16 store.
+generate_ds41 mxfp8_w8a8_gemm_bf16 0 8
 # PIN(2026-10-25): MXFP8 W8A8 norm-gate spill and GB10 JIT local measured with ptxas 13.3.73, driver 595.84, sm_121a.
 # PIN(2026-10-25): 376 -> 364 spill bytes (ptxas 13.3.73 sm_121a, GB10 driver 595.84) when the epilogue also writes
 # the output's MXFP8 form. JIT local bytes remain unchanged.

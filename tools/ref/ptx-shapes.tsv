@@ -32,6 +32,8 @@ generate_ds41   bf16_cols                                0           0
 generate_ds41   bf16_gemv                                0           0
 generate_ds41   bf16_gemv_ids                            0           0
 generate_ds41   bf16_mma_cols_gemm                       0           0
+# PIN(2026-10-31): bf16_mma_cols_gemm_bf16 and gdn_conv_prep_bf16 at the sm_86 ptxas spill (13.3.73) and the cc 12.1 JIT's local bytes on GB10, not measured on cc 8.6, until a cc 8.6 scan runs.
+generate_ds41   bf16_mma_cols_gemm_bf16                  0           0
 generate_ds41   bf16_mma_gemm                            0           0
 # PIN(2026-10-25): the new entry uses sm_86 ptxas 13.3.73 spill/stack (0/0). The cc 8.6 JIT was not measured (the GB10
 # JIT reads 160 B of local for this PTX); this new entry's jit_local pin uses the measured ptxas stack frame.
@@ -163,6 +165,7 @@ generate_ds41   gdn_chunk_prepare                        0           0
 # PIN(2026-10-26): 0 -> 8 spill bytes and 0 -> 8 JIT local bytes (sm_86 ptxas 13.3.73, cc 8.6 JIT of gate-ptx-spill's run). 56 -> 72 registers,
 # 9 -> 7 blocks an SM in the no-JIT scan. cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the PTX of 1507 of 1585 scanned entries moved with it (just canon-check; 1483 of them by `ld.global.nc` loads and the placement they allow).
 generate_ds41   gdn_conv_prep                            8           8
+generate_ds41   gdn_conv_prep_bf16                      16          24
 generate_ds41   gdn_delta                                0           0
 generate_ds41   gdn_delta_lanes                          0           0
 generate_ds41   gdn_delta_recovery                       0           0
