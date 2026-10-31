@@ -154,7 +154,9 @@ group_clear() {
 # this trap still holds a signal for the caller (tools/nightly/units.sh's run_unit). Without it, a process the
 # command leaves in its group lives on (tools/ref/lease-hold.sh reports one that keeps the lease).
 # The status contract is GNU coreutils timeout's: after a TERM from outside it returns the child's code.
-# uutils coreutils timeout 0.8.0 returns 143 there instead, so under it a cancelled run reports 143.
+# uutils coreutils timeout 0.8.0 returns 143 there instead, so under it a cancelled run reports 143. GNU timeout
+# before 9.5 does too when the TERM comes before its fork returns, without signalling the child; the TERM to the
+# group below ends that child.
 # timeout runs the binary in a process group of its own, which a signal to the runner's group never
 # reaches. So a TERM or HUP to the runner (an INT too, unless the runner was started with & by a shell,
 # which leaves INT ignored) goes on to the child as a TERM, and the
