@@ -30,8 +30,9 @@
 //!   GEMMs the kernel table names for the layer's type
 //!   (`crate::card_leg::StackW::route`: Q4_K, Q5_K, IQ3_XXS or IQ4_XS over
 //!   the run's q8_1 rows; NVFP4's planes over its 32-value rows), the card
-//!   slots' SwiGLU (`swiglu_quant32_sel`; with NVFP4's planes on a native
-//!   FP4 build the gate, the up and the SwiGLU are one launch,
+//!   slots' SwiGLU (`swiglu_quant32_sel`; with every card gate, up and down
+//!   in NVFP4's planes on a native FP4 build the gate, the up, the SwiGLU
+//!   and its native FP4 are one launch,
 //!   `Gemm32Kernels::enqueue_gate_up_sel32`), the down GEMM of its type (the
 //!   file's Q5_1, Q8_0 or IQ4_NL blocks, or NVFP4's planes) and the card sum
 //!   into the unit's acc — the host tier
@@ -791,8 +792,10 @@ pub(super) struct CardRoute38 {
     g: DeviceBuffer<f32>,
     u: DeviceBuffer<f32>,
     /// The card slots' SwiGLU in the 32-value GEMM's activation form, ten
-    /// columns a run token; a host slot's column is never written and never
-    /// read (the route leaves it to the host tier).
+    /// columns a run token, in the native FP4 form alone where one launch
+    /// runs the gate and up (`GemmAct32::new_gate_up_output`); a host slot's
+    /// column is never written and never read (the route leaves it to the
+    /// host tier).
     act: GemmAct32,
     /// The down GEMM's output, ten slots a run token of [`geo::HIDDEN`]
     /// values, slot-major — a token of the whole unit on a load with an
@@ -946,10 +949,10 @@ enum GateUp<'a> {
 /// `n_places` a column it writes; the 32-value GEMM's NVFP4 up folds it into
 /// its own launch, `Gemm32Kernels::enqueue_up_swiglu32`, and on a native FP4
 /// build the gate joins them, `Gemm32Kernels::enqueue_gate_up_sel32`) and the
-/// down GEMM into the run's `down_y` rows. Six launches, five with the fold;
-/// only the batch's slots are touched, so a pass's batches write the rows the
-/// whole pass always wrote, the same values in the same order — the bits do
-/// not move.
+/// down GEMM into the run's `down_y` rows. Six launches, five with the fold,
+/// four where the gate joins them; only the batch's slots are touched, so a
+/// pass's batches write the rows the whole pass always wrote, the same
+/// values in the same order — the bits do not move.
 #[allow(
     clippy::too_many_arguments,
     reason = "the batch's context, wait, ids, map, weights, width, places bound, sink, run rows and buffers (rust-quality R8)"
@@ -1082,19 +1085,24 @@ impl CardRoute38 {
         }
         let slots = run * geo::N_USED;
         let kept = if tiered { rows * geo::N_USED } else { slots };
-        let act = GemmAct32::new_routed_for(
-            stream,
-            slots,
-            geo::FF,
-            card.routed_types().map(|(_, down)| down),
-        )?;
+        let all_nvfp4 = card
+            .routed_types()
+            .all(|(gate, down)| gate == GgmlType::NVFP4 && down == GgmlType::NVFP4);
+        let act = if card.blocks32_gate_up() && all_nvfp4 {
+            GemmAct32::new_gate_up_output(stream, slots, geo::FF)?
+        } else {
+            GemmAct32::new_routed_for(
+                stream,
+                slots,
+                geo::FF,
+                card.routed_types().map(|(_, down)| down),
+            )?
+        };
         let bf16_down = !tiered
             && card.all_hostless()
             && act.has_native_form()
             && card.routed_types().all(|(_, down)| down == GgmlType::NVFP4);
-        let fused = act.has_native_form()
-            && card.blocks32_gate_up()
-            && card.routed_types().all(|(gate, _)| gate == GgmlType::NVFP4);
+        let fused = act.has_native_form() && card.blocks32_gate_up() && all_nvfp4;
         let product_cells = if fused { 0 } else { slots * geo::FF };
         Ok(CardRoute38 {
             run,

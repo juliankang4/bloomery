@@ -1354,17 +1354,19 @@ pub const CARD_ROUTE_RUN_TOKEN_BYTES: u64 = 170_360;
 /// places and a landing batch's places 120 B (ten u32 each); the gate·up
 /// input's native FP4 form at K = 2,560, 1,444 B a column (codes 1,280,
 /// block scales 160, the column's scale 4), and no 32-value or q8_1 form;
-/// no gate or up rows; the SwiGLU `GemmAct32` at K = 640 with its native
-/// form, 1,164 B a column (800 + 364), 11,640 B; the down f32 rows
-/// 10 · 2,560 · 4 = 102,400 B (a load whose every layer runs without the
-/// host leg keeps them in BF16, half); two route tables — the cols list
-/// 2 · 40 B, the zero ids of a table over one expert 40 B, their tile
-/// words at the most experts 2 · 8 · (320 + 512) / 2,048 = 6.5 B, the
+/// no gate or up rows; the SwiGLU `GemmAct32` at K = 640 in its native
+/// form alone, with the frames the gate and up launch writes it through,
+/// 408 B a column (codes 320, block scales 40, the column's scale 4, a
+/// frame a 64-value step 40, a tile's arrival word 4), 4,080 B; the down
+/// f32 rows 10 · 2,560 · 4 = 102,400 B (a load whose every layer runs
+/// without the host leg keeps them in BF16, half); two route tables — the
+/// cols list 2 · 40 B, the zero ids of a table over one expert 40 B, their
+/// tile words at the most experts 2 · 8 · (320 + 512) / 2,048 = 6.5 B, the
 /// counts; the identity map of the ids compression 512 words = 1 B:
-/// 115,724 + 6.5 + 1, rounded up]. The tables' expert tiles and the
+/// 108,164 + 6.5 + 1, rounded up]. The tables' expert tiles and the
 /// identity map are spread over a run of [`CARD_ROUTE_ROWS`] tokens, as in
 /// [`CARD_ROUTE_RUN_TOKEN_BYTES`].
-pub const NATIVE_ROUTE_RUN_TOKEN_BYTES: u64 = 115_732;
+pub const NATIVE_ROUTE_RUN_TOKEN_BYTES: u64 = 108_172;
 
 /// How a load's card route holds a run's rows between the routing and the
 /// down GEMM, which the plan counts a run token by
@@ -5260,7 +5262,7 @@ mod tests {
         /// tiered load's run holds 2,048 · (170,360 − 102,440) B more, the
         /// join keeping the down rows and places), two of them, or one beside
         /// a ubatch of one run, even of 0 B. In the native form the reserve
-        /// is 2,048 run tokens of 115,732 B (a tiered load's 115,732 −
+        /// is 2,048 run tokens of 108,172 B (a tiered load's 108,172 −
         /// 102,440), which a load reads back in that form and refuses in the
         /// other. What the caller reads of a plan is read of the plan of the
         /// machine returned, widened or not.
@@ -5337,7 +5339,7 @@ mod tests {
             let native = route_unit_bytes(4096, false, RouteForm::Native);
             assert_eq!(
                 (native, route_unit_bytes(4096, true, RouteForm::Native)),
-                (237_019_136, 27_222_016)
+                (221_536_256, 11_739_136)
             );
             let whole_native = widen_in(&inputs, machine(), 4096, Experts::Card, RouteForm::Native);
             assert_eq!(
@@ -5472,8 +5474,8 @@ mod tests {
         /// NVFP4 (a stack past its layers, a draft's, not read), the rows'
         /// form on another build or with one stack of another type; and a
         /// card-experts machine counts its route in the form it is given,
-        /// 2,048 run tokens of 170,360 − 115,732 B fewer at U 4,096 in the
-        /// native one [derived: 111,878,144 B], a host-routed machine none.
+        /// 2,048 run tokens of 170,360 − 108,172 B fewer at U 4,096 in the
+        /// native one [derived: 127,361,024 B], a host-routed machine none.
         #[test]
         fn a_card_route_is_counted_in_its_files_form() {
             use crate::placement::workstation::RTX_3090;
@@ -5501,7 +5503,7 @@ mod tests {
             };
             assert_eq!(
                 scratch(Experts::Card, RouteForm::Rows) - scratch(Experts::Card, RouteForm::Native),
-                111_878_144
+                127_361_024
             );
             assert_eq!(
                 scratch(Experts::Card, RouteForm::Rows),

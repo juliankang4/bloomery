@@ -3778,9 +3778,9 @@ mod gate {
         /// A routed block's gate, up and SwiGLU at Qwen3.8's prompt shape (512
         /// NVFP4 experts of 640 x 2560, top-10, 4,096 tokens): `_split` the
         /// gate and up GEMMs and `swiglu_quant32_sel`, the other
-        /// `enqueue_gate_up_sel32` (one launch and the FP4 pack on a native
-        /// build). Both arms first run both forms once and print whether their
-        /// Q8 bytes agree, and the bytes' hash.
+        /// `enqueue_gate_up_sel32` into its own scratch (one launch that packs
+        /// the FP4 on a native build). Each arm prints its activations' hash
+        /// (the `nvfp4_gate_up` case holds the two forms to each other).
         fn nvfp4_gate_up_arm(gpu: &bloomery_gpu::Gpu, arm: &str) -> Result<bool, GateError> {
             use bloomery_gpu::gemm::{
                 GateUp32Args, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput,
@@ -3835,8 +3835,12 @@ mod gate {
             gk.enqueue_route(stream, &ids_d, slots, &mut route, sink)?;
             let mut g = DeviceBuffer::<f32>::zeroed(stream, slots * rows)?;
             let mut u = DeviceBuffer::<f32>::zeroed(stream, slots * rows)?;
-            let mut act = GemmAct32::new_routed(stream, slots, rows)?;
-            let mut enq = |s: &CudaStream, split: bool, act: &mut GemmAct32| {
+            let mut act = if split {
+                GemmAct32::new_routed(stream, slots, rows)?
+            } else {
+                GemmAct32::new_gate_up_output(stream, slots, rows)?
+            };
+            let mut enq = |s: &CudaStream, act: &mut GemmAct32| {
                 if !split {
                     return g32.enqueue_gate_up_sel32(
                         s,
@@ -3870,24 +3874,22 @@ mod gate {
                 }
                 g32.enqueue_swiglu_quant32_sel(s, &g, &u, &ids_d, experts, slots, act, sink)
             };
-            let mut q8 = Vec::new();
-            for form in [true, false] {
-                enq(stream, form, &mut act)?;
-                q8.push(act.q().to_host_vec(stream)?);
-            }
-            let eager = burst(stream, &mut |s| enq(s, split, &mut act))?;
-            let graph = gpu.capture(|s| (0..N).try_for_each(|_| enq(s, split, &mut act)))?;
+            let eager = burst(stream, &mut |s| enq(s, &mut act))?;
+            let graph = gpu.capture(|s| (0..N).try_for_each(|_| enq(s, &mut act)))?;
             let timed = replay(stream, &graph)?;
             let bytes =
                 (2 * experts * rows * k * 9 / 16 + tokens * k + slots * rows * 5 / 4) as u64;
             print_arm(arm, rows, bytes, graph.node_count(), eager, timed);
-            let q8_eq = q8[0] == q8[1];
+            // The codes the down reads: the FP4 ones on a native build, the Q8 ones otherwise.
+            let codes = act.fp4_planes().map_or(act.q(), |(codes, _, _)| codes);
             println!(
-                "bench op={arm} slots={slots} k={k} experts={experts} q8_eq={q8_eq} q8_fnv={:016x}",
-                bloomery_gpu_gates::Fnv1a64::default().u32s(&q8[0]).value()
+                "bench op={arm} slots={slots} k={k} experts={experts} codes_fnv={:016x}",
+                bloomery_gpu_gates::Fnv1a64::default()
+                    .u32s(&codes.to_host_vec(stream)?)
+                    .value()
             );
-            if !q8_eq || gpu.take_fault()?.is_some() {
-                return Err("NVFP4 gate and up benchmark forms disagree".into());
+            if gpu.take_fault()?.is_some() {
+                return Err("NVFP4 gate and up benchmark raised a fault".into());
             }
             Ok(true)
         }
@@ -3944,7 +3946,7 @@ mod gate {
         use bloomery_gpu::q5::{Q8Blocks32, pack_q5_0};
         use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE};
         use bloomery_gpu_gates::gemm32::{
-            HostAct, Planes32, dot32, dot32_nv, dot32_nv_fp4, host_act,
+            HostAct, Planes32, dot32, dot32_nv, dot32_nv_fp4, gate_up_fp4, host_act,
         };
         use bloomery_gpu_gates::rounding::gamma;
         use bloomery_gpu_gates::swiglu_host;
@@ -9339,13 +9341,35 @@ mod gate {
         /// The `nvfp4_gate_up` case: `enqueue_gate_up_sel32`'s native launch
         /// against the gate and up GEMMs and `swiglu_quant32_sel` it replaces,
         /// over a remapped route with host slots, and with a refused id or a
-        /// NaN token: the card slots' Q8 bytes, the down GEMM's output over
-        /// every slot (sentinel on host slots) and the raised fault are equal,
-        /// `g` and `u` keep their sentinel (the native launch ran), and a graph
-        /// replay over a reset output and overwritten activations leaves the
-        /// same output, Q8 bytes and fault; down activations of another K than
-        /// the gate and up rows are refused by name.
+        /// NaN token: each card slot's FP4 is the transcription of the split
+        /// pair's Q8 codes (`gemm32::gate_up_fp4`: levels, scale bytes and
+        /// column scale), the other slots' the reset's zero column; the down
+        /// GEMM's output holds a sentinel, a NaN or a finite value in the same
+        /// cells for both, each finite card cell within the block-scaled MMA's
+        /// band of the host down over the fused FP4; the raised fault is
+        /// equal, `g` and `u` keep their sentinel (the native launch ran), and
+        /// a graph replay over a reset output and overwritten activations
+        /// leaves the same output and fault; down activations of another K
+        /// than the gate and up rows are refused by name. Three cases reach the
+        /// FP4's range edges (`Values`).
         fn nvfp4_gate_up_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            /// A case's values: `Spread` gives each expert's first 16 gate and
+            /// up rows the UE4M3 scale 2^7 and the rest 1, so a column's
+            /// sub-blocks and steps lie about 14 binades apart, across the
+            /// lowest scale field the FP4 keeps; `Tiny`
+            /// scales the input by 2^-66, so the SwiGLU nears 2^-121 and its
+            /// column scale 2^-130; `Edge` makes every card column's gate 128
+            /// and up `f32::MAX / 128`, so the SwiGLU is `f32::MAX` and 127
+            /// times its Q8 block scale overflows f32. An `Edge` card column's
+            /// FP4 levels must all be nonzero and its down outputs finite and
+            /// nonzero, apart from the transcription.
+            #[derive(Clone, Copy, Debug, PartialEq)]
+            enum Values {
+                Plain,
+                Spread,
+                Tiny,
+                Edge,
+            }
             if !wanted("nvfp4_gate_up") {
                 return Ok(true);
             }
@@ -9362,23 +9386,28 @@ mod gate {
             }
             let sink = gpu.unlabelled_sink();
             let (n_card, hidden, top_k) = (3usize, 64usize, 2usize);
+            const EXPERT_SCALES: [f32; 3] = [0.5, 1.0, 0.25];
             // Id 1 is the host's; id 4 maps past the card's experts (refused).
             let map = [0u32, HOST, 1, 2, 7];
             let map_d = DeviceBuffer::from_host(stream, &map)?;
             let mut ok = true;
-            for (rows, k, tokens, refused, poison, varied) in [
-                (64usize, 64usize, 9usize, false, None, false),
-                (128, 128, 50, true, None, false),
-                (64, 192, 23, false, None, false),
-                (64, 448, 23, false, None, false),
-                (192, 256, 37, false, Some(5usize), false),
-                (640, 2560, 131, false, None, false),
+            use Values::{Edge, Plain, Spread, Tiny};
+            for (rows, k, tokens, refused, poison, varied, values) in [
+                (64usize, 64usize, 9usize, false, None, false, Plain),
+                (128, 128, 50, true, None, false, Plain),
+                (64, 192, 23, false, None, false, Plain),
+                (64, 448, 23, false, None, false, Plain),
+                (192, 256, 37, false, Some(5usize), false, Plain),
+                (192, 256, 37, false, None, false, Spread),
+                (192, 256, 37, false, None, false, Tiny),
+                (64, 64, 9, false, None, false, Edge),
+                (640, 2560, 131, false, None, false, Plain),
                 // Varied columns force the gate/up walk's 1, 2, 4, 6 and 8 live-fragment arms.
-                (128, 128, 8, false, None, true),
-                (128, 128, 16, false, None, true),
-                (128, 128, 32, false, None, true),
-                (128, 128, 48, false, None, true),
-                (128, 128, 64, false, None, true),
+                (128, 128, 8, false, None, true, Plain),
+                (128, 128, 16, false, None, true, Plain),
+                (128, 128, 32, false, None, true, Plain),
+                (128, 128, 48, false, None, true, Plain),
+                (128, 128, 64, false, None, true, Plain),
             ] {
                 let slots = tokens * top_k;
                 let mut lcg = Lcg(0x5eed ^ (rows * k + tokens) as u64);
@@ -9395,27 +9424,58 @@ mod gate {
                 let sel: Vec<u32> = ids.iter().map(|&id| map[id as usize]).collect();
                 let ids_d = DeviceBuffer::from_host(stream, &ids)?;
                 let sel_d = DeviceBuffer::from_host(stream, &sel)?;
-                let stack = |n_rows: usize, n_k: usize, seed: u64| -> Result<_, GateError> {
+                // Each stack's E4M3 block scales: random between 2^-3 and 2^2, or
+                // fixed for each expert's first 16 rows and for the rest.
+                let stack = |n_rows: usize,
+                             n_k: usize,
+                             seed: u64,
+                             bytes: Option<[u32; 2]>,
+                             scales: [f32; 3]|
+                 -> Result<_, GateError> {
                     let mut g = Lcg(seed);
+                    // `Edge` weights hold one level-1 code in each eight values.
                     let codes: Vec<u32> = (0..n_card * n_rows * n_k / 8)
-                        .map(|_| g.next() as u32)
+                        .map(|_| if values == Edge { 2 } else { g.next() as u32 })
                         .collect();
-                    // E4M3 block scales between 2^-3 and 2^2.
                     let e: Vec<u32> = (0..n_card * n_rows * n_k / 64)
-                        .map(|_| {
-                            (0..4u32)
-                                .fold(0u32, |w, j| w | ((0x20 + g.below(40) as u32) << (8 * j)))
+                        .map(|i| {
+                            let top = i / (n_k / 64) % n_rows < 16;
+                            (0..4u32).fold(0u32, |w, j| {
+                                let byte = match bytes {
+                                    None => 0x20 + g.below(40) as u32,
+                                    Some([first, rest]) => {
+                                        if top {
+                                            first
+                                        } else {
+                                            rest
+                                        }
+                                    }
+                                };
+                                w | (byte << (8 * j))
+                            })
                         })
                         .collect();
                     Ok((
                         DeviceTensor::upload(stream, &codes, n_card * n_rows, n_k / 8)?,
                         DeviceTensor::upload(stream, &e, n_card * n_rows, n_k / 64)?,
-                        DeviceTensor::upload(stream, &[0.5f32, 1.0, 0.25], n_card, 1)?,
+                        DeviceTensor::upload(stream, &scales, n_card, 1)?,
                     ))
                 };
-                let (gq, ge, gs) = stack(rows, k, 1)?;
-                let (uq, ue, us) = stack(rows, k, 2)?;
-                let (dq, de, ds) = stack(hidden, rows, 3)?;
+                // `Edge`: the input's 2^-3 column scale times the level-6 input and
+                // level-1 weight, 6, times these expert scales gives 128 and f32::MAX / 128.
+                let (gate_up_bytes, gate_scales, up_scales, down_bytes) = match values {
+                    Plain | Tiny => (None, EXPERT_SCALES, EXPERT_SCALES, None),
+                    Spread => (Some([0x70, 0x38]), EXPERT_SCALES, EXPERT_SCALES, None),
+                    Edge => (
+                        Some([0x38, 0x38]),
+                        [512.0 / 3.0; 3],
+                        [f32::MAX / 96.0; 3],
+                        Some([0x08, 0x08]),
+                    ),
+                };
+                let (gq, ge, gs) = stack(rows, k, 1, gate_up_bytes, gate_scales)?;
+                let (uq, ue, us) = stack(rows, k, 2, gate_up_bytes, up_scales)?;
+                let (dq, de, ds) = stack(hidden, rows, 3, down_bytes, EXPERT_SCALES)?;
                 let gate = Gemm32Weight::Nvfp4Planes(Nvfp4Stack {
                     qs: &gq,
                     e: &ge,
@@ -9432,12 +9492,20 @@ mod gate {
                     scales: &ds,
                 });
                 let mut lx = Lcg(7 + tokens as u64);
+                let x_scale = if values == Tiny { 2f32.powi(-66) } else { 1.0 };
                 let xs: Vec<f32> = (0..tokens * k)
                     .map(|i| {
                         if poison == Some(i / k) && i % k == 3 {
                             f32::NAN
+                        } else if values == Edge {
+                            // Its Q8 scale c / 127 times 127 / 6 rounds to 2^-3 in f32.
+                            if i % k == 0 {
+                                f32::from_bits(0x3f40_0001)
+                            } else {
+                                0.0
+                            }
                         } else {
-                            (lx.below(4001) as f32 - 2000.0) / 1000.0
+                            (lx.below(4001) as f32 - 2000.0) / 1000.0 * x_scale
                         }
                     })
                     .collect();
@@ -9453,7 +9521,11 @@ mod gate {
                     let scratch_cells = if fused { 0 } else { slots * rows };
                     let mut g = DeviceBuffer::from_host(stream, &vec![SENT; scratch_cells])?;
                     let mut u = DeviceBuffer::from_host(stream, &vec![SENT; scratch_cells])?;
-                    let mut act = GemmAct32::new_routed(stream, slots, rows)?;
+                    let mut act = if fused {
+                        GemmAct32::new_gate_up_output(stream, slots, rows)?
+                    } else {
+                        GemmAct32::new_routed(stream, slots, rows)?
+                    };
                     let mut y = DeviceBuffer::from_host(stream, &vec![SENT; slots * hidden])?;
                     let mut enqueue = |s: &cuda_core::CudaStream,
                                        g: &mut DeviceBuffer<f32>,
@@ -9527,33 +9599,118 @@ mod gate {
                         .iter()
                         .chain(&u.to_host_vec(stream)?)
                         .all(|v| v.to_bits() == SENT.to_bits());
+                    let (fq, fe, fs) = act.fp4_planes().ok_or("a native scratch")?;
                     runs.push((
                         eager,
                         replay,
                         fault,
                         untouched,
                         reset_fault.is_none() && replay_fault == fault,
-                        act.q().to_host_vec(stream)?,
-                        act.d().to_host_vec(stream)?,
-                        act.s().to_host_vec(stream)?,
+                        (act.q().to_host_vec(stream)?, act.d().to_host_vec(stream)?),
+                        (
+                            fq.to_host_vec(stream)?,
+                            fe.to_host_vec(stream)?,
+                            fs.to_host_vec(stream)?,
+                        ),
+                        act.bytes(),
                     ));
                 }
                 let (plain, fused) = (&runs[0], &runs[1]);
                 let steps = rows / 64;
-                let mut q8_off = 0usize;
+                let ((q8, d8), (fq, fe, fs)) = (&plain.5, &fused.6);
+                let mut fp4_off = 0usize;
                 for (s, &place) in sel.iter().enumerate() {
+                    let (qr, er) = (s * rows / 8..(s + 1) * rows / 8, s * steps..(s + 1) * steps);
                     if place as usize >= n_card {
+                        // The reset's zero column, which the native launch leaves.
+                        fp4_off += usize::from(
+                            fq[qr].iter().chain(&fe[er]).any(|&w| w != 0) || fs[s] != 1.0,
+                        );
                         continue;
                     }
-                    let (w, b) = (s * 16 * steps, s * 2 * steps);
-                    q8_off += usize::from(plain.5[w..w + 16 * steps] != fused.5[w..w + 16 * steps])
-                        + usize::from(!bits_equal(
-                            &plain.6[b..b + 2 * steps],
-                            &fused.6[b..b + 2 * steps],
-                        ))
-                        + usize::from(plain.7[b..b + 2 * steps] != fused.7[b..b + 2 * steps]);
+                    let codes: Vec<i8> = q8[s * 16 * steps..(s + 1) * 16 * steps]
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes().map(|b| b as i8))
+                        .collect();
+                    let want = gate_up_fp4(&codes, &d8[s * 2 * steps..(s + 1) * 2 * steps]);
+                    let got = fq[qr].iter().enumerate().flat_map(|(w, &word)| {
+                        // Byte i of a sub-block's word pair holds values i (low nibble) and i + 8.
+                        (0..4).flat_map(move |b| {
+                            let at = 16 * (w / 2) + 4 * (w % 2) + b;
+                            let byte = (word >> (8 * b)) & 255;
+                            [(at, byte & 15), (at + 8, byte >> 4)]
+                        })
+                    });
+                    fp4_off += usize::from(
+                        got.into_iter().any(|(at, n)| {
+                            f32::from(KVALUES_MXFP4[n as usize]) / 2.0 != want.levels[at]
+                        }) || fe[er] != want.scale_words[..]
+                            || !bits_equal(&[fs[s]], &[want.scale]),
+                    );
                 }
-                let y_eq = bits_equal(&plain.0, &fused.0);
+                // Each cell a sentinel, a NaN or finite in both runs.
+                let kind = |v: f32| (v.to_bits() == SENT.to_bits(), v.is_nan());
+                let y_kind_eq = plain
+                    .0
+                    .iter()
+                    .zip(&fused.0)
+                    .all(|(&a, &b)| kind(a) == kind(b));
+                // PIN(2026-10-31): power-of-two FP4 frames replace exact split-output equality.
+                // The down over the fused FP4 on the host: each card cell within 2^-16 of its
+                // magnitude (the block-scaled MMA sums at its own width) plus half the f32
+                // spacing below 2^-126 the store rounds to, NaN where its column is refused.
+                let (dqh, deh) = (dq.buf().to_host_vec(stream)?, de.buf().to_host_vec(stream)?);
+                let code = |words: &[u32], v: usize| {
+                    let byte = 8 * (v / 16) + v % 8;
+                    let n = (words[byte / 4] >> (8 * (byte % 4) + 4 * (v % 16 / 8))) & 15;
+                    i32::from(KVALUES_MXFP4[n as usize])
+                };
+                let half = |words: &[u32], sb: usize| {
+                    f64::from(ue4m3_half((words[sb / 4] >> (8 * (sb % 4))) & 255))
+                };
+                let mut y_off = 0usize;
+                for (i, &value) in fused.0.iter().enumerate() {
+                    let (s, row) = (i / hidden, i % hidden);
+                    let place = sel[s] as usize;
+                    if place >= n_card {
+                        continue;
+                    }
+                    let w0 = place * hidden + row;
+                    let (w, we) = (&dqh[w0 * rows / 8..], &deh[w0 * rows / 64..]);
+                    let (a, ae) = (&fq[s * rows / 8..], &fe[s * steps..]);
+                    let (sum, mag) = (0..rows / 16).fold((0.0f64, 0.0f64), |(y, m), sb| {
+                        let isum: i32 = (16 * sb..16 * sb + 16)
+                            .map(|v| code(w, v) * code(a, v))
+                            .sum();
+                        let t = half(we, sb) * half(ae, sb) * f64::from(isum);
+                        (y + t, m + t.abs())
+                    });
+                    let g = f64::from(EXPERT_SCALES[place]) * f64::from(fs[s]);
+                    let (want, band) = (
+                        g * sum,
+                        g.abs() * mag * 2.0f64.powi(-16) + f64::from(f32::from_bits(1)) / 2.0,
+                    );
+                    y_off += usize::from(if want.is_nan() {
+                        !value.is_nan()
+                    } else {
+                        !value.is_finite() || (f64::from(value) - want).abs() > band
+                    });
+                }
+                // `Edge`: every card column's Q8 block scale is f32::MAX / 127, its FP4
+                // levels nonzero and its down outputs finite and nonzero.
+                let edge_ok = values != Edge
+                    || sel.iter().enumerate().all(|(s, &place)| {
+                        place as usize >= n_card
+                            || (d8[s * 2 * steps..(s + 1) * 2 * steps]
+                                .iter()
+                                .all(|&d| d == f32::MAX / 127.0)
+                                && fq[s * rows / 8..(s + 1) * rows / 8]
+                                    .iter()
+                                    .all(|&w| (0..8).all(|n| (w >> (4 * n)) & 15 != 0))
+                                && fused.0[s * hidden..(s + 1) * hidden]
+                                    .iter()
+                                    .all(|&v| v.is_finite() && v != 0.0))
+                    });
                 let replay_eq = bits_equal(&fused.0, &fused.1);
                 let want_fault = if poison.is_some() {
                     Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn))
@@ -9563,16 +9720,18 @@ mod gate {
                     None
                 };
                 let fault_eq = plain.2 == want_fault && fused.2 == want_fault && plain.4 && fused.4;
-                let pass = q8_off == 0
-                    && y_eq
+                let pass = fp4_off == 0
+                    && edge_ok
+                    && y_kind_eq
+                    && y_off == 0
                     && replay_eq
                     && fault_eq
                     && fused.3
                     && !plain.3
                     && x_fault == poison.map(|_| Fault::at(LAYER_NONE, FaultSite::QuantColumn));
                 println!(
-                    "gemm32 case=nvfp4_gate_up rows={rows} k={k} slots={slots} varied={varied} scratch_saved_bytes={} refused={refused} poison={poison:?} q8_off={q8_off} y_eq={y_eq} eager_graph_eq={replay_eq} fault={:?} replay_fault_eq={} native={} {}",
-                    2 * slots * rows * size_of::<f32>(),
+                    "gemm32 case=nvfp4_gate_up rows={rows} k={k} slots={slots} varied={varied} values={values:?} scratch_saved_bytes={} refused={refused} poison={poison:?} fp4_off={fp4_off} edge_ok={edge_ok} y_kind_eq={y_kind_eq} y_off={y_off} eager_graph_eq={replay_eq} fault={:?} replay_fault_eq={} native={} {}",
+                    2 * slots * rows * size_of::<f32>() + plain.7 - fused.7,
                     fused.2,
                     plain.4 && fused.4,
                     fused.3,
@@ -9583,7 +9742,7 @@ mod gate {
                     // The down's activations must hold K = the gate and up rows.
                     let mut g = DeviceBuffer::from_host(stream, &vec![SENT; slots * rows])?;
                     let mut u = DeviceBuffer::from_host(stream, &vec![SENT; slots * rows])?;
-                    let mut wide = GemmAct32::new_routed(stream, slots, 2 * rows)?;
+                    let mut wide = GemmAct32::new_gate_up_output(stream, slots, 2 * rows)?;
                     let refusal = dev.g32.enqueue_gate_up_sel32(
                         stream,
                         GateUp32Args {
