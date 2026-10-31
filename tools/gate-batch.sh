@@ -3296,10 +3296,11 @@ PY
     k=$((k + 1))
   done
   wait "$sp" 2> /dev/null || true
-  if [ -n "$pkmark" ] && [ -n "$ap" ] && ! kill -0 "$ap" 2> /dev/null && ! grep -q cancel "$t/twin-ssh.log" 2> /dev/null; then
+  # PIN(2026-10-31): the pattern names the cancel request; a bare `cancel` matched the logged `stdbuf -o0 tail -c +1 -F <run dir>/fix-gate-cancel-status/tmp/r.XXXXXX/gate-batch-test.XXXXXX/...` when the run directory carried the item name.
+  if [ -n "$pkmark" ] && [ -n "$ap" ] && ! kill -0 "$ap" 2> /dev/null && ! grep -Eq '/jobs/[^ ]+/cancel' "$t/twin-ssh.log" 2> /dev/null; then
     pass 'twin: TERM to a batch ends a pack item'"'"'s attach client, and the twin job is not cancelled'
   else
-    fail 'twin: TERM to a batch ends a pack item'"'"'s attach client, and the twin job is not cancelled' "mark='$pkmark' client='$ap' $(grep -c cancel "$t/twin-ssh.log" 2> /dev/null) cancel call(s)"
+    fail 'twin: TERM to a batch ends a pack item'"'"'s attach client, and the twin job is not cancelled' "mark='$pkmark' client='$ap' $(grep -Ec '/jobs/[^ ]+/cancel' "$t/twin-ssh.log" 2> /dev/null) cancel call(s)"
     [ -z "$ap" ] || kill -KILL "$ap" 2> /dev/null || true
   fi
   twin_none() { # <tag> <job status> <job rc> <the rc it gives>: a twin with no verdict on these inputs; the item queues itself
