@@ -390,8 +390,8 @@ mod gate {
         crate::residency_clauses::seeds(machine, b.hybrid().slots().layers())
     }
 
-    /// `transform`: each admitted expert's slot against its static bytes
-    /// (three parts an expert: the gate and up, the down).
+    /// `transform`: each admitted expert's slot against its static bytes,
+    /// every part of it the source stages.
     fn transform_clause(s: &Session<Body38>) -> Result<bool, GateError> {
         let m = s.model();
         let b = m.body(NAME)?;
@@ -404,7 +404,7 @@ mod gate {
             .ok_or("the load has no residency source")?;
         let layers = crate::residency_clauses::layer_seeds(machine, b.hybrid().slots().layers())?;
         let (checked, bad) =
-            crate::residency_clauses::transform_check(m.gpu(), machine, source, &layers, |_| 3)?;
+            crate::residency_clauses::transform_check(m.gpu(), machine, source, &layers)?;
         Ok(crate::residency_clauses::transform_verdict(checked, &bad))
     }
 

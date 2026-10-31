@@ -562,9 +562,7 @@ mod gate {
             .residency_source()
             .ok_or("the load has no residency source")?;
         let (checked, bad) =
-            crate::residency_clauses::transform_check(m.gpu(), machine, source, seeds, |l| {
-                source.part_bytes(l).len()
-            })?;
+            crate::residency_clauses::transform_check(m.gpu(), machine, source, seeds)?;
         // The source's parts against the header, over every layer: the byte
         // check above reads the source's own part sizes on both sides.
         let mut cards = Vec::new();

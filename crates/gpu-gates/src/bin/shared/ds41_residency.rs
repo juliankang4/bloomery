@@ -354,7 +354,7 @@ fn transform_clause(s: &Session<Body>) -> Result<bool, GateError> {
     }
     let layers = crate::residency_clauses::layer_seeds(machine, b.hybrid().slots().layers())?;
     let (checked, bad) =
-        crate::residency_clauses::transform_check(m.gpu(), machine, source, &layers, |_| 3)?;
+        crate::residency_clauses::transform_check(m.gpu(), machine, source, &layers)?;
     Ok(crate::residency_clauses::transform_verdict_with(
         checked,
         &bad,
