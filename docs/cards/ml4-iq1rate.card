@@ -1,0 +1,15 @@
+# ML4 host leg: the IQ1_S x Q8_K AVX2 hand kernel (ik's mul_mat_iq1_s_q8_K port) vs the IQ2_XXS hand kernel at ML4's
+# row width, one process, one lease. An untimed run of the same binary read IQ1_S 84.2 GB/s and IQ2_XXS 67.1 GB/s
+# (ratio 1.25), and the generic IQ1_S decode 31.2 GB/s (0.46, inside the design's 0.33..0.65 for that path) [derived:
+# untimed, no lease, so the band is wide].
+kind: calibration
+question: does the IQ1_S x Q8_K hand kernel keep up with IQ2_XXS at k=6144, T=32?
+term: qdot-rate-mt GB/s ratio IQ1_S(k=6144, 1200 B/row) / IQ2_XXS(k=6144, 1584 B/row), T=32, both rows in one process
+unit: ratio
+predict: 1.05..1.45
+condition: just measure-qdot-rate-mt --only IQ1_S,IQ2_XXS under the CPU lease, netdata frozen, no other compute
+reason: sets the IQ1_S host rate the ML4 decode band rests on (75 % of its host bytes are IQ1_S); why now: it decides
+  whether the 17-21 tok/s band (DRAM-bound host leg) or the 9-15 band holds before the ML4 timing sitting
+decide-in: the IQ1_S leg is not the bound; ML4 decode band 17-21 tok/s at depth 6, no further host kernel work
+decide-below: perf -e cpu-clock on the IQ1_S row; 0.65..1.05 prices the loss (bytes x (1/r - 1)) before any work
+decide-above: both rows are at the DRAM ceiling; read the IQ2_XXS row against its own earlier rates for a regression
