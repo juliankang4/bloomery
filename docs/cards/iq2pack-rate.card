@@ -1,0 +1,17 @@
+# IQ2_XXS x Q8_K host dot without its spilled whole-block pack (ik's prepare/consume halves): the spill's 48 ymm stack
+# operations and 16 dead zero-stores a block are gone, 355 -> 308 instructions a 66-B block [counted in the box's
+# znver3 asm]. Base 59.7 GB/s at T=32 unpinned, 3.6 at T=1 (ml4-iq1rate's sitting). A per-core gain of 308/355 alone
+# predicts ~1.15x [derived]; the investigation put SMT pairing of unpinned threads beside it, which this binary's
+# --pin arm separates.
+kind: calibration
+question: how much faster is the IQ2_XXS kernel without the spilled pack at k=6144, T=32, unpinned?
+term: qdot-rate-mt GB/s ratio IQ2_XXS(k=6144) new tree / main, T=32 unpinned, one lease, base first then new
+unit: ratio
+predict: 1.08..1.40
+condition: just measure-qdot-rate-mt --only IQ2_XXS,IQ1_S on main, then on the iq2pack tree without and with --pin,
+  in one sitting under the CPU lease, netdata frozen, no other compute
+reason: IQ2_XXS is a quarter of ML4's host bytes and most of Muse's; why now: the kernel change lands only with its
+  timed effect
+decide-in: land the kernel; the pinned row says whether the ceiling binary's placement hid the rest
+decide-below: the spill was not the cost; keep the change only as a code-shape fix and read perf on the gathers
+decide-above: the spill cost more than its instructions (stalls); land it and check IQ3_XXS for the same shape
