@@ -629,6 +629,12 @@ pub struct ArenaDial {
     pub room: u64,
     /// The plan's host terms beside the routed experts.
     pub base: u64,
+    /// On a unified machine, the cards' share of the pool that `room` and
+    /// `base` both carry (`HostNeed::cards`); 0 where each card has memory
+    /// of its own. The dial's step and deep side read the host's room past
+    /// it, so a unified card gets the arena a discrete one gets beside the
+    /// same card bytes.
+    pub cards: u64,
     /// `W`: the host-served expert bytes of the layer with the most.
     pub heavy: u64,
     /// `H`: the host leg's routed-expert bytes before the split.
@@ -651,14 +657,26 @@ impl ArenaDial {
             })
     }
 
-    /// What the room leaves above the floor where it reaches half the host
-    /// leg, `H/2 − floor` (the deep side's arenas lie under it), when the
+    /// The room the dial steps at, `H/2 + cards`: where the host's room past
+    /// the cards reaches half the host leg. Refused by name past u64.
+    fn half(&self) -> Result<u64, PlacementError> {
+        (self.held / 2)
+            .checked_add(self.cards)
+            .ok_or_else(|| PlacementError::Metadata {
+                key: "the NVMe expert tier's step".to_string(),
+                detail: "passes u64 bytes".to_string(),
+            })
+    }
+
+    /// What the room leaves above the floor at the step,
+    /// `H/2 + cards − floor` (the deep side's arenas lie under it), when the
     /// arena's least fits under it; `None` on a plan the dial gives no
     /// arena.
-    fn peak(&self, floor: u64) -> Option<u64> {
-        (self.held / 2)
+    fn peak(&self, floor: u64) -> Result<Option<u64>, PlacementError> {
+        Ok(self
+            .half()?
             .checked_sub(floor)
-            .filter(|&peak| peak >= self.least.bytes)
+            .filter(|&peak| peak >= self.least.bytes))
     }
 
     /// The least room the dial plans at under the lever's `given` arena:
@@ -666,18 +684,19 @@ impl ArenaDial {
     /// arena's least above it.
     pub fn room_floor(&self, given: Option<u64>) -> Result<u64, PlacementError> {
         let floor = self.floor()?;
-        Ok(match (given, self.peak(floor)) {
+        Ok(match (given, self.peak(floor)?) {
             (None, Some(_)) => floor + self.least.bytes,
             _ => floor,
         })
     }
 
-    /// The last room the dial gives an arena, `H/2 − 1` — the deep side's
-    /// largest, `H/2 − 1 − F`, its one step to none at `H/2` — or `None` on
-    /// a plan with no deep side.
+    /// The last room the dial gives an arena, `H/2 + cards − 1` — the deep
+    /// side's largest, `H/2 + cards − 1 − F`, its one step to none at
+    /// `H/2 + cards` — or `None` on a plan with no deep side.
     pub fn step_room(&self) -> Result<Option<u64>, PlacementError> {
         let floor = self.floor()?;
-        Ok(self.peak(floor).map(|_| self.held / 2 - 1))
+        let half = self.half()?;
+        Ok(self.peak(floor)?.map(|_| half - 1))
     }
 }
 
@@ -688,14 +707,15 @@ impl ArenaDial {
 ///
 /// The default, with `F` the floor, `H` the host leg and `M` the arena's
 /// least ([`ArenaFloor`]): the room above the floor, `room − F`, while the
-/// room is under `H/2` (a deep split: the prompt is NVMe-bound whatever the
-/// split, so the arena's warm set costs prefill little); from `H/2` on,
-/// none (the split keeps every host expert it can and pages through the
-/// file mapping, which serves several columns and the draft). No room gets
-/// an arena under `M`: a room under `F + M` on a plan with a deep side is
-/// refused. The one step is at `H/2`, from `H/2 − 1 − F` to none; a byte of
-/// room moves the arena by one byte everywhere else. A plan whose deep side
-/// cannot hold `M` gets none at any room.
+/// host's room past the cards ([`ArenaDial::cards`]) is under `H/2` (a deep
+/// split: the prompt is NVMe-bound whatever the split, so the arena's warm
+/// set costs prefill little); from there on, none (the split keeps every
+/// host expert it can and pages through the file mapping, which serves
+/// several columns and the draft). No room gets an arena under `M`: a room
+/// under `F + M` on a plan with a deep side is refused. The one step is at
+/// `H/2 + cards`, from `H/2 + cards − 1 − F` to none; a byte of room moves
+/// the arena by one byte everywhere else. A plan whose deep side cannot
+/// hold `M` gets none at any room.
 ///
 /// Refused by name: a room under [`ArenaDial::room_floor`]
 /// ([`PlacementError::HostRoomFloor`], naming the arena's least when it
@@ -728,7 +748,7 @@ pub fn nvme_arena_of(dial: &ArenaDial, given: Option<u64>) -> Result<u64, Placem
         Some(arena) => return Ok(arena),
         None => {}
     }
-    if dial.peak(floor).is_none() || room >= dial.held / 2 {
+    if dial.peak(floor)?.is_none() || room >= dial.half()? {
         return Ok(0);
     }
     Ok(room - floor)
@@ -840,6 +860,7 @@ pub fn expert_nvme_tier(
     let dial = ArenaDial {
         room,
         base,
+        cards: need.cards,
         heavy,
         held,
         need: need.bytes(),

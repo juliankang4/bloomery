@@ -22,8 +22,8 @@ use super::workstation::{
 };
 use super::{
     ARENA_ALIGN, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, Card, Device, KvBytes, Machine,
-    ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers, Role, nvme_arena_of,
-    plan_routed_reserving,
+    ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers, Role, UnifiedPool,
+    nvme_arena_of, plan_routed_reserving,
 };
 use crate::accepts::{Program, routed_rule};
 use crate::slots::{SeqTerms, Stores};
@@ -937,6 +937,7 @@ fn dial_of(twin: &Plan<'_>, room: u64) -> ArenaDial {
     ArenaDial {
         room,
         base: HostNeed { experts: 0, ..need }.bytes(),
+        cards: need.cards,
         heavy: (0..LAYERS)
             .map(|l| layer_split(twin, l).2)
             .max()
@@ -1768,6 +1769,41 @@ fn the_dials_one_step_is_at_half_the_host_leg() {
     assert!(last - floor >= dial.least.bytes);
 }
 
+/// A unified card plans the arena a discrete one does beside the same card
+/// bytes: the gate plan at host room `R`, and the same machine on a unified
+/// pool at `R` plus the cards' share of it, take one arena at 4,096
+/// positions for one slot and for two, the deep side's at 27 GiB and none
+/// at 40 GiB.
+#[test]
+fn a_unified_card_reads_the_host_room_past_its_share() {
+    let q4 = model(false);
+    let discrete = machine_a(RTX_3090);
+    let mut unified = machine_a(RTX_3090);
+    *unified.unified_mut() = Some(UnifiedPool { bytes: 1 << 40 });
+    for slots in [1, 2] {
+        for (gib, deep) in [(27u64, true), (40, false)] {
+            let room = gib << 30;
+            let twin =
+                plan_with(&q4, &unified, 4096, slots, room, false).expect("the unsplit plan");
+            let cards = HostNeed::of(&twin, 0).cards;
+            assert!(cards > 0, "the unified plan counts its card in the pool");
+            let arena = |m, room| {
+                plan_at(&q4, m, 4096, slots, room)
+                    .expect("the split plan")
+                    .host
+                    .nvme_arena_bytes
+            };
+            let want = arena(&discrete, room);
+            assert_eq!(want > 0, deep, "{slots} slots, {gib} GiB: {want} B");
+            assert_eq!(
+                arena(&unified, room + cards),
+                want,
+                "{slots} slots, {gib} GiB plus the cards' {cards} B"
+            );
+        }
+    }
+}
+
 /// The dial at the gate plan's and the A6000 plan's terms (one slot, 4,096
 /// positions), every room from the floor to the need on a 64 MiB grid and at
 /// each breakpoint and its neighbours: refused only under the floor and its
@@ -1834,6 +1870,7 @@ fn the_split_dial_picks_its_arena_or_refuses_a_too_large_one() {
     let dial = |room| ArenaDial {
         room,
         base: G,
+        cards: 0,
         heavy: G,
         held: 60 * G,
         need: 61 * G,
