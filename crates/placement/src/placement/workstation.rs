@@ -1004,6 +1004,12 @@ pub fn spec_of(card: &Card) -> Option<CardSpec> {
 /// hold. The page cache the host set will reuse is inside `MemAvailable`
 /// already, as reclaimable file pages, so no term adds it.
 ///
+/// The need is the load's peak, not the sum of every term: a part source's
+/// reads ([`HostNeed::read_ahead`]) end with the card upload, and a host set
+/// that holds `extra` is read in after it (`GpuModel::load_placed`'s order),
+/// so a load holds the larger of the two, never both. Every other term is
+/// counted in both phases.
+///
 /// The one owner of a plan's host bound: the load holds the need to the
 /// host's reading, and the plan its own terms to its machine's figure
 /// ([`HostNeed::machine_room`]: `Plan::violations`' host check and a plan's
@@ -1017,7 +1023,8 @@ pub struct HostNeed {
     pub shadows: u64,
     pub reserves: u64,
     pub extra: u64,
-    /// Owned part results and their concurrent read/normalization scratch during loading.
+    /// Owned part results and their concurrent read/normalization scratch during loading, never
+    /// held beside `extra`.
     pub read_ahead: u64,
     /// The plan's NVMe expert tier arena (`HostTotals::nvme_arena_bytes`):
     /// the bytes the tier's slots fill beside these terms, anonymous or
@@ -1087,8 +1094,7 @@ impl HostNeed {
             self.tables,
             self.shadows,
             self.reserves,
-            self.extra,
-            self.read_ahead,
+            self.extra.max(self.read_ahead),
             if arena { self.arena } else { 0 },
             self.cards,
         ]
@@ -1098,24 +1104,38 @@ impl HostNeed {
         .saturating_sub(u128::from(self.os))
     }
 
-    /// The bytes `MemAvailable` must cover: the plan's host terms, `extra`,
-    /// the arena and the cards' share of a unified pool — what a placed load
-    /// of this plan holds. A need past u64 bytes reads `u64::MAX`, which no
-    /// reading but `u64::MAX` covers ([`HostNeed::check`] holds the exact
-    /// sum).
+    /// The bytes `MemAvailable` must cover: the plan's host terms, the larger
+    /// of `extra` and the part reads, the arena and the cards' share of a
+    /// unified pool — what a placed load of this plan holds at its peak. A
+    /// need past u64 bytes reads `u64::MAX`, which no reading but `u64::MAX`
+    /// covers ([`HostNeed::check`] holds the exact sum).
     #[must_use]
     pub fn bytes(&self) -> u64 {
         u64::try_from(self.exact(true)).unwrap_or(u64::MAX)
     }
 
     /// [`HostNeed::bytes`] with the arena out: the plan's own host terms,
-    /// `extra` and the cards' share of a unified pool — the sum the
-    /// plan-time room arithmetic of `expert_nvme_tier` shapes, the arena
-    /// being its own dial beside it (the room that arithmetic splits has
-    /// already lost the arena).
+    /// the larger of `extra` and the part reads, and the cards' share of a
+    /// unified pool — the sum the plan-time room arithmetic of
+    /// `expert_nvme_tier` shapes, the arena being its own dial beside it (the
+    /// room that arithmetic splits has already lost the arena).
     #[must_use]
     pub fn plan_bytes(&self) -> u64 {
         u64::try_from(self.exact(false)).unwrap_or(u64::MAX)
+    }
+
+    /// What `room` leaves a part source's reads ([`HostNeed::read_ahead`]):
+    /// the room less every term but `extra` and the reads, which the load
+    /// never holds at once, so the reads may take the room the churn pool
+    /// takes once they end.
+    #[must_use]
+    pub fn read_room(&self, room: u64) -> u64 {
+        let beside = HostNeed {
+            extra: 0,
+            read_ahead: 0,
+            ..*self
+        };
+        room.saturating_sub(beside.bytes())
     }
 
     /// What `room` leaves past [`HostNeed::plan_bytes`]: the plan's host
@@ -1271,11 +1291,15 @@ impl fmt::Display for HostShort {
             n.shadows,
             n.reserves
         )?;
-        if n.extra > 0 {
-            write!(f, " + residency churn pool {} B", n.extra)?;
-        }
-        if n.read_ahead > 0 {
-            write!(f, " + part read-ahead {} B", n.read_ahead)?;
+        match (n.extra, n.read_ahead) {
+            (0, 0) => {}
+            (pool, 0) => write!(f, " + residency churn pool {pool} B")?,
+            (0, reads) => write!(f, " + part read-ahead {reads} B")?,
+            (pool, reads) => write!(
+                f,
+                " + the larger of the residency churn pool {pool} B and the part read-ahead \
+                 {reads} B, which the load never holds at once"
+            )?,
         }
         if n.arena > 0 {
             write!(f, " + NVMe tier arena {} B", n.arena)?;
@@ -1304,7 +1328,7 @@ impl fmt::Display for HostShort {
                 HostRead::Machine => "Ask for a shorter context".to_string(),
             }
         )?;
-        if n.extra > 0 {
+        if n.extra > n.read_ahead {
             write!(f, "; BLOOMERY_RESIDENCY=off drops the churn pool")?;
         }
         if n.arena > 0 {
@@ -1363,8 +1387,10 @@ pub struct Hosting {
 }
 
 /// An addend of [`HostNeed::bytes`], the reserves split by what they set
-/// aside. [`NeedTerm::class`] is the one table of which page class holds
-/// each: a term added to the need is added here, and the match is exhaustive.
+/// aside, [`NeedTerm::Extra`] and [`NeedTerm::PartReads`] the one of the two
+/// the need's peak holds. [`NeedTerm::class`] is the one table of which page
+/// class holds each: a term added to the need is added here, and the match is
+/// exhaustive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NeedTerm {
     /// The routed experts the host keeps ([`HostNeed::experts`]): file pages
@@ -1531,7 +1557,8 @@ impl std::error::Error for NeedClassError {}
 
 impl HostNeed {
     /// The need by page class under `how`: each addend of [`HostNeed::bytes`]
-    /// in the class [`NeedTerm::class`] gives it, the OS reserve out. `self`
+    /// in the class [`NeedTerm::class`] gives it, the OS reserve out, and of
+    /// the churn pool and the part reads the larger, the one the peak holds. `self`
     /// is [`HostNeed::of`] of `plan`; a need made of another plan, or edited
     /// since, is refused by name.
     pub fn classes(&self, plan: &Plan<'_>, how: Hosting) -> Result<NeedClasses, NeedClassError> {
@@ -1567,8 +1594,11 @@ impl HostNeed {
         add(NeedTerm::Shadows, self.shadows);
         add(NeedTerm::RowCache, rows);
         add(NeedTerm::RunAhead, window);
-        add(NeedTerm::Extra, self.extra);
-        add(NeedTerm::PartReads, self.read_ahead);
+        if self.extra >= self.read_ahead {
+            add(NeedTerm::Extra, self.extra);
+        } else {
+            add(NeedTerm::PartReads, self.read_ahead);
+        }
         add(NeedTerm::Arena, self.arena);
         add(NeedTerm::Cards, self.cards);
         Ok(classes)
@@ -2663,6 +2693,68 @@ mod tests {
             ..base
         };
         assert!(overflow.check(&read(u64::MAX)).is_err());
+    }
+
+    /// A Qwen3.8 NVFP4 folder split on a GB10 under a 60 GB card budget with the residency
+    /// unset: its host set reads the churn pool in after the card upload has ended the part
+    /// reads, so the load holds the larger of the two, and the reads may take the room the pool
+    /// takes once they end; the cards' share of the unified pool stays in both. A refusal at
+    /// reads past the pool names no residency word, which would free nothing. Mutants: the two
+    /// summed, which refuses this load; the residency hint on any pool.
+    #[test]
+    fn a_load_never_holds_its_part_reads_and_its_churn_pool_at_once() {
+        let need = HostNeed {
+            experts: 18_687_283_200,
+            tables: 0,
+            shadows: 100_663_296,
+            reserves: 835_456_128,
+            extra: 39_307_161_600,
+            read_ahead: 10_171_207_688,
+            arena: 0,
+            cards: 64_139_335_376,
+            os: 0,
+            card_budget: true,
+        };
+        let room = read(123_551_232_000);
+        let beside = 18_687_283_200 + 100_663_296 + 835_456_128 + 64_139_335_376;
+        assert_eq!(need.bytes(), beside + need.extra);
+        assert_eq!(need.check(&room), Ok(()));
+        assert_eq!(need.read_room(room.0), room.0 - beside);
+        let most = HostNeed {
+            read_ahead: need.read_room(room.0),
+            ..need
+        };
+        assert_eq!(most.bytes(), room.0);
+        assert_eq!(most.check(&room), Ok(()));
+        let past = HostNeed {
+            read_ahead: most.read_ahead + 1,
+            ..need
+        };
+        let text = past
+            .check(&room)
+            .expect_err("a byte past the room")
+            .to_string();
+        assert!(
+            text.contains(
+                "the larger of the residency churn pool 39307161600 B and the part read-ahead \
+                 39788494001 B"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("the cards' share of the unified pool 64139335376 B"));
+        assert!(!text.contains("BLOOMERY_RESIDENCY=off"), "{text}");
+        let pooled = HostNeed {
+            extra: room.0 - beside + 1,
+            ..need
+        };
+        let text = pooled
+            .check(&room)
+            .expect_err("a byte past the room")
+            .to_string();
+        assert!(
+            text.contains("BLOOMERY_RESIDENCY=off drops the churn pool"),
+            "{text}"
+        );
     }
 
     const PAGED_AVAILABLE: u64 = 27_499_458_560;

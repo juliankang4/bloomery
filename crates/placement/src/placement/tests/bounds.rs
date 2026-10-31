@@ -1030,6 +1030,7 @@ fn a_host_need_is_held_by_page_class() {
             need.bytes(),
             "{how:?}: the classes sum to the need"
         );
+        // Reads past the churn pool are the peak's, the pool out: the load reads it in after them.
         let reading = HostNeed {
             read_ahead: 17,
             ..need
@@ -1037,6 +1038,7 @@ fn a_host_need_is_held_by_page_class() {
         let with_reads = reading.classes(&plan, how).expect("a load's read reserve");
         assert_eq!(with_reads.anon, got.anon + 17);
         assert_eq!(with_reads.bytes(), reading.bytes());
+        assert_eq!(reading.bytes(), need.bytes() - extra + 17);
     }
     // The table: each term's class under both holdings.
     let locked = Hosting {

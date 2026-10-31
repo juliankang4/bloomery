@@ -2287,7 +2287,8 @@ pub trait PartsLoad: Send {
     /// one card, with no plan ([`GpuModel::load_blocks_from`]).
     fn load_whole(&self, stream: &CudaStream, card: CardOf<'_>) -> Result<Weights, GpuError>;
 
-    /// The host admission and exact read peak to pass to load.
+    /// The host admission and exact read peak to pass to load: the reads planned within the room
+    /// the need's other terms leave them, `extra` out ([`HostNeed::read_room`]).
     fn host_need(
         &self,
         plan: &Plan<'_>,
@@ -2296,8 +2297,7 @@ pub trait PartsLoad: Send {
         available: u64,
     ) -> Result<(HostNeed, u64), GpuError> {
         let mut need = HostNeed::of(plan, extra);
-        let room = available.saturating_sub(need.bytes());
-        let peak = self.host_bytes(plan, card, room)?;
+        let peak = self.host_bytes(plan, card, need.read_room(available))?;
         if peak > 0 {
             let ring = crate::upload::UploadRing::HOST_MAX;
             need.read_ahead = peak.checked_sub(ring).ok_or_else(|| {
@@ -2338,7 +2338,9 @@ pub trait PartsLoad: Send {
 /// holds experts of card segments (`extra`, the residency machine's churn
 /// pool) reads them in and locks them where the upload releases the card
 /// segments' pages, so that load keeps the old order: the walk after the
-/// upload and derive.
+/// upload and derive. The host need counts on that order: a part source's
+/// reads end with the upload, so the need holds them and `extra` never at
+/// once ([`HostNeed::read_room`]).
 #[allow(
     clippy::too_many_arguments,
     reason = "the load's file and where its card bytes come from, its plan and card, the host's levers, the extra and known host runs, and the derive (rust-quality R8)"
